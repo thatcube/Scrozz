@@ -1205,6 +1205,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3336,6 +3346,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "fs2",
  "image",
  "raw-window-handle",
  "scrozz-annotate",
@@ -3444,12 +3455,14 @@ version = "0.1.0"
 dependencies = [
  "ashpd",
  "global-hotkey",
+ "image",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
  "scrozz-core",
+ "scrozz-export",
  "thiserror 2.0.20",
  "tracing",
  "tray-icon",

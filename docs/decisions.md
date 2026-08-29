@@ -1052,7 +1052,7 @@ responses, in order of preference per surface:
 2. **The Recent Captures Overlay falls back to an ordinary window on GNOME/Wayland.** A
    normal `xdg_toplevel`, placed by the compositor rather than by us. This
    contradicts D27's "fixed position" property, but the alternative is no capture
-   stack at all. It must be visibly a deliberate adaptation, not a broken version
+   recent-captures surface at all. It must be visibly a deliberate adaptation, not a broken version
    of the macOS behaviour.
 
 3. **XWayland is documented, not defaulted.** Running under XWayland restores
@@ -1155,6 +1155,56 @@ screen with motion before the user acts. Guides and a loupe are precision tools,
 not baseline chrome, so they should appear only by explicit preference or a
 momentary modifier. Keeping freeze independent avoids coupling capture
 correctness to a visual aid.
+
+## D34 — After Capture is a persisted multi-action policy
+
+**Decision.** Settings presents one **After Capture** matrix with independent
+Screenshot and Recording columns. Rows are Show Recent Captures Overlay, Copy to
+clipboard, Save automatically, Upload and copy link, Open Editor, and Pin to
+Screen. Pin to Screen is screenshot-only. A cell without a real implementation
+is an explicitly described unavailable state, never an inert checkbox.
+
+Every profile without an explicit screenshot After Capture policy enables
+**Copy to clipboard** and **Show Recent Captures Overlay**. This includes legacy
+profiles with unrelated settings or history: Scrozz is unreleased, so an
+accidental earlier behavior is not a compatibility default. An explicitly stored
+value—including `false` for Copy—remains authoritative through migration and
+restart. Recordings keep the conservative overlay-only default. The versioned
+settings document is replaced atomically, preserves unknown newer fields across
+a downgrade, and keeps screenshot and recording action sets independent.
+
+**Execution.** The capture backend finalizes one immutable artifact before any
+action runs. Actions then run exactly once in this order:
+
+1. Copy to clipboard.
+2. Save automatically.
+3. Upload and copy link.
+4. Show Recent Captures Overlay.
+5. Open Editor.
+6. Pin to Screen.
+
+Copy receives the original frame and current color-space metadata; on macOS the
+clipboard declares the exact profiled PNG plus an ICC-bearing native TIFF
+fallback. Save and upload consume the retained encoded artifact. Overlay, editor,
+and pin receive that same artifact and metadata. Each action records its own
+success or failure and the sequence never short-circuits, so one destination
+cannot suppress unrelated enabled actions.
+
+An explicit CLI/JSON/IPC capture is not an ambient GUI capture. Its requested
+sinks and destinations are the whole policy, and forwarded requests carry the
+`direct-command` policy token so a running GUI cannot surprise automation with
+an overlay, editor, pin, duplicate save, or duplicate upload.
+
+A recording action pass begins only after the recorder has finalized or salvaged
+a non-empty playable file. That file is copied out of recorder-owned temporary
+storage before any clipboard, overlay, save, or upload reference escapes; the
+retained path is not deleted when the recorder cleans up its temporary session.
+
+**Why.** Multi-action workflows are ordinary—copy and keep a draggable recent
+capture, or save and open an editor. Encoding each action as an exclusive mode
+would force unnecessary tradeoffs, while letting each consumer invent its own
+post-capture bytes would create profile drift, duplicate writes, and redaction
+hazards.
 
 ---
 

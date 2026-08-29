@@ -53,11 +53,15 @@ use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError, Provenance,
     ScaleFactor, SelectionMode, SelectionOptions,
 };
-use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage, SystemClipboard};
+use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage};
 use scrozz_store::{CaptureId, History, NewCapture, SqliteStore};
 use scrozz_ui::editor::RevisionedFrame;
 
 use crate::{
+    after_capture::{
+        ActionEffect, ActionExecutor, AfterCaptureAction, AfterCaptureSettings, ExecutionReport,
+        FinalizedScreenshot, MediaKind, orchestrate,
+    },
     fault::{CliError, CliResult},
     gui::{
         action::{CaptureKind, CaptureOrigin},
@@ -79,6 +83,8 @@ pub enum Job {
         /// The identity the resulting card will carry, allocated up front so the
         /// main thread can correlate the answer with the request.
         card: CardId,
+        /// The persisted GUI policy snapshotted when this capture was requested.
+        policy: AfterCaptureSettings,
     },
     /// Decode a card's capture so the annotation editor can open on it.
     ///
@@ -129,7 +135,7 @@ pub enum Job {
 #[derive(Debug)]
 pub enum Outcome {
     /// A capture succeeded and is ready to show.
-    Ready(Box<Card>),
+    Ready(Box<ReadyCapture>),
     /// A card's capture was decoded and the editor can open on it.
     Opened {
         /// Which card.
@@ -180,6 +186,15 @@ pub enum Outcome {
     },
 }
 
+/// A finalized card plus every isolated ambient action result.
+#[derive(Debug)]
+pub struct ReadyCapture {
+    /// The surface model built from the immutable artifact.
+    pub card: Card,
+    /// Enabled actions in deterministic execution order.
+    pub actions: ExecutionReport,
+}
+
 /// A handle to the capture thread.
 pub struct Pipeline {
     jobs: Sender<Job>,
@@ -199,6 +214,17 @@ impl Pipeline {
     /// reports and continues past, because a capture the user can see and copy
     /// is worth more than a capture refused because history was unavailable.
     pub fn start(selector: Arc<dyn CaptureSelector>) -> CliResult<Self> {
+        Self::start_with_history(selector, true)
+    }
+
+    /// Starts the worker with persistent history explicitly enabled or disabled.
+    ///
+    /// Sealed/headless tests disable it so validation cannot create or migrate a
+    /// developer's real profile.
+    pub fn start_with_history(
+        selector: Arc<dyn CaptureSelector>,
+        history_enabled: bool,
+    ) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (outcome_tx, outcomes) = channel();
         let vault = CaptureVault::new();
@@ -206,7 +232,9 @@ impl Pipeline {
 
         let worker = std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
-            .spawn(move || Worker::new(outcome_tx, selector, worker_vault).run(&job_rx))
+            .spawn(move || {
+                Worker::new(outcome_tx, selector, worker_vault, history_enabled).run(&job_rx);
+            })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
@@ -297,6 +325,41 @@ struct Cached {
     /// round-trip a colour profile — and a capture that was known to be
     /// Display P3 must not silently become unlabelled on its way to the editor.
     color_space: ColorSpace,
+}
+
+struct ScreenshotExecutor<'a> {
+    policy: &'a AfterCaptureSettings,
+}
+
+impl ActionExecutor<FinalizedScreenshot<'_>> for ScreenshotExecutor<'_> {
+    fn execute(
+        &mut self,
+        action: AfterCaptureAction,
+        artifact: &FinalizedScreenshot<'_>,
+    ) -> std::result::Result<ActionEffect, String> {
+        match action {
+            AfterCaptureAction::CopyToClipboard => {
+                scrozz_shell::write_capture_to_clipboard(artifact.frame, artifact.png)
+                    .map(|_| ActionEffect::Completed)
+                    .map_err(|error| error.to_string())
+            }
+            AfterCaptureAction::SaveAutomatically => {
+                crate::output::export_with_settings(artifact.png, self.policy)
+                    .map(ActionEffect::Saved)
+                    .map_err(|error| error.to_string())
+            }
+            AfterCaptureAction::UploadAndCopyLink => Err(
+                "no cloud upload provider is implemented or configured in this build".to_owned(),
+            ),
+            AfterCaptureAction::ShowRecentCapturesOverlay => {
+                Ok(ActionEffect::ShowRecentCapturesOverlay)
+            }
+            AfterCaptureAction::OpenEditor => Ok(ActionEffect::OpenEditor),
+            AfterCaptureAction::PinToScreen => {
+                Err("Pin to Screen is not implemented in this build".to_owned())
+            }
+        }
+    }
 }
 
 /// What is kept for a card that is still on screen.
@@ -515,20 +578,25 @@ impl Worker {
         outcomes: Sender<Outcome>,
         selector: Arc<dyn CaptureSelector>,
         vault: CaptureVault,
+        history_enabled: bool,
     ) -> Self {
         // Opened once, here, rather than per capture: the schema check and the
         // directory creation are not free, and doing them on the shutter path
         // would put them between the keypress and the card.
-        let store = match SqliteStore::open_default() {
-            Ok(store) => {
-                tracing::debug!(root = %store.layout().root().display(), "history opened");
-                Some(store)
-            }
-            Err(err) => {
-                // Degradation, not failure: captures still reach the clipboard
-                // and the filesystem, they just are not remembered.
-                tracing::warn!("history is unavailable, captures will not be kept: {err}");
-                None
+        let store = if !history_enabled {
+            None
+        } else {
+            match SqliteStore::open_default() {
+                Ok(store) => {
+                    tracing::debug!(root = %store.layout().root().display(), "history opened");
+                    Some(store)
+                }
+                Err(err) => {
+                    // Degradation, not failure: captures still reach the clipboard
+                    // and the filesystem, they just are not remembered.
+                    tracing::warn!("history is unavailable, captures will not be kept: {err}");
+                    None
+                }
             }
         };
 
@@ -543,7 +611,12 @@ impl Worker {
     fn run(mut self, jobs: &Receiver<Job>) {
         while let Ok(job) = jobs.recv() {
             match job {
-                Job::Capture { kind, card, origin } => self.capture(kind, card, origin),
+                Job::Capture {
+                    kind,
+                    card,
+                    origin,
+                    policy,
+                } => self.capture(kind, card, origin, &policy),
                 Job::Open(card) => self.open(card),
                 Job::PrepareImage {
                     card,
@@ -562,7 +635,13 @@ impl Worker {
         tracing::debug!("capture worker stopped");
     }
 
-    fn capture(&mut self, kind: CaptureKind, card: CardId, origin: CaptureOrigin) {
+    fn capture(
+        &mut self,
+        kind: CaptureKind,
+        card: CardId,
+        origin: CaptureOrigin,
+        policy: &AfterCaptureSettings,
+    ) {
         tracing::debug!(
             %card,
             capture = kind.label(),
@@ -570,7 +649,7 @@ impl Worker {
             "capture job started"
         );
         let mut lifecycle = CaptureLifecycle::new(Arc::clone(&self.selector));
-        let result = self.take(kind, card, &mut lifecycle);
+        let result = self.take(kind, card, policy, &mut lifecycle);
         match result {
             Ok(built) => {
                 let _ = self.outcomes.send(Outcome::Ready(Box::new(built)));
@@ -589,8 +668,9 @@ impl Worker {
         &mut self,
         kind: CaptureKind,
         card: CardId,
+        policy: &AfterCaptureSettings,
         lifecycle: &mut CaptureLifecycle,
-    ) -> CliResult<Card> {
+    ) -> CliResult<ReadyCapture> {
         // Through `platform`, not `scrozz_capture` directly, so the
         // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
         let backend = platform::capture_backend()?;
@@ -660,9 +740,19 @@ impl Worker {
         {
             tracing::warn!("the capture succeeded but its region could not be remembered: {error}");
         }
-        let bytes = FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?;
+        let bytes = Arc::new(FrameEncoder::new().encode(&capture.frame, ImageFormat::Png)?);
+
+        // Finalized bytes and metadata exist before any action runs. Copy is
+        // first and happens before thumbnailing or history I/O; durable
+        // destinations follow, then host presentation effects are returned.
+        let artifact = FinalizedScreenshot {
+            frame: &capture.frame,
+            png: bytes.as_slice(),
+        };
+        let mut executor = ScreenshotExecutor { policy };
+        let actions = orchestrate(MediaKind::Screenshot, policy, &artifact, &mut executor);
+
         let thumbnail = Thumbnail::from_frame(&capture.frame, THUMBNAIL_MAX_EDGE).ok();
-        let capture_id = self.remember(&capture);
 
         // Encoded here, on the worker, because the only caller is a drag and a
         // drag has no time to spare once it has started.
@@ -673,7 +763,7 @@ impl Worker {
                 bytes: CaptureBytes {
                     generation: None,
                     revision: 0,
-                    full: Arc::new(bytes),
+                    full: Arc::clone(&bytes),
                     preview,
                 },
                 rendered: None,
@@ -684,20 +774,38 @@ impl Worker {
             },
         );
 
-        Ok(Card {
-            id: card,
-            capture_id,
-            kind,
-            provenance: capture.provenance,
-            source_width: capture.frame.width(),
-            source_height: capture.frame.height(),
-            scale: capture.frame.scale.get(),
-            thumbnail,
-            // History persistence is internal and does not count as an export.
-            // A visible file is created only when the user presses Save; writing
-            // one here made Save create a duplicate a few seconds later.
-            written: Vec::new(),
-            taken_at: SystemTime::now(),
+        let capture_id = self.remember(&capture);
+        let written = actions
+            .steps
+            .iter()
+            .filter_map(|step| match &step.outcome {
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Saved(path)) => {
+                    Some(path.display().to_string())
+                }
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Uploaded(url)) => {
+                    Some(url.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        Ok(ReadyCapture {
+            card: Card {
+                id: card,
+                capture_id,
+                kind,
+                provenance: capture.provenance,
+                source_width: capture.frame.width(),
+                source_height: capture.frame.height(),
+                scale: capture.frame.scale.get(),
+                thumbnail,
+                // History persistence is internal and does not count as an export.
+                // A visible file is created only when the user presses Save; writing
+                // one here made Save create a duplicate a few seconds later.
+                written,
+                taken_at: SystemTime::now(),
+            },
+            actions,
         })
     }
 
@@ -794,9 +902,12 @@ impl Worker {
             revision = rendered.revision(),
             "copying a rendered document revision"
         );
-        let result = SystemClipboard::new()
-            .write_image_reporting(rendered.frame())
-            .map(|_report| "copied the annotated image".to_owned())
+        let result = FrameEncoder::new()
+            .encode(rendered.frame(), ImageFormat::Png)
+            .and_then(|png| {
+                scrozz_shell::write_capture_to_clipboard(rendered.frame(), &png).map(|_| ())
+            })
+            .map(|()| "copied the annotated image".to_owned())
             .map_err(CliError::from);
         self.answer(card, result);
     }
@@ -821,13 +932,13 @@ impl Worker {
         // The round trip through PNG is deliberate — see the module docs — and
         // is also what will make "copy" work for a card whose capture arrived
         // over IPC, where the worker never held a `Frame` at all.
-        let result = self
-            .cached(card, "copy")
-            .and_then(|cached| Ok(scrozz_export::decode(&cached.full)?))
-            .and_then(|frame| {
-                SystemClipboard::new().write_image_reporting(&frame)?;
-                Ok("copied to the clipboard".to_owned())
-            });
+        let result = self.cached_entry(card, "copy").and_then(|cached| {
+            let mut frame = scrozz_export::decode(&cached.bytes.full)?;
+            frame.scale = cached.scale;
+            frame.color_space = cached.color_space;
+            scrozz_shell::write_capture_to_clipboard(&frame, &cached.bytes.full)?;
+            Ok("copied to the clipboard".to_owned())
+        });
         self.answer(card, result);
     }
 
@@ -937,7 +1048,8 @@ mod tests {
     impl CaptureSelector for RefusingSelector {}
 
     fn start_pipeline() -> Pipeline {
-        Pipeline::start(Arc::new(RefusingSelector)).expect("the worker should start")
+        Pipeline::start_with_history(Arc::new(RefusingSelector), false)
+            .expect("the worker should start")
     }
 
     /// Builds a worker whose cache is seeded by hand.

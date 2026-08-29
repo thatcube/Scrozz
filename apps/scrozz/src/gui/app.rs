@@ -24,6 +24,7 @@
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
 use std::{
+    collections::{HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -37,7 +38,11 @@ use scrozz_shell::{
 };
 
 use crate::{
-    cli::Cli,
+    after_capture::{
+        ActionEffect, AfterCaptureAction, AfterCaptureSettings, AfterCaptureStore, InstallProfile,
+        MediaKind, current_availability,
+    },
+    cli::{Cli, SettingsCommand},
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind, CaptureOrigin},
@@ -54,7 +59,10 @@ use crate::{
 use scrozz_shell::DragOutcome;
 use scrozz_ui::{
     editor::{EditorUi, RevisionedFrame},
-    settings::{ShortcutEdit, ShortcutRow},
+    settings::{
+        AfterCaptureCell, AfterCaptureEdit, AfterCaptureMedia, AfterCaptureRow, ShortcutEdit,
+        ShortcutRow,
+    },
 };
 
 /// The binding table a set of configured shortcuts asks for.
@@ -118,6 +126,14 @@ pub struct Config {
     pub capture_on_start: Option<CaptureKind>,
     /// Audible feedback after a successful screenshot.
     pub screenshot_sound: ScreenshotSound,
+    /// Whether this run opens the persistent history store.
+    pub history: bool,
+    /// Ambient actions used only for captures initiated by the GUI.
+    pub after_capture: AfterCaptureSettings,
+    /// Where successful settings edits are persisted.
+    pub after_capture_store: Option<AfterCaptureStore>,
+    /// A startup problem that forced the action policy back to safe defaults.
+    pub after_capture_warning: Option<String>,
 }
 
 impl Default for Config {
@@ -131,6 +147,10 @@ impl Default for Config {
             deadline: None,
             capture_on_start: None,
             screenshot_sound: ScreenshotSound::EightBit,
+            history: true,
+            after_capture: AfterCaptureSettings::fresh(),
+            after_capture_store: AfterCaptureStore::default_location().ok(),
+            after_capture_warning: None,
         }
     }
 }
@@ -146,10 +166,38 @@ impl Config {
     pub fn from_cli(_cli: &Cli) -> Self {
         let mut config = Self::default();
 
-        // What the user stored wins over what this build ships with. A missing
-        // or unreadable file is the first run, which is the defaults.
+        // What the user stored wins over what this build ships with.
         config.shortcuts = crate::settings::stored_shortcuts();
         config.bindings = bindings_from(&config.shortcuts);
+        if let Some(store) = config.after_capture_store.as_ref() {
+            let profile = store.inferred_profile();
+            match store.load(profile) {
+                Ok(settings) => config.after_capture = settings,
+                Err(error) => {
+                    config.after_capture_warning = Some(format!(
+                        "After Capture settings could not be loaded; preserving the inferred profile defaults for this session: {error}"
+                    ));
+                    config.after_capture = match profile {
+                        InstallProfile::Fresh => AfterCaptureSettings::fresh(),
+                        InstallProfile::Existing => AfterCaptureSettings::legacy(),
+                    };
+                }
+            }
+        }
+        match crate::settings::screenshot_sound(&config.after_capture) {
+            Ok(sound) => config.screenshot_sound = sound,
+            Err(error) => {
+                let warning = format!(
+                    "Screenshot sound settings are invalid; using 8-bit this session: {error}"
+                );
+                config.after_capture_warning = Some(
+                    config
+                        .after_capture_warning
+                        .take()
+                        .map_or(warning.clone(), |existing| format!("{existing}; {warning}")),
+                );
+            }
+        }
 
         if let Ok(raw) = std::env::var(HOTKEYS_ENV) {
             config.bindings = parse_bindings(&raw);
@@ -195,6 +243,10 @@ impl Config {
             deadline: Some(Duration::from_millis(250)),
             capture_on_start: None,
             screenshot_sound: ScreenshotSound::Off,
+            history: false,
+            after_capture: AfterCaptureSettings::legacy(),
+            after_capture_store: None,
+            after_capture_warning: None,
         }
     }
 }
@@ -316,7 +368,9 @@ pub struct App {
     captures: u64,
     sound_warning_shown: bool,
     settings_requested: bool,
-    editor_request: Option<EditorRequest>,
+    editor_requests: VecDeque<EditorRequest>,
+    /// Captures retained only because their editor is open, not by the overlay.
+    editor_only_cards: HashSet<CardId>,
     /// The one editor revision currently being prepared on the worker.
     editor_render_pending: Option<(CardId, u64, u64)>,
     /// A failed version is not retried until the document or editor changes.
@@ -422,8 +476,11 @@ impl App {
         surface: Box<dyn CardSurface>,
         selector: Arc<dyn CaptureSelector>,
     ) -> CliResult<Self> {
-        let pipeline = Pipeline::start(Arc::clone(&selector))?;
+        let pipeline = Pipeline::start_with_history(Arc::clone(&selector), config.history)?;
         let mut notes = Vec::new();
+        if let Some(warning) = config.after_capture_warning.clone() {
+            notes.push(warning);
+        }
         let session = Session::detect();
         let selection_capabilities = selector.capabilities();
         let capture_backend_ready = crate::platform::capture_backend_is_ready();
@@ -511,7 +568,8 @@ impl App {
             captures: 0,
             sound_warning_shown: false,
             settings_requested: false,
-            editor_request: None,
+            editor_requests: VecDeque::new(),
+            editor_only_cards: HashSet::new(),
             editor_render_pending: None,
             editor_render_failed: None,
             next_editor_generation: 1,
@@ -758,6 +816,14 @@ impl App {
         }
         for command in completed.into_iter().flatten() {
             self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
+            if matches!(
+                command,
+                crate::cli::Command::Settings(crate::cli::SettingsArgs {
+                    command: SettingsCommand::Set { .. }
+                })
+            ) {
+                self.reload_persisted_settings();
+            }
             if matches!(command, crate::cli::Command::Gui) {
                 // A second `scrozz gui` means "show yourself", not "start
                 // again". There is nothing to show yet, so it is a no-op
@@ -773,10 +839,36 @@ impl App {
         Tick::Continue
     }
 
+    fn reload_persisted_settings(&mut self) {
+        let Some(store) = self.config.after_capture_store.clone() else {
+            self.note("persisted settings changed but no config path is available to reload");
+            return;
+        };
+        match store.load(store.inferred_profile()) {
+            Ok(settings) => match crate::settings::screenshot_sound(&settings) {
+                Ok(sound) => {
+                    self.config.after_capture = settings;
+                    self.config.screenshot_sound = sound;
+                    self.note("persisted settings reloaded");
+                }
+                Err(error) => {
+                    self.note(format!(
+                        "persisted settings changed but could not be applied: {error}"
+                    ));
+                }
+            },
+            Err(error) => {
+                self.note(format!(
+                    "persisted settings changed but could not be reloaded: {error}"
+                ));
+            }
+        }
+    }
+
     fn drain_pipeline(&mut self) {
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {
-                Outcome::Ready(card) => {
+                Outcome::Ready(ready) => {
                     self.captures += 1;
                     if let Err(error) = play_screenshot_sound(&self.config.screenshot_sound) {
                         let fell_back = !matches!(
@@ -799,11 +891,65 @@ impl App {
                             });
                         }
                     }
+                    let ready = *ready;
+                    let card = ready.card;
+                    let card_id = card.id;
                     let summary = card.summary();
-                    if let Err(err) = self.surface.present(*card) {
-                        self.note(format!("a card could not be shown: {err}"));
+                    for (action, error) in ready.actions.failures() {
+                        self.note(format!("{card_id} {} failed: {error}", action.label()));
+                    }
+                    for step in &ready.actions.steps {
+                        match &step.outcome {
+                            crate::after_capture::ActionOutcome::Succeeded(
+                                ActionEffect::Completed,
+                            ) if step.action == AfterCaptureAction::CopyToClipboard => {
+                                self.note(format!("{card_id} copied to the clipboard"));
+                            }
+                            crate::after_capture::ActionOutcome::Succeeded(
+                                ActionEffect::Saved(path),
+                            ) => {
+                                self.note(format!("{card_id} saved to {}", path.display()));
+                            }
+                            crate::after_capture::ActionOutcome::Succeeded(
+                                ActionEffect::Uploaded(url),
+                            ) => {
+                                self.note(format!("{card_id} uploaded to {url}"));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let show_overlay = ready
+                        .actions
+                        .has_effect(&ActionEffect::ShowRecentCapturesOverlay);
+                    let open_editor = ready.actions.has_effect(&ActionEffect::OpenEditor);
+                    let mut retained = false;
+                    if show_overlay {
+                        if let Err(err) = self.surface.present(card) {
+                            self.note(format!(
+                                "{card_id} could not be shown in Recent Captures Overlay: {err}"
+                            ));
+                        } else {
+                            retained = true;
+                            self.note(summary);
+                        }
                     } else {
                         self.note(summary);
+                    }
+                    if open_editor {
+                        if self.pipeline.post(Job::Open(card_id)) {
+                            retained = true;
+                            if !show_overlay {
+                                self.editor_only_cards.insert(card_id);
+                            }
+                        } else {
+                            self.note(format!(
+                                "{card_id} could not be queued for Open Editor: the capture worker has gone"
+                            ));
+                        }
+                    }
+                    if !retained {
+                        self.pipeline.post(Job::Release(card_id));
                     }
                 }
                 Outcome::Failed { card, error } => {
@@ -815,7 +961,7 @@ impl App {
                 Outcome::Opened { card, capture } => {
                     let generation = self.next_editor_generation;
                     self.next_editor_generation = self.next_editor_generation.wrapping_add(1);
-                    self.editor_request = Some(EditorRequest {
+                    self.editor_requests.push_back(EditorRequest {
                         card,
                         generation,
                         capture: *capture,
@@ -1148,7 +1294,12 @@ impl App {
             origin = origin.label(),
             "posting capture job"
         );
-        if !self.pipeline.post(Job::Capture { kind, card, origin }) {
+        if !self.pipeline.post(Job::Capture {
+            kind,
+            card,
+            origin,
+            policy: self.config.after_capture.clone(),
+        }) {
             self.note("the capture worker has gone");
         }
     }
@@ -1207,6 +1358,95 @@ impl App {
                 }
             })
             .collect()
+    }
+
+    /// The platform-resolved After Capture matrix shown in Settings.
+    #[must_use]
+    pub fn after_capture_rows(&self) -> Vec<AfterCaptureRow> {
+        let cell = |media, action| {
+            let availability = current_availability(media, action);
+            AfterCaptureCell {
+                enabled: self.config.after_capture.is_enabled(media, action),
+                available: availability.available,
+                unavailable_reason: availability.reason.map(str::to_owned),
+            }
+        };
+        AfterCaptureAction::UI_ORDER
+            .into_iter()
+            .map(|action| AfterCaptureRow {
+                screenshot_id: action.setting_key(MediaKind::Screenshot),
+                recording_id: action
+                    .is_contract_available(MediaKind::Recording)
+                    .then(|| action.setting_key(MediaKind::Recording)),
+                label: action.label().to_owned(),
+                description: action.description().to_owned(),
+                screenshot: cell(MediaKind::Screenshot, action),
+                recording: cell(MediaKind::Recording, action),
+            })
+            .collect()
+    }
+
+    /// Persists accepted After Capture edits before putting them in force.
+    pub fn edit_after_capture(&mut self, edits: &[AfterCaptureEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+        let mut changes = Vec::new();
+        for edit in edits {
+            let Some((media, action)) = AfterCaptureSettings::resolve_key(&edit.id) else {
+                self.note(format!(
+                    "unknown After Capture setting {:?} was ignored",
+                    edit.id
+                ));
+                continue;
+            };
+            let expected = match edit.media {
+                AfterCaptureMedia::Screenshot => MediaKind::Screenshot,
+                AfterCaptureMedia::Recording => MediaKind::Recording,
+            };
+            if media != expected {
+                self.note(format!(
+                    "{} was not changed because it arrived from the wrong settings column",
+                    edit.id
+                ));
+                continue;
+            }
+            let availability = current_availability(media, action);
+            if edit.enabled && !availability.available {
+                self.note(format!(
+                    "{} was not enabled: {}",
+                    edit.id,
+                    availability
+                        .reason
+                        .unwrap_or("the action is unavailable in this build")
+                ));
+                continue;
+            }
+            changes.push((media, action, edit.enabled));
+        }
+        if changes.is_empty() {
+            return;
+        }
+        let Some(store) = self.config.after_capture_store.clone() else {
+            self.note(
+                "After Capture settings were not changed because no config directory is available",
+            );
+            return;
+        };
+        match store.update(store.inferred_profile(), |latest| {
+            for &(media, action, enabled) in &changes {
+                latest.set(media, action, enabled);
+            }
+            Ok(())
+        }) {
+            Ok(updated) => {
+                self.config.after_capture = updated;
+                self.note("After Capture settings saved");
+            }
+            Err(error) => {
+                self.note(format!("After Capture settings were not saved: {error}"));
+            }
+        }
     }
 
     /// Applies what the settings pane asked for, reporting anything refused.
@@ -1390,7 +1630,14 @@ impl App {
 
     /// Takes a pending request to open the annotation editor.
     pub fn take_editor_request(&mut self) -> Option<EditorRequest> {
-        self.editor_request.take()
+        self.editor_requests.pop_front()
+    }
+
+    /// Releases an artifact that was retained only for its editor window.
+    pub fn editor_closed(&mut self, card: CardId) {
+        if self.editor_only_cards.remove(&card) {
+            self.pipeline.post(Job::Release(card));
+        }
     }
 
     /// Asks the worker to prepare the latest settled editor revision for drag.
@@ -1587,6 +1834,172 @@ mod tests {
         app.selection_capabilities = SelectionCapabilities::CLIENT_OVERLAY;
         app.capture_backend_ready = true;
         app
+    }
+
+    #[test]
+    fn after_capture_rows_expose_real_capabilities_not_inert_controls() {
+        let (app, _) = app();
+        let rows = app.after_capture_rows();
+        assert_eq!(rows.len(), AfterCaptureAction::UI_ORDER.len());
+        assert!(
+            rows.iter().all(|row| !row.label.contains("Quick Access")),
+            "{rows:?}"
+        );
+
+        let copy = rows
+            .iter()
+            .find(|row| row.label == "Copy to clipboard")
+            .expect("copy row");
+        assert!(copy.screenshot.available);
+        assert!(!copy.recording.available);
+        assert!(copy.recording.unavailable_reason.is_some());
+
+        let pin = rows
+            .iter()
+            .find(|row| row.label == "Pin to Screen")
+            .expect("pin row");
+        assert!(!pin.screenshot.available);
+        assert!(pin.recording_id.is_none());
+        assert!(pin.recording.unavailable_reason.is_some());
+    }
+
+    #[test]
+    fn after_capture_edits_persist_before_taking_effect_and_survive_restart() {
+        let root =
+            std::env::temp_dir().join(format!("scrozz-app-after-capture-{}", std::process::id()));
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let surface = Recording::new();
+        let mut config = Config::sealed();
+        config.after_capture = AfterCaptureSettings::fresh();
+        config.after_capture_store = Some(store.clone());
+        let mut app = App::new(
+            config,
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+        )
+        .expect("sealed app");
+
+        app.edit_after_capture(&[AfterCaptureEdit {
+            id: AfterCaptureAction::SaveAutomatically.setting_key(MediaKind::Screenshot),
+            media: AfterCaptureMedia::Screenshot,
+            enabled: true,
+        }]);
+        assert!(
+            app.config
+                .after_capture
+                .is_enabled(MediaKind::Screenshot, AfterCaptureAction::SaveAutomatically)
+        );
+        drop(app);
+
+        let restarted = store
+            .load(crate::after_capture::InstallProfile::Fresh)
+            .unwrap();
+        assert!(restarted.is_enabled(MediaKind::Screenshot, AfterCaptureAction::SaveAutomatically));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_settings_write_failure_does_not_create_success_shaped_live_state() {
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-app-after-capture-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked_parent = root.join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").unwrap();
+
+        let surface = Recording::new();
+        let mut config = Config::sealed();
+        config.after_capture = AfterCaptureSettings::fresh();
+        config.after_capture_store =
+            Some(AfterCaptureStore::new(blocked_parent.join("settings.json")));
+        let mut app = App::new(
+            config,
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+        )
+        .unwrap();
+
+        app.edit_after_capture(&[AfterCaptureEdit {
+            id: AfterCaptureAction::SaveAutomatically.setting_key(MediaKind::Screenshot),
+            media: AfterCaptureMedia::Screenshot,
+            enabled: true,
+        }]);
+        assert!(
+            !app.config
+                .after_capture
+                .is_enabled(MediaKind::Screenshot, AfterCaptureAction::SaveAutomatically)
+        );
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("were not saved")),
+            "{:?}",
+            app.notes()
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn host_reload_applies_settings_written_by_a_forwarded_command() {
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-app-after-capture-reload-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let surface = Recording::new();
+        let mut config = Config::sealed();
+        config.after_capture_store = Some(store.clone());
+        let mut app = App::new(
+            config,
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+        )
+        .unwrap();
+
+        let mut changed = AfterCaptureSettings::fresh();
+        changed.set(
+            MediaKind::Screenshot,
+            AfterCaptureAction::ShowRecentCapturesOverlay,
+            false,
+        );
+        store.save(&changed).unwrap();
+        app.reload_persisted_settings();
+
+        assert!(!app.config.after_capture.is_enabled(
+            MediaKind::Screenshot,
+            AfterCaptureAction::ShowRecentCapturesOverlay
+        ));
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note == "persisted settings reloaded")
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_editor_requests_queue_without_discarding_active_work() {
+        let (mut app, _) = app();
+        let capture = redacted_editor().document().source.clone();
+        app.editor_requests.push_back(EditorRequest {
+            card: CardId(1),
+            generation: 1,
+            capture: capture.clone(),
+        });
+        app.editor_requests.push_back(EditorRequest {
+            card: CardId(2),
+            generation: 2,
+            capture,
+        });
+
+        assert_eq!(app.take_editor_request().unwrap().card, CardId(1));
+        assert_eq!(app.take_editor_request().unwrap().card, CardId(2));
+        assert!(app.take_editor_request().is_none());
     }
 
     fn redacted_editor() -> EditorUi {

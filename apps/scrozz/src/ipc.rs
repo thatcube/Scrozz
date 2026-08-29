@@ -8,9 +8,9 @@
 //! every hotkey press starts a **second process**.
 //!
 //! Left alone, that second process is a second application: its own capture
-//! stack, its own store handle, its own overlay. Pressing the hotkey twice would
-//! produce two captures that never appear in the same history, and two writers
-//! against one SQLite file.
+//! stack, its own store handle, its own overlay. Direct commands still keep their
+//! explicit destinations and bypass ambient GUI After Capture actions, but they
+//! run in the owning process so only one writer touches shared state.
 //!
 //! # The design
 //!
@@ -24,7 +24,8 @@
 //! # The wire format, and why it is not JSON both ways
 //!
 //! ```text
-//! -->  {"schema":1,"argv":["capture","--json"],"cwd":"/home/u"}\n   (then EOF)
+//! -->  {"schema":2,"argv":["capture","--json"],"cwd":"/home/u","after_capture_policy":"direct-command"}\n
+//!      (then EOF)
 //! <--  SCROZZ/1 0 json\n
 //! <--  <payload bytes until EOF>
 //! ```
@@ -60,7 +61,10 @@ use crate::{
 pub const PROTOCOL_TOKEN: &str = "SCROZZ/1";
 
 /// The request schema version.
-pub const REQUEST_SCHEMA: i64 = 1;
+pub const REQUEST_SCHEMA: i64 = 2;
+
+/// Explicit policy carried by every forwarded request.
+pub const DIRECT_AFTER_CAPTURE_POLICY: &str = "direct-command";
 
 /// Overrides the endpoint, for tests and for unusual sandboxes.
 pub const ENDPOINT_ENV: &str = "SCROZZ_IPC_SOCKET";
@@ -242,6 +246,10 @@ pub fn encode_request(argv: &[String], cwd: Option<&Path>) -> String {
         (
             "cwd",
             Json::opt(cwd, |p| Json::str(p.to_string_lossy().into_owned())),
+        ),
+        (
+            "after_capture_policy",
+            Json::str(DIRECT_AFTER_CAPTURE_POLICY),
         ),
     ]);
     format!("{}\n", request.to_compact_string())
@@ -499,7 +507,16 @@ mod tests {
         let request = encode_request(&argv(&["capture", "--json"]), Some(Path::new("/home/u")));
         assert_eq!(
             request,
-            "{\"schema\":1,\"argv\":[\"capture\",\"--json\"],\"cwd\":\"/home/u\"}\n"
+            "{\"schema\":2,\"argv\":[\"capture\",\"--json\"],\"cwd\":\"/home/u\",\"after_capture_policy\":\"direct-command\"}\n"
+        );
+    }
+
+    #[test]
+    fn forwarded_commands_explicitly_bypass_ambient_gui_actions() {
+        let request = encode_request(&argv(&["capture"]), None);
+        assert!(
+            request.contains(r#""after_capture_policy":"direct-command""#),
+            "{request}"
         );
     }
 
