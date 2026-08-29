@@ -11,12 +11,12 @@
 //!
 //! 1. **The combination is already Scrozz's.** Caught in [`GlobalHotkeys`]'s own
 //!    bookkeeping before the OS is touched.
-//! 2. **The combination belongs to the OS.** `Cmd+Shift+4` is macOS's own
-//!    screenshot shortcut, and — this is the trap — Carbon's
-//!    `RegisterEventHotKey` returns success for it anyway. The system keeps the
-//!    key and Scrozz's handler never fires. No API reports this, so
-//!    [`reserved_shortcuts`] is a table of the combinations known to be taken,
-//!    checked before registering.
+//! 2. **The combination may belong to the OS.** `Cmd+Shift+4` is a macOS
+//!    screenshot default, but users can disable or reassign it. Carbon may also
+//!    report successful registration while an enabled system shortcut keeps the
+//!    event. [`reserved_shortcuts`] is therefore diagnostic metadata only.
+//!    Callers must try native registration and, for a known default, verify that
+//!    the registered event is actually delivered before persisting the change.
 //! 3. **The platform has no global hotkeys at all.** See below.
 //!
 //! # Wayland (decision D11)
@@ -129,9 +129,9 @@ impl Accelerator {
         keysym_for(self.code)
     }
 
-    /// Whether this is a combination the OS itself has already taken.
+    /// Whether this is a combination the OS commonly owns by default.
     ///
-    /// See [`reserved_shortcuts`] for why this cannot be left to the platform.
+    /// This is advisory metadata, not proof of a current conflict.
     #[must_use]
     pub fn system_owner(&self) -> Option<&'static ReservedShortcut> {
         reserved_shortcuts()
@@ -372,14 +372,13 @@ pub struct ReservedShortcut {
     pub remedy: &'static str,
 }
 
-/// Combinations this platform has already taken.
+/// Combinations this platform commonly takes by default.
 ///
-/// This table exists because **no platform API will tell you**. On macOS,
-/// `RegisterEventHotKey` returns `noErr` for `Cmd+Shift+4` and then the system
-/// keeps the key; on Windows `RegisterHotKey` does fail for most reserved
-/// combinations but not for shell-owned ones. Registering into a conflict and
-/// waiting to find out is exactly the silent failure this module exists to
-/// prevent, so the check happens first, from a table.
+/// This table is diagnostic metadata, never a registration veto. A user can
+/// disable or reassign many defaults, and a static list cannot know their
+/// current configuration. The native registrar is always attempted; macOS
+/// callers additionally verify delivery for combinations listed here because
+/// Carbon can return success while an enabled system shortcut swallows events.
 ///
 /// It is deliberately short: only combinations that are reserved by default on
 /// a stock system, where being wrong would be worse than being silent.
@@ -509,17 +508,15 @@ pub const fn reserved_shortcuts() -> &'static [ReservedShortcut] {
 }
 
 /// Why a hotkey could not be bound, in a form a settings pane can render.
+///
+/// Known system defaults are intentionally absent: they are advisory metadata,
+/// not evidence that the current configuration owns a combination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Conflict {
     /// Scrozz already binds this combination to another action.
     AlreadyBound {
         /// The action currently holding it.
         action: String,
-    },
-    /// The operating system holds this combination.
-    SystemReserved {
-        /// What holds it, and where the user would free it.
-        reserved: ReservedShortcut,
     },
     /// The OS refused at registration time, for a reason it did not elaborate.
     Refused {
@@ -534,11 +531,6 @@ impl fmt::Display for Conflict {
             Self::AlreadyBound { action } => {
                 write!(f, "already bound in Scrozz to \"{action}\"")
             }
-            Self::SystemReserved { reserved } => write!(
-                f,
-                "already used by {}; free it in {}",
-                reserved.owner, reserved.remedy
-            ),
             Self::Refused { detail } => write!(f, "the system refused it: {detail}"),
         }
     }
@@ -1010,15 +1002,10 @@ impl GlobalHotkeys {
     }
 
     fn conflict_for(&self, accelerator: &Accelerator) -> Option<Conflict> {
-        if let Some(existing) = self.bindings.get(accelerator) {
-            return Some(Conflict::AlreadyBound {
+        self.bindings
+            .get(accelerator)
+            .map(|existing| Conflict::AlreadyBound {
                 action: existing.action.clone(),
-            });
-        }
-        accelerator
-            .system_owner()
-            .map(|reserved| Conflict::SystemReserved {
-                reserved: *reserved,
             })
     }
 
@@ -1138,8 +1125,8 @@ impl GlobalHotkeys {
     /// keyboard no longer matches anything on screen.
     ///
     /// So this validates the entire set before touching the OS — every
-    /// accelerator parses, no two rows want the same combination, none is one
-    /// the system already owns — and only then rebinds. If the OS still refuses
+    /// accelerator parses and no two rows want the same combination — and only
+    /// then rebinds. If the OS refuses
     /// a row (another application can hold a combination without the reserved
     /// table knowing), everything is released and the *previous* set is put back,
     /// so a failed edit leaves the shortcuts that were working still working.
@@ -1181,17 +1168,6 @@ impl GlobalHotkeys {
                     want,
                     Conflict::AlreadyBound {
                         action: (*holder).to_owned(),
-                    }
-                    .to_string(),
-                ));
-                continue;
-            }
-
-            if let Some(reserved) = accelerator.system_owner() {
-                rejections.push(Rejection::new(
-                    want,
-                    Conflict::SystemReserved {
-                        reserved: *reserved,
                     }
                     .to_string(),
                 ));
@@ -1350,8 +1326,8 @@ fn refusal(detail: &str) -> Conflict {
         crate::permissions::SystemPermissions::new().is_granted(Capability::Accessibility);
     let detail = if trusted {
         format!(
-            "{detail}. Another application is probably holding this combination; \
-             free it there, or in System Settings › Keyboard › Keyboard Shortcuts"
+            "{detail}. macOS did not identify an owner; another application or an enabled \
+             system shortcut may be handling this combination"
         )
     } else {
         format!(
@@ -1540,18 +1516,20 @@ mod tests {
     }
 
     #[test]
-    fn a_system_owned_combination_is_refused_by_name() {
+    fn a_known_system_default_is_advisory_not_a_static_veto() {
         let Some(reserved) = reserved_shortcuts().first() else {
             return;
         };
         let mut manager = GlobalHotkeys::detached();
-        let refused = manager
+        manager
             .apply(&[want(reserved.accelerator, "capture.region")])
-            .expect_err("the system already owns this");
-        assert_eq!(refused.len(), 1);
+            .expect("current OS availability cannot be inferred from defaults");
         assert!(
-            refused[0].reason.contains(reserved.owner),
-            "the refusal must name who holds it, not merely that it is taken"
+            Accelerator::parse(reserved.accelerator)
+                .expect("reserved entry parses")
+                .system_owner()
+                .is_some_and(|owner| owner == reserved),
+            "the default owner remains available for verification diagnostics"
         );
     }
 
@@ -1618,8 +1596,37 @@ mod tests {
             .expect_err("the backend refuses this");
         let reason = &refused[0].reason;
         assert!(
-            reason.contains("System Settings") || reason.contains("Accessibility"),
+            reason.contains("did not identify an owner") || reason.contains("Accessibility"),
             "a refusal must point somewhere: {reason}"
+        );
+        assert!(
+            !reason.contains("already used by"),
+            "a native refusal cannot identify a specific owner: {reason}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_known_default_still_reports_a_real_native_refusal() {
+        let known_default = "Cmd+Shift+4";
+        let mut manager = GlobalHotkeys::refusing(known_default);
+        manager
+            .apply(&[want(FREE, "capture.window")])
+            .expect("the previous binding starts active");
+        let refused = manager
+            .apply(&[
+                want(FREE, "capture.window"),
+                want(known_default, "capture.region"),
+            ])
+            .expect_err("the simulated native registrar refuses this combination");
+        let reason = &refused[0].reason;
+        assert!(reason.contains("HotKey already registered"));
+        assert!(!reason.contains("macOS Screenshot"));
+        assert!(!reason.contains("already used by"));
+        assert_eq!(
+            bound(&manager),
+            vec![(FREE.to_owned(), "capture.window".to_owned())],
+            "a true native conflict restores the prior registered set"
         );
     }
 

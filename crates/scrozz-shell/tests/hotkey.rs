@@ -146,11 +146,11 @@ fn bad_accelerators_are_rejected_with_an_explanation() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_reserved_shortcut_parses_and_is_detected() {
+fn every_known_system_default_parses_and_is_detected() {
     let reserved = reserved_shortcuts();
     assert!(
         !reserved.is_empty(),
-        "every supported platform has combinations the OS keeps for itself"
+        "every supported platform has common system defaults"
     );
 
     for entry in reserved {
@@ -163,7 +163,7 @@ fn every_reserved_shortcut_parses_and_is_detected() {
         assert_eq!(
             accelerator.system_owner().map(|it| it.accelerator),
             Some(entry.accelerator),
-            "{} should report itself as system-reserved",
+            "{} should report its advisory owner",
             entry.accelerator
         );
         assert!(!entry.owner.is_empty());
@@ -180,28 +180,18 @@ fn an_ordinary_combination_is_not_reserved() {
 }
 
 #[test]
-fn binding_a_system_shortcut_fails_loudly_instead_of_silently() {
-    // The whole point: on macOS `RegisterEventHotKey` returns success for this
-    // and then the system keeps the key. Registering must fail here instead.
+fn binding_a_system_default_is_attempted_instead_of_statically_refused() {
+    // A user may have disabled this system default. Registration and, on macOS,
+    // live event delivery decide current availability.
     let reserved = reserved_shortcuts()[0];
     let mut manager = GlobalHotkeys::detached();
 
-    let error = manager
+    manager
         .register(&hotkey(reserved.accelerator), "capture.region")
-        .expect_err("a system-owned combination must be refused");
-
-    let message = error.to_string();
-    assert!(
-        message.contains(reserved.owner),
-        "the error must name what holds the key; got {message:?}"
-    );
-    assert!(
-        message.contains(reserved.remedy),
-        "the error must carry the remedy; got {message:?}"
-    );
-    assert!(
-        manager.action_for(&parse(reserved.accelerator)).is_none(),
-        "a refused binding must not be recorded"
+        .expect("a static default cannot prove a current conflict");
+    assert_eq!(
+        manager.action_for(&parse(reserved.accelerator)),
+        Some("capture.region")
     );
 }
 
@@ -249,7 +239,8 @@ fn a_conflict_can_be_tested_before_committing_to_it() {
     let reserved = reserved_shortcuts()[0];
     assert_eq!(
         manager.check(&hotkey(reserved.accelerator)).expect("valid"),
-        Some(Conflict::SystemReserved { reserved })
+        None,
+        "known defaults are advisory until native registration and delivery"
     );
 }
 

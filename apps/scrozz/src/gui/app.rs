@@ -30,8 +30,8 @@ use std::{
 
 use scrozz_core::SelectionCapabilities;
 use scrozz_shell::{
-    Accelerator, Capability, GlobalHotkeys, KeyState, Permissions, ScreenshotSound, Session,
-    SystemPermissions, Tray, TrayAction,
+    Accelerator, Capability, GlobalHotkeys, HotkeyEvent, KeyState, Permissions, ScreenshotSound,
+    Session, SystemPermissions, Tray, TrayAction,
     hotkey::{DesiredBinding, Rejection},
     play_screenshot_sound,
 };
@@ -274,6 +274,14 @@ fn install_forgivingly(
     }
 }
 
+fn rejection_summary(rejections: &[Rejection]) -> String {
+    rejections
+        .iter()
+        .map(|rejection| rejection.reason.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Whether the host should keep going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
@@ -281,6 +289,16 @@ pub enum Tick {
     Continue,
     /// Quit was asked for, or the deadline passed.
     Stop,
+}
+
+const SHORTCUT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(12);
+
+struct PendingShortcutVerification {
+    action: ShortcutAction,
+    accelerator: Accelerator,
+    candidate: Shortcuts,
+    previous: Shortcuts,
+    deadline: Instant,
 }
 
 /// The running application.
@@ -301,6 +319,7 @@ pub struct App {
     shortcuts: Shortcuts,
     shortcut_store: Option<ShortcutStore>,
     rejected: Vec<(ShortcutAction, String)>,
+    pending_shortcut: Option<PendingShortcutVerification>,
     session: Session,
     selection_capabilities: SelectionCapabilities,
     capture_backend_ready: bool,
@@ -411,6 +430,7 @@ impl App {
             shortcuts,
             shortcut_store,
             rejected: Vec::new(),
+            pending_shortcut: None,
             session,
             selection_capabilities,
             capture_backend_ready,
@@ -439,6 +459,7 @@ impl App {
             return Tick::Stop;
         }
         self.drain_hotkeys();
+        self.expire_shortcut_verification();
         if self.drain_server() == Tick::Stop {
             return Tick::Stop;
         }
@@ -475,18 +496,80 @@ impl App {
     fn drain_hotkeys(&mut self) {
         let mut pending = Vec::new();
         while let Some(event) = self.hotkeys.poll() {
-            // Both edges arrive. Acting on the release as well would take two
-            // captures per press.
-            if event.state == KeyState::Pressed {
-                pending.push(event.action);
-            }
+            pending.push(event);
         }
 
-        for id in pending {
+        for event in pending {
+            self.handle_hotkey_event(event);
+        }
+    }
+
+    fn handle_hotkey_event(&mut self, event: HotkeyEvent) {
+        // Both edges arrive. Acting on the release as well would take two
+        // captures per press.
+        if event.state != KeyState::Pressed {
+            return;
+        }
+        if self.pending_shortcut.as_ref().is_some_and(|pending| {
+            pending.accelerator == event.accelerator && pending.action.id() == event.action
+        }) {
+            let pending = self
+                .pending_shortcut
+                .take()
+                .expect("the verification was just matched");
+            self.commit_shortcuts(pending.candidate);
+            self.rejected.clear();
+            self.note(format!(
+                "{} verified and saved for {}",
+                event.accelerator, event.action
+            ));
+            return;
+        }
+
+        let id = event.action;
+        {
             if let Some(action) = Action::from_id(&id) {
                 self.perform(action);
             } else {
                 tracing::warn!(action = %id, "a hotkey fired for an action this build does not know");
+            }
+        }
+    }
+
+    fn expire_shortcut_verification(&mut self) {
+        let Some(pending) = self
+            .pending_shortcut
+            .take_if(|pending| Instant::now() >= pending.deadline)
+        else {
+            return;
+        };
+        let action = pending.action;
+        let symbols = pending.accelerator.symbols();
+        match self.register_shortcuts(&pending.previous) {
+            Ok(()) => {
+                self.refresh_tray_shortcuts();
+                self.rejected = vec![(
+                    action,
+                    format!(
+                        "Scrozz did not receive {symbols} during verification. macOS may still be \
+                         handling it; check the current Keyboard Shortcuts settings or choose \
+                         another combination."
+                    ),
+                )];
+                self.note(format!(
+                    "{symbols} verification timed out; restored previous shortcuts"
+                ));
+            }
+            Err(rejections) => {
+                self.pending_shortcut = Some(pending);
+                self.rejected = vec![(
+                    action,
+                    format!(
+                        "{symbols} was not verified, and the previous shortcuts could not be \
+                         restored yet: {}",
+                        rejection_summary(&rejections)
+                    ),
+                )];
             }
         }
     }
@@ -679,11 +762,15 @@ impl App {
     /// The editable shortcut table, as the settings pane needs to see it.
     #[must_use]
     pub fn shortcut_rows(&self) -> Vec<ShortcutRow> {
-        let problems = self.shortcuts.problems();
+        let shown = self
+            .pending_shortcut
+            .as_ref()
+            .map_or(&self.shortcuts, |pending| &pending.candidate);
+        let problems = shown.problems();
         ShortcutAction::ALL
             .into_iter()
             .map(|action| {
-                let accelerator = self.shortcuts.get(action).unwrap_or_default();
+                let accelerator = shown.get(action).unwrap_or_default();
                 // A stored value that will not parse is shown back verbatim,
                 // because "that is not a combination" is only useful next to what
                 // the user actually typed.
@@ -693,6 +780,18 @@ impl App {
                     .iter()
                     .find(|(offender, _)| *offender == action)
                     .map(|(_, why)| why.to_string())
+                    .or_else(|| {
+                        self.pending_shortcut
+                            .as_ref()
+                            .filter(|pending| pending.action == action)
+                            .map(|pending| {
+                                format!(
+                                    "Press {} now to verify that macOS delivers it to Scrozz. \
+                                     The previous shortcut stays saved until verification succeeds.",
+                                    pending.accelerator.symbols()
+                                )
+                            })
+                    })
                     .or_else(|| {
                         self.rejected
                             .iter()
@@ -704,7 +803,7 @@ impl App {
                     label: action.label().to_owned(),
                     accelerator: accelerator.to_owned(),
                     symbols,
-                    is_default: self.shortcuts.is_default(action),
+                    is_default: shown.is_default(action),
                     usable: self.shortcut_is_usable(action),
                     problem,
                 }
@@ -722,6 +821,22 @@ impl App {
         if edits.is_empty() {
             return;
         }
+        if let Some(pending) = self.pending_shortcut.take() {
+            if let Err(rejections) = self.register_shortcuts(&pending.previous) {
+                let action = pending.action;
+                self.pending_shortcut = Some(pending);
+                self.rejected = vec![(
+                    action,
+                    format!(
+                        "The pending shortcut could not be cancelled safely: {}",
+                        rejection_summary(&rejections)
+                    ),
+                )];
+                return;
+            }
+            self.refresh_tray_shortcuts();
+        }
+
         let mut candidate = self.shortcuts.clone();
         let mut touched = Vec::new();
         for edit in edits {
@@ -784,8 +899,34 @@ impl App {
             return;
         }
 
-        match self.apply_shortcuts(&candidate) {
-            Ok(()) => self.rejected.clear(),
+        match self.register_shortcuts(&candidate) {
+            Ok(()) => {
+                let verification = touched.iter().find_map(|action| {
+                    let accelerator = candidate
+                        .get(*action)
+                        .and_then(|raw| Accelerator::parse(raw).ok())?;
+                    (cfg!(target_os = "macos") && accelerator.system_owner().is_some())
+                        .then_some((*action, accelerator))
+                });
+                if let Some((action, accelerator)) = verification {
+                    self.pending_shortcut = Some(PendingShortcutVerification {
+                        action,
+                        accelerator,
+                        candidate,
+                        previous: self.shortcuts.clone(),
+                        deadline: Instant::now() + SHORTCUT_VERIFICATION_TIMEOUT,
+                    });
+                    self.rejected.clear();
+                    self.refresh_tray_shortcuts();
+                    self.note(format!(
+                        "{} registered provisionally; waiting for live delivery",
+                        accelerator.symbols()
+                    ));
+                } else {
+                    self.commit_shortcuts(candidate);
+                    self.rejected.clear();
+                }
+            }
             Err(rejections) => {
                 self.rejected = rejections
                     .iter()
@@ -820,20 +961,7 @@ impl App {
         )
     }
 
-    /// Puts an edited set of shortcuts in force, saving it if it takes.
-    ///
-    /// Atomic by construction: [`GlobalHotkeys::apply`] validates the whole set
-    /// before touching the OS and restores the previous registrations if the OS
-    /// refuses one, so a rejected edit leaves the shortcuts that were working
-    /// still working — and, because nothing is written until registration
-    /// succeeds, the file on disk keeps matching what the keyboard does.
-    ///
-    /// # Errors
-    ///
-    /// Returns one [`Rejection`] per offending row so the pane can mark each of
-    /// them, rather than reporting only the first and sending the user round the
-    /// loop again.
-    pub fn apply_shortcuts(&mut self, next: &Shortcuts) -> std::result::Result<(), Vec<Rejection>> {
+    fn register_shortcuts(&mut self, next: &Shortcuts) -> std::result::Result<(), Vec<Rejection>> {
         let session = self.session.clone();
         let capabilities = self.selection_capabilities;
         let ready = self.capture_backend_ready;
@@ -843,10 +971,6 @@ impl App {
         let desired = wanted(&bindings_from(next), &available, &mut skipped);
 
         self.hotkeys.apply(&desired)?;
-
-        self.shortcuts = next.clone();
-        self.config.shortcuts = next.clone();
-        self.config.bindings = bindings_from(next);
         for note in skipped {
             self.note(note);
         }
@@ -854,15 +978,22 @@ impl App {
             self.note(format!("{} → {}", want.accelerator, want.action));
         }
 
+        Ok(())
+    }
+
+    fn commit_shortcuts(&mut self, next: Shortcuts) {
+        self.shortcuts = next.clone();
+        self.config.shortcuts = next.clone();
+        self.config.bindings = bindings_from(&next);
+
         // Saving last, and only on success, so the stored set is always one the
         // app was able to put in force.
         if let Some(store) = self.shortcut_store.clone()
-            && let Err(err) = store.save(next)
+            && let Err(err) = store.save(&next)
         {
             self.note(format!("shortcuts not saved: {err}"));
         }
         self.refresh_tray_shortcuts();
-        Ok(())
     }
 
     /// Relabels the menu with the shortcuts that are actually registered.
@@ -964,11 +1095,13 @@ impl Drop for App {
     }
 }
 
-/// Reports what a hotkey would do to the system, without registering it.
+/// Reports whether a hotkey is a known system default, without claiming its
+/// current availability.
 ///
 /// Used by diagnostics, and worth having separately: the answer for
-/// `Cmd+Shift+4` is *not* "it failed", it is "macOS owns this one", and the two
-/// send a user to very different places.
+/// The result is diagnostic metadata only. Users can disable or reassign these
+/// defaults, so native registration and live delivery still decide whether the
+/// combination is usable.
 ///
 /// # Errors
 ///
@@ -977,7 +1110,7 @@ pub fn describe_conflict(accelerator: &str) -> CliResult<Option<String>> {
     let parsed = Accelerator::parse(accelerator).map_err(CliError::Core)?;
     Ok(parsed
         .system_owner()
-        .map(|reserved| format!("{parsed} is reserved: {reserved:?}")))
+        .map(|reserved| format!("{parsed} is a known system default: {reserved:?}")))
 }
 
 /// The tray entries this build offers, for diagnostics.
@@ -995,6 +1128,7 @@ mod tests {
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn app() -> (App, Recording) {
         let surface = Recording::new();
@@ -1016,7 +1150,22 @@ mod tests {
         let (mut app, _) = app();
         app.shortcuts = shortcuts.clone();
         app.config.shortcuts = shortcuts;
+        app.shortcut_store = None;
         app
+    }
+
+    fn shortcut_store(name: &str) -> (std::path::PathBuf, ShortcutStore) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "scrozz-gui-shortcuts-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).expect("create shortcut test directory");
+        (
+            directory.clone(),
+            ShortcutStore::new(directory.join("shortcuts.json")),
+        )
     }
 
     #[test]
@@ -1045,6 +1194,144 @@ mod tests {
             Accelerator::parse(&row.accelerator)
                 .expect("recorded chord parses")
                 .symbols()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_known_default_verification(app: &mut App) -> Accelerator {
+        let accelerator = Accelerator::parse("Cmd+Shift+4").expect("known default parses");
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: accelerator.to_string(),
+        }]);
+        accelerator
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disabled_system_default_can_commit_after_live_delivery() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let (directory, store) = shortcut_store("verified-default");
+        app.shortcut_store = Some(store.clone());
+        let previous = app
+            .shortcuts
+            .get(ShortcutAction::CaptureRegion)
+            .map(str::to_owned);
+        let accelerator = start_known_default_verification(&mut app);
+
+        assert!(app.pending_shortcut.is_some());
+        assert_eq!(
+            app.shortcuts.get(ShortcutAction::CaptureRegion),
+            previous.as_deref(),
+            "the saved configuration stays unchanged until delivery is observed"
+        );
+        let provisional = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is listed");
+        assert_eq!(provisional.accelerator, accelerator.to_string());
+        assert!(
+            provisional
+                .problem
+                .is_some_and(|message| message.contains("verify"))
+        );
+
+        app.handle_hotkey_event(HotkeyEvent {
+            action: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator,
+            state: KeyState::Pressed,
+        });
+
+        assert!(app.pending_shortcut.is_none());
+        assert_eq!(
+            app.shortcuts.get(ShortcutAction::CaptureRegion),
+            Some(accelerator.to_string().as_str())
+        );
+        let committed = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is listed");
+        assert_eq!(committed.accelerator, accelerator.to_string());
+        assert_eq!(committed.symbols, accelerator.symbols());
+        assert!(committed.problem.is_none());
+        assert_eq!(
+            store.load().get(ShortcutAction::CaptureRegion),
+            Some(accelerator.to_string().as_str()),
+            "only observed delivery is persisted"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn successful_registration_without_delivery_restores_the_previous_binding() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        let (directory, store) = shortcut_store("unverified-default");
+        store
+            .save(&app.shortcuts)
+            .expect("save the previously working shortcuts");
+        app.shortcut_store = Some(store.clone());
+        let previous = app
+            .shortcuts
+            .get(ShortcutAction::CaptureRegion)
+            .expect("region ships bound")
+            .to_owned();
+        start_known_default_verification(&mut app);
+        app.pending_shortcut
+            .as_mut()
+            .expect("known default awaits verification")
+            .deadline = Instant::now();
+
+        app.expire_shortcut_verification();
+
+        assert!(app.pending_shortcut.is_none());
+        assert_eq!(
+            app.shortcuts.get(ShortcutAction::CaptureRegion),
+            Some(previous.as_str())
+        );
+        let row = app
+            .shortcut_rows()
+            .into_iter()
+            .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+            .expect("region is listed");
+        let message = row.problem.expect("timeout is explained");
+        assert!(message.contains("did not receive"));
+        assert!(
+            !message.contains("already used by"),
+            "delivery failure cannot identify an owner: {message}"
+        );
+        assert_eq!(
+            store.load().get(ShortcutAction::CaptureRegion),
+            Some(previous.as_str()),
+            "an unobserved registration must not replace the saved binding"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_edit_cancels_provisional_verification_before_rebinding() {
+        let mut app = app_with_shortcuts(Shortcuts::default());
+        start_known_default_verification(&mut app);
+        assert!(app.pending_shortcut.is_some());
+
+        app.edit_shortcuts(&[ShortcutEdit::Set {
+            id: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator: "Cmd+Shift+F13".to_owned(),
+        }]);
+
+        assert!(app.pending_shortcut.is_none());
+        assert_eq!(
+            app.shortcuts.get(ShortcutAction::CaptureRegion),
+            Some("Shift+Cmd+F13")
+        );
+        assert!(
+            app.shortcut_rows()
+                .into_iter()
+                .find(|row| row.id == ShortcutAction::CaptureRegion.id())
+                .is_some_and(|row| row.problem.is_none())
         );
     }
 
@@ -1292,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn the_screenshot_shortcuts_are_recognised_as_taken() {
+    fn system_defaults_are_recognised_as_advisory_metadata() {
         // The negative of the test above: if this stops holding, the one above
         // has stopped proving anything.
         //
@@ -1304,7 +1591,7 @@ mod tests {
         let reserved = scrozz_shell::hotkey::reserved_shortcuts();
         assert!(
             !reserved.is_empty(),
-            "every platform must declare the combinations it has already taken"
+            "every platform must declare its common system defaults"
         );
 
         for shortcut in reserved {

@@ -204,13 +204,6 @@ pub enum ShortcutError {
         /// The parser's own explanation.
         detail: String,
     },
-    /// The operating system already owns it.
-    Reserved {
-        /// What holds it.
-        owner: &'static str,
-        /// Where the user would free it.
-        remedy: &'static str,
-    },
     /// Another Scrozz action already uses it.
     Duplicate {
         /// The action holding it.
@@ -222,9 +215,6 @@ impl fmt::Display for ShortcutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unparseable { detail } => f.write_str(detail),
-            Self::Reserved { owner, remedy } => {
-                write!(f, "already used by {owner}; free it in {remedy}")
-            }
             Self::Duplicate { other } => {
                 write!(f, "already used by {other} — clear that one first")
             }
@@ -343,13 +333,6 @@ impl Shortcuts {
         let parsed = Accelerator::parse(candidate).map_err(|err| ShortcutError::Unparseable {
             detail: err.to_string(),
         })?;
-
-        if let Some(reserved) = parsed.system_owner() {
-            return Err(ShortcutError::Reserved {
-                owner: reserved.owner,
-                remedy: reserved.remedy,
-            });
-        }
 
         for other in ShortcutAction::ALL {
             if other == action {
@@ -837,18 +820,19 @@ mod tests {
     }
 
     #[test]
-    fn a_system_owned_combination_is_refused_before_it_is_ever_registered() {
+    fn a_system_default_is_allowed_until_native_registration_and_delivery_decide() {
         let shortcuts = Shortcuts::default();
         let reserved = scrozz_shell::hotkey::reserved_shortcuts();
         assert!(!reserved.is_empty(), "every platform declares some");
 
         for taken in reserved {
-            let problem = shortcuts
+            let parsed = shortcuts
                 .check(ShortcutAction::CaptureRegion, taken.accelerator)
-                .expect_err("the platform's own shortcuts are not available");
+                .expect("a configurable system default is not a current conflict")
+                .expect("the candidate is assigned");
             assert!(
-                matches!(problem, ShortcutError::Reserved { .. }),
-                "{} should be reported as reserved, got {problem:?}",
+                parsed.system_owner().is_some(),
+                "{} should retain advisory owner metadata",
                 taken.accelerator
             );
         }
