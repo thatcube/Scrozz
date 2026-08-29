@@ -569,7 +569,10 @@ mod tests {
         let id = CaptureId("0".repeat(crate::id::ID_LEN));
 
         layout.write_deletion(&id).expect("write marker");
-        assert_eq!(layout.scan_deletions().expect("scan markers"), [id.clone()]);
+        assert_eq!(
+            layout.scan_deletions().expect("scan markers").as_slice(),
+            std::slice::from_ref(&id)
+        );
         assert!(layout.delete_deletion(&id).expect("delete marker"));
         assert!(layout.scan_deletions().expect("scan empty").is_empty());
     }

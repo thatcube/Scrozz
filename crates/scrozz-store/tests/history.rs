@@ -64,6 +64,7 @@ fn a_native_recording_round_trips_as_external_video_history() {
         audio_channels: Some(2),
         file_size_bytes: Some(4_096),
         codec: Some("h264".into()),
+        content_type: Some("video/mp4".into()),
         quality: Some("balanced".into()),
         resolution: Some("1080p".into()),
     };
@@ -114,6 +115,45 @@ fn a_native_recording_round_trips_as_external_video_history() {
 }
 
 #[test]
+fn exported_gif_and_webm_keep_truthful_history_types() {
+    let (dir, mut store) = store("exported-media-types");
+    let target = CaptureTarget::Display(DisplayId("main".into()));
+    for (name, content_type, codec, expected_kind) in [
+        ("animation.gif", "image/gif", "gif", MediaKind::Gif),
+        ("fallback.webm", "video/webm", "av1", MediaKind::Video),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, [1, 2, 3, 4]).unwrap();
+        let id = store
+            .insert_recording(NewRecording::new(
+                target.clone(),
+                Provenance::Display,
+                VideoMetadata {
+                    path,
+                    duration_secs: 1.0,
+                    engine: "editor export".into(),
+                    completion: VideoCompletion::Complete,
+                    size: Some(PhysicalSize::new(64.0, 48.0)),
+                    frames: Some(10),
+                    audio_channels: Some(0),
+                    file_size_bytes: Some(4),
+                    codec: Some(codec.into()),
+                    content_type: Some(content_type.into()),
+                    quality: Some("low".into()),
+                    resolution: Some("custom".into()),
+                },
+            ))
+            .unwrap();
+        let record = store.record(&id).unwrap().unwrap();
+        assert_eq!(record.media_kind, expected_kind);
+        assert_eq!(
+            record.video.as_ref().unwrap().content_type.as_deref(),
+            Some(content_type)
+        );
+    }
+}
+
+#[test]
 fn recording_history_rejects_missing_relative_and_empty_media() {
     let (dir, mut store) = store("video-validation");
     let target = CaptureTarget::Display(DisplayId("main".into()));
@@ -127,9 +167,14 @@ fn recording_history_rejects_missing_relative_and_empty_media() {
         audio_channels: None,
         file_size_bytes: None,
         codec: Some("h264".into()),
+        content_type: Some("video/mp4".into()),
         quality: None,
         resolution: None,
     };
+
+    let mut mismatched = metadata(dir.path().join("mismatched.gif"));
+    mismatched.content_type = Some("video/mp4".into());
+    assert!(mismatched.validate().is_err());
 
     assert!(
         store

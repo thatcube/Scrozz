@@ -10,22 +10,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use scrozz_record::{
         Recording,
-        edit::{EditPlan, TrimRange, VideoDocument},
+        edit::{AnimationFormat, EditOutput, EditPlan, TrimRange, VideoDocument},
         media::NativeMediaSource,
-        transcode::{NativeTranscoder, TranscodeEvent, Transcoder as _},
+        transcode::{NativeTranscoder, TranscodeEvent, Transcoder as _, inspect_webm_file},
     };
 
     let mut args = std::env::args_os().skip(1);
     let source = args
         .next()
         .map(PathBuf::from)
-        .ok_or("usage: macos_export_smoke SOURCE.mp4 OUTPUT.mp4")?;
+        .ok_or("usage: macos_export_smoke SOURCE.mp4 OUTPUT.{mp4,gif,webm}")?;
     let output = args
         .next()
         .map(PathBuf::from)
-        .ok_or("usage: macos_export_smoke SOURCE.mp4 OUTPUT.mp4")?;
+        .ok_or("usage: macos_export_smoke SOURCE.mp4 OUTPUT.{mp4,gif,webm}")?;
     if args.next().is_some() {
-        return Err("usage: macos_export_smoke SOURCE.mp4 OUTPUT.mp4".into());
+        return Err("usage: macos_export_smoke SOURCE.mp4 OUTPUT.{mp4,gif,webm}".into());
     }
 
     let source_before = std::fs::metadata(&source)?;
@@ -39,7 +39,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         document.metadata().audio_channels,
         document.duration().as_secs_f64()
     );
-    let mut plan = EditPlan::video(&document)?;
+    let mut plan = match output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" | "m4v" => EditPlan::video(&document)?,
+        "gif" => EditPlan::gif(&document)?,
+        "webm" => EditPlan::webm(&document)?,
+        extension => {
+            return Err(format!(
+                "unsupported smoke output extension {extension:?}; use mp4, gif, or webm"
+            )
+            .into());
+        }
+    };
     let trim_start = std::env::var("SCROZZ_EXPORT_SMOKE_START_SECONDS")
         .ok()
         .map(|value| value.parse::<f64>())
@@ -103,34 +119,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return Err("native export modified its source recording".into());
                 }
-                let source_media = NativeMediaSource::open(Recording::native(
-                    &source,
-                    document.duration().as_secs_f64(),
-                    "native export smoke source",
-                )?)?;
-                let output_media = NativeMediaSource::open(Recording::native(
-                    &output.path,
-                    plan.trim.duration().as_secs_f64(),
-                    "native export smoke output",
-                )?)?;
-                let source_frames = count_video_frames(&source_media, plan.trim)?;
-                let output_frames = count_video_frames(
-                    &output_media,
-                    TrimRange::full(output_media.inspection().duration)?,
-                )?;
-                if source_frames != output_frames {
-                    return Err(format!(
-                        "export frame count {output_frames} differs from preview/source count {source_frames}"
-                    )
-                    .into());
-                }
-                if output_media.metadata().audio_channels
-                    != plan.output_audio_channels(document.metadata())
-                {
-                    return Err("export audio presence differs from the edit preview".into());
-                }
+                let frames = match plan.output {
+                    EditOutput::Video => {
+                        let source_media = NativeMediaSource::open(Recording::native(
+                            &source,
+                            document.duration().as_secs_f64(),
+                            "native export smoke source",
+                        )?)?;
+                        let output_media = NativeMediaSource::open(Recording::native(
+                            &output.path,
+                            plan.trim.duration().as_secs_f64(),
+                            "native export smoke output",
+                        )?)?;
+                        let source_frames = count_video_frames(&source_media, plan.trim)?;
+                        let output_frames = count_video_frames(
+                            &output_media,
+                            TrimRange::full(output_media.inspection().duration)?,
+                        )?;
+                        if source_frames != output_frames {
+                            return Err(format!(
+                                "export frame count {output_frames} differs from preview/source count {source_frames}"
+                            )
+                            .into());
+                        }
+                        if output_media.metadata().audio_channels
+                            != plan.output_audio_channels(document.metadata())
+                        {
+                            return Err(
+                                "export audio presence differs from the edit preview".into()
+                            );
+                        }
+                        output_frames
+                    }
+                    EditOutput::Animation(AnimationFormat::Gif) => {
+                        let inspection = scrozz_export::inspect_gif_file(&output.path)?;
+                        if inspection.duration.abs_diff(plan.trim.duration())
+                            > Duration::from_millis(5)
+                        {
+                            return Err("GIF duration differs from the selected trim".into());
+                        }
+                        inspection.frames
+                    }
+                    EditOutput::WebM => {
+                        let inspection = inspect_webm_file(&output.path)?;
+                        if inspection.duration.abs_diff(plan.trim.duration())
+                            > Duration::from_secs_f64(
+                                1.0 / f64::from(plan.webm_frame_rate(document.metadata())),
+                            )
+                        {
+                            return Err("WebM duration differs from the selected trim".into());
+                        }
+                        inspection.frames
+                    }
+                };
                 println!(
-                    "native export smoke passed: {source_frames} frames, {} bytes at {}",
+                    "native export smoke passed: {frames} frames, {} bytes at {}",
                     output.bytes_written,
                     output.path.display()
                 );

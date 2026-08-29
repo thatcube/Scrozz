@@ -15,11 +15,7 @@ use crate::muxer::VideoCodecConfiguration;
 
 #[cfg(all(target_os = "linux", feature = "linux-native"))]
 pub(crate) mod aac;
-#[cfg(all(
-    target_os = "linux",
-    feature = "linux-native",
-    feature = "rav1e-fallback"
-))]
+#[cfg(feature = "rav1e-fallback")]
 mod rav1e;
 #[cfg(all(target_os = "linux", feature = "linux-native"))]
 mod vaapi;
@@ -103,6 +99,19 @@ fn open_rav1e(settings: VideoEncoderSettings) -> Result<Box<dyn VideoEncoder>> {
 fn open_rav1e(_settings: VideoEncoderSettings) -> Result<Box<dyn VideoEncoder>> {
     Err(Error::Unsupported {
         what: "AV1 recording".into(),
+        why: "this binary was built without the `rav1e-fallback` feature".into(),
+    })
+}
+
+#[cfg(feature = "rav1e-fallback")]
+pub(crate) fn open_software_av1(settings: VideoEncoderSettings) -> Result<Box<dyn VideoEncoder>> {
+    Ok(Box::new(rav1e::Rav1eEncoder::new(settings)?))
+}
+
+#[cfg(not(feature = "rav1e-fallback"))]
+pub(crate) fn open_software_av1(_settings: VideoEncoderSettings) -> Result<Box<dyn VideoEncoder>> {
+    Err(scrozz_core::Error::Unsupported {
+        what: "software AV1/WebM export".into(),
         why: "this binary was built without the `rav1e-fallback` feature".into(),
     })
 }

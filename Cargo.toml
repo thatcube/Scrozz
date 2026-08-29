@@ -60,6 +60,9 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 gif = "0.14"
+color_quant = "1.1"
+oxideav-core = "=0.1.34"
+oxideav-mkv = "=0.0.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

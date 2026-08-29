@@ -215,6 +215,7 @@ fn every_format_agrees_with_itself() {
         DragFormat::Webp,
         DragFormat::Gif,
         DragFormat::Mp4,
+        DragFormat::Webm,
     ] {
         assert!(!format.extension().is_empty());
         assert!(!format.extension().starts_with('.'), "{format:?}");
@@ -237,16 +238,17 @@ fn every_format_agrees_with_itself() {
 }
 
 #[test]
-fn only_video_is_file_or_nothing() {
+fn video_containers_are_file_or_nothing() {
     // Everything a decoder will hand back as a single frame can also ride the
     // pasteboard as image data — a GIF included, since AppKit reads one and
     // takes the first frame. A recording cannot: there is no video flavour any
-    // real receiver accepts, so an MP4 is file-or-nothing.
+    // real receiver accepts, so MP4 and WebM are file-or-nothing.
     assert!(DragFormat::Png.is_still_image());
     assert!(DragFormat::Jpeg.is_still_image());
     assert!(DragFormat::Webp.is_still_image());
     assert!(DragFormat::Gif.is_still_image());
     assert!(!DragFormat::Mp4.is_still_image());
+    assert!(!DragFormat::Webm.is_still_image());
 }
 
 #[test]
@@ -259,6 +261,7 @@ fn extensions_are_recognised_however_they_are_written() {
     assert_eq!(DragFormat::from_extension("jpg"), Some(DragFormat::Jpeg));
     assert_eq!(DragFormat::from_extension("jpeg"), Some(DragFormat::Jpeg));
     assert_eq!(DragFormat::from_extension("m4v"), Some(DragFormat::Mp4));
+    assert_eq!(DragFormat::from_extension("webm"), Some(DragFormat::Webm));
     assert_eq!(DragFormat::from_extension("heic"), None);
     assert_eq!(DragFormat::from_extension(""), None);
 }
@@ -272,6 +275,7 @@ fn png_is_the_type_apple_and_the_web_agree_on() {
     assert_eq!(DragFormat::Png.mime(), "image/png");
     assert_eq!(DragFormat::Jpeg.uti(), "public.jpeg");
     assert_eq!(DragFormat::Mp4.uti(), "public.mpeg-4");
+    assert_eq!(DragFormat::Webm.mime(), "video/webm");
 }
 
 // ---------------------------------------------------------------------------

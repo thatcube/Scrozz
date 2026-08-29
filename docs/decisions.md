@@ -1036,6 +1036,39 @@ the comparison table, not buried in a footnote.
 
 ---
 
+## D32 — Recording exports name their codec and bound their work
+
+**Decision.** The recording editor offers three explicit destinations: hardware
+H.264 in MP4, software AV1 in WebM, and animated GIF. Hardware H.264 remains the
+default because it has the broadest native playback support. If it is
+unavailable, Scrozz explains why and offers WebM; it never changes the selected
+container or codec silently. GIF and the current WebM fallback are video-only,
+so their audio controls are disabled before export.
+
+GIF work is streamed one frame at a time and capped by duration, dimensions,
+frame rate, estimated output size and estimated working set. Its palette quality,
+Floyd–Steinberg dithering and loop behavior are explicit plan values. Software
+AV1 is similarly bounded and uses `rav1e` (BSD-2-Clause). Scrozz writes the
+small, required WebM/EBML subset directly and uses the independent
+`oxideav-mkv` MIT demuxer to verify emitted tracks, duration, timestamps and
+cues. The codec and verifier are pinned through Cargo.
+
+No x264 code is linked or bundled. `ffmpeg-sys-next` remains a Linux-only native
+adapter dependency; its exact 9.0.0 WTFPL declaration receives a package-scoped
+cargo-deny exception because WTFPL is GPL-compatible. `rav1e` 0.8.1's
+compile-time `paste` dependency is covered by a dated exception for
+RUSTSEC-2024-0436, an unmaintained notice with no reported vulnerability and no
+patched upstream rav1e release. Both exceptions must be revisited on dependency
+updates rather than widened globally.
+
+**Why.** A fallback that silently changes file type produces artifacts that
+destinations cannot predict, while an unbounded frame loop can exhaust disk or
+memory far faster than the source recording. Explicit choices and hard limits
+make retries deterministic, keep source media untouched, and preserve the App
+Store exception without introducing a software H.264 patent or license surprise.
+
+---
+
 # Open questions
 
 - **The Scrozz design language.** Seeded by the spike's token layer; needs

@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["rav1e-fallback"]
 linux-recording = ["scrozz-record/linux-native"]
 rav1e-fallback = ["scrozz-record/rav1e-fallback"]
 

@@ -25,14 +25,16 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use scrozz_core::{
-    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, Provenance,
-    SelectionOptions, SelectionOutcome,
+    Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, PhysicalSize,
+    Provenance, SelectionOptions, SelectionOutcome,
 };
 use scrozz_export::{Clipboard, Encoder, FrameEncoder, ImageFormat};
 use scrozz_ocr::Ocr as _;
 use scrozz_record::{
     Recording, RecordingCompletion, RecordingRequest, RecordingSession, RecordingState,
     Salvageability, SessionEvent,
+    edit::{EditOutput, EditPlan, VideoDocument},
+    transcode::{TranscodeCompletion, TranscodeOutput},
 };
 use scrozz_store::{
     CaptureId, CaptureRecord, History as _, ImageState, NewRecording, Page, SearchQuery,
@@ -1186,6 +1188,7 @@ fn persist_recording(
         scrozz_record::RecordingProvenance::Native { engine, target } => {
             (engine.clone(), target.as_ref())
         }
+
         scrozz_record::RecordingProvenance::Synthetic { .. } => {
             unreachable!("require_native rejects synthetic output before history construction")
         }
@@ -1222,6 +1225,7 @@ fn persist_recording(
             .metadata
             .video_codec
             .map(|codec| codec.slug().to_owned()),
+        content_type: Some("video/mp4".to_owned()),
         quality: recording
             .metadata
             .quality
@@ -1231,6 +1235,56 @@ fn persist_recording(
             .resolution
             .map(|resolution| resolution.slug()),
     };
+    let mut store = platform::store()?;
+    Ok(store.insert_recording(NewRecording::new(target, provenance, video))?)
+}
+
+pub(crate) fn persist_transcode_output(
+    document: &VideoDocument,
+    plan: &EditPlan,
+    output: &TranscodeOutput,
+) -> CliResult<CaptureId> {
+    output.require_native()?;
+    let target = match &document.recording().provenance {
+        scrozz_record::RecordingProvenance::Native {
+            target: Some(target),
+            ..
+        } => target.clone(),
+        scrozz_record::RecordingProvenance::Native { target: None, .. } => {
+            return Err(CliError::Core(CoreError::Storage(
+                "edited recording source did not retain its capture target".into(),
+            )));
+        }
+        scrozz_record::RecordingProvenance::Synthetic { .. } => {
+            return Err(CliError::Core(CoreError::InvalidRequest(
+                "synthetic media cannot enter capture history".into(),
+            )));
+        }
+    };
+    let completion = match &output.completion {
+        TranscodeCompletion::Complete => VideoCompletion::Complete,
+        TranscodeCompletion::Partial { reason } => VideoCompletion::Partial {
+            salvageability: VideoSalvageability::Playable,
+            reason: reason.clone(),
+        },
+    };
+    let (width, height) = plan.output_dimensions(document.metadata());
+    let video = VideoMetadata {
+        path: output.path.clone(),
+        duration_secs: plan.trim.duration().as_secs_f64(),
+        engine: output.producer().to_owned(),
+        completion,
+        size: Some(PhysicalSize::new(f64::from(width), f64::from(height))),
+        frames: (!matches!(plan.output, EditOutput::Video))
+            .then(|| plan.export_estimate(document.metadata()).frame_count),
+        audio_channels: Some(plan.output_audio_channels(document.metadata())),
+        file_size_bytes: Some(output.bytes_written),
+        codec: Some(plan.output.codec_slug().to_owned()),
+        content_type: Some(plan.output.media_type().to_owned()),
+        quality: Some(plan.quality.slug().to_owned()),
+        resolution: Some(plan.resolution.slug().to_owned()),
+    };
+    let provenance = provenance_for_target(&target);
     let mut store = platform::store()?;
     Ok(store.insert_recording(NewRecording::new(target, provenance, video))?)
 }

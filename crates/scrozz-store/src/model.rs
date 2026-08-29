@@ -123,6 +123,9 @@ pub struct VideoMetadata {
     /// Resolved codec slug.
     #[serde(default)]
     pub codec: Option<String>,
+    /// IANA content type for the durable artifact.
+    #[serde(default)]
+    pub content_type: Option<String>,
     /// Encoder quality slug.
     #[serde(default)]
     pub quality: Option<String>,
@@ -132,6 +135,36 @@ pub struct VideoMetadata {
 }
 
 impl VideoMetadata {
+    /// Content type implied by the durable filename, when recognized.
+    #[must_use]
+    pub fn inferred_content_type(&self) -> Option<&'static str> {
+        match self
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mp4" | "m4v" => Some("video/mp4"),
+            "webm" => Some("video/webm"),
+            "gif" => Some("image/gif"),
+            _ => None,
+        }
+    }
+
+    /// History category implied by the explicit content type and path.
+    #[must_use]
+    pub fn media_kind(&self) -> MediaKind {
+        if self.content_type.as_deref() == Some("image/gif")
+            || self.inferred_content_type() == Some("image/gif")
+        {
+            MediaKind::Gif
+        } else {
+            MediaKind::Video
+        }
+    }
+
     /// Validates persisted recording metadata without opening the media file.
     pub fn validate(&self) -> Result<()> {
         if self.path.as_os_str().is_empty() {
@@ -148,6 +181,24 @@ impl VideoMetadata {
             return Err(Error::InvalidRequest(
                 "history video metadata must name its native engine".into(),
             ));
+        }
+        if self
+            .content_type
+            .as_deref()
+            .is_some_and(|content_type| content_type.trim().is_empty())
+        {
+            return Err(Error::InvalidRequest(
+                "history media content type cannot be empty".into(),
+            ));
+        }
+        if let (Some(explicit), Some(inferred)) =
+            (self.content_type.as_deref(), self.inferred_content_type())
+            && explicit != inferred
+        {
+            return Err(Error::InvalidRequest(format!(
+                "history media content type {explicit:?} does not match {}",
+                self.path.display()
+            )));
         }
         if matches!(
             &self.completion,

@@ -3130,6 +3130,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxideav-core"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a68d9a74d6d0a7373589eca0c0bb8ab380c46fd1d7fc807e696d716cdad078c"
+dependencies = [
+ "bytemuck",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "oxideav-mkv"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8841f155fb729296f6162a143b8509074ff6a2a1b4c09a2b6576c204a50c482"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
 name = "pango"
 version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3873,6 +3893,7 @@ name = "scrozz-export"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "color_quant",
  "gif",
  "image",
  "scrozz-core",
@@ -3918,6 +3939,8 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-media-toolbox",
  "objc2-screen-capture-kit",
+ "oxideav-core",
+ "oxideav-mkv",
  "pipewire",
  "rav1e",
  "scrozz-capture",

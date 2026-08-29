@@ -36,7 +36,7 @@ use scrozz_core::{CaptureTarget, Error as CoreError, SelectionMode as CaptureSel
 use scrozz_record::{
     MachineEvent, MachineFailure, Recording, RecordingMachine, RecordingPhase, RecordingRequest,
     RecordingSettings,
-    edit::{EditOutput, EditPlan, VideoDocument},
+    edit::{EditPlan, VideoDocument},
     handoff::FinalizedMediaHandoff,
     playback::{NativePlayback, sync_document},
     storyboard::NativeStoryboard,
@@ -1084,50 +1084,96 @@ impl App {
     }
 
     fn advance_video_export(&mut self) {
-        let Some(editor) = self.recording_editor.as_mut() else {
-            return;
-        };
-        let Some(job) = editor.transcode_job.as_mut() else {
-            return;
-        };
-        let mut terminal = false;
-        for _ in 0..64 {
-            let Some(event) = job.poll() else {
-                break;
+        let completed = {
+            let Some(editor) = self.recording_editor.as_mut() else {
+                return;
             };
-            match event {
-                TranscodeEvent::Progress(progress) => {
-                    editor.transcode_progress = progress;
-                    editor.transcode_status = Some(TranscodeStatus::Running { progress });
-                }
-                TranscodeEvent::Finished(output) => {
-                    editor.transcode_progress = 1.0;
-                    editor.transcode_output = Some(output);
-                    editor.transcode_failure = None;
-                    editor.transcode_status = Some(TranscodeStatus::Finished);
-                    terminal = true;
+            if editor.transcode_job.is_none() {
+                return;
+            }
+            let mut terminal = false;
+            let mut completed = None;
+            for _ in 0..64 {
+                let Some(event) = editor
+                    .transcode_job
+                    .as_mut()
+                    .expect("the export job was checked above")
+                    .poll()
+                else {
                     break;
-                }
-                TranscodeEvent::Failed(failure) => {
-                    editor.transcode_output = None;
-                    editor.transcode_failure = Some(failure);
-                    editor.transcode_status = Some(TranscodeStatus::Failed);
-                    terminal = true;
-                    break;
-                }
-                TranscodeEvent::Cancelled(partial) => {
-                    editor.transcode_output = partial;
-                    editor.transcode_failure = None;
-                    editor.transcode_status = Some(TranscodeStatus::Cancelled);
-                    terminal = true;
-                    break;
+                };
+                match event {
+                    TranscodeEvent::Progress(progress) => {
+                        editor.transcode_progress = progress;
+                        editor.transcode_status = Some(TranscodeStatus::Running { progress });
+                    }
+                    TranscodeEvent::Finished(output) => {
+                        completed = Some((
+                            editor.document.clone(),
+                            editor.plan,
+                            output.clone(),
+                            export_poster(editor),
+                        ));
+                        editor.transcode_progress = 1.0;
+                        editor.transcode_output = Some(output);
+                        editor.transcode_failure = None;
+                        editor.transcode_status = Some(TranscodeStatus::Finished);
+                        terminal = true;
+                        break;
+                    }
+                    TranscodeEvent::Failed(failure) => {
+                        editor.transcode_output = None;
+                        editor.transcode_failure = Some(failure);
+                        editor.transcode_status = Some(TranscodeStatus::Failed);
+                        terminal = true;
+                        break;
+                    }
+                    TranscodeEvent::Cancelled(partial) => {
+                        editor.transcode_output = partial;
+                        editor.transcode_failure = None;
+                        editor.transcode_status = Some(TranscodeStatus::Cancelled);
+                        terminal = true;
+                        break;
+                    }
                 }
             }
-        }
-        if terminal {
-            editor.transcode_job = None;
-        } else {
-            editor.transcode_status = Some(job.status());
+            if terminal {
+                editor.transcode_job = None;
+            } else {
+                editor.transcode_status = editor.transcode_job.as_ref().map(|job| job.status());
+            }
+            completed
+        };
+
+        if let Some((document, plan, output, poster)) = completed {
+            match commands::persist_transcode_output(&document, &plan, &output) {
+                Ok(id) => {
+                    self.note(format!(
+                        "{} export entered history as {}",
+                        plan.output.label(),
+                        id.0
+                    ));
+                    if self.history_window.is_some() {
+                        self.refresh_history();
+                    }
+                }
+                Err(error) => self.note(format!(
+                    "export was saved but could not enter capture history: {error}"
+                )),
+            }
+            match poster.as_ref().map_or_else(
+                || {
+                    Err(CoreError::Codec(
+                        "completed export has no decoded preview for the aggregate card".into(),
+                    ))
+                },
+                |frame| FinalizedMediaHandoff::from_export(&document, &plan, &output, frame),
+            ) {
+                Ok(handoff) => self.finalized_media_handoff = Some(handoff),
+                Err(error) => self.note(format!(
+                    "export was saved but its aggregate media handoff failed: {error}"
+                )),
+            }
         }
     }
 
@@ -2182,6 +2228,28 @@ fn active_video_editor(
     }))
 }
 
+fn export_poster(editor: &ActiveVideoEditor) -> Option<scrozz_record::media::DecodedVideoFrame> {
+    let storyboard = editor.storyboard.snapshot();
+    storyboard
+        .frames
+        .iter()
+        .flatten()
+        .filter(|slot| {
+            slot.frame.timestamp >= editor.plan.trim.start
+                && slot.frame.timestamp < editor.plan.trim.end
+        })
+        .min_by_key(|slot| slot.frame.timestamp)
+        .map(|slot| slot.frame.as_ref().clone())
+        .or_else(|| {
+            editor
+                .playback
+                .snapshot()
+                .frame
+                .as_ref()
+                .map(|preview| preview.frame.as_ref().clone())
+        })
+}
+
 fn edited_output_path(
     document: &VideoDocument,
     plan: &EditPlan,
@@ -2192,10 +2260,7 @@ fn edited_output_path(
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("recording");
-    let extension = match plan.output {
-        EditOutput::Video => "mp4",
-        EditOutput::Animation(format) => format.extension(),
-    };
+    let extension = plan.output.extension();
     for suffix in 0..1_000 {
         let name = if suffix == 0 {
             format!("{stem}-edited.{extension}")
@@ -2423,6 +2488,54 @@ mod tests {
         ] {
             assert!(video_editor_action_allowed_during_export(&action));
         }
+    }
+
+    #[test]
+    fn edited_output_paths_match_format_and_never_replace_a_collision() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("scrozz-output-path-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let document = VideoDocument::open_fixture(
+            scrozz_record::Recording::synthetic(
+                root.join("capture.mp4"),
+                2.0,
+                "output path fixture",
+            )
+            .unwrap(),
+            scrozz_record::edit::SourceMetadata {
+                width: 64,
+                height: 48,
+                fps: 10.0,
+                audio_channels: 0,
+            },
+        )
+        .unwrap();
+
+        let gif = EditPlan::gif(&document).unwrap();
+        let first = edited_output_path(&document, &gif).unwrap();
+        assert_eq!(first.file_name().unwrap(), "capture-edited.gif");
+        std::fs::write(&first, b"existing").unwrap();
+        assert_eq!(
+            edited_output_path(&document, &gif)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "capture-edited-1.gif"
+        );
+
+        let webm = EditPlan::webm(&document).unwrap();
+        assert_eq!(
+            edited_output_path(&document, &webm)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "capture-edited.webm"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -9,11 +9,16 @@ use egui::{
     pos2, vec2,
 };
 use scrozz_record::{
-    edit::{ChannelBehavior, EditOutput, EditPlan, OutputDimensions, PlaybackState, VideoDocument},
+    edit::{
+        AnimationFormat, AnimationRepeat, ChannelBehavior, EditOutput, EditPlan, GifDither,
+        GifExportSettings, OutputDimensions, PlaybackState, VideoDocument, WebmExportSettings,
+    },
     playback::{PlaybackAudio, PlaybackPhase, PlaybackSnapshot},
     settings::{Quality, ResolutionCap},
     storyboard::{STORYBOARD_SLOTS, StoryboardSnapshot},
-    transcode::{TranscodeFailure, TranscodeOutput, TranscodeStatus},
+    transcode::{
+        ExportCapabilities, NativeTranscoder, TranscodeFailure, TranscodeOutput, TranscodeStatus,
+    },
 };
 
 use crate::{
@@ -128,6 +133,7 @@ pub fn show_window(
                             },
                             theme,
                         )
+                        .with_capabilities(NativeTranscoder::capabilities())
                         .show(ui)
                     })
                     .inner
@@ -383,6 +389,12 @@ pub struct VideoEditorControls {
     pub export_enabled: bool,
     /// Whether an active export can be cancelled.
     pub cancel_export_enabled: bool,
+    /// Whether this machine can produce hardware H.264/MP4.
+    pub mp4_h264_available: bool,
+    /// Whether this build can produce software AV1/WebM.
+    pub webm_av1_available: bool,
+    /// Whether this machine can decode the source for GIF output.
+    pub gif_available: bool,
     /// Plan validation message preventing export.
     pub validation_error: Option<String>,
 }
@@ -426,13 +438,25 @@ pub struct VideoEditorResponse {
 pub struct VideoEditor<'a> {
     model: VideoEditorModel<'a>,
     theme: &'a Theme,
+    capabilities: ExportCapabilities,
 }
 
 impl<'a> VideoEditor<'a> {
     /// Creates an editor from a source document, edit plan, and export state.
     #[must_use]
-    pub const fn new(model: VideoEditorModel<'a>, theme: &'a Theme) -> Self {
-        Self { model, theme }
+    pub fn new(model: VideoEditorModel<'a>, theme: &'a Theme) -> Self {
+        Self {
+            model,
+            theme,
+            capabilities: ExportCapabilities::all_available(),
+        }
+    }
+
+    /// Overrides runtime capabilities for deterministic UI tests.
+    #[must_use]
+    pub const fn with_capabilities(mut self, capabilities: ExportCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// Draws transport, trim, edit, and export controls.
@@ -448,8 +472,8 @@ impl<'a> VideoEditor<'a> {
         let running = self.model.transcode.is_running();
         let playback_available = self.model.preview.phase != PlaybackPhase::Failed;
         let layout = VideoEditorLayout::for_width(ui.available_width());
-        let gif = !plan.output.supports_audio();
-        if gif && !plan.audio.mute {
+        let silent_output = !plan.output.supports_audio();
+        if silent_output && !plan.audio.mute {
             plan.audio.mute = true;
             plan_changed = true;
         }
@@ -551,6 +575,7 @@ impl<'a> VideoEditor<'a> {
                                             &mut actions,
                                             &mut responses.reveal,
                                             self.model.transcode,
+                                            self.capabilities,
                                         );
                                     },
                                 );
@@ -580,6 +605,7 @@ impl<'a> VideoEditor<'a> {
                                 &mut actions,
                                 &mut responses.reveal,
                                 self.model.transcode,
+                                self.capabilities,
                             );
                         }
                     });
@@ -587,10 +613,7 @@ impl<'a> VideoEditor<'a> {
                 rule(ui, self.theme);
                 ui.add_space(Space::MD);
 
-                let validation_error = document
-                    .validate_plan(&plan)
-                    .err()
-                    .map(|error| error.to_string());
+                let validation_error = editor_validation_error(document, &plan, self.capabilities);
                 ui.horizontal(|ui| {
                     let close = button(ui, self.theme, "Cancel", false, !running);
                     if close.clicked() {
@@ -599,15 +622,16 @@ impl<'a> VideoEditor<'a> {
                     responses.close = Some(close);
 
                     ui.add_space(Space::SM);
-                    if let Some(bytes) = estimated_output_bytes(plan, metadata) {
-                        caption(
-                            ui,
-                            self.theme,
-                            format!("Estimated size {}", format_file_size(bytes)),
-                        );
-                    } else {
-                        caption(ui, self.theme, "Size is estimated during GIF export");
-                    }
+                    let estimate = plan.export_estimate(metadata);
+                    caption(
+                        ui,
+                        self.theme,
+                        format!(
+                            "Estimated {}  •  working memory up to {}",
+                            format_file_size(estimate.output_bytes),
+                            format_file_size(estimate.working_set_bytes)
+                        ),
+                    );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let export_enabled = validation_error.is_none() && !running;
@@ -642,10 +666,7 @@ impl<'a> VideoEditor<'a> {
         if plan_changed {
             actions.insert(0, VideoEditorAction::PlanChanged(plan));
         }
-        let validation_error = document
-            .validate_plan(&plan)
-            .err()
-            .map(|error| error.to_string());
+        let validation_error = editor_validation_error(document, &plan, self.capabilities);
         let audio_enabled = metadata.audio_channels > 0 && plan.output.supports_audio() && !running;
         let controls = VideoEditorControls {
             layout,
@@ -655,6 +676,9 @@ impl<'a> VideoEditor<'a> {
             mono_enabled: audio_enabled && metadata.audio_channels > 1 && !plan.audio.mute,
             export_enabled: validation_error.is_none() && !running,
             cancel_export_enabled: running,
+            mp4_h264_available: self.capabilities.mp4_h264.available,
+            webm_av1_available: self.capabilities.webm_av1.available,
+            gif_available: self.capabilities.gif.available,
             validation_error,
         };
 
@@ -1271,6 +1295,7 @@ fn draw_inspector(
     actions: &mut Vec<VideoEditorAction>,
     reveal_response: &mut Option<Response>,
     transcode: TranscodeView<'_>,
+    capabilities: ExportCapabilities,
 ) {
     if wide {
         inspector_panel(ui, theme, "Video", |ui| {
@@ -1282,7 +1307,15 @@ fn draw_inspector(
         });
         ui.add_space(Space::SM);
         inspector_panel(ui, theme, "Export", |ui| {
-            draw_export_controls(ui, theme, document, running, plan, plan_changed);
+            draw_export_controls(
+                ui,
+                theme,
+                document,
+                running,
+                plan,
+                plan_changed,
+                capabilities,
+            );
             ui.add_space(Space::SM);
             draw_transcode_status(ui, theme, transcode, actions, reveal_response);
         });
@@ -1306,7 +1339,15 @@ fn draw_inspector(
                 .id_salt("video-editor-stacked-export")
                 .default_open(true)
                 .show(ui, |ui| {
-                    draw_export_controls(ui, theme, document, running, plan, plan_changed);
+                    draw_export_controls(
+                        ui,
+                        theme,
+                        document,
+                        running,
+                        plan,
+                        plan_changed,
+                        capabilities,
+                    );
                     draw_transcode_status(ui, theme, transcode, actions, reveal_response);
                 });
         });
@@ -1337,7 +1378,15 @@ fn draw_video_controls(
     plan_changed: &mut bool,
 ) {
     let metadata = document.metadata();
-    caption(ui, theme, "Quality");
+    caption(
+        ui,
+        theme,
+        if matches!(plan.output, EditOutput::Animation(AnimationFormat::Gif)) {
+            "Palette quality"
+        } else {
+            "Quality"
+        },
+    );
     ui.add_enabled_ui(!running, |ui| {
         ComboBox::from_id_salt("video-editor-quality")
             .width(ui.available_width())
@@ -1429,11 +1478,57 @@ fn draw_video_controls(
 
     ui.add_space(Space::SM);
     caption(ui, theme, "Frame rate");
-    body(
-        ui,
-        theme,
-        format!("Match source  •  {:.2} fps", metadata.fps),
-    );
+    match plan.output {
+        EditOutput::Video => {
+            body(
+                ui,
+                theme,
+                format!("Match source  •  {:.2} fps", metadata.fps),
+            );
+        }
+        EditOutput::WebM => {
+            ui.add_enabled_ui(!running, |ui| {
+                ComboBox::from_id_salt("video-editor-webm-frame-rate")
+                    .width(ui.available_width())
+                    .selected_text(format!("{} fps", plan.webm.frame_rate))
+                    .show_ui(ui, |ui| {
+                        for frame_rate in WebmExportSettings::FRAME_RATES {
+                            if ui
+                                .selectable_value(
+                                    &mut plan.webm.frame_rate,
+                                    frame_rate,
+                                    format!("{frame_rate} fps"),
+                                )
+                                .changed()
+                            {
+                                *plan_changed = true;
+                            }
+                        }
+                    });
+            });
+        }
+        EditOutput::Animation(AnimationFormat::Gif) => {
+            ui.add_enabled_ui(!running, |ui| {
+                ComboBox::from_id_salt("video-editor-gif-frame-rate")
+                    .width(ui.available_width())
+                    .selected_text(format!("{} fps", plan.gif.frame_rate))
+                    .show_ui(ui, |ui| {
+                        for frame_rate in GifExportSettings::FRAME_RATES {
+                            if ui
+                                .selectable_value(
+                                    &mut plan.gif.frame_rate,
+                                    frame_rate,
+                                    format!("{frame_rate} fps"),
+                                )
+                                .changed()
+                            {
+                                *plan_changed = true;
+                            }
+                        }
+                    });
+            });
+        }
+    }
 }
 
 fn draw_audio_controls(
@@ -1454,11 +1549,19 @@ fn draw_audio_controls(
         );
         return;
     }
-    if !plan.output.supports_audio() {
+    if matches!(plan.output, EditOutput::Animation(AnimationFormat::Gif)) {
         caption(
             ui,
             theme,
             "GIF cannot contain audio. The export will be muted.",
+        );
+        return;
+    }
+    if matches!(plan.output, EditOutput::WebM) {
+        caption(
+            ui,
+            theme,
+            "Software AV1 export is video-only in this build. Choose MP4 to retain audio.",
         );
         return;
     }
@@ -1506,6 +1609,7 @@ fn draw_export_controls(
     running: bool,
     plan: &mut EditPlan,
     plan_changed: &mut bool,
+    capabilities: ExportCapabilities,
 ) {
     caption(ui, theme, "Format");
     ui.add_enabled_ui(!running, |ui| {
@@ -1513,31 +1617,150 @@ fn draw_export_controls(
             .width(ui.available_width())
             .selected_text(match plan.output {
                 EditOutput::Video => "MP4  •  H.264",
-                EditOutput::Animation(_) => "GIF  •  no audio",
+                EditOutput::WebM => "WebM  •  AV1",
+                EditOutput::Animation(AnimationFormat::Gif) => "GIF  •  no audio",
             })
             .popup_style(ui.style().as_ref().clone().into())
             .show_ui(ui, |ui| {
                 if ui
-                    .selectable_label(matches!(plan.output, EditOutput::Video), "MP4  •  H.264")
+                    .add_enabled(
+                        capabilities.mp4_h264.available,
+                        egui::Button::selectable(
+                            matches!(plan.output, EditOutput::Video),
+                            "MP4  •  hardware H.264",
+                        ),
+                    )
+                    .on_disabled_hover_text(
+                        capabilities
+                            .mp4_h264
+                            .unavailable_reason
+                            .unwrap_or("hardware H.264 is unavailable"),
+                    )
                     .clicked()
                 {
                     plan.output = EditOutput::Video;
+                    if document.metadata().audio_channels > 0 {
+                        plan.audio.mute = false;
+                    }
                     *plan_changed = true;
                 }
                 if ui
-                    .selectable_label(
-                        matches!(plan.output, EditOutput::Animation(_)),
-                        "GIF  •  no audio",
+                    .add_enabled(
+                        capabilities.webm_av1.available,
+                        egui::Button::selectable(
+                            matches!(plan.output, EditOutput::WebM),
+                            "WebM  •  software AV1",
+                        ),
+                    )
+                    .on_disabled_hover_text(
+                        capabilities
+                            .webm_av1
+                            .unavailable_reason
+                            .unwrap_or("software AV1 is unavailable"),
+                    )
+                    .clicked()
+                    && let Ok(webm) = EditPlan::webm(document)
+                {
+                    plan.output = webm.output;
+                    plan.webm = webm.webm;
+                    plan.resolution = webm.resolution;
+                    plan.custom_dimensions = webm.custom_dimensions;
+                    plan.audio.mute = true;
+                    *plan_changed = true;
+                }
+                if ui
+                    .add_enabled(
+                        capabilities.gif.available,
+                        egui::Button::selectable(
+                            matches!(plan.output, EditOutput::Animation(AnimationFormat::Gif)),
+                            "GIF  •  no audio",
+                        ),
+                    )
+                    .on_disabled_hover_text(
+                        capabilities
+                            .gif
+                            .unavailable_reason
+                            .unwrap_or("GIF export is unavailable"),
                     )
                     .clicked()
                     && let Ok(gif) = EditPlan::gif(document)
                 {
                     plan.output = gif.output;
+                    plan.gif = gif.gif;
+                    plan.resolution = gif.resolution;
+                    plan.custom_dimensions = gif.custom_dimensions;
                     plan.audio.mute = true;
                     *plan_changed = true;
                 }
             });
     });
+    match plan.output {
+        EditOutput::Video => {
+            caption(
+                ui,
+                theme,
+                "Best destination compatibility. Requires a hardware H.264 encoder.",
+            );
+        }
+        EditOutput::WebM => {
+            caption(
+                ui,
+                theme,
+                "Open AV1 fallback for browsers and VLC. Some native players do not support WebM.",
+            );
+        }
+        EditOutput::Animation(AnimationFormat::Gif) => {
+            ui.add_space(Space::SM);
+            caption(ui, theme, "Loop");
+            ui.add_enabled_ui(!running, |ui| {
+                ComboBox::from_id_salt("video-editor-gif-loop")
+                    .width(ui.available_width())
+                    .selected_text(match plan.gif.repeat {
+                        AnimationRepeat::Infinite => "Forever",
+                        AnimationRepeat::Once | AnimationRepeat::Finite(0) => "Once",
+                        AnimationRepeat::Finite(_) => "Finite",
+                    })
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(
+                                &mut plan.gif.repeat,
+                                AnimationRepeat::Infinite,
+                                "Forever",
+                            )
+                            .changed()
+                        {
+                            *plan_changed = true;
+                        }
+                        if ui
+                            .selectable_value(&mut plan.gif.repeat, AnimationRepeat::Once, "Once")
+                            .changed()
+                        {
+                            *plan_changed = true;
+                        }
+                    });
+                let mut dither = plan.gif.dither == GifDither::FloydSteinberg;
+                if ui
+                    .checkbox(&mut dither, "Smooth palette gradients")
+                    .on_hover_text(
+                        "Floyd–Steinberg dithering reduces banding while keeping memory bounded.",
+                    )
+                    .changed()
+                {
+                    plan.gif.dither = if dither {
+                        GifDither::FloydSteinberg
+                    } else {
+                        GifDither::None
+                    };
+                    *plan_changed = true;
+                }
+            });
+            caption(
+                ui,
+                theme,
+                "GIF is widely supported but larger than video and always silent.",
+            );
+        }
+    }
     ui.add_space(Space::SM);
     let (width, height) = plan.output_dimensions(document.metadata());
     caption(
@@ -1547,10 +1770,10 @@ fn draw_export_controls(
             "{} × {}  •  {}",
             width,
             height,
-            if plan.output.supports_audio() {
-                "Source preserved"
-            } else {
-                "Silent animation"
+            match plan.output {
+                EditOutput::Video => "Source audio available",
+                EditOutput::WebM => "Video-only AV1",
+                EditOutput::Animation(AnimationFormat::Gif) => "Silent animation",
             }
         ),
     );
@@ -1701,25 +1924,16 @@ fn format_precise_duration(duration: Duration) -> String {
     }
 }
 
-fn estimated_output_bytes(
-    plan: EditPlan,
-    metadata: scrozz_record::edit::SourceMetadata,
-) -> Option<u64> {
-    if !plan.output.supports_audio() {
-        return None;
-    }
-    let (width, height) = plan.output_dimensions(metadata);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let fps = metadata.fps.round().clamp(1.0, 240.0) as u32;
-    let video_bps = plan.quality.target_bitrate(width, height, fps);
-    let audio_bps: u64 = if plan.output_audio_channels(metadata) == 0 {
-        0
-    } else {
-        192_000
-    };
-    let bits =
-        (u128::from(video_bps) + u128::from(audio_bps)) * safe_trim_duration(plan.trim).as_millis();
-    u64::try_from(bits / 8_000).ok()
+fn editor_validation_error(
+    document: &VideoDocument,
+    plan: &EditPlan,
+    capabilities: ExportCapabilities,
+) -> Option<String> {
+    document
+        .validate_plan(plan)
+        .and_then(|()| capabilities.require(plan.output))
+        .err()
+        .map(|error| error.to_string())
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -2023,6 +2237,7 @@ impl Scene for VideoEditorScene {
                 },
                 &theme,
             )
+            .with_capabilities(ExportCapabilities::all_available())
             .show(ui);
         });
     }

@@ -202,6 +202,19 @@ fn draw_record(
                             ),
                         };
                         ui.colored_label(color, summary);
+                        caption(
+                            ui,
+                            theme,
+                            format!(
+                                "{}  ·  {}",
+                                video.codec.as_deref().unwrap_or("unknown codec"),
+                                video
+                                    .content_type
+                                    .as_deref()
+                                    .or_else(|| video.inferred_content_type())
+                                    .unwrap_or("unknown content type")
+                            ),
+                        );
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

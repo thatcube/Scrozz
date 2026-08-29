@@ -110,6 +110,7 @@ fn a_video_sidecar_rebuilds_the_recording_index() {
                 audio_channels: None,
                 file_size_bytes: Some(512),
                 codec: Some("h264".into()),
+                content_type: Some("video/mp4".into()),
                 quality: None,
                 resolution: None,
             },
@@ -348,8 +349,8 @@ fn a_delete_marker_survives_until_blob_cleanup_can_finish() {
         .expect_err("unsafe garbage collection must block deletion completion");
     assert!(error.to_string().contains("unreadable"), "{error}");
     assert_eq!(
-        layout.scan_deletions().expect("pending marker"),
-        [id.clone()]
+        layout.scan_deletions().expect("pending marker").as_slice(),
+        std::slice::from_ref(&id)
     );
     fs::remove_file(unreadable).expect("remove damaged test record");
     drop(store);

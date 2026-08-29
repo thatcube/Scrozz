@@ -8,10 +8,11 @@ use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, vec2};
 use scrozz_core::{CaptureTarget, Error, LogicalPoint, LogicalRect, LogicalSize};
 use scrozz_record::{
     Recording,
-    edit::{EditPlan, SourceMetadata, TrimRange, VideoDocument},
+    edit::{EditOutput, EditPlan, SourceMetadata, TrimRange, VideoDocument},
     engine::EngineCapabilities,
     machine::{MachineFailure, RecordingPhase},
     selection::{AspectRatio, LastSelectionMemory, SelectionConstraints, SelectionMode},
+    transcode::{ExportCapabilities, ExportCapability},
 };
 use scrozz_ui::{
     Countdown, RecordingHud, RecordingHudAction, RecordingHudControls, RecordingHudModel,
@@ -528,6 +529,60 @@ fn video_editor_disables_inapplicable_audio_and_invalid_trim() {
 }
 
 #[test]
+fn video_editor_gates_hardware_and_exposes_explicit_webm_fallback() {
+    let context = new_context();
+    let theme = Theme::dark();
+    let document = document(2);
+    let capabilities = ExportCapabilities {
+        mp4_h264: ExportCapability::unavailable(
+            "no compatible hardware H.264 encoder is available; choose WebM / AV1",
+        ),
+        gif: ExportCapability::available(),
+        webm_av1: ExportCapability::available(),
+    };
+    let video = run_ui(&context, Vec::new(), |ui| {
+        VideoEditor::new(
+            VideoEditorModel {
+                document: &document,
+                plan: EditPlan::video(&document).unwrap(),
+                preview: VideoPreview::default(),
+                transcode: TranscodeView::Idle,
+            },
+            &theme,
+        )
+        .with_capabilities(capabilities)
+        .show(ui)
+    });
+    assert!(!video.controls.mp4_h264_available);
+    assert!(video.controls.webm_av1_available);
+    assert!(!video.controls.export_enabled);
+    assert!(
+        video
+            .controls
+            .validation_error
+            .as_deref()
+            .is_some_and(|error| error.contains("choose WebM"))
+    );
+
+    let webm = run_ui(&context, Vec::new(), |ui| {
+        VideoEditor::new(
+            VideoEditorModel {
+                document: &document,
+                plan: EditPlan::webm(&document).unwrap(),
+                preview: VideoPreview::default(),
+                transcode: TranscodeView::Idle,
+            },
+            &theme,
+        )
+        .with_capabilities(capabilities)
+        .show(ui)
+    });
+    assert_eq!(webm.plan.output, EditOutput::WebM);
+    assert!(webm.controls.export_enabled);
+    assert!(!webm.controls.audio_enabled);
+}
+
+#[test]
 fn video_editor_keyboard_and_responsive_contracts_are_semantic() {
     let context = new_context();
     let theme = Theme::dark();
@@ -664,6 +719,7 @@ const RECORDING_SCENARIOS: &[Scenario] = &[
     Scenario::RecordingFailedPartial,
     Scenario::VideoEditing,
     Scenario::VideoExporting,
+    Scenario::VideoWebmFallback,
     Scenario::VideoExportFailedPartial,
 ];
 

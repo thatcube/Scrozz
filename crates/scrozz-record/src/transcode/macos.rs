@@ -4,10 +4,10 @@ use std::{
     path::{Path, PathBuf},
     ptr::NonNull,
     sync::{
-        Arc, Condvar, Mutex, PoisonError,
+        Arc, Condvar, Mutex, OnceLock, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use block2::RcBlock;
@@ -47,6 +47,70 @@ const MAX_ENCODER_RATE_HINT: f64 = 60.0;
 const AUDIO_ENCODER_CHUNK_FRAMES: usize = 1_024;
 
 pub(super) const TRANSCODER_NAME: &str = "macOS AVFoundation + VideoToolbox";
+
+pub(super) fn hardware_h264_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| match probe_hardware_h264() {
+        Ok(available) => available,
+        Err(error) => {
+            tracing::warn!(%error, "hardware H.264 capability probe failed");
+            false
+        }
+    })
+}
+
+fn probe_hardware_h264() -> Result<bool> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        ".scrozz-h264-probe-{}-{nonce}.mp4",
+        std::process::id()
+    ));
+    let _cleanup = ProbeOutput(path.clone());
+    let file_type = unsafe { AVFileTypeMPEG4 }.ok_or_else(|| Error::Unsupported {
+        what: "MP4 video export".to_owned(),
+        why: "AVFoundation did not expose the MPEG-4 container type".to_owned(),
+    })?;
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    let asset = unsafe {
+        AVAssetWriter::assetWriterWithURL_fileType_error(&url, file_type)
+            .map_err(|failure| Error::Storage(error::describe(&failure, "probing video export")))?
+    };
+    let video_type = unsafe { AVMediaTypeVideo }.ok_or_else(|| Error::Unsupported {
+        what: "video export".to_owned(),
+        why: "AVFoundation did not expose the video media type".to_owned(),
+    })?;
+    let settings = settings::transcode_video(64, 64, 30, 30, Quality::Low)?;
+    if !unsafe { asset.canApplyOutputSettings_forMediaType(Some(&settings), video_type) } {
+        return Ok(false);
+    }
+    let input = unsafe {
+        AVAssetWriterInput::assetWriterInputWithMediaType_outputSettings(
+            video_type,
+            Some(&settings),
+        )
+    };
+    unsafe {
+        input.setExpectsMediaDataInRealTime(true);
+        if !asset.canAddInput(&input) {
+            return Ok(false);
+        }
+        asset.addInput(&input);
+        let started = asset.startWriting();
+        asset.cancelWriting();
+        Ok(started)
+    }
+}
+
+struct ProbeOutput(PathBuf);
+
+impl Drop for ProbeOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 pub(super) struct VideoWriter {
     asset: Retained<AVAssetWriter>,

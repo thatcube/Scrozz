@@ -58,14 +58,22 @@ contract, but report an explicit unsupported capability until Media Foundation
 source-reader/audio-renderer and linked-libav/desktop-audio adapters exist. They
 never advance a synthetic clock or show source thumbnails as fake playback.
 
-Completed recordings cross into newer aggregate UI through
+Completed recordings and editor exports cross into newer aggregate UI through
 `scrozz_record::handoff::FinalizedMediaHandoff`. It carries only durable media
-ownership, the canonical video path, bounded RGBA poster plus explicit colour
-metadata, duration, dimensions, file size, audio presence, and video-appropriate
-actions. Card geometry and rendering deliberately stay out of `scrozz-record`;
-the modern aggregate reuses its adaptive screenshot card and maps the handoff to
-video badge/duration/open-editor behavior without reviving this branch's older
-capture-card layout.
+ownership, the canonical media path, content type and codec, bounded RGBA poster
+plus explicit colour metadata, duration, dimensions, file size, audio presence,
+and media-appropriate actions. GIF uses `image/gif`, hardware H.264 uses
+`video/mp4`, and software AV1 uses `video/webm`; no consumer has to infer a
+container from a generic "video" bit. Card geometry and rendering deliberately
+stay out of `scrozz-record`; the modern aggregate reuses its adaptive screenshot
+card without reviving this branch's older capture-card layout.
+
+Editor export capabilities are also intentionally asymmetric. macOS probes the
+hardware-only H.264 writer at export startup, while Windows and Linux advertise
+that path as unavailable until their native source-reader/writer adapters exist.
+The pure-Rust rav1e/WebM path is offered only when the `rav1e-fallback` feature
+is compiled and native source decoding exists. The editor never changes a
+requested MP4 into WebM behind the user's back.
 
 `scrozz-store` is platform-agnostic pure Rust; cross-checking it would prove
 almost nothing, and CI compiles it natively on all three runners anyway (layer

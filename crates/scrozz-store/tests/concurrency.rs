@@ -219,59 +219,6 @@ fn concurrent_pin_and_read_never_produce_a_torn_view() {
                 .set_pinned(&toggler_id, n % 2 == 0)
                 .expect("pin toggle");
         }
-
-        #[test]
-        fn concurrent_metadata_updates_cannot_resurrect_a_deleted_capture() {
-            let dir = scratch_dir("delete-update-race");
-            let mut seed = SqliteStore::open(dir.path()).expect("open");
-            let id = seed
-                .insert(NewCapture::new(&sample_document(8, 8, 9, 1)))
-                .expect("insert");
-            drop(seed);
-
-            let root = dir.path().to_path_buf();
-            let gate = Arc::new(Barrier::new(2));
-            let updater_gate = Arc::clone(&gate);
-            let updater_root = root.clone();
-            let updater_id = id.clone();
-            let updater = thread::spawn(move || {
-                let mut store = SqliteStore::open(updater_root).expect("open updater");
-                updater_gate.wait();
-                for pinned in [true, false].into_iter().cycle().take(100) {
-                    if let Err(error) = store.set_pinned(&updater_id, pinned) {
-                        assert!(error.to_string().contains("no capture"), "{error}");
-                        break;
-                    }
-                }
-            });
-
-            let deleter_gate = Arc::clone(&gate);
-            let deleter_id = id.clone();
-            let deleter = thread::spawn(move || {
-                let mut store = SqliteStore::open(root).expect("open deleter");
-                deleter_gate.wait();
-                store.delete(&deleter_id).expect("delete")
-            });
-
-            updater.join().expect("updater");
-            assert!(deleter.join().expect("deleter"));
-            let store = SqliteStore::open(dir.path()).expect("reopen");
-            assert!(store.record(&id).expect("read").is_none());
-            assert!(
-                store
-                    .layout()
-                    .read_record(&id)
-                    .expect("sidecar state")
-                    .is_none()
-            );
-            assert!(
-                store
-                    .layout()
-                    .scan_deletions()
-                    .expect("deletion markers")
-                    .is_empty()
-            );
-        }
     });
 
     let reader_gate = Arc::clone(&gate);
@@ -297,6 +244,59 @@ fn concurrent_pin_and_read_never_produce_a_torn_view() {
 
     toggler.join().expect("toggler");
     reader.join().expect("reader");
+}
+
+#[test]
+fn concurrent_metadata_updates_cannot_resurrect_a_deleted_capture() {
+    let dir = scratch_dir("delete-update-race");
+    let mut seed = SqliteStore::open(dir.path()).expect("open");
+    let id = seed
+        .insert(NewCapture::new(&sample_document(8, 8, 9, 1)))
+        .expect("insert");
+    drop(seed);
+
+    let root = dir.path().to_path_buf();
+    let gate = Arc::new(Barrier::new(2));
+    let updater_gate = Arc::clone(&gate);
+    let updater_root = root.clone();
+    let updater_id = id.clone();
+    let updater = thread::spawn(move || {
+        let mut store = SqliteStore::open(updater_root).expect("open updater");
+        updater_gate.wait();
+        for pinned in [true, false].into_iter().cycle().take(100) {
+            if let Err(error) = store.set_pinned(&updater_id, pinned) {
+                assert!(error.to_string().contains("no capture"), "{error}");
+                break;
+            }
+        }
+    });
+
+    let deleter_gate = Arc::clone(&gate);
+    let deleter_id = id.clone();
+    let deleter = thread::spawn(move || {
+        let mut store = SqliteStore::open(root).expect("open deleter");
+        deleter_gate.wait();
+        store.delete(&deleter_id).expect("delete")
+    });
+
+    updater.join().expect("updater");
+    assert!(deleter.join().expect("deleter"));
+    let store = SqliteStore::open(dir.path()).expect("reopen");
+    assert!(store.record(&id).expect("read").is_none());
+    assert!(
+        store
+            .layout()
+            .read_record(&id)
+            .expect("sidecar state")
+            .is_none()
+    );
+    assert!(
+        store
+            .layout()
+            .scan_deletions()
+            .expect("deletion markers")
+            .is_empty()
+    );
 }
 
 #[test]

@@ -242,13 +242,14 @@ impl StoredRecord {
         video: VideoMetadata,
     ) -> Result<Self> {
         video.validate()?;
+        let media_kind = video.media_kind();
         Ok(Self {
             format: RECORD_FORMAT,
             id: id.0.clone(),
             created_at: created_at.0,
             stored_at: stored_at.0,
             pinned,
-            media_kind: MediaKind::Video,
+            media_kind,
             app_name: None,
             app_identifier: None,
             window_title: None,
