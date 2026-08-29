@@ -93,7 +93,7 @@ Some things are behavioural and cannot be faked:
   happens on GNOME, which does not implement it?
 - Do global hotkeys survive a UAC prompt, a lock screen, a Space switch?
 - Do the permission dialogs say something a real person can act on?
-- Does drag-and-drop out of the capture stack land correctly in a real app?
+- Does drag-and-drop out of Recent Captures Overlay land correctly in a real app?
 
 These need a real desktop session: Windows 11 on ARM under UTM or Parallels, and
 a Linux VM running **both GNOME and KDE**, since the Wayland story differs sharply
@@ -275,7 +275,7 @@ rather than corrupting memory if that ever stops being true.
 Key-ness and activation are deliberately separate: the class always answers
 `canBecomeKeyWindow` so **Escape still works**, while capture cards additionally
 set `becomesKeyOnlyIfNeeded` so a click never takes the user's keystrokes. That
-combination is what makes the capture stack usable *while typing* — the normal
+combination is what makes Recent Captures Overlay usable *while typing* — the normal
 case, not an edge case.
 
 ---

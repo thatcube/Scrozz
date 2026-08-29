@@ -275,6 +275,8 @@ pub enum Scenario {
     SelectorAllInOne,
     /// The selector overlay spanning mixed-DPI displays without crossing scales.
     SelectorMixedDpi,
+    /// The persisted screenshot/recording action matrix in Settings.
+    SettingsAfterCapture,
 }
 
 impl Scenario {
@@ -299,6 +301,7 @@ impl Scenario {
             Self::SelectorMagnifier,
             Self::SelectorAllInOne,
             Self::SelectorMixedDpi,
+            Self::SettingsAfterCapture,
         ]
     }
 
@@ -318,6 +321,7 @@ impl Scenario {
             Self::DockCollapsing => "dock-collapsing",
             Self::DockCollapsed => "dock-collapsed",
             Self::EditorAnnotating => "editor-annotating",
+            Self::SettingsAfterCapture => "settings-after-capture",
             Self::SelectorIdle => "selector-idle",
             Self::SelectorDragging => "selector-dragging",
             Self::SelectorRemembered => "selector-remembered",
@@ -779,6 +783,16 @@ impl Fixture {
                     instants::REST,
                     None,
                 ),
+                Scenario::SettingsAfterCapture => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Choose what happens next",
+                    "The platform-adaptive After Capture matrix with independent screenshot and recording actions, explicit unavailable states, and fresh-profile defaults.",
+                    instants::REST,
+                    None,
+                ),
                 Scenario::SelectorIdle => (
                     Vec::new(),
                     Gesture::None,
@@ -863,6 +877,7 @@ impl Fixture {
 
         let size_pt = match scenario {
             Scenario::EditorAnnotating => (900.0, 620.0),
+            Scenario::SettingsAfterCapture => (780.0, 640.0),
             Scenario::SelectorIdle
             | Scenario::SelectorDragging
             | Scenario::SelectorRemembered
@@ -2016,6 +2031,10 @@ impl SceneRegistry {
         me.register(
             Scenario::EditorAnnotating,
             Box::new(crate::editor::EditorScene),
+        );
+        me.register(
+            Scenario::SettingsAfterCapture,
+            Box::new(crate::settings::AfterCaptureSettingsScene),
         );
         me
     }
@@ -3796,6 +3815,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::StackFull,
         Scenario::DockCollapsed,
         Scenario::EditorAnnotating,
+        Scenario::SettingsAfterCapture,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),
@@ -3815,6 +3835,16 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         spec: RenderSpec::golden(Scenario::StackFull, VirtualClock::ZERO).with_scale(1.0),
         expectation: "the stack at 1x: grayscale text anti-aliasing, where \
                       subpixel positioning and gamma problems are visible"
+            .to_owned(),
+    });
+
+    cases.push(GoldenCase {
+        name: "settings-after-capture--compact".to_owned(),
+        spec: RenderSpec::golden(Scenario::SettingsAfterCapture, VirtualClock::ZERO)
+            .with_size_pt((620.0, 1_250.0)),
+        expectation: "After Capture at the minimum window width: every action reflows into a \
+                      two-column card without horizontal scrolling, clipped labels, or an inert \
+                      unavailable checkbox"
             .to_owned(),
     });
 

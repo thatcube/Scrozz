@@ -23,10 +23,11 @@ use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, SelectionOptions,
     SelectionOutcome,
 };
-use scrozz_export::{Clipboard, Encoder, FrameEncoder};
+use scrozz_export::{Encoder, FrameEncoder};
 use scrozz_ocr::Ocr as _;
 
 use crate::{
+    after_capture::{AfterCaptureSettings, current_availability},
     cli::{
         CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand, HotkeyCommand,
         InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
@@ -109,6 +110,11 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
             describe_plan("Would capture", &requested_target, &sinks),
         ));
     }
+    // Resolve ambient non-action preferences before reading pixels. A malformed
+    // settings document must not turn a completed file/clipboard write into a
+    // failure-shaped command after the side effect already happened.
+    let (persisted, _) = settings::stored_settings()?;
+    let screenshot_sound = settings::screenshot_sound(&persisted)?;
 
     // Check before interactive preparation: freezing or magnifying the desktop
     // reaches the capture backend too, and must obey the same unstable-backend
@@ -192,8 +198,14 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
                 written.push(path.display().to_string());
             }
             Sink::Clipboard => {
-                scrozz_export::SystemClipboard::new()
-                    .write_image(frame)
+                let clipboard_png = if args.format() == crate::cli::Format::Png {
+                    bytes.clone()
+                } else {
+                    FrameEncoder::new()
+                        .encode(frame, scrozz_export::ImageFormat::Png)
+                        .map_err(CliError::Core)?
+                };
+                scrozz_shell::write_capture_to_clipboard(frame, &clipboard_png)
                     .map_err(CliError::Core)?;
                 written.push("clipboard".to_string());
             }
@@ -201,12 +213,12 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
             // D18: any folder the user picks, which is what lets a Dropbox or
             // iCloud directory provide sync for free with no service on our side.
             Sink::DefaultFolder => {
-                let path = crate::output::export_default(&bytes)?;
+                let path = crate::output::export_with_settings(&bytes, &persisted)?;
                 written.push(path.display().to_string());
             }
         }
     }
-    if let Err(error) = scrozz_shell::play_screenshot_sound(&settings::screenshot_sound()?) {
+    if let Err(error) = scrozz_shell::play_screenshot_sound(&screenshot_sound) {
         tracing::warn!(%error, "the screenshot succeeded but its sound could not play");
     }
 
@@ -697,15 +709,19 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
 
 fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
     let shortcuts = settings::stored_shortcuts();
+    let (persisted, store) = settings::stored_settings()?;
     match command {
         SettingsCommand::Get { key: None } => Ok(Report::new(
-            Json::obj([("settings", settings::all_json_resolved(&shortcuts))]),
-            settings::all_human_resolved(&shortcuts),
+            Json::obj([(
+                "settings",
+                settings::all_json_resolved(&shortcuts, &persisted),
+            )]),
+            settings::all_human_resolved(&shortcuts, &persisted),
         )),
 
         SettingsCommand::Get { key: Some(key) } => {
             let setting = settings::lookup(key)?;
-            let (value, source) = settings::resolve(setting, &shortcuts);
+            let (value, source) = settings::resolve(setting, &shortcuts, &persisted);
             let text = if value.is_empty() {
                 "(unassigned)".to_owned()
             } else {
@@ -722,13 +738,56 @@ fn settings_command(command: &SettingsCommand) -> CliResult<Report> {
             let setting = settings::lookup(key)?;
             setting.validate(value)?;
 
+            if let Some((media, action)) = AfterCaptureSettings::resolve_key(setting.key) {
+                let enabled = value == "true";
+                let availability = current_availability(media, action);
+                if enabled && !availability.available {
+                    return Err(CliError::usage(format!(
+                        "{key} cannot be enabled: {}",
+                        availability
+                            .reason
+                            .unwrap_or("this action is unavailable in this build")
+                    )));
+                }
+                store
+                    .update(store.inferred_profile(), |latest| {
+                        latest.set(media, action, enabled);
+                        Ok(())
+                    })
+                    .map_err(CliError::Core)?;
+                return Ok(Report::new(
+                    setting.to_json_valued(
+                        value,
+                        if value == setting.default {
+                            "default"
+                        } else {
+                            "user"
+                        },
+                    ),
+                    format!("{key} is now {value}"),
+                ));
+            }
+
             // Shortcuts are the one area with somewhere to put a value. Storing
             // them here rather than only in the GUI matters because the CLI is
             // how a dotfiles setup configures a machine it has never opened.
             let Some(action) = ShortcutAction::from_stored_key(setting.key) else {
-                return Err(CliError::not_implemented(
-                    format!("saving {key}"),
-                    "scrozz-store (settings persistence)",
+                store
+                    .update(store.inferred_profile(), |latest| {
+                        latest.set_value(key, value);
+                        Ok(())
+                    })
+                    .map_err(CliError::Core)?;
+                return Ok(Report::new(
+                    setting.to_json_valued(
+                        value,
+                        if value == setting.default {
+                            "default"
+                        } else {
+                            "user"
+                        },
+                    ),
+                    format!("{key} is now {value}"),
                 ));
             };
 
@@ -972,10 +1031,43 @@ pub fn should_forward(command: &Command, no_ipc: bool) -> ipc::Forwarding {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use clap::Parser;
 
     use super::*;
-    use crate::{cli::Cli, exit::Exit};
+    use crate::{cli::Cli, exit::Exit, test_env};
+
+    struct SettingsFixture {
+        _environment: test_env::EnvGuard,
+        root: std::path::PathBuf,
+    }
+
+    impl Drop for SettingsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn isolated_settings(label: &str) -> SettingsFixture {
+        let environment = test_env::lock();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-command-settings-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        test_env::set(
+            crate::after_capture::SETTINGS_FILE_ENV,
+            &root.join("settings.json").to_string_lossy(),
+        );
+        SettingsFixture {
+            _environment: environment,
+            root,
+        }
+    }
 
     fn run(argv: &[&str]) -> CliResult<Report> {
         let cli = Cli::try_parse_from(argv).expect("should parse");
@@ -1182,6 +1274,7 @@ mod tests {
 
     #[test]
     fn listing_settings_works_today() {
+        let _settings = isolated_settings("list");
         let rendered = json_of(&["scrozz", "settings", "get"]);
         assert!(rendered.contains(r#""key":"capture.format""#), "{rendered}");
         assert!(
@@ -1192,6 +1285,7 @@ mod tests {
 
     #[test]
     fn reading_one_setting_returns_just_that_one() {
+        let _settings = isolated_settings("read");
         let report = run(&["scrozz", "settings", "get", "capture.quality"]).unwrap();
         assert_eq!(report.human, "90");
         assert!(
@@ -1204,6 +1298,7 @@ mod tests {
 
     #[test]
     fn an_unknown_setting_is_a_usage_error_with_a_suggestion() {
+        let _settings = isolated_settings("unknown");
         let err = run(&["scrozz", "settings", "get", "capture.forrmat"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Usage);
         assert!(err.to_string().contains("capture.format"), "{err}");
@@ -1211,18 +1306,29 @@ mod tests {
 
     #[test]
     fn a_bad_value_is_rejected_for_being_bad_not_for_being_unimplemented() {
+        let _settings = isolated_settings("bad-value");
         // The distinction that matters: the user must learn about their mistake
-        // even though persistence is missing.
+        // before persistence is touched.
         let err = run(&["scrozz", "settings", "set", "capture.format", "gif"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Usage);
         assert!(err.to_string().contains("png"), "{err}");
     }
 
     #[test]
-    fn a_good_value_reports_the_missing_persistence() {
-        let err = run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap_err();
-        assert_eq!(err.exit(), Exit::NotImplemented);
-        assert!(err.to_string().contains("capture.format"), "{err}");
+    fn a_good_value_persists_across_reads() {
+        let _settings = isolated_settings("round-trip");
+        run(&["scrozz", "settings", "set", "capture.format", "webp"]).unwrap();
+        let read = run(&["scrozz", "settings", "get", "capture.format"]).unwrap();
+        assert_eq!(read.human, "webp");
+        assert!(read.data.to_compact_string().contains(r#""source":"user""#));
+    }
+
+    #[test]
+    fn an_unavailable_after_capture_action_cannot_be_enabled_from_the_cli() {
+        let _settings = isolated_settings("unavailable");
+        let err = run(&["scrozz", "settings", "set", "capture.pin-to-screen", "true"]).unwrap_err();
+        assert_eq!(err.exit(), Exit::Usage);
+        assert!(err.to_string().contains("not implemented"), "{err}");
     }
 
     // -- hotkey ------------------------------------------------------------

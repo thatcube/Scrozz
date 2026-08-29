@@ -9,7 +9,9 @@
 // dependency graph forbids unsafe outright.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod clipboard;
 pub mod drag;
+pub mod filesystem;
 pub mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -24,11 +26,13 @@ pub mod windows;
 #[cfg(target_os = "linux")]
 mod x11_focus;
 
+pub use clipboard::write_capture as write_capture_to_clipboard;
 pub use drag::{
     ArtifactState, ByteSource, DragArtifact, DragCapability, DragFormat, DragOperation, DragOrigin,
     DragOutcome, DragPayload, DragPreview, DragSession, DragSource, NativeDragSource,
     NativeSurface, PromisedFile, byte_source, native_drag_source,
 };
+pub use filesystem::replace_file;
 pub use hotkey::{
     Accelerator, Compositor, Conflict, DisplayServer, GlobalHotkeys, HotkeyEvent, KeyState,
     ReservedShortcut, Session,

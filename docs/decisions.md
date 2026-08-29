@@ -61,7 +61,7 @@ app finished.
 
 - Screenshot capture: area, window, fullscreen
 - Screen recording: video and GIF
-- **Drag-out from the capture stack** — the hero interaction (see D12)
+- **Drag-out from Recent Captures Overlay** — the hero interaction (see D12)
 - **Clipboard** — captures also land on the clipboard, ready to paste
 - Annotation editor, held to a high quality bar
 - Automatic compression to the best codec the destination accepts
@@ -257,7 +257,7 @@ capture, annotation, or encoding logic of its own**.
 
 ---
 
-## D12 — The capture stack is the primary interface; drag-out is the hero action
+## D12 — Recent Captures Overlay is the primary interface; drag-out is the hero action
 
 **Decision.** The post-capture overlay is a **vertical list of captures**, not a
 single card. Its primary interaction is **dragging a capture directly into
@@ -875,7 +875,7 @@ leaving it on a developer's desktop between runs. The general principle stands
 even where drag does not: **the more insistent a window is, the cheaper its
 escape must be.**
 
-## D28 — The capture stack is bottom-anchored and grows upward
+## D28 — Recent Captures Overlay is bottom-anchored and grows upward
 
 **Decision.** The pile of capture cards is anchored to the **bottom-left of the
 screen** and grows **upward**. Cards enter and leave **only from the left**, and
@@ -1031,7 +1031,7 @@ GNOME-on-Wayland as unsupported.
 `xdg_shell` omits it on purpose — so layer-shell is the *only* way to place a
 floating surface. Without it, on GNOME/Wayland:
 
-- the **capture stack** (D28) cannot be anchored to the bottom-left;
+- **Recent Captures Overlay** (D28) cannot be anchored to the bottom-left;
 - the **capture dock** (D20) cannot be anchored anywhere;
 - the **selection overlay** cannot cover the screen as a client-drawn surface;
 - **pinned captures** cannot be placed.
@@ -1049,10 +1049,10 @@ responses, in order of preference per surface:
    D-Bus API is allowlisted to the portal backend, so replicating it from an
    external app is not merely hard — it is closed off.
 
-2. **The capture stack falls back to an ordinary window on GNOME/Wayland.** A
+2. **Recent Captures Overlay falls back to an ordinary window on GNOME/Wayland.** A
    normal `xdg_toplevel`, placed by the compositor rather than by us. This
    contradicts D27's "fixed position" property, but the alternative is no capture
-   stack at all. It must be visibly a deliberate adaptation, not a broken version
+   recent-captures surface at all. It must be visibly a deliberate adaptation, not a broken version
    of the macOS behaviour.
 
 3. **XWayland is documented, not defaulted.** Running under XWayland restores
@@ -1068,7 +1068,7 @@ is buggy; per D8 the limitation is stated, in the UI, with the reason.
 **Honest restatement of D8.** "Full GNOME and KDE support" now means: **KDE gets
 the complete Scrozz experience. GNOME gets full capture, recording, annotation,
 OCR and history, with compositor-owned region selection and a
-compositor-positioned capture stack.** That is a real difference and it belongs in
+compositor-positioned Recent Captures Overlay.** That is a real difference and it belongs in
 the comparison table, not buried in a footnote.
 
 ## D32 — Releases use Plozz-style calendar versions
@@ -1155,6 +1155,55 @@ screen with motion before the user acts. Guides and a loupe are precision tools,
 not baseline chrome, so they should appear only by explicit preference or a
 momentary modifier. Keeping freeze independent avoids coupling capture
 correctness to a visual aid.
+
+## D34 — After Capture is a persisted multi-action policy
+
+**Decision.** Settings presents one **After Capture** matrix with independent
+Screenshot and Recording columns. Rows are Show Recent Captures Overlay, Copy to
+clipboard, Save automatically, Upload and copy link, Open Editor, and Pin to
+Screen. Pin to Screen is screenshot-only. A cell without a real implementation
+is an explicitly described unavailable state, never an inert checkbox.
+
+Fresh profiles enable **Copy to clipboard** and **Show Recent Captures Overlay**
+for screenshots. Recordings keep the conservative overlay-only default. When an
+existing Scrozz configuration can be inferred but has no After Capture document,
+the migration preserves the prior screenshot behavior—overlay only—rather than
+silently adding a clipboard write. The versioned settings document is replaced
+atomically, preserves unknown newer fields across a downgrade, and keeps
+screenshot and recording action sets independent.
+
+**Execution.** The capture backend finalizes one immutable artifact before any
+action runs. Actions then run exactly once in this order:
+
+1. Copy to clipboard.
+2. Save automatically.
+3. Upload and copy link.
+4. Show Recent Captures Overlay.
+5. Open Editor.
+6. Pin to Screen.
+
+Copy receives the original frame and current color-space metadata; on macOS the
+clipboard declares the exact profiled PNG plus an ICC-bearing native TIFF
+fallback. Save and upload consume the retained encoded artifact. Overlay, editor,
+and pin receive that same artifact and metadata. Each action records its own
+success or failure and the sequence never short-circuits, so one destination
+cannot suppress unrelated enabled actions.
+
+An explicit CLI/JSON/IPC capture is not an ambient GUI capture. Its requested
+sinks and destinations are the whole policy, and forwarded requests carry the
+`direct-command` policy token so a running GUI cannot surprise automation with
+an overlay, editor, pin, duplicate save, or duplicate upload.
+
+A recording action pass begins only after the recorder has finalized or salvaged
+a non-empty playable file. That file is copied out of recorder-owned temporary
+storage before any clipboard, overlay, save, or upload reference escapes; the
+retained path is not deleted when the recorder cleans up its temporary session.
+
+**Why.** Multi-action workflows are ordinary—copy and keep a draggable recent
+capture, or save and open an editor. Encoding each action as an exclusive mode
+would force unnecessary tradeoffs, while letting each consumer invent its own
+post-capture bytes would create profile drift, duplicate writes, and redaction
+hazards.
 
 ---
 

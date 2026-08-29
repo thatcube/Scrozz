@@ -34,6 +34,7 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
+fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

@@ -87,8 +87,9 @@ pub struct GlobalArgs {
     /// Never hand the command to an already-running Scrozz instance.
     ///
     /// By default a capture taken while the menu-bar app is running is performed
-    /// *by* that app, so the result joins the existing capture stack instead of
-    /// starting a second copy of Scrozz. This forces the work to happen here.
+    /// *by* that app while retaining explicit command-line destinations and
+    /// bypassing ambient GUI After Capture actions. This forces the work to happen
+    /// here without surprising scripts with an overlay or editor.
     #[arg(long, global = true)]
     pub no_ipc: bool,
 }

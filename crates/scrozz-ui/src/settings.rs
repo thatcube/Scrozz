@@ -2,13 +2,89 @@
 
 use egui::{
     Align, Color32, Key, Layout, Modifiers, RichText, Sense, TextureHandle, TextureOptions, Vec2,
+    WidgetInfo, WidgetType,
 };
 
 use crate::theme::{Appearance, Space, Text, Theme};
 
 const SETTINGS_VIEWPORT: &str = "scrozz-settings";
-const WINDOW_SIZE: Vec2 = Vec2::new(680.0, 470.0);
+const WINDOW_SIZE: Vec2 = Vec2::new(780.0, 640.0);
+const WINDOW_MIN_SIZE: Vec2 = Vec2::new(620.0, 540.0);
 const ICON_SIZE: f32 = 132.0;
+
+/// Screenshot or recording column in the After Capture matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterCaptureMedia {
+    /// Still screenshot actions.
+    Screenshot,
+    /// Completed recording actions.
+    Recording,
+}
+
+impl AfterCaptureMedia {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Screenshot => "Screenshot",
+            Self::Recording => "Recording",
+        }
+    }
+}
+
+/// One matrix cell as the platform host resolved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AfterCaptureCell {
+    /// Stored value, retained even while a feature is unavailable.
+    pub enabled: bool,
+    /// Whether this build and session can execute the action.
+    pub available: bool,
+    /// Clear explanation rendered instead of an inert checkbox.
+    pub unavailable_reason: Option<String>,
+}
+
+/// One action row in the platform-adaptive After Capture matrix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AfterCaptureRow {
+    /// Stable dotted setting key for the screenshot cell.
+    pub screenshot_id: String,
+    /// Stable dotted setting key for the recording cell, if the contract has one.
+    pub recording_id: Option<String>,
+    /// Approved user-facing action name.
+    pub label: String,
+    /// What the action does and what artifact it consumes.
+    pub description: String,
+    /// Screenshot state and capability.
+    pub screenshot: AfterCaptureCell,
+    /// Recording state and capability.
+    pub recording: AfterCaptureCell,
+}
+
+/// One user-requested After Capture toggle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AfterCaptureEdit {
+    /// Stable dotted setting key.
+    pub id: String,
+    /// Column that raised the edit.
+    pub media: AfterCaptureMedia,
+    /// Requested value.
+    pub enabled: bool,
+}
+
+/// All edits raised during one Settings frame.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SettingsEdits {
+    /// Shortcut changes.
+    pub shortcuts: Vec<ShortcutEdit>,
+    /// After Capture changes.
+    pub after_capture: Vec<AfterCaptureEdit>,
+}
+
+impl SettingsEdits {
+    /// Whether the frame requested no changes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.shortcuts.is_empty() && self.after_capture.is_empty()
+    }
+}
 
 /// One editable shortcut, as the settings window needs to see it.
 ///
@@ -67,6 +143,7 @@ pub enum ShortcutEdit {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Pane {
     #[default]
+    AfterCapture,
     Shortcuts,
     About,
 }
@@ -120,8 +197,9 @@ impl SettingsWindow {
         ctx: &egui::Context,
         build: BuildInfo,
         shortcuts: &[ShortcutRow],
-    ) -> Vec<ShortcutEdit> {
-        let mut edits = Vec::new();
+        after_capture: &[AfterCaptureRow],
+    ) -> SettingsEdits {
+        let mut edits = SettingsEdits::default();
         if !self.open {
             self.recording = None;
             return edits;
@@ -143,9 +221,8 @@ impl SettingsWindow {
             .with_title("Scrozz Settings")
             .with_app_id("com.thatcube.Scrozz.settings")
             .with_inner_size(WINDOW_SIZE)
-            .with_min_inner_size(WINDOW_SIZE)
-            .with_max_inner_size(WINDOW_SIZE)
-            .with_resizable(false);
+            .with_min_inner_size(WINDOW_MIN_SIZE)
+            .with_resizable(true);
         if std::mem::take(&mut self.focus_requested) {
             builder = builder.with_active(true);
         }
@@ -174,8 +251,11 @@ impl SettingsWindow {
                         ui.separator();
                         ui.add_space(Space::LG);
                         match self.pane {
+                            Pane::AfterCapture => {
+                                edits.after_capture = draw_after_capture(ui, &theme, after_capture);
+                            }
                             Pane::Shortcuts => {
-                                edits = self.draw_shortcuts(ui, &theme, shortcuts);
+                                edits.shortcuts = self.draw_shortcuts(ui, &theme, shortcuts);
                             }
                             Pane::About => draw_about(ui, &theme, &icon, build),
                         }
@@ -199,7 +279,11 @@ impl SettingsWindow {
                     .color(palette.text),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                for (pane, name) in [(Pane::About, "About"), (Pane::Shortcuts, "Shortcuts")] {
+                for (pane, name) in [
+                    (Pane::About, "About"),
+                    (Pane::Shortcuts, "Shortcuts"),
+                    (Pane::AfterCapture, "After Capture"),
+                ] {
                     let selected = self.pane == pane;
                     let fill = if selected {
                         palette.active
@@ -211,15 +295,16 @@ impl SettingsWindow {
                     } else {
                         palette.text_muted
                     };
-                    let response = egui::Frame::new()
+                    let response = ui.add(
+                        egui::Button::new(
+                            RichText::new(name).font(theme.font(Text::Label)).color(ink),
+                        )
                         .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, palette.hairline))
                         .corner_radius(9)
-                        .inner_margin(egui::Margin::symmetric(14, 7))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(name).font(theme.font(Text::Label)).color(ink));
-                        })
-                        .response
-                        .interact(Sense::click());
+                        .min_size(Vec2::new(104.0, 36.0))
+                        .selected(selected),
+                    );
                     if response.clicked() {
                         self.pane = pane;
                         self.recording = None;
@@ -408,6 +493,252 @@ impl SettingsWindow {
     }
 }
 
+fn draw_after_capture(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    rows: &[AfterCaptureRow],
+) -> Vec<AfterCaptureEdit> {
+    let palette = theme.palette;
+    let mut edits = Vec::new();
+    ui.label(
+        RichText::new("After Capture")
+            .font(theme.font(Text::Title))
+            .color(palette.text),
+    );
+    ui.add_space(Space::XS);
+    ui.label(
+        RichText::new(
+            "Choose any combination. Screenshot pixels are finalized once, then Copy runs \
+             first; other actions use that same immutable capture.",
+        )
+        .font(theme.font(Text::Body))
+        .color(palette.text),
+    );
+    ui.add_space(Space::LG);
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if ui.available_width() >= 650.0 {
+                draw_after_capture_table(ui, theme, rows, &mut edits);
+            } else {
+                draw_after_capture_cards(ui, theme, rows, &mut edits);
+            }
+        });
+    edits
+}
+
+fn draw_after_capture_table(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    rows: &[AfterCaptureRow],
+    edits: &mut Vec<AfterCaptureEdit>,
+) {
+    let palette = theme.palette;
+    egui::Frame::new()
+        .fill(palette.card_fill_raised)
+        .stroke(egui::Stroke::new(1.0, palette.hairline))
+        .corner_radius(12)
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            egui::Grid::new("after-capture-matrix")
+                .num_columns(3)
+                .striped(true)
+                .spacing(Vec2::new(Space::LG, Space::MD))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Action")
+                            .font(theme.font(Text::Label))
+                            .color(palette.text),
+                    );
+                    for heading in ["Screenshot", "Recording"] {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(heading)
+                                    .font(theme.font(Text::Label))
+                                    .color(palette.text),
+                            );
+                        });
+                    }
+                    ui.end_row();
+
+                    for row in rows {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(310.0, 58.0),
+                            Layout::top_down(Align::Min),
+                            |ui| draw_after_capture_label(ui, theme, row),
+                        );
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(145.0, 58.0),
+                            Layout::top_down(Align::Center),
+                            |ui| {
+                                draw_after_capture_cell(
+                                    ui,
+                                    theme,
+                                    row,
+                                    AfterCaptureMedia::Screenshot,
+                                    &row.screenshot,
+                                    edits,
+                                );
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(145.0, 58.0),
+                            Layout::top_down(Align::Center),
+                            |ui| {
+                                draw_after_capture_cell(
+                                    ui,
+                                    theme,
+                                    row,
+                                    AfterCaptureMedia::Recording,
+                                    &row.recording,
+                                    edits,
+                                );
+                            },
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn draw_after_capture_cards(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    rows: &[AfterCaptureRow],
+    edits: &mut Vec<AfterCaptureEdit>,
+) {
+    let palette = theme.palette;
+    for row in rows {
+        egui::Frame::new()
+            .fill(palette.card_fill_raised)
+            .stroke(egui::Stroke::new(1.0, palette.hairline))
+            .corner_radius(12)
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                draw_after_capture_label(ui, theme, row);
+                ui.add_space(Space::SM);
+                ui.columns(2, |columns| {
+                    let (screenshot, recording) = columns.split_at_mut(1);
+                    screenshot[0].label(
+                        RichText::new(AfterCaptureMedia::Screenshot.label())
+                            .font(theme.font(Text::Caption))
+                            .color(palette.text),
+                    );
+                    draw_after_capture_cell(
+                        &mut screenshot[0],
+                        theme,
+                        row,
+                        AfterCaptureMedia::Screenshot,
+                        &row.screenshot,
+                        edits,
+                    );
+                    recording[0].label(
+                        RichText::new(AfterCaptureMedia::Recording.label())
+                            .font(theme.font(Text::Caption))
+                            .color(palette.text),
+                    );
+                    draw_after_capture_cell(
+                        &mut recording[0],
+                        theme,
+                        row,
+                        AfterCaptureMedia::Recording,
+                        &row.recording,
+                        edits,
+                    );
+                });
+            });
+        ui.add_space(Space::SM);
+    }
+}
+
+fn draw_after_capture_label(ui: &mut egui::Ui, theme: &Theme, row: &AfterCaptureRow) {
+    let palette = theme.palette;
+    ui.label(
+        RichText::new(&row.label)
+            .font(theme.font(Text::Label))
+            .color(palette.text),
+    );
+    ui.label(
+        RichText::new(&row.description)
+            .font(theme.font(Text::Caption))
+            .color(palette.text),
+    );
+}
+
+fn draw_after_capture_cell(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    row: &AfterCaptureRow,
+    media: AfterCaptureMedia,
+    cell: &AfterCaptureCell,
+    edits: &mut Vec<AfterCaptureEdit>,
+) {
+    let palette = theme.palette;
+    let id = match media {
+        AfterCaptureMedia::Screenshot => Some(row.screenshot_id.as_str()),
+        AfterCaptureMedia::Recording => row.recording_id.as_deref(),
+    };
+    if let Some(id) = id.filter(|_| cell.available) {
+        let mut enabled = cell.enabled;
+        let response = ui.add_sized(
+            Vec2::new(44.0, 36.0),
+            egui::Checkbox::without_text(&mut enabled),
+        );
+        let accessible = format!(
+            "{} for {}: {}",
+            row.label,
+            media.label(),
+            if enabled { "enabled" } else { "disabled" }
+        );
+        response.widget_info(|| {
+            WidgetInfo::selected(WidgetType::Checkbox, true, enabled, accessible.clone())
+        });
+        if response.changed() {
+            edits.push(AfterCaptureEdit {
+                id: id.to_owned(),
+                media,
+                enabled,
+            });
+        }
+        response.on_hover_text(format!("{} for {}", row.label, media.label()));
+        return;
+    }
+
+    let reason = cell
+        .unavailable_reason
+        .as_deref()
+        .unwrap_or("This action is unavailable in this build.");
+    let response = ui.label(
+        RichText::new("Unavailable")
+            .font(theme.font(Text::Caption))
+            .color(palette.text)
+            .strong(),
+    );
+    let accessible = format!("{} for {} unavailable: {reason}", row.label, media.label());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, false, accessible.clone()));
+    response.on_hover_text(reason);
+    ui.label(
+        RichText::new(unavailable_summary(reason))
+            .font(theme.font(Text::Caption))
+            .color(palette.text),
+    );
+}
+
+fn unavailable_summary(reason: &str) -> &'static str {
+    if reason.contains("Screen recording") {
+        "Recording not available"
+    } else if reason.contains("provider") {
+        "Provider required"
+    } else if reason.contains("only for screenshots") {
+        "Screenshots only"
+    } else if reason.contains("Pin to Screen") {
+        "Not implemented"
+    } else {
+        "Not available here"
+    }
+}
+
 /// What a frame of keyboard input meant to an armed shortcut row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Chord {
@@ -580,6 +911,134 @@ fn embedded_app_icon() -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw())
 }
 
+/// Headless golden scene for the platform-adaptive After Capture pane.
+pub struct AfterCaptureSettingsScene;
+
+impl crate::harness::Scene for AfterCaptureSettingsScene {
+    fn name(&self) -> &str {
+        "after-capture-settings"
+    }
+
+    fn setup(&self, ctx: &egui::Context) {
+        crate::theme::install_fonts(ctx);
+    }
+
+    fn ui(&self, ui: &mut egui::Ui, ctx: &crate::harness::SceneCtx<'_>) {
+        let theme = if ctx.theme == egui::Theme::Dark {
+            Theme::for_appearance(Appearance::Dark)
+        } else {
+            Theme::for_appearance(Appearance::Light)
+        };
+        crate::theme::install_style(ui.ctx(), &theme);
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, theme.palette.canvas());
+        egui::Frame::new()
+            .inner_margin(egui::Margin::same(Space::XXL as i8))
+            .show(ui, |ui| {
+                ui.heading(
+                    RichText::new("Settings")
+                        .font(theme.font(Text::Title))
+                        .color(theme.palette.text),
+                );
+                ui.add_space(Space::LG);
+                ui.separator();
+                ui.add_space(Space::LG);
+                let _ = draw_after_capture(ui, &theme, &preview_after_capture_rows());
+            });
+    }
+}
+
+fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
+    const RECORDING_UNAVAILABLE: &str =
+        "Screen recording is not implemented in this build, so recording actions cannot run yet.";
+    const UPLOAD_UNAVAILABLE: &str =
+        "No cloud upload provider is implemented or configured in this build.";
+    const PIN_UNAVAILABLE: &str = "Pin to Screen is not implemented in this build.";
+    let available = |enabled| AfterCaptureCell {
+        enabled,
+        available: true,
+        unavailable_reason: None,
+    };
+    let unavailable = |enabled, reason: &str| AfterCaptureCell {
+        enabled,
+        available: false,
+        unavailable_reason: Some(reason.to_owned()),
+    };
+    [
+        (
+            "show-recent-captures-overlay",
+            "Show Recent Captures Overlay",
+            "Keep the completed capture in the nonactivating recent-captures corner surface.",
+            true,
+            true,
+            None,
+        ),
+        (
+            "copy-to-clipboard",
+            "Copy to clipboard",
+            "Copy screenshot pixels immediately, or a retained recording file reference where supported.",
+            true,
+            false,
+            None,
+        ),
+        (
+            "save-automatically",
+            "Save automatically",
+            "Write once to the configured export location with collision-safe naming.",
+            false,
+            false,
+            None,
+        ),
+        (
+            "upload-and-copy-link",
+            "Upload and copy link",
+            "Use the configured cloud provider, then copy its shareable link.",
+            false,
+            false,
+            Some(UPLOAD_UNAVAILABLE),
+        ),
+        (
+            "open-editor",
+            "Open Editor",
+            "Open the annotation editor for screenshots or the video editor for recordings.",
+            false,
+            false,
+            None,
+        ),
+        (
+            "pin-to-screen",
+            "Pin to Screen",
+            "Keep a screenshot visible in a floating window.",
+            false,
+            false,
+            Some(PIN_UNAVAILABLE),
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(slug, label, description, screenshot_enabled, recording_enabled, unavailable_reason)| {
+            let screenshot = unavailable_reason.map_or_else(
+                || available(screenshot_enabled),
+                |reason| unavailable(screenshot_enabled, reason),
+            );
+            let recording_reason = if slug == "pin-to-screen" {
+                "Pin to Screen is available only for screenshots."
+            } else {
+                RECORDING_UNAVAILABLE
+            };
+            AfterCaptureRow {
+                screenshot_id: format!("capture.{slug}"),
+                recording_id: (slug != "pin-to-screen").then(|| format!("record.{slug}")),
+                label: label.to_owned(),
+                description: description.to_owned(),
+                screenshot,
+                recording: unavailable(recording_enabled, recording_reason),
+            }
+        },
+    )
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +1172,7 @@ mod tests {
                 build: "0",
             },
             &[],
+            &[],
         );
         assert!(edits.is_empty());
         assert!(!window.is_recording());
@@ -728,5 +1188,43 @@ mod tests {
             .label(),
             "Version 2026.8.28 (Build 92)"
         );
+    }
+
+    #[test]
+    fn preview_matrix_uses_approved_vocabulary_and_explicit_unavailable_states() {
+        let rows = preview_after_capture_rows();
+        assert_eq!(rows.len(), 6);
+        assert!(
+            rows.iter().all(|row| !row.label.contains("Quick Access")),
+            "{rows:?}"
+        );
+        assert_eq!(rows[0].label, "Show Recent Captures Overlay");
+        for row in &rows {
+            for cell in [&row.screenshot, &row.recording] {
+                assert!(
+                    cell.available || cell.unavailable_reason.is_some(),
+                    "{} has a mystery disabled cell",
+                    row.label
+                );
+            }
+        }
+        let pin = rows
+            .iter()
+            .find(|row| row.label == "Pin to Screen")
+            .unwrap();
+        assert!(pin.recording_id.is_none());
+        assert!(!pin.recording.available);
+    }
+
+    #[test]
+    fn settings_edits_report_both_kinds_of_change() {
+        let mut edits = SettingsEdits::default();
+        assert!(edits.is_empty());
+        edits.after_capture.push(AfterCaptureEdit {
+            id: "capture.copy-to-clipboard".to_owned(),
+            media: AfterCaptureMedia::Screenshot,
+            enabled: false,
+        });
+        assert!(!edits.is_empty());
     }
 }

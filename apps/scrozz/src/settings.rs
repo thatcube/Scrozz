@@ -2,16 +2,11 @@
 //!
 //! # Why the schema lives here and not in the store
 //!
-//! Nothing persists settings yet. That could mean `scrozz settings` waits for a
-//! store, but it should not: the *schema* is the interesting part and the part
-//! everything else depends on. A key's name, type and default are what the GUI
-//! renders, what `--json` reports, and what a user's dotfiles refer to. Getting
-//! them wrong is expensive to undo; getting them right costs nothing today.
-//!
-//! So `settings get` works now, reporting defaults and saying so, and
-//! `settings set` validates fully before reporting that persistence is missing.
-//! A typo in a key or a value is caught immediately rather than being written
-//! somewhere and silently ignored later.
+//! A key's name, type and default are what the GUI renders, what `--json`
+//! reports, and what a user's dotfiles refer to. The values live in the
+//! versioned, atomically replaced document owned by [`crate::after_capture`];
+//! shortcuts retain their dedicated store because applying one can fail at the
+//! operating-system registration boundary.
 //!
 //! # Naming
 //!
@@ -20,6 +15,7 @@
 //! object path and a command-line argument without being quoted.
 
 use crate::{
+    after_capture::{AfterCaptureSettings, AfterCaptureStore},
     fault::{CliError, CliResult},
     hotkey_config::Accelerator,
     json::Json,
@@ -80,7 +76,7 @@ pub struct Setting {
 }
 
 impl Setting {
-    /// The JSON representation, including the current (always default) value.
+    /// The JSON representation of the schema default.
     #[must_use]
     pub fn to_json(self) -> Json {
         self.to_json_valued(self.default, "default")
@@ -260,8 +256,38 @@ pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "capture.copy-to-clipboard",
         kind: Kind::Bool,
+        default: "true",
+        description: "Copy screenshot pixels immediately after capture.",
+    },
+    Setting {
+        key: "capture.show-recent-captures-overlay",
+        kind: Kind::Bool,
+        default: "true",
+        description: "Show screenshots in Recent Captures Overlay.",
+    },
+    Setting {
+        key: "capture.save-automatically",
+        kind: Kind::Bool,
         default: "false",
-        description: "Also copy every capture to the clipboard.",
+        description: "Save screenshots automatically to the configured folder.",
+    },
+    Setting {
+        key: "capture.upload-and-copy-link",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Upload screenshots with the configured provider and copy the link.",
+    },
+    Setting {
+        key: "capture.open-editor",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Open screenshots in the annotation editor.",
+    },
+    Setting {
+        key: "capture.pin-to-screen",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Pin screenshots in a floating always-above window.",
     },
     Setting {
         key: "capture.window-shadow",
@@ -286,6 +312,36 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Bool,
         default: "false",
         description: "Record system audio output.",
+    },
+    Setting {
+        key: "record.show-recent-captures-overlay",
+        kind: Kind::Bool,
+        default: "true",
+        description: "Show completed recordings in Recent Captures Overlay.",
+    },
+    Setting {
+        key: "record.copy-to-clipboard",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Copy a retained recording file reference where the platform supports it.",
+    },
+    Setting {
+        key: "record.save-automatically",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Save completed recordings automatically to the configured folder.",
+    },
+    Setting {
+        key: "record.upload-and-copy-link",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Upload recordings with the configured provider and copy the link.",
+    },
+    Setting {
+        key: "record.open-editor",
+        kind: Kind::Bool,
+        default: "false",
+        description: "Open completed recordings in the video editor.",
     },
     Setting {
         key: "history.max-image-bytes",
@@ -422,12 +478,28 @@ pub fn stored_shortcuts() -> Shortcuts {
     ShortcutStore::default_location().map_or_else(|_| Shortcuts::default(), |store| store.load())
 }
 
+/// The versioned settings stored on this machine.
+///
+/// # Errors
+///
+/// Returns a storage error if an existing document cannot be read or migrated.
+pub fn stored_settings() -> CliResult<(AfterCaptureSettings, AfterCaptureStore)> {
+    let store = AfterCaptureStore::default_location().map_err(CliError::Core)?;
+    let profile = store.inferred_profile();
+    let settings = store.load(profile).map_err(CliError::Core)?;
+    Ok((settings, store))
+}
+
 /// The value in force for a setting, and whether the user chose it.
 ///
-/// Only the shortcut keys can currently be overridden; everything else still
-/// reports its default, which is the truth rather than a placeholder.
+/// Shortcuts resolve through their registration-aware store; every other key
+/// resolves through the versioned settings document.
 #[must_use]
-pub fn resolve(setting: &Setting, shortcuts: &Shortcuts) -> (String, &'static str) {
+pub fn resolve(
+    setting: &Setting,
+    shortcuts: &Shortcuts,
+    persisted: &AfterCaptureSettings,
+) -> (String, &'static str) {
     match ShortcutAction::from_stored_key(setting.key) {
         Some(action) => {
             let value = shortcuts.get(action).unwrap_or_default().to_owned();
@@ -438,15 +510,27 @@ pub fn resolve(setting: &Setting, shortcuts: &Shortcuts) -> (String, &'static st
             };
             (value, source)
         }
-        None => (setting.default.to_owned(), "default"),
+        None => {
+            let value = persisted
+                .value_for_key(setting.key)
+                .map(|value| value.to_string())
+                .or_else(|| persisted.value(setting.key).map(str::to_owned))
+                .unwrap_or_else(|| setting.default.to_owned());
+            let source = if value == setting.default {
+                "default"
+            } else {
+                "user"
+            };
+            (value, source)
+        }
     }
 }
 
 /// Every setting as JSON, with anything the user has stored applied.
 #[must_use]
-pub fn all_json_resolved(shortcuts: &Shortcuts) -> Json {
+pub fn all_json_resolved(shortcuts: &Shortcuts, persisted: &AfterCaptureSettings) -> Json {
     Json::arr(SETTINGS.iter().map(|setting| {
-        let (value, source) = resolve(setting, shortcuts);
+        let (value, source) = resolve(setting, shortcuts, persisted);
         setting.to_json_valued(&value, source)
     }))
 }
@@ -456,12 +540,12 @@ pub fn all_json_resolved(shortcuts: &Shortcuts) -> Json {
 /// An unassigned shortcut prints as `(unassigned)` rather than as nothing at
 /// all, because a blank column in a listing reads as a bug.
 #[must_use]
-pub fn all_human_resolved(shortcuts: &Shortcuts) -> String {
+pub fn all_human_resolved(shortcuts: &Shortcuts, persisted: &AfterCaptureSettings) -> String {
     let width = SETTINGS.iter().map(|s| s.key.len()).max().unwrap_or(0);
     SETTINGS
         .iter()
         .map(|setting| {
-            let (value, _) = resolve(setting, shortcuts);
+            let (value, _) = resolve(setting, shortcuts, persisted);
             let shown = if value.is_empty() {
                 "(unassigned)".to_owned()
             } else {
@@ -475,12 +559,12 @@ pub fn all_human_resolved(shortcuts: &Shortcuts) -> String {
 
 /// Resolves the screenshot sound from schema values.
 ///
-/// Persistence will pass the stored values through this same parser; today the
-/// schema defaults are the current values.
-pub fn screenshot_sound() -> CliResult<ScreenshotSound> {
-    let selected = lookup("capture.screenshot-sound")?.default;
-    let custom = lookup("capture.custom-sound-file")?.default;
-    screenshot_sound_from(selected, custom)
+/// Stored and default values pass through this same parser.
+pub fn screenshot_sound(persisted: &AfterCaptureSettings) -> CliResult<ScreenshotSound> {
+    let shortcuts = Shortcuts::default();
+    let selected = resolve(lookup("capture.screenshot-sound")?, &shortcuts, persisted).0;
+    let custom = resolve(lookup("capture.custom-sound-file")?, &shortcuts, persisted).0;
+    screenshot_sound_from(&selected, &custom)
 }
 
 fn screenshot_sound_from(selected: &str, custom: &str) -> CliResult<ScreenshotSound> {
@@ -649,7 +733,10 @@ mod tests {
             ]
         );
         assert_eq!(setting.default, "8-bit");
-        assert_eq!(screenshot_sound().unwrap(), ScreenshotSound::EightBit);
+        assert_eq!(
+            screenshot_sound(&AfterCaptureSettings::fresh()).unwrap(),
+            ScreenshotSound::EightBit
+        );
         assert_eq!(
             screenshot_sound_from("custom", "/tmp/shutter.wav").unwrap(),
             ScreenshotSound::Custom(PathBuf::from("/tmp/shutter.wav"))
@@ -794,8 +881,7 @@ mod tests {
 
     #[test]
     fn values_are_reported_as_sourced_from_defaults() {
-        // Until persistence exists, saying "user" would be a lie a script could
-        // act on.
+        // Schema-only values have no persisted context, so they are defaults.
         for setting in SETTINGS {
             assert!(
                 setting

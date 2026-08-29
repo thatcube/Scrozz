@@ -39,6 +39,7 @@
 //! - **An unfinished backend is never a panic** ([`platform`]). Much of this
 //!   workspace is `todo!()` today; none of it reaches the user as exit 101.
 
+mod after_capture;
 mod build_info;
 mod cli;
 mod commands;

@@ -3,10 +3,11 @@
 //! # The problem this solves
 //!
 //! Once the menu-bar app is running it owns things a second process cannot see:
-//! the capture stack on screen, the recording in progress, the hotkey
+//! the recording in progress, the hotkey
 //! registrations. A `scrozz capture` typed into a terminal at that moment must
-//! therefore happen *inside* the running app, so the result joins the stack the
-//! user is already looking at rather than appearing nowhere.
+//! therefore happen *inside* the running app while preserving command-line
+//! semantics: explicit sinks and JSON automation bypass ambient GUI After
+//! Capture actions and never open an overlay or editor unexpectedly.
 //!
 //! [`crate::ipc`] already has the client half — [`crate::ipc::forward`] is what
 //! the terminal process calls, and `main` already routes through it. This module
@@ -41,7 +42,7 @@ use crate::{
     commands,
     fault::{CliError, CliResult},
     gui::selection::CaptureSelector,
-    ipc::{self, Response, StreamKind},
+    ipc::{self, DIRECT_AFTER_CAPTURE_POLICY, Response, StreamKind},
     report::{error_envelope, success_envelope},
 };
 
@@ -52,6 +53,8 @@ pub struct Request {
     /// The caller's working directory, so relative `--output` paths resolve
     /// against *their* directory rather than the daemon's.
     pub cwd: Option<PathBuf>,
+    /// Explicitly says direct command semantics bypass ambient GUI actions.
+    pub after_capture_policy: String,
     #[cfg(unix)]
     stream: std::os::unix::net::UnixStream,
 }
@@ -61,6 +64,7 @@ impl std::fmt::Debug for Request {
         f.debug_struct("Request")
             .field("argv", &self.argv)
             .field("cwd", &self.cwd)
+            .field("after_capture_policy", &self.after_capture_policy)
             .finish_non_exhaustive()
     }
 }
@@ -375,9 +379,31 @@ impl Server {
         }
 
         let line = String::from_utf8_lossy(&raw);
+        let schema = integer_field(&line, "schema")?;
+        if schema != ipc::REQUEST_SCHEMA {
+            tracing::warn!(
+                schema,
+                expected = ipc::REQUEST_SCHEMA,
+                "refusing a forwarded request with an unsupported schema"
+            );
+            return None;
+        }
         let argv = string_array(&line, "argv")?;
         let cwd = string_field(&line, "cwd").map(PathBuf::from);
-        Some(Request { argv, cwd, stream })
+        let after_capture_policy = string_field(&line, "after_capture_policy")?;
+        if after_capture_policy != DIRECT_AFTER_CAPTURE_POLICY {
+            tracing::warn!(
+                policy = %after_capture_policy,
+                "refusing a forwarded request with an unknown After Capture policy"
+            );
+            return None;
+        }
+        Some(Request {
+            argv,
+            cwd,
+            after_capture_policy,
+            stream,
+        })
     }
 
     /// Nothing arrives without a listener.
@@ -455,6 +481,15 @@ fn string_array(line: &str, key: &str) -> Option<Vec<String>> {
 fn string_field(line: &str, key: &str) -> Option<String> {
     let at = line.find(&format!("\"{key}\":\""))? + key.len() + 4;
     read_string(line, at).map(|(value, _)| value)
+}
+
+fn integer_field(line: &str, key: &str) -> Option<i64> {
+    let at = line.find(&format!("\"{key}\":"))? + key.len() + 3;
+    let digits: String = line[at..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '-')
+        .collect();
+    digits.parse().ok()
 }
 
 /// Reads one JSON string body starting at `from`, just after the opening quote.

@@ -28,8 +28,27 @@
 
 use std::{
     ffi::OsStr,
+    path::PathBuf,
     process::{Command, Output},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+fn isolated_settings_path() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir()
+        .join(format!(
+            "scrozz-cli-surface-{}-{sequence}",
+            std::process::id()
+        ))
+        .join("settings.json")
+}
+
+fn clean_settings(path: &std::path::Path) {
+    if let Some(root) = path.parent() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
 
 /// Runs the binary and returns everything the shell would have seen.
 fn scrozz<I, S>(args: I) -> Output
@@ -37,15 +56,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new(env!("CARGO_BIN_EXE_scrozz"))
+    let settings = isolated_settings_path();
+    let output = Command::new(env!("CARGO_BIN_EXE_scrozz"))
         .args(args)
         // Otherwise the developer's own RUST_LOG decides whether the assertions
         // about stderr hold.
         .env_remove("RUST_LOG")
         .env_remove("SCROZZ_SIMULATE_ERROR")
         .env_remove("SCROZZ_UNSTABLE_BACKENDS")
+        .env("SCROZZ_SETTINGS_FILE", &settings)
         .output()
-        .expect("the binary should run")
+        .expect("the binary should run");
+    clean_settings(&settings);
+    output
 }
 
 /// Runs the binary with one simulated failure injected.
@@ -54,13 +77,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new(env!("CARGO_BIN_EXE_scrozz"))
+    let settings = isolated_settings_path();
+    let output = Command::new(env!("CARGO_BIN_EXE_scrozz"))
         .args(args)
         .env_remove("RUST_LOG")
         .env_remove("SCROZZ_UNSTABLE_BACKENDS")
+        .env("SCROZZ_SETTINGS_FILE", &settings)
         .env("SCROZZ_SIMULATE_ERROR", kind)
         .output()
-        .expect("the binary should run")
+        .expect("the binary should run");
+    clean_settings(&settings);
+    output
 }
 
 fn code(out: &Output) -> i32 {
@@ -335,12 +362,15 @@ fn json_mode_emits_exactly_one_document_on_stdout() {
 
 #[test]
 fn logs_never_reach_stdout_however_loud_the_verbosity() {
+    let settings = isolated_settings_path();
     let out = Command::new(env!("CARGO_BIN_EXE_scrozz"))
         .args(["-vvv", "--json", "settings", "get"])
         .env_remove("SCROZZ_SIMULATE_ERROR")
+        .env("SCROZZ_SETTINGS_FILE", &settings)
         .env("RUST_LOG", "trace")
         .output()
         .expect("the binary should run");
+    clean_settings(&settings);
 
     let text = stdout(&out);
     assert_eq!(
@@ -633,12 +663,15 @@ fn no_ipc_keeps_the_work_in_this_process() {
 fn a_command_that_needs_the_running_app_says_so_rather_than_hanging() {
     // `record --stop` has nothing to stop in this process. It must fail
     // immediately and legibly.
+    let settings = isolated_settings_path();
     let out = Command::new(env!("CARGO_BIN_EXE_scrozz"))
         .args(["record", "--stop"])
         .env_remove("SCROZZ_SIMULATE_ERROR")
+        .env("SCROZZ_SETTINGS_FILE", &settings)
         .env("SCROZZ_IPC_SOCKET", "/nonexistent/scrozz-test/absent.sock")
         .output()
         .expect("the binary should run");
+    clean_settings(&settings);
 
     assert_ne!(code(&out), 0);
     assert_ne!(code(&out), 101, "{}", stderr(&out));

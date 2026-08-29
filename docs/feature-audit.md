@@ -192,7 +192,7 @@ non-destructive. This is the single largest surface area in the product.
 
 ---
 
-## 5. Quick Access Overlay
+## 5. Recent Captures Overlay
 
 The post-capture floating thumbnail. Small surface, enormous share of daily-use satisfaction.
 
@@ -218,7 +218,7 @@ The post-capture floating thumbnail. Small surface, enormous share of daily-use 
 | QA-10 | **Swipe-to-dismiss gesture** | **T1** | Previously mis-tiered T3. Primary dismissal on macOS; needs a non-trackpad equivalent on Windows/Linux |
 | QA-11 | Quick actions | T2 | |
 | QA-12 | Temporarily hide overlays | T2 | |
-| QA-13 | **Capture stack — multiple captures stacked in the corner** | **T0** | **Missing from the first pass entirely.** Card-stack metaphor with per-card actions; changes the overlay's whole data model from one capture to a collection |
+| QA-13 | **Recent captures — multiple captures stacked in the corner** | **T0** | **Missing from the first pass entirely.** Card-stack metaphor with per-card actions; changes the overlay's whole data model from one capture to a collection |
 | QA-14 | **Promised-file drag (drag out before saving)** | **T0** | The technical core of QA-03 — see below |
 
 > **QA-14 is the sleeper cost in this section.** Dragging a capture that has never
@@ -421,9 +421,9 @@ Screenshots: `~/.copilot/scrozz-ui-reference/cleanshot/settings/`
 | NEW-16 | Dim screen while recording | T2 | Focuses attention on the recorded region |
 | NEW-17 | Show countdown before recording | T2 | |
 | NEW-18 | Remember last recording selection | T2 | |
-| NEW-19 | Quick Access: **close after dragging** (⌥ to keep) | T1 | Directly serves D12's drag-first model |
-| NEW-20 | Quick Access: save-button behaviour — export location, or ⌥ to choose | T2 | |
-| NEW-21 | Quick Access: position on screen, move to active display, overlay size | T2 | |
+| NEW-19 | Recent Captures Overlay: **close after dragging** (⌥ to keep) | T1 | Directly serves D12's drag-first model |
+| NEW-20 | Recent Captures Overlay: save-button behaviour — export location, or ⌥ to choose | T2 | |
+| NEW-21 | Recent Captures Overlay: position on screen, move to active display, overlay size | T2 | |
 | NEW-22 | History: **source-app icon badge per capture** | T2 | "Which app was this from" is often how you find a capture again |
 | NEW-23 | History: filmstrip layout, All / Screenshots / Videos / GIFs filters, relative timestamps | T1 | |
 | NEW-24 | Ask for filename after every capture | T3 | |

@@ -525,6 +525,7 @@ impl Driver {
         self.app
             .prepare_editor(EditorSnapshot::new(card, generation, editor));
         if !self.editor.is_open() {
+            self.app.editor_closed(card);
             self.editing = None;
         }
     }
@@ -644,7 +645,9 @@ impl eframe::App for Driver {
         if self.app.take_settings_request() {
             self.settings.open();
         }
-        if let Some(request) = self.app.take_editor_request() {
+        if self.editing.is_none()
+            && let Some(request) = self.app.take_editor_request()
+        {
             let title = format!("{}", request.card);
             self.editing = Some(Editing {
                 card: request.card,
@@ -693,6 +696,7 @@ impl eframe::App for Driver {
                 build: crate::build_info::BUILD,
             },
             &self.app.shortcut_rows(),
+            &self.app.after_capture_rows(),
         );
         // Order matters. Applying the edits can rebind every global hotkey, so
         // the editor's claim on the keyboard has to be re-asserted *after* that
@@ -706,7 +710,8 @@ impl eframe::App for Driver {
             KeyboardOwner::ShortcutRecorder,
             self.settings.is_recording(),
         );
-        self.app.edit_shortcuts(&edits);
+        self.app.edit_shortcuts(&edits.shortcuts);
+        self.app.edit_after_capture(&edits.after_capture);
         self.show_editor(ui.ctx());
 
         if self.selection.owns_surface() {
@@ -926,7 +931,7 @@ mod tests {
             .map(|(ui, _)| ui)
             .expect("Driver has a UI pass");
         let edits = ui
-            .find("self.app.edit_shortcuts(&edits)")
+            .find("self.app.edit_shortcuts(&edits.shortcuts)")
             .expect("shortcut edits are applied");
         let editor = ui
             .find("self.show_editor(ui.ctx())")
