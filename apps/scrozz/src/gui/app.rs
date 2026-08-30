@@ -695,51 +695,51 @@ pub struct App {
     next_upload_action: u64,
     /// Whether each live card has another retained artifact and a visible export.
     card_retention: HashMap<CardId, (bool, bool)>,
-    /// The (editor generation, document revision) most recently committed by
-    /// Done for each card still tracked, used to detect a stale Copy/Save/
-    /// Upload completion racing a newer commit (round 5, Finding #2).
-    ///
-    /// Written synchronously inside [`App::commit_card_output`] at *dispatch*
-    /// time -- not from a later `CardOutputCommitted` acknowledgment. The
-    /// capture worker is a single strictly-FIFO thread, so an earlier
-    /// dispatched Copy/Save/Upload always has its own outcome emitted before
-    /// a later commit's ack; only recording the committed version at dispatch
-    /// time (mirroring the existing `card_retention` reset's timing) lets a
-    /// stale completion drained afterward actually be compared against it.
-    /// A `CardOutputCommitFailed` for the exact same tuple clears it again,
-    /// so a legitimate subsequent Save in the same still-open generation is
-    /// not permanently blocked by a commit that never actually succeeded.
-    ///
-    /// Cleared whenever a fresh editor opens for the card, so gating only
-    /// ever applies within one editing session -- never against a version
-    /// left over from a previous one. `next_editor_generation` is a `u64`
-    /// incremented once per newly opened editor and never reused within a
-    /// process's lifetime in practice, so a generation collision with a
-    /// stale tracked tuple is not a realistic concern.
-    card_committed_version: HashMap<CardId, (u64, u64)>,
-    /// The editor generation of the most recent *cancelled* (or cleanly, i.e.
-    /// non-Done, closed) editing session for each card still tracked (round
-    /// 9, Finding #1).
+    /// Per-generation output-staleness fate recorded for each card with any
+    /// retired (committed or cancelled) editing session that might still
+    /// matter (round 5, Finding #2; round 9, Finding #1; round 10,
+    /// Finding #1).
     ///
     /// A live editor's Copy/Save/Upload exports its own current, uncommitted
     /// render -- see [`Self::card_output_job`] -- carrying that render's
-    /// exact `(generation, revision)` as its completion's `version`. Nothing
-    /// about that dispatch is retracted when the user goes on to Cancel: the
-    /// completion can still arrive afterward, and at that point
-    /// `card_committed_version` holds nothing for this card (Cancel never
-    /// commits), so the existing "trust an unopposed version" staleness
-    /// check alone would wrongly treat the completion as current and mark
-    /// the untouched base card retained/exported for content that no longer
-    /// exists anywhere. Recording the cancelled generation here lets that
-    /// same staleness check also recognise a completion whose version names
-    /// a generation known to have been discarded -- retention is never
-    /// updated for it, which is exactly "restoring" it, since Cancel itself
-    /// never touches `card_retention` in the first place.
+    /// exact `(generation, revision)` as its completion's `version`. That
+    /// dispatch is never retracted by anything that happens to the editor
+    /// afterward: Done may later commit a *different* revision of the same
+    /// generation, Cancel (or a clean close) may discard the generation
+    /// outright, or an entirely new editing session may open and itself
+    /// resolve one way or the other before this stale completion drains.
+    /// Whichever it is must be recognisable no matter how many editing
+    /// sessions have come and gone for this card since.
     ///
-    /// Cleared whenever a fresh editor opens for the card, mirroring
-    /// `card_committed_version`'s own reset: a new session's own completions
-    /// must never be gated by an unrelated, previous session's cancellation.
-    card_cancelled_generation: HashMap<CardId, u64>,
+    /// Earlier rounds tracked only the single *most recent* generation's
+    /// fate per card, in two scalar maps both cleared the instant a new
+    /// editor opened. That erased an older generation's own tombstone
+    /// before every action dispatched against it had resolved: a second
+    /// Cancel silently overwrote the first's record, and merely opening a
+    /// new editor discarded it outright -- either way, a subsequently-
+    /// arriving late completion for the *forgotten* older generation found
+    /// nothing left to compare itself against and was wrongly trusted as
+    /// though it answered whichever generation the scalar happened to hold
+    /// instead.
+    ///
+    /// Recording every retired generation's fate independently, keyed by
+    /// its own generation number, closes that gap: opening or retiring a
+    /// new generation only ever adds an entry here, never erases one. A
+    /// generation with no entry at all is either still open or was never
+    /// opened -- either way, its completion is trusted, matching a plain
+    /// no-live-editor output's behaviour and a fresh session's own first
+    /// completion.
+    ///
+    /// Entries are removed only in the two cases where they can never be
+    /// consulted again: [`Self::dismiss_recent_capture`] drops every entry
+    /// for a card that is fully retiring, and `Outcome::CardOutputCommitFailed`
+    /// rolls back its own single optimistic write (never any other
+    /// generation's) when that commit never actually became durable.
+    /// `next_editor_generation` is a `u64` incremented once per newly opened
+    /// editor and never reused within a process's lifetime in practice, so a
+    /// generation-number collision between two editing sessions of the same
+    /// card is not a realistic concern.
+    card_generation_fates: HashMap<CardId, HashMap<u64, GenerationFate>>,
     /// Durable identities used to re-check source retention at cleanup time.
     card_capture_ids: HashMap<CardId, CaptureId>,
     /// Cards awaiting a current history-retention answer before cleanup.
@@ -1063,6 +1063,18 @@ struct PendingUploadAction {
     /// Whether *this* dispatch should retire the card once it completes,
     /// captured fresh at dispatch time.
     close_after: bool,
+}
+
+/// The final fate recorded for one editor generation, once known (round 10,
+/// Finding #1). See [`App::card_generation_fates`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationFate {
+    /// This generation's edit was committed by Done, with its final
+    /// document revision.
+    Committed(u64),
+    /// This generation's edit was cancelled, or closed cleanly without ever
+    /// committing anything.
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -1510,8 +1522,7 @@ impl App {
             pending_upload: HashMap::new(),
             next_upload_action: 0,
             card_retention: HashMap::new(),
-            card_committed_version: HashMap::new(),
-            card_cancelled_generation: HashMap::new(),
+            card_generation_fates: HashMap::new(),
             card_capture_ids: HashMap::new(),
             pending_retention_close: HashSet::new(),
             pending_retention_overflow: HashSet::new(),
@@ -2255,13 +2266,18 @@ impl App {
                 } => {
                     let generation = self.next_editor_generation;
                     self.next_editor_generation = self.next_editor_generation.wrapping_add(1);
-                    // A brand-new editing session starts with a clean slate:
-                    // any version tracked from a prior session must not gate
-                    // this session's own first Done/Save completion (round 5,
-                    // Finding #2), and a prior session's cancellation must
-                    // not gate it either (round 9, Finding #1).
-                    self.card_committed_version.remove(&card);
-                    self.card_cancelled_generation.remove(&card);
+                    // Round 10, Finding #1: a brand-new editing session
+                    // needs no clean-slate reset here at all -- its
+                    // `generation` number is freshly allocated and has never
+                    // been used before, so `card_generation_fates` has no
+                    // entry for it yet, and an absent entry is exactly what
+                    // `Self::output_version_is_stale` already trusts as "not
+                    // known to be stale". Previously this scrubbed *every*
+                    // fate recorded for the card so far, which erased an
+                    // older, still-unresolved generation's own tombstone the
+                    // instant any new editor opened -- long before every
+                    // action dispatched against that older generation had
+                    // actually resolved.
                     if editor_only {
                         self.editor_only_cards.insert(card);
                     }
@@ -2408,9 +2424,18 @@ impl App {
                     // wrongly compare unequal to this failed attempt and be
                     // suppressed as "stale" even though it is the only
                     // record of the card's current content (round 5,
-                    // Finding #2).
-                    if self.card_committed_version.get(&card) == Some(&(generation, revision)) {
-                        self.card_committed_version.remove(&card);
+                    // Finding #2). Only this exact generation's own entry is
+                    // ever touched here -- any other generation's recorded
+                    // fate for this card is a separate, already-resolved
+                    // editing session this failure has nothing to say about
+                    // (round 10, Finding #1).
+                    if let Some(fates) = self.card_generation_fates.get_mut(&card) {
+                        if fates.get(&generation) == Some(&GenerationFate::Committed(revision)) {
+                            fates.remove(&generation);
+                        }
+                        if fates.is_empty() {
+                            self.card_generation_fates.remove(&card);
+                        }
                     }
                     self.surface
                         .set_status(card, Some(format!("Action failed: {error}")));
@@ -3179,28 +3204,38 @@ impl App {
 
     /// Whether a Copy/Save/Upload completion's `version` no longer describes
     /// this card's current, exportable content (round 5, Finding #2; round 9,
-    /// Finding #1).
+    /// Finding #1; round 10, Finding #1).
     ///
     /// A `None` version (a plain, no-live-editor output) never races
-    /// anything and is always current. A `Some` version is stale exactly
-    /// when either:
-    /// - a *different* revision has since been committed for this exact
-    ///   editor generation (`card_committed_version` disagrees), meaning a
-    ///   later Done already superseded it; or
-    /// - this exact generation is known to have been Cancelled (or closed
-    ///   without Done) rather than committed, meaning the edit this
-    ///   completion answers for no longer exists anywhere for the user to
-    ///   see, even though nothing was ever committed to disagree with it.
+    /// anything and is always current. A `Some((generation, revision))` is
+    /// looked up by its exact `generation` in [`Self::card_generation_fates`]:
+    /// - no entry at all means that generation is either still open or was
+    ///   never opened -- the first completion of a fresh, still-open editing
+    ///   session (neither committed nor cancelled yet) is trusted, matching
+    ///   a plain output's behaviour;
+    /// - [`GenerationFate::Committed`] with a *different* revision means a
+    ///   later Done already superseded this exact completion's revision
+    ///   within the same generation;
+    /// - [`GenerationFate::Cancelled`] means the edit this completion
+    ///   answers for no longer exists anywhere for the user to see, even
+    ///   though nothing was ever committed to disagree with it.
     ///
-    /// The first completion of a fresh, still-open editing session -- one
-    /// neither committed nor cancelled yet -- is trusted, matching a plain
-    /// output's behaviour.
+    /// Looking this up per-generation, rather than against a single most-
+    /// recent value for the whole card, is what lets an *older* generation's
+    /// own fate stay correctly recorded no matter how many newer editing
+    /// sessions have opened, committed, or cancelled since (round 10,
+    /// Finding #1).
     fn output_version_is_stale(&self, card: CardId, version: Option<(u64, u64)>) -> bool {
-        version.is_some_and(|v| {
-            self.card_committed_version
+        version.is_some_and(|(generation, revision)| {
+            match self
+                .card_generation_fates
                 .get(&card)
-                .is_some_and(|current| *current != v)
-                || self.card_cancelled_generation.get(&card) == Some(&v.0)
+                .and_then(|fates| fates.get(&generation))
+            {
+                Some(GenerationFate::Committed(committed)) => *committed != revision,
+                Some(GenerationFate::Cancelled) => true,
+                None => false,
+            }
         })
     }
 
@@ -3476,6 +3511,12 @@ impl App {
         self.pending_upload.remove(&card);
         self.drag_keep_after_accept.remove(&card);
         self.card_retention.remove(&card);
+        // Round 10, Finding #1: this card's generation history can never be
+        // consulted again once it is gone -- no overlay card remains for a
+        // completion racing an already-retired generation to update, and no
+        // recorded fate here could ever again distinguish "stale" from
+        // "current" for it.
+        self.card_generation_fates.remove(&card);
         self.card_capture_ids.remove(&card);
         self.pending_retention_close.remove(&card);
         self.pending_retention_overflow.remove(&card);
@@ -5165,14 +5206,20 @@ impl App {
         let editors = if committed {
             EditorSnapshots::new(std::slice::from_ref(&editor))
         } else {
-            // Round 9, Finding #1: a live Copy/Save/Upload dispatched before
-            // this Cancel (or clean close) exports this exact generation's
-            // uncommitted render and can still be in flight. Recording it
-            // here lets a completion that arrives afterward be recognised as
-            // answering a discarded edit, even though no committed version
-            // was ever recorded for this card to compare it against.
-            self.card_cancelled_generation
-                .insert(card, editor.generation);
+            // Round 9, Finding #1; round 10, Finding #1: a live Copy/Save/
+            // Upload dispatched before this Cancel (or clean close) exports
+            // this exact generation's uncommitted render and can still be
+            // in flight. Recording this generation's fate here lets a
+            // completion that arrives afterward be recognised as answering
+            // a discarded edit, even though nothing was ever committed for
+            // this card to compare it against. Keyed by generation, not
+            // merely by card, so an older cancelled generation's own record
+            // survives however many later editing sessions open, commit, or
+            // are themselves cancelled before that late completion drains.
+            self.card_generation_fates
+                .entry(card)
+                .or_default()
+                .insert(editor.generation, GenerationFate::Cancelled);
             EditorSnapshots::EMPTY
         };
         if let Some(action) = self.deferred_auto_close.remove(&card) {
@@ -5234,9 +5281,15 @@ impl App {
             // completion for an older revision of this same editor
             // generation be recognised as stale and ignored, rather than
             // wrongly re-marking this newly committed (and not yet exported)
-            // revision as retained/exported (round 5, Finding #2).
-            self.card_committed_version
-                .insert(card, (generation, revision));
+            // revision as retained/exported (round 5, Finding #2). Keyed by
+            // generation, not merely by card, so this generation's own
+            // record survives however many later editing sessions open,
+            // commit, or are cancelled before a stale completion for *this*
+            // one drains (round 10, Finding #1).
+            self.card_generation_fates
+                .entry(card)
+                .or_default()
+                .insert(generation, GenerationFate::Committed(revision));
         } else {
             let error = "the capture worker has gone".to_string();
             self.note(format!(
@@ -6614,7 +6667,26 @@ impl App {
                 action,
             })
         });
+        self.report_recorded_media_dispatch_outcome(card, dispatched);
+    }
+
+    /// Reports the result of a recorded-media upload dispatch attempt.
+    ///
+    /// Split out of [`Self::upload_recorded_media`] so its failure path is
+    /// directly testable: that function's own cloud-availability check
+    /// cannot be made to pass in a build without the `cloud` feature (see
+    /// the comment on `a_stale_recorded_media_upload_outcome_never_overwrites_a_newer_ones_status`),
+    /// so a test exercising this branch calls this method directly instead.
+    fn report_recorded_media_dispatch_outcome(&mut self, card: CardId, dispatched: bool) {
         if !dispatched {
+            // Round 10, Finding #2: this branch previously only logged a
+            // note, leaving the "Uploading..." status set moments ago to
+            // linger forever as though a recording upload were still
+            // underway. Mirror the still-image path's own fix (round 9,
+            // Finding #3, `CardEvent::Upload` above): nothing is in flight
+            // for this card now, so an explicit failure status replaces it.
+            self.surface
+                .set_status(card, Some("upload could not be started".to_owned()));
             self.note(format!(
                 "{card} could not be queued for upload: the capture worker has gone"
             ));
@@ -8590,8 +8662,10 @@ mod tests {
             .expect("render committed revision 2");
         app.commit_card_output(card, generation, committed, editor.document().data());
         assert_eq!(
-            app.card_committed_version.get(&card),
-            Some(&(generation, 2)),
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&generation)),
+            Some(&GenerationFate::Committed(2)),
             "the commit must be recorded synchronously, before the stale Save's own \
              completion is ever drained"
         );
@@ -8618,7 +8692,7 @@ mod tests {
     #[test]
     fn the_first_save_completion_of_a_fresh_editing_session_is_trusted() {
         // The counterpart to the stale case above: with no prior commit for
-        // this card, `card_committed_version` holds nothing to compare
+        // this card, `card_generation_fates` holds nothing to compare
         // against, so the very first Save/Copy/Upload completion of a session
         // must still be trusted -- otherwise every card's first export would
         // wrongly be treated as unproven.
@@ -8630,9 +8704,8 @@ mod tests {
             .store_test_capture(card, editor.document().source())
             .expect("editor source");
         app.card_retention.insert(card, (false, false));
-        assert_eq!(
-            app.card_committed_version.get(&card),
-            None,
+        assert!(
+            !app.card_generation_fates.contains_key(&card),
             "no Done has committed anything yet for this card"
         );
 
@@ -8680,16 +8753,20 @@ mod tests {
             .expect("render first committed revision");
         app.commit_card_output(card, generation, first, editor.document().data());
         assert_eq!(
-            app.card_committed_version.get(&card),
-            Some(&(generation, 2))
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&generation)),
+            Some(&GenerationFate::Committed(2))
         );
 
         let second = RevisionedFrame::from_document(editor.document(), 3)
             .expect("render second, newer committed revision");
         app.commit_card_output(card, generation, second, editor.document().data());
         assert_eq!(
-            app.card_committed_version.get(&card),
-            Some(&(generation, 3)),
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&generation)),
+            Some(&GenerationFate::Committed(3)),
             "the second commit must fully supersede the first, not merge with it"
         );
 
@@ -8753,8 +8830,10 @@ mod tests {
             .expect("render committed revision 4");
         app.commit_card_output(card, generation, committed, editor.document().data());
         assert_eq!(
-            app.card_committed_version.get(&card),
-            Some(&(generation, 4))
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&generation)),
+            Some(&GenerationFate::Committed(4))
         );
 
         let path = temp_export_path("current-save");
@@ -8780,12 +8859,17 @@ mod tests {
     }
 
     #[test]
-    fn reopening_a_card_clears_the_previous_sessions_committed_version() {
-        // Finding #2's gate is scoped to one editor generation. If a stale
-        // tracked version from a closed session survived into the next
-        // editing session unchanged, an early Save in the *new* session could
-        // be wrongly compared against -- and suppressed by -- bookkeeping
-        // that describes a session the user has already left.
+    fn reopening_a_card_does_not_erase_an_older_generations_recorded_fate() {
+        // Round 10, Finding #1: earlier rounds cleared *every* fate recorded
+        // for a card the instant any new editor opened for it. That erased
+        // an older, not-yet-fully-resolved generation's own tombstone before
+        // every action dispatched against it had actually settled -- a late
+        // completion for that older generation then found nothing left to
+        // compare itself against and was wrongly trusted as though it
+        // answered whichever generation the map happened to describe
+        // instead. A per-generation record must survive a newer editor
+        // opening; only that exact generation's own later resolution, or
+        // the card's own final retirement, may ever remove it.
         let (mut app, _surface) = app();
         let editor = redacted_editor();
         let card = CardId(204);
@@ -8793,18 +8877,196 @@ mod tests {
             .captures()
             .store_test_capture(card, editor.document().source())
             .expect("editor source");
-        app.card_committed_version.insert(card, (7, 99));
+        app.card_generation_fates
+            .entry(card)
+            .or_default()
+            .insert(99, GenerationFate::Committed(7));
 
         assert!(app.pipeline.post(Job::Open(card)));
-        drain_until(&mut app, |app| {
-            !app.card_committed_version.contains_key(&card)
-        });
+        drain_until(&mut app, |app| app.next_editor_generation != 1);
 
         assert_eq!(
-            app.card_committed_version.get(&card),
-            None,
-            "opening a card for a new editing session must clear any version tracked \
-             from a previous one"
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&99)),
+            Some(&GenerationFate::Committed(7)),
+            "opening a new editing session must not erase an older, unrelated \
+             generation's own recorded fate"
+        );
+        assert!(
+            !app.output_version_is_stale(card, Some((1, 1))),
+            "the freshly opened generation's own first completion has no \
+             entry yet and must still be trusted, unaffected by an older \
+             generation's fate"
+        );
+    }
+
+    #[test]
+    fn cancel_gen1_then_open_gen2_a_late_gen1_upload_completion_is_still_recognised_stale() {
+        // Round 10, Finding #1's central regression: Cancel records
+        // generation 1's own fate, then a brand-new editing session --
+        // generation 2 -- opens for the very same card before generation
+        // 1's own already-dispatched upload has completed. Before this
+        // fix, opening generation 2 would have scrubbed generation 1's
+        // record outright, so this late completion would have found
+        // nothing to compare itself against and been wrongly trusted.
+        let (mut app, surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(230);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_capture_ids
+            .insert(card, CaptureId("cancel-gen1-open-gen2".into()));
+        app.card_retention.insert(card, (false, false));
+
+        // Generation 1 is cancelled -- its own already-dispatched upload
+        // (inserted below) is still in flight.
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), false);
+        assert_eq!(
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&1)),
+            Some(&GenerationFate::Cancelled)
+        );
+
+        // A brand-new editing session -- generation 2 -- now opens for the
+        // same card.
+        assert!(app.pipeline.post(Job::Open(card)));
+        drain_until(&mut app, |app| app.next_editor_generation != 1);
+        assert_eq!(
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&1)),
+            Some(&GenerationFate::Cancelled),
+            "opening generation 2 must never erase generation 1's own \
+             recorded fate"
+        );
+
+        // Generation 1's own upload -- dispatched before the Cancel above,
+        // naming the exact action generation 2 has not itself superseded --
+        // now completes late.
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 7,
+                close_after: true,
+            },
+        );
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "uploaded and copied the private share link".to_owned(),
+            version: Some((1, 3)),
+            action: 7,
+        });
+        app.drain_pipeline();
+
+        assert!(
+            !app.pending_upload.contains_key(&card),
+            "the stale upload's own close-after-upload bookkeeping must still \
+             retire"
+        );
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(false, false)),
+            "a late completion for a cancelled generation must never mark \
+             retention, even after a newer generation has since opened"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "a late completion for a cancelled generation must never dismiss \
+             the card, even after a newer generation has since opened"
+        );
+    }
+
+    #[test]
+    fn multiple_cancelled_generations_each_retain_their_own_independent_fate() {
+        // Round 10, Finding #1: a second (or third) Cancel must not
+        // silently overwrite an earlier generation's own record -- every
+        // editing session a card has been through keeps its own
+        // independent tombstone.
+        let (mut app, surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(231);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_capture_ids
+            .insert(card, CaptureId("multi-cancel".into()));
+        app.card_retention.insert(card, (false, false));
+
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), false);
+        app.editor_closed(EditorSnapshot::new(card, 2, &editor), false);
+        app.editor_closed(EditorSnapshot::new(card, 3, &editor), false);
+
+        for generation in [1_u64, 2, 3] {
+            assert_eq!(
+                app.card_generation_fates
+                    .get(&card)
+                    .and_then(|fates| fates.get(&generation)),
+                Some(&GenerationFate::Cancelled),
+                "generation {generation}'s own Cancelled fate must survive \
+                 every later generation's own cancellation"
+            );
+        }
+
+        // A late completion naming any of the three discarded generations
+        // must still be recognised as stale, not merely the most recent one.
+        for generation in [1_u64, 2, 3] {
+            app.pending_upload.insert(
+                card,
+                PendingUploadAction {
+                    action: generation,
+                    close_after: true,
+                },
+            );
+            app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+                card,
+                detail: "uploaded and copied the private share link".to_owned(),
+                version: Some((generation, 1)),
+                action: generation,
+            });
+            app.drain_pipeline();
+            assert_eq!(
+                app.card_retention.get(&card),
+                Some(&(false, false)),
+                "a late completion for cancelled generation {generation} must \
+                 never mark retention"
+            );
+        }
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "none of the three late, stale completions may ever dismiss the card"
+        );
+    }
+
+    #[test]
+    fn dismissing_a_card_clears_its_recorded_generation_fates() {
+        // Round 10, Finding #1: `card_generation_fates` must not silently
+        // accumulate forever. Once a card is fully retired there is no
+        // overlay card left for a late completion to race, and no fate
+        // recorded here could ever again distinguish "stale" from "current"
+        // for it.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(232);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_capture_ids
+            .insert(card, CaptureId("dismiss-clears-fates".into()));
+        app.card_retention.insert(card, (false, false));
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), false);
+        assert!(app.card_generation_fates.contains_key(&card));
+
+        app.dismiss_recent_capture(card, "test retirement");
+
+        assert!(
+            !app.card_generation_fates.contains_key(&card),
+            "a fully retired card must not leave any generation fates behind"
         );
     }
 
@@ -8830,19 +9092,23 @@ mod tests {
             .expect("render the attempted commit");
         app.commit_card_output(card, generation, attempted, editor.document().data());
         assert_eq!(
-            app.card_committed_version.get(&card),
-            Some(&(generation, 5)),
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&generation)),
+            Some(&GenerationFate::Committed(5)),
             "the optimistic dispatch-time write happens before the worker can report \
              the commit failed"
         );
 
         drain_until(&mut app, |app| {
-            !app.card_committed_version.contains_key(&card)
+            !app.card_generation_fates.contains_key(&card)
         });
         assert_eq!(
-            app.card_committed_version.get(&card),
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&generation)),
             None,
-            "a failed commit must clear the provisional version it optimistically \
+            "a failed commit must clear the provisional fate it optimistically \
              recorded, not leave it describing a revision that was never filed"
         );
 
@@ -9011,8 +9277,10 @@ mod tests {
             .expect("render committed revision 2");
         app.commit_card_output(card, generation, committed, editor.document().data());
         assert_eq!(
-            app.card_committed_version.get(&card),
-            Some(&(generation, 2))
+            app.card_generation_fates
+                .get(&card)
+                .and_then(|fates| fates.get(&generation)),
+            Some(&GenerationFate::Committed(2))
         );
 
         app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
@@ -9050,8 +9318,8 @@ mod tests {
         // Round 9, Finding #1: a Save dispatched against a live editor's
         // uncommitted revision can still be in flight when the user Cancels
         // that exact editing session, with no Done ever having committed
-        // anything for it to disagree with -- `card_committed_version` stays
-        // empty for this card the whole time. Before this fix,
+        // anything for it to disagree with -- `card_generation_fates` has no
+        // entry for this card at all the whole time. Before this fix,
         // `output_version_is_stale` only checked for a *different* committed
         // revision, so this exact scenario -- a save answering a discarded
         // edit that was never superseded, only abandoned -- passed straight
@@ -9068,7 +9336,7 @@ mod tests {
         app.card_retention.insert(card, (false, false));
         app.close_after_output.insert(card);
         assert!(
-            !app.card_committed_version.contains_key(&card),
+            !app.card_generation_fates.contains_key(&card),
             "nothing was ever committed for this generation to compare the stale \
              completion against"
         );
@@ -11291,6 +11559,56 @@ mod tests {
              genuine completion"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_recorded_media_upload_that_cannot_be_dispatched_sets_an_explicit_failure_status() {
+        // Round 10, Finding #2: `upload_recorded_media` set the card's status
+        // to "Uploading..." optimistically, then -- if the dispatch itself
+        // failed (the capture worker had gone) -- only logged a note and
+        // left that "Uploading..." status to linger on the card forever,
+        // unlike the still-image path's `CardEvent::Upload` handler, which
+        // replaces it with an explicit failure status (round 9, Finding #3).
+        //
+        // `upload_recorded_media` itself cannot be driven end to end in this
+        // test binary: its very first line calls `refresh_cloud_settings`,
+        // which always resolves to unavailable without the `cloud` feature
+        // (see `a_stale_recorded_media_upload_outcome_never_overwrites_a_newer_ones_status`
+        // for the identical, pre-existing limitation). This calls the
+        // extracted `report_recorded_media_dispatch_outcome` directly with
+        // `dispatched: false`, exercising exactly the branch this finding
+        // fixed.
+        let (mut app, surface) = app();
+        let card = CardId(227);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 300,
+                close_after: false,
+            },
+        );
+        surface.clear_trace();
+
+        app.report_recorded_media_dispatch_outcome(card, false);
+
+        let trace = surface.trace();
+        assert_eq!(
+            trace.last(),
+            Some(&SurfaceCall::SetStatus {
+                id: card,
+                status: Some("upload could not be started".to_owned()),
+            }),
+            "a refused dispatch must replace the optimistic \"Uploading...\" status \
+             with an explicit failure, not leave it showing forever: {trace:?}"
+        );
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("could not be queued for upload")),
+            "the failure must still be surfaced in the notes log, not silently \
+             swallowed: {:?}",
+            app.notes()
+        );
     }
 
     #[test]

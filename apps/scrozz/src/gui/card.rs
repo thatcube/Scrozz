@@ -745,6 +745,13 @@ pub enum SurfaceCall {
     },
     /// [`CardSurface::refresh_card_image`] replaced a card's thumbnail.
     RefreshCardImage(CardId),
+    /// [`CardSurface::set_status`] showed or cleared a card's action status.
+    SetStatus {
+        /// Which card's status changed.
+        id: CardId,
+        /// The status text now shown, or `None` if it was cleared.
+        status: Option<String>,
+    },
 }
 
 impl Default for Recording {
@@ -913,6 +920,10 @@ impl CardSurface for Recording {
 
     fn refresh_card_image(&mut self, id: CardId, _frame: &Frame) {
         self.record(SurfaceCall::RefreshCardImage(id));
+    }
+
+    fn set_status(&mut self, id: CardId, status: Option<String>) {
+        self.record(SurfaceCall::SetStatus { id, status });
     }
 
     fn poll_drag_starts(&mut self) -> Vec<CardEvent> {
