@@ -717,6 +717,29 @@ pub struct App {
     /// process's lifetime in practice, so a generation collision with a
     /// stale tracked tuple is not a realistic concern.
     card_committed_version: HashMap<CardId, (u64, u64)>,
+    /// The editor generation of the most recent *cancelled* (or cleanly, i.e.
+    /// non-Done, closed) editing session for each card still tracked (round
+    /// 9, Finding #1).
+    ///
+    /// A live editor's Copy/Save/Upload exports its own current, uncommitted
+    /// render -- see [`Self::card_output_job`] -- carrying that render's
+    /// exact `(generation, revision)` as its completion's `version`. Nothing
+    /// about that dispatch is retracted when the user goes on to Cancel: the
+    /// completion can still arrive afterward, and at that point
+    /// `card_committed_version` holds nothing for this card (Cancel never
+    /// commits), so the existing "trust an unopposed version" staleness
+    /// check alone would wrongly treat the completion as current and mark
+    /// the untouched base card retained/exported for content that no longer
+    /// exists anywhere. Recording the cancelled generation here lets that
+    /// same staleness check also recognise a completion whose version names
+    /// a generation known to have been discarded -- retention is never
+    /// updated for it, which is exactly "restoring" it, since Cancel itself
+    /// never touches `card_retention` in the first place.
+    ///
+    /// Cleared whenever a fresh editor opens for the card, mirroring
+    /// `card_committed_version`'s own reset: a new session's own completions
+    /// must never be gated by an unrelated, previous session's cancellation.
+    card_cancelled_generation: HashMap<CardId, u64>,
     /// Durable identities used to re-check source retention at cleanup time.
     card_capture_ids: HashMap<CardId, CaptureId>,
     /// Cards awaiting a current history-retention answer before cleanup.
@@ -1488,6 +1511,7 @@ impl App {
             next_upload_action: 0,
             card_retention: HashMap::new(),
             card_committed_version: HashMap::new(),
+            card_cancelled_generation: HashMap::new(),
             card_capture_ids: HashMap::new(),
             pending_retention_close: HashSet::new(),
             pending_retention_overflow: HashSet::new(),
@@ -2136,23 +2160,26 @@ impl App {
                 } => {
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
-                    // Round 5, Finding #2: a Save dispatched against a live
-                    // editor's revision can complete after a *later* Done has
-                    // already committed a newer revision and reset retention
-                    // for it. Only trust the completion when it is not known
-                    // to be stale -- i.e. no *different* revision has since
-                    // been committed for this exact editor generation. A
-                    // plain (no live editor) output has no version to race
-                    // and always applies, and the first completion of a fresh
-                    // editing session (nothing committed yet) is trusted too.
-                    let stale = version.is_some_and(|v| {
-                        self.card_committed_version
-                            .get(&card)
-                            .is_some_and(|current| *current != v)
-                    });
+                    // Round 5, Finding #2 / round 9, Finding #1: a Save
+                    // dispatched against a live editor's revision can
+                    // complete after a *later* Done has already committed a
+                    // newer revision and reset retention for it, or after
+                    // that exact editing session was Cancelled and never
+                    // committed anything at all. Only trust the completion
+                    // when it is not known to be stale -- i.e. no
+                    // *different* revision has since been committed for this
+                    // exact editor generation, and this generation was never
+                    // cancelled. A plain (no live editor) output has no
+                    // version to race and always applies, and the first
+                    // completion of a fresh, still-open editing session
+                    // (nothing committed, nothing cancelled, yet) is trusted
+                    // too.
+                    let stale = self.output_version_is_stale(card, version);
                     if stale {
                         // Round 6, Finding #1: this Save/Copy answered
-                        // *after* a later Done committed a newer revision.
+                        // *after* a later Done committed a newer revision --
+                        // or, since round 9, after this exact edit was
+                        // discarded by Cancel.
                         // `complete_output_action` unconditionally dismisses
                         // the card once `close_after_output` clears, and if
                         // the editor that produced the newer revision has
@@ -2162,7 +2189,11 @@ impl App {
                         // about the one before it. Retire only this stale
                         // action's own bookkeeping, resolving any overflow
                         // retirement waiting behind it against whatever the
-                        // card holds now instead.
+                        // card holds now instead. Retention is left exactly
+                        // as it was before this stale completion arrived --
+                        // for a cancelled edit that is the card's pre-edit
+                        // retention, untouched by Cancel, which is precisely
+                        // what round 9, Finding #1 requires.
                         self.resolve_stale_output_completion(card, false);
                         continue;
                     }
@@ -2200,13 +2231,11 @@ impl App {
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
                     // See the matching comment on `Outcome::Done` above.
-                    let stale = version.is_some_and(|v| {
-                        self.card_committed_version
-                            .get(&card)
-                            .is_some_and(|current| *current != v)
-                    });
+                    let stale = self.output_version_is_stale(card, version);
                     if stale {
-                        // Round 6, Finding #1 (upload side).
+                        // Round 6, Finding #1 (upload side); round 9,
+                        // Finding #1 extends the same reasoning to a
+                        // cancelled edit.
                         self.resolve_stale_output_completion(card, true);
                         continue;
                     }
@@ -2229,8 +2258,10 @@ impl App {
                     // A brand-new editing session starts with a clean slate:
                     // any version tracked from a prior session must not gate
                     // this session's own first Done/Save completion (round 5,
-                    // Finding #2).
+                    // Finding #2), and a prior session's cancellation must
+                    // not gate it either (round 9, Finding #1).
                     self.card_committed_version.remove(&card);
+                    self.card_cancelled_generation.remove(&card);
                     if editor_only {
                         self.editor_only_cards.insert(card);
                     }
@@ -2692,30 +2723,21 @@ impl App {
                     self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
                     if self.cloud_settings.upload_enabled {
                         self.surface.set_status(id, Some("Uploading...".to_owned()));
-                        // Round 8, Finding #4: unconditionally insert a
-                        // fresh `PendingUploadAction` whose `close_after`
-                        // reflects the *current* config read -- never merely
-                        // conditionally inserting a flag on top of whatever a
-                        // previous, now-superseded dispatch may have left
-                        // behind. A second Upload before the first's outcome
-                        // drains wholesale replaces the entry, so the
-                        // superseded request's eventual completion or
-                        // refusal is recognized as stale (action mismatch)
-                        // and can never inherit or leak this dispatch's own
-                        // close policy.
-                        let action = self.next_upload_action;
-                        self.next_upload_action = self.next_upload_action.wrapping_add(1);
-                        if self.post_card_output(id, CardOutput::Upload(action), editors) {
-                            self.pending_upload.insert(
-                                id,
-                                PendingUploadAction {
-                                    action,
-                                    close_after: self
-                                        .config
-                                        .recent_captures_overlay
-                                        .close_after_upload,
-                                },
-                            );
+                        let close_after = self.config.recent_captures_overlay.close_after_upload;
+                        let dispatched =
+                            self.dispatch_upload_action(id, close_after, |app, action| {
+                                app.post_card_output(id, CardOutput::Upload(action), editors)
+                            });
+                        if !dispatched {
+                            // Round 9, Finding #3: nothing is in flight for
+                            // this card now (any prior action was just
+                            // invalidated inside `dispatch_upload_action`),
+                            // so an explicit failure status replaces the
+                            // "Uploading..." status set moments ago rather
+                            // than leaving it to linger as though an upload
+                            // were still underway.
+                            self.surface
+                                .set_status(id, Some("upload could not be started".to_owned()));
                         }
                     } else {
                         let reason = self
@@ -3155,6 +3177,33 @@ impl App {
         }
     }
 
+    /// Whether a Copy/Save/Upload completion's `version` no longer describes
+    /// this card's current, exportable content (round 5, Finding #2; round 9,
+    /// Finding #1).
+    ///
+    /// A `None` version (a plain, no-live-editor output) never races
+    /// anything and is always current. A `Some` version is stale exactly
+    /// when either:
+    /// - a *different* revision has since been committed for this exact
+    ///   editor generation (`card_committed_version` disagrees), meaning a
+    ///   later Done already superseded it; or
+    /// - this exact generation is known to have been Cancelled (or closed
+    ///   without Done) rather than committed, meaning the edit this
+    ///   completion answers for no longer exists anywhere for the user to
+    ///   see, even though nothing was ever committed to disagree with it.
+    ///
+    /// The first completion of a fresh, still-open editing session -- one
+    /// neither committed nor cancelled yet -- is trusted, matching a plain
+    /// output's behaviour.
+    fn output_version_is_stale(&self, card: CardId, version: Option<(u64, u64)>) -> bool {
+        version.is_some_and(|v| {
+            self.card_committed_version
+                .get(&card)
+                .is_some_and(|current| *current != v)
+                || self.card_cancelled_generation.get(&card) == Some(&v.0)
+        })
+    }
+
     /// Retires a stale Save/Copy/Upload completion's own bookkeeping without
     /// dismissing the card (round 6, Finding #1).
     ///
@@ -3171,7 +3220,11 @@ impl App {
     /// mirroring [`Self::fail_upload`]'s existing recovery-resume idiom,
     /// resolves any overflow retirement that was waiting behind it against
     /// whatever the card holds now instead of the stale action's own
-    /// outcome.
+    /// outcome. Retention itself is left untouched: for a stale answer to a
+    /// committed-over edit that already holds its own (freshly reset)
+    /// retention, and for a cancelled edit that never touched retention in
+    /// the first place, "untouched" is exactly correct in both cases (round
+    /// 9, Finding #1).
     fn resolve_stale_output_completion(&mut self, card: CardId, upload: bool) {
         let was_waiting = if upload {
             self.pending_upload
@@ -3247,6 +3300,56 @@ impl App {
                     self.close_after_output.insert(id);
                 }
             }
+        }
+    }
+
+    /// Dispatches a fresh upload action for `card`, invalidating whatever
+    /// action preceded it *before* this attempt's own enqueue is known to
+    /// succeed (round 9, Finding #3).
+    ///
+    /// A second Upload dispatch for the same card -- whether the user
+    /// pressed Upload again before the first's outcome drained, or a
+    /// recorded-media retry -- always represents a fresh intent, and must
+    /// always retire the previous action's bookkeeping, regardless of
+    /// whether this new attempt itself reaches the pipeline. Previously
+    /// only a *successful* new dispatch replaced `pending_upload`: if
+    /// `try_post` failed (a render error, or the capture/upload worker
+    /// having gone), the prior action's entry -- and its close policy --
+    /// was left untouched, so a late outcome for that now-truly-superseded
+    /// action still matched `pending_upload` and applied its (possibly
+    /// obsolete) close policy, exactly as though the second dispatch had
+    /// never happened. Clearing first means a failed re-dispatch leaves
+    /// nothing tracked as current for this card, so any old outcome that
+    /// still arrives -- for the action just invalidated -- falls through
+    /// to the ordinary "a newer one has since replaced" no-op every upload
+    /// outcome handler already applies to an action mismatch.
+    ///
+    /// Returns whether `try_post` reached the pipeline. On success, the
+    /// freshly allocated action becomes the card's tracked
+    /// [`PendingUploadAction`] with `close_after` as given. On failure, no
+    /// action is left tracked for the card at all -- callers own reporting
+    /// the failure (status/notes), since what counts as informative differs
+    /// between the still-image and recorded-media paths.
+    fn dispatch_upload_action(
+        &mut self,
+        card: CardId,
+        close_after: bool,
+        try_post: impl FnOnce(&mut Self, u64) -> bool,
+    ) -> bool {
+        self.pending_upload.remove(&card);
+        let action = self.next_upload_action;
+        self.next_upload_action = self.next_upload_action.wrapping_add(1);
+        if try_post(self, action) {
+            self.pending_upload.insert(
+                card,
+                PendingUploadAction {
+                    action,
+                    close_after,
+                },
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -5062,6 +5165,14 @@ impl App {
         let editors = if committed {
             EditorSnapshots::new(std::slice::from_ref(&editor))
         } else {
+            // Round 9, Finding #1: a live Copy/Save/Upload dispatched before
+            // this Cancel (or clean close) exports this exact generation's
+            // uncommitted render and can still be in flight. Recording it
+            // here lets a completion that arrives afterward be recognised as
+            // answering a discarded edit, even though no committed version
+            // was ever recorded for this card to compare it against.
+            self.card_cancelled_generation
+                .insert(card, editor.generation);
             EditorSnapshots::EMPTY
         };
         if let Some(action) = self.deferred_auto_close.remove(&card) {
@@ -6493,24 +6604,17 @@ impl App {
         // request. Track this action like any other upload; `close_after:
         // false` preserves the existing, intentional behavior that a
         // recording's own upload never retires the card by itself.
-        let action = self.next_upload_action;
-        self.next_upload_action = self.next_upload_action.wrapping_add(1);
-        if self.pipeline.post(Job::UploadRecording {
-            card,
-            capture,
-            path,
-            content_type,
-            file_name,
-            action,
-        }) {
-            self.pending_upload.insert(
+        let dispatched = self.dispatch_upload_action(card, false, move |app, action| {
+            app.pipeline.post(Job::UploadRecording {
                 card,
-                PendingUploadAction {
-                    action,
-                    close_after: false,
-                },
-            );
-        } else {
+                capture,
+                path,
+                content_type,
+                file_name,
+                action,
+            })
+        });
+        if !dispatched {
             self.note(format!(
                 "{card} could not be queued for upload: the capture worker has gone"
             ));
@@ -8942,6 +9046,63 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_editors_stale_save_completion_never_marks_a_reverted_card_retained() {
+        // Round 9, Finding #1: a Save dispatched against a live editor's
+        // uncommitted revision can still be in flight when the user Cancels
+        // that exact editing session, with no Done ever having committed
+        // anything for it to disagree with -- `card_committed_version` stays
+        // empty for this card the whole time. Before this fix,
+        // `output_version_is_stale` only checked for a *different* committed
+        // revision, so this exact scenario -- a save answering a discarded
+        // edit that was never superseded, only abandoned -- passed straight
+        // through as though it answered the (untouched) pre-edit bytes.
+        let (mut app, surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(225);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_capture_ids
+            .insert(card, CaptureId("cancelled-save-stale".into()));
+        app.card_retention.insert(card, (false, false));
+        app.close_after_output.insert(card);
+        assert!(
+            !app.card_committed_version.contains_key(&card),
+            "nothing was ever committed for this generation to compare the stale \
+             completion against"
+        );
+
+        let generation = 1;
+        // Cancel: the editing session at generation 1 is discarded before
+        // its already-dispatched Save's completion has drained.
+        app.editor_closed(EditorSnapshot::new(card, generation, &editor), false);
+
+        app.pipeline.inject_outcome_for_test(Outcome::Done {
+            card,
+            detail: "saved to Export Location".to_owned(),
+            // Stale: answers for the exact generation Cancel just discarded.
+            version: Some((generation, 1)),
+        });
+        app.drain_pipeline();
+
+        assert!(
+            !app.close_after_output.contains(&card),
+            "the cancelled edit's own close-after-output bookkeeping must still retire"
+        );
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(false, false)),
+            "a stale completion for a cancelled edit must never mark the card's \
+             untouched pre-edit bytes as saved/exported"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "a stale completion for a cancelled edit must never dismiss the card"
+        );
+    }
+
+    #[test]
     fn a_stale_completion_for_an_editor_only_cards_sole_copy_never_dismisses_it() {
         // Round 6, Finding #1's most severe case: an editor-only card (no
         // durable history row at all -- `card_capture_ids` holds nothing for
@@ -11130,6 +11291,99 @@ mod tests {
              genuine completion"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dispatch_upload_action_invalidates_the_superseded_action_before_attempting_the_new_one() {
+        // Round 9, Finding #3: a second Upload dispatch for the same card
+        // must retire whatever action preceded it *before* this attempt's
+        // own enqueue is known to succeed, not only once it succeeds.
+        // Previously, a failed re-dispatch (a render error, or the capture
+        // worker having gone) left the previous action's bookkeeping -- and
+        // its close policy -- fully intact, so a late outcome for that now
+        // truly-superseded action was still matched and treated as current.
+        let (mut app, _surface) = app();
+        let card = CardId(226);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 10,
+                close_after: true,
+            },
+        );
+
+        // The new dispatch's own enqueue fails (worker gone, render error,
+        // ...).
+        let dispatched = app.dispatch_upload_action(card, false, |_app, _action| false);
+
+        assert!(
+            !dispatched,
+            "a failed enqueue must report failure to its caller"
+        );
+        assert!(
+            !app.pending_upload.contains_key(&card),
+            "a failed re-dispatch must still invalidate the action it superseded, \
+             leaving nothing tracked as current for this card"
+        );
+
+        // The old (now-invalidated) action's outcome, arriving late, must
+        // fall through to the ordinary \"a newer one has since replaced\"
+        // no-op every upload outcome handler already applies on an action
+        // mismatch -- not be mistaken for still current.
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "uploaded and copied the private share link".to_owned(),
+            version: None,
+            action: 10,
+        });
+        app.drain_pipeline();
+        assert!(
+            !app.pending_upload.contains_key(&card),
+            "the invalidated old action's own late outcome must not resurrect any \
+             bookkeeping for it"
+        );
+        assert!(
+            app.notes
+                .iter()
+                .any(|note| note.contains("a newer one has since replaced")),
+            "the old action's late outcome must be recognised as superseded, not \
+             silently accepted as though it were still current"
+        );
+    }
+
+    #[test]
+    fn dispatch_upload_action_tracks_the_new_action_with_its_own_close_policy_on_success() {
+        // Companion to the failure case above: a *successful* re-dispatch
+        // must still fully replace the superseded action -- its own id, and
+        // its own close policy, both independent of whatever the request it
+        // replaced carried.
+        let (mut app, _surface) = app();
+        let card = CardId(227);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 10,
+                close_after: true,
+            },
+        );
+
+        let dispatched = app.dispatch_upload_action(card, false, |_app, _action| true);
+
+        assert!(dispatched, "a successful enqueue must report success");
+        let pending = app
+            .pending_upload
+            .get(&card)
+            .expect("a successful dispatch must be tracked as current");
+        assert_ne!(
+            pending.action, 10,
+            "the new dispatch must allocate its own action id rather than reuse the \
+             superseded one"
+        );
+        assert!(
+            !pending.close_after,
+            "the new dispatch's own close policy must replace whatever the \
+             superseded action carried"
+        );
     }
 
     #[test]

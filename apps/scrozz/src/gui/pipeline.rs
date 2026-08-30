@@ -3052,7 +3052,14 @@ impl Worker {
                 action,
             },
         };
-        let _ = self.outcomes.send(outcome);
+        // Round 9, Finding #2: this local refusal (encoding failure, a
+        // missing cache entry, a read failure, or the upload worker's queue
+        // having gone) previously sent straight to `self.outcomes` rather
+        // than through the wake-aware `Self::emit` every other outcome in
+        // this worker uses. In a reactive event loop that is woken only by
+        // `SurfaceWaker`, that left the answer sitting in the channel with
+        // nothing to prompt draining it.
+        self.emit(outcome);
     }
 
     /// Attaches secret-free remote metadata to the capture's history row.
@@ -5068,6 +5075,43 @@ mod tests {
         assert!(pipeline.post(Job::Copy(CardId(404))));
         let _ = wait_for(&pipeline);
         assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// Round 9, Finding #2: `Worker::answer_upload`'s local refusal path (a
+    /// missing cache entry here, but the same fix also covers an encoding
+    /// failure, a read failure, and the upload worker's queue having gone)
+    /// previously sent straight to the outcome channel, bypassing
+    /// `Worker::emit`'s wake-aware send every other outcome in this worker
+    /// uses. A reactive event loop woken only by `SurfaceWaker` could then
+    /// leave the refusal sitting undrained in the channel.
+    #[test]
+    fn a_locally_refused_upload_wakes_the_window_event_loop() {
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let pipeline =
+            Pipeline::start_with_history_and_waker(Arc::new(RefusingSelector), false, Some(waker))
+                .expect("worker");
+        // Never captured, so `cached_entry` refuses before the upload ever
+        // reaches the upload worker -- exactly the local-refusal branch of
+        // `answer_upload` this finding covers.
+        assert!(pipeline.post(Job::Upload {
+            card: CardId(9001),
+            action: 1,
+        }));
+        match wait_for(&pipeline) {
+            Some(Outcome::UploadRefused { card, action, .. }) => {
+                assert_eq!(card, CardId(9001));
+                assert_eq!(action, 1);
+            }
+            other => panic!("expected a local upload refusal, got {other:?}"),
+        }
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "a locally refused upload must wake the event loop"
+        );
     }
 
     #[test]
