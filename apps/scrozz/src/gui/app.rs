@@ -1918,17 +1918,15 @@ impl App {
                         retention.0 = true;
                         retention.1 = true;
                     }
-                    if detail.starts_with("uploaded") {
-                        if let Some(retention) = self.card_retention.get_mut(&card) {
-                            retention.0 = true;
-                        }
-                        if self.close_after_upload.remove(&card) {
-                            self.dismiss_recent_capture(card, "completed its upload");
-                        }
+                    self.complete_output_action(card);
+                }
+                Outcome::UploadDone { card, detail } => {
+                    self.surface.set_status(card, Some(detail.clone()));
+                    self.note(format!("{card} {detail}"));
+                    if let Some(retention) = self.card_retention.get_mut(&card) {
+                        retention.0 = true;
                     }
-                    if self.close_after_output.remove(&card) {
-                        self.dismiss_recent_capture(card, "completed its action");
-                    }
+                    self.complete_upload(card);
                 }
                 Outcome::Opened {
                     card,
@@ -1994,13 +1992,18 @@ impl App {
                     });
                 }
                 Outcome::Refused { card, error } => {
-                    // A failed upload leaves the card exactly where it is: the
-                    // link the user asked for never arrived, so hiding it now
-                    // would throw away the only copy they can still act on.
-                    self.close_after_upload.remove(&card);
                     self.surface
                         .set_status(card, Some(format!("Action failed: {error}")));
                     self.note(format!("{card} refused: {error}"));
+                }
+                Outcome::UploadRefused { card, error } => {
+                    // A failed upload leaves the card exactly where it is: the
+                    // link the user asked for never arrived, so hiding it now
+                    // would throw away the only copy they can still act on.
+                    self.fail_upload(card);
+                    self.surface
+                        .set_status(card, Some(format!("Action failed: {error}")));
+                    self.note(format!("{card} upload refused: {error}"));
                 }
                 Outcome::OutputRefused { card, error } => {
                     self.close_after_output.remove(&card);
@@ -2569,10 +2572,10 @@ impl App {
         // An in-flight Save As or output already owns this card's outcome.
         // Retiring it here would invalidate that work, so overflow only records
         // that the card is no longer reachable and lets the outcome decide.
-        if self.close_after_output.contains(&id) {
+        if self.close_after_output.contains(&id) || self.close_after_upload.contains(&id) {
             self.overflow_recovery_in_flight.insert(id);
             self.note(format!(
-                "{id} left the display while its output action finishes"
+                "{id} left the display while its output or upload action finishes"
             ));
             return;
         }
@@ -2649,6 +2652,34 @@ impl App {
                 id,
                 "released after overflow recovery save could not be queued",
             );
+        }
+    }
+
+    fn complete_output_action(&mut self, card: CardId) {
+        if self.close_after_output.remove(&card) && !self.close_after_upload.contains(&card) {
+            self.dismiss_recent_capture(card, "completed its action");
+        }
+    }
+
+    fn complete_upload(&mut self, card: CardId) {
+        if self.close_after_upload.remove(&card) {
+            self.dismiss_recent_capture(card, "completed its upload");
+        }
+    }
+
+    fn fail_upload(&mut self, card: CardId) {
+        let was_waiting = self.close_after_upload.remove(&card);
+        if !was_waiting
+            || !self.overflow_recovery_in_flight.contains(&card)
+            || self.close_after_output.contains(&card)
+        {
+            return;
+        }
+        self.overflow_recovery_in_flight.remove(&card);
+        if self.active_editor_card == Some(card) {
+            self.deferred_overflow.insert(card);
+        } else {
+            self.handle_overflow(card, None);
         }
     }
 
@@ -7247,6 +7278,57 @@ mod tests {
             "resuming a deferred overflow must not cancel the Save As already in flight"
         );
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
+    }
+
+    #[test]
+    fn completed_output_waits_for_a_concurrent_upload_before_dismissal() {
+        let (mut app, surface) = app();
+        let card = CardId(56);
+        app.close_after_output.insert(card);
+        app.close_after_upload.insert(card);
+
+        app.complete_output_action(card);
+
+        assert!(!app.close_after_output.contains(&card));
+        assert!(app.close_after_upload.contains(&card));
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
+
+        app.complete_upload(card);
+
+        assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
+    }
+
+    #[test]
+    fn overflow_waits_for_a_successful_upload_before_dismissal() {
+        let (mut app, surface) = app();
+        let card = CardId(57);
+        app.card_retention.insert(card, (true, false));
+        app.close_after_upload.insert(card);
+
+        app.handle_overflow(card, None);
+
+        assert!(app.overflow_recovery_in_flight.contains(&card));
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
+
+        app.complete_upload(card);
+
+        assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
+        assert!(!app.overflow_recovery_in_flight.contains(&card));
+    }
+
+    #[test]
+    fn failed_upload_resumes_deferred_overflow_cleanup() {
+        let (mut app, surface) = app();
+        let card = CardId(58);
+        app.card_retention.insert(card, (true, false));
+        app.close_after_upload.insert(card);
+        app.handle_overflow(card, None);
+
+        app.fail_upload(card);
+
+        assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
+        assert!(!app.close_after_upload.contains(&card));
+        assert!(!app.overflow_recovery_in_flight.contains(&card));
     }
 
     #[test]

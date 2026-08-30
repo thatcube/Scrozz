@@ -738,8 +738,22 @@ pub enum Outcome {
         /// What happened, e.g. "copied to the clipboard".
         detail: String,
     },
+    /// A cloud upload completed and its share link reached the clipboard.
+    UploadDone {
+        /// Which card.
+        card: CardId,
+        /// User-facing completion detail.
+        detail: String,
+    },
     /// A card action failed.
     Refused {
+        /// Which card.
+        card: CardId,
+        /// Why.
+        error: CliError,
+    },
+    /// A cloud upload failed before its share link reached the clipboard.
+    UploadRefused {
         /// Which card.
         card: CardId,
         /// Why.
@@ -2636,7 +2650,7 @@ impl Worker {
 
     /// Reports whether the upload reached its worker.
     ///
-    /// A refusal here is [`Outcome::Refused`] rather than
+    /// A refusal here is [`Outcome::UploadRefused`] rather than
     /// [`Outcome::OutputRefused`] so the card shows the reason: the user
     /// pressed Upload and is watching that card for an answer.
     fn answer_upload(&mut self, card: CardId, result: CliResult<()>) {
@@ -2645,7 +2659,7 @@ impl Worker {
                 card,
                 detail: "upload queued".to_owned(),
             },
-            Err(error) => Outcome::Refused { card, error },
+            Err(error) => Outcome::UploadRefused { card, error },
         };
         let _ = self.outcomes.send(outcome);
     }
@@ -3738,13 +3752,13 @@ impl UploadWorker {
                     self.links.insert(card, CachedShare::new(shared, version));
                 }
                 Err(error) => {
-                    let _ = self.outcomes.send(Outcome::Refused { card, error });
+                    let _ = self.outcomes.send(Outcome::UploadRefused { card, error });
                     return;
                 }
             }
         }
         let Some(shared) = self.links.get(&card) else {
-            let _ = self.outcomes.send(Outcome::Refused {
+            let _ = self.outcomes.send(Outcome::UploadRefused {
                 card,
                 error: CliError::Core(CoreError::Platform(
                     "the upload completed without a retained share link".to_owned(),
@@ -3753,11 +3767,11 @@ impl UploadWorker {
             return;
         };
         let outcome = match scrozz_export::SystemClipboard::new().write_text(&shared.shared.url) {
-            Ok(()) => Outcome::Done {
+            Ok(()) => Outcome::UploadDone {
                 card,
                 detail: "uploaded and copied the private share link".to_owned(),
             },
-            Err(error) => Outcome::Refused {
+            Err(error) => Outcome::UploadRefused {
                 card,
                 error: CliError::Core(CoreError::Platform(format!(
                     "the upload succeeded, but its link could not be copied: {error}. \
@@ -5176,7 +5190,7 @@ mod tests {
         assert!(pipeline.post(Job::Upload(CardId(8))));
 
         match wait_for(&pipeline) {
-            Some(Outcome::Refused { card, .. }) => assert_eq!(card, CardId(8)),
+            Some(Outcome::UploadRefused { card, .. }) => assert_eq!(card, CardId(8)),
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
