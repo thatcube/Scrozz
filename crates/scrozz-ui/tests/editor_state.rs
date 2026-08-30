@@ -1352,6 +1352,39 @@ fn aspect_projection_keeps_the_structurally_snapped_edge_and_guide_aligned() {
 }
 
 #[test]
+fn aspect_projection_drops_a_guide_disconnected_from_the_final_edge_span() {
+    let mut capture = capture();
+    for y in 0..capture.frame.height() as usize {
+        for x in 0..capture.frame.width() as usize {
+            let value = if y < 240 && x < 400 { 32 } else { 224 };
+            let offset = y * capture.frame.stride + x * 4;
+            capture.frame.data[offset..offset + 4].copy_from_slice(&[value, value, value, 255]);
+        }
+    }
+    let index =
+        StructuralBoundaryIndex::analyze(&capture.frame, &AnalysisCancellation::default()).unwrap();
+    assert!(index.segments().iter().any(|segment| {
+        segment.position == 200.0 && segment.start <= 1.0 && segment.end <= 125.0
+    }));
+    let mut state = EditorState::new(Document::new(capture));
+    state.set_tool(Tool::Crop);
+    state.set_crop_aspect(CropAspect::Square);
+    state.set_crop_boundaries(Arc::new(index));
+    let crop = state.pending_crop().unwrap();
+    let top_right = Handle::TopRight.position(&crop);
+    state.pointer_pressed(top_right);
+
+    state.pointer_dragged_with_snap(at(204.0, 100.0), false, false);
+
+    let projected = state.pending_crop().unwrap();
+    assert_eq!(projected.origin.x + projected.size.width, 200.0);
+    assert!(
+        state.active_crop_snap_segments().is_empty(),
+        "the projected edge no longer overlaps the structural segment"
+    );
+}
+
+#[test]
 fn crop_rotation_and_flip_are_transactional_and_share_one_undo_step() {
     let mut state = state();
     draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
@@ -1459,6 +1492,29 @@ fn crop_history_is_orthogonal_to_applied_smart_frame_history() {
 
     state.undo_framing();
     assert_eq!(state.document().beautification(), None);
+}
+
+#[test]
+fn abandoning_empty_text_preserves_applied_smart_frame_and_its_redo_lane() {
+    let mut state = state();
+    state.set_tool(Tool::Text);
+    state.pointer_pressed(at(40.0, 40.0));
+    state.pointer_released();
+    assert!(state.editing_text().is_some());
+
+    let framing = Beautification::preset(BeautificationPreset::Social);
+    state.begin_with(framing.clone());
+    state.apply_smart_frame();
+    state.command(Command::Escape).unwrap();
+
+    assert!(state.document().annotations().is_empty());
+    assert_eq!(state.document().beautification(), Some(&framing));
+    assert!(state.can_undo_framing());
+    state.undo_framing();
+    assert_eq!(state.document().beautification(), None);
+    assert!(state.can_redo_framing());
+    state.redo_framing();
+    assert_eq!(state.document().beautification(), Some(&framing));
 }
 
 #[test]

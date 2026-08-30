@@ -1326,6 +1326,7 @@ impl EditorState {
             if self.selection == Some(id) {
                 self.selection = None;
             }
+            self.synchronize_framing_history();
             if fresh
                 && self
                     .history
@@ -1389,6 +1390,7 @@ impl EditorState {
             self.preedit = None;
             return true;
         }
+        self.synchronize_framing_history();
         let cancelled = self
             .history
             .abandon(&mut self.document)
@@ -3724,7 +3726,8 @@ fn snap_lock_matches_rect(lock: CropSnapLock, rect: LogicalRect) -> bool {
         (BoundaryAxis::Horizontal, CropSnapEdge::Low) => rect.origin.y,
         (BoundaryAxis::Horizontal, CropSnapEdge::High) => geom::max_y(&rect),
     };
-    (coordinate - lock.segment.position).abs() <= 1.0e-6
+    let span = source_span(rect, lock.segment.axis);
+    (coordinate - lock.segment.position).abs() <= 1.0e-6 && lock.segment.overlaps(span.0, span.1)
 }
 
 fn snap_moved_crop(
