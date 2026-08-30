@@ -1389,6 +1389,80 @@ surprising existing users or corrupting active interactions.
 
 ---
 
+## D36 — The editor has one toolbar, two spacings, and one state per card
+
+The annotation editor was carrying three separate places to end a session, two
+places to say "reset this to Automatic", and a Scene inspector whose copy
+explained the feature to a user who had already opened it. It also had a
+transparent shell around the capture that read as dead space rather than as
+margin. This decision settles four things.
+
+**One toolbar.** Cancel and Done live in the editor's own toolbar, to the right
+of the document actions, and nowhere else. There is no chrome bar above the
+canvas, and neither the Scene inspector nor the Crop bar grows an action pair
+of its own; the Crop bar's transaction controls are named *Cancel Crop* and
+*Apply Crop* so two controls a few points apart cannot both say "Cancel" and
+mean different things. Done commits any open Scene draft as part of finishing
+the session, which is why the inspector needs no Apply.
+
+**Two spacings.** A Scene has an *inner content inset* — how much of the
+capture's own outer margin is held back so its content sits centred — and an
+*outer padding* between that content and the Scene background. Both are
+non-destructive, per-property Automatic, undoable, serialised, and preset-
+compatible; both render identically in preview and export because both go
+through the same renderer. Automatic inner inset is deliberately timid: uniform
+or transparent edges only, never more than a quarter of an axis, nothing below
+its confidence floor, and the complete source as the fallback. A window capture
+never takes one at all (D9). See `docs/scene.md`.
+
+**Semantic tokens, not hardcoded surfaces.** `theme::apply_style` now resolves
+egui's five widget states from the palette, and starts from the appearance's own
+base rather than mutating whatever was there. A light window wearing dark widget
+chrome — illegible percentage labels, an invisible Reset to Automatic — was one
+missing line, and it is the kind of bug that only a token layer prevents
+structurally. Keyboard focus rides on the `active` state, so every stock control
+shows a focus ring without anyone remembering to add one (D13).
+
+**One state per card.** A capture card whose editor is open offers exactly one
+control: the Editing/Continue pill. Copy, Save, Pin, Upload and Close are absent
+rather than disabled, because the card's pixels are frozen at their pre-edit
+revision for the whole session and every one of those actions would either
+answer with content the thumbnail is no longer showing or dismiss a card the
+open editor still needs to be raised from. The state covers the commit
+acknowledgement too, not just the open window: Done restores the card's actions
+against the committed edited pixels, Cancel against the prior committed state.
+
+## D37 — A landing card announces itself, once, and then costs nothing
+
+A capture that has just finished sliding into the stack lights up for about six
+seconds: an even wash of light across its thumbnail, then a coloured aurora that
+blooms outward from its edge, turns slowly, and fades to nothing. Colour comes
+from the capture's own dominant hues, weighted by saturation and brightness, so
+what is *present* beats what merely covers area — and a capture with no colour
+in it lights its rim white rather than having a hue invented for it.
+
+The reason this is a decision and not a detail is what it must not do:
+
+- **It starts after the entry motion settles**, from a `landed_at` fixed at the
+  card's birth. The entry timeline is garbage-collected the first frame it stops
+  being active, which is exactly the instant a landing effect wants to read it.
+- **A card the stack was seeded with never animates.** Whatever was already
+  there when the overlay drew its first frame did not just arrive.
+- **Reduce-motion removes it entirely** (D13), and so does an open editor: a
+  card being edited has one thing to say about itself and the pill is saying it.
+- **It leaves the frame schedule when it ends.** `glow::is_active` is the single
+  predicate both the painter and `Activity` read, so a card cannot draw light
+  nobody is scheduling frames for, nor keep a settled or hidden overlay awake.
+  A decorative 60 Hz idle repaint is a battery bug, not a flourish.
+
+The falloff is baked into a texture rather than built from geometry. egui has no
+shaders and interpolates vertex colour affinely, which reproduces a gradient
+exactly only when it is linear; a glow is a steep curve, and every attempt to
+spend mesh resolution on it faceted visibly. The rim's cross-section is an alpha
+image generated once per card size from the exact rounded-rect signed distance,
+leaving the mesh to carry only the broad brightness envelope.
+
+
 # Open questions
 
 - **The Scrozz design language.** Seeded by the spike's token layer; needs

@@ -11,6 +11,12 @@
 //! keeps only video-appropriate corner actions. The card body *is* the drag
 //! handle; there is no separate grab affordance.
 //!
+//! A card whose editor is open is the one exception: it offers no hover
+//! chrome whatsoever, only the Editing/Continue pill. See
+//! [`CardContent::editing`].
+//!
+//! A card that has just arrived also announces itself — see [`glow`].
+//!
 //! # Motion applies to the card, not to its buttons
 //!
 //! The reveal animates because the chrome is an object arriving (D19). The
@@ -27,6 +33,9 @@
 //! capture handed to the clipboard, file encoder and editor is untouched.
 
 use std::time::Duration;
+
+#[path = "card_glow.rs"]
+pub mod glow;
 
 use egui::epaint::{Mesh, Vertex};
 use egui::{
@@ -49,11 +58,15 @@ const ICON_BTN: f32 = 28.0;
 const CHROME_INSET: f32 = Space::SM;
 /// Peak alpha of the hover scrim.
 const HOVER_SCRIM: f32 = 132.0;
-/// Transparent viewport room needed for a fully lifted card shadow to fade.
+/// Transparent viewport room needed for everything a card paints outside
+/// itself to fade out rather than being clipped.
 ///
-/// The deepest card shadow offsets 16 points and blurs 44 points. Forty-eight
-/// points clears that complete falloff with a little rounding tolerance.
-pub const SHADOW_BLEED: f32 = 48.0;
+/// Two things reach past a card's own rectangle, and this clears the larger.
+/// The deepest shadow offsets 13 points and blurs 76 at a 1.4 lift, so its
+/// falloff runs about 71 points; the landing glow's halo reaches
+/// [`glow::HALO_OUT`] points beyond the thumbnail. Eighty points covers both
+/// with rounding tolerance.
+pub const SHADOW_BLEED: f32 = 80.0;
 /// Width below which primary actions collapse to icon-only controls.
 const COMPACT_CHROME_W: f32 = 154.0;
 /// Height below which the two-row chrome collapses to icon-only controls.
@@ -234,14 +247,22 @@ pub struct CardContent<'a> {
     pub provenance: Provenance,
     /// Whether this card is a still or a recording.
     pub media: CardMedia,
-    /// Whether this card's editor is currently open.
+    /// Whether this card's editor is currently open, or is still waiting for
+    /// its close and commit to be acknowledged.
     ///
-    /// While `true` the card freezes its pre-edit thumbnail, replaces its
-    /// edit corner with an always-visible morphing pill (D13), and blocks
-    /// Close as the one action that is not proven revision-safe.
+    /// While `true` the card freezes its pre-edit thumbnail, offers no hover
+    /// chrome at all, and shows one always-visible morphing pill (D13) in its
+    /// place. Copy, Save, Pin, Upload and Close would each answer with
+    /// content the frozen thumbnail is no longer showing, or dismiss a card
+    /// the open editor still needs to be raised from, so the card stops
+    /// offering them rather than offering them greyed out.
     pub editing: bool,
     /// The uploaded thumbnail, if it has been uploaded yet.
     pub texture: Option<egui::TextureId>,
+    /// The colours the capture is made of, sampled when its thumbnail was
+    /// uploaded. Only the landing glow reads this; without it the glow is
+    /// monochrome.
+    pub accent: Option<glow::Accent>,
     /// Whether Upload accepts input for this capture.
     pub upload_enabled: bool,
     /// Accessible explanation for a disabled Upload control.
@@ -261,6 +282,7 @@ impl<'a> CardContent<'a> {
             media: CardMedia::Image,
             editing: false,
             texture: None,
+            accent: None,
             upload_enabled: true,
             upload_unavailable_reason: None,
             status: None,
@@ -271,6 +293,13 @@ impl<'a> CardContent<'a> {
     #[must_use]
     pub fn with_texture(mut self, texture: egui::TextureId) -> Self {
         self.texture = Some(texture);
+        self
+    }
+
+    /// The same content lit, on landing, in its own colours.
+    #[must_use]
+    pub const fn with_accent(mut self, accent: glow::Accent) -> Self {
+        self.accent = Some(accent);
         self
     }
 
@@ -472,7 +501,13 @@ pub fn draw_card(
     }
 
     let capture = geometry.capture;
-    draw_capture(ui, surface, content, chrome, capture, angle, alpha);
+    // Suppressed while the card's editor is open, and under reduce-motion
+    // (D13). `glow::is_active` is the same predicate the frame scheduler
+    // reads, so what is drawn and what is scheduled cannot disagree.
+    let landed = frame.landed.filter(|landed| {
+        glow::is_active(Some(*landed), content.editing, surface.motion.is_reduced())
+    });
+    draw_capture(ui, surface, content, chrome, capture, angle, alpha, landed);
     draw_media_marks(ui, content, capture, alpha);
 
     let reveal = frame.reveal.clamp(0.0, 1.0) * flat;
@@ -501,6 +536,7 @@ pub fn draw_card(
 }
 
 /// Draw the capture itself, or a neutral placeholder while it uploads.
+#[allow(clippy::too_many_arguments)]
 fn draw_capture(
     ui: &mut Ui,
     surface: &Surface<'_>,
@@ -509,13 +545,39 @@ fn draw_capture(
     capture: Rect,
     angle: f32,
     alpha: f32,
+    landed: Option<f32>,
 ) {
     let painter = ui.painter();
     let palette = surface.palette();
 
-    let Some(texture) = content.texture else {
+    if let Some(texture) = content.texture {
+        // Every capture type fills the same preview frame. Cropping exists only
+        // in this texture mapping; the capture itself is never mutated.
+        let uv = cover_uv(capture, content.source_px);
+        let tint = Color32::WHITE.gamma_multiply(alpha);
+        textured_round_rect_uv(
+            painter,
+            texture,
+            capture,
+            uv,
+            chrome.thumb_radius,
+            angle,
+            tint,
+        );
+
+        if chrome.capture_border {
+            painter.rect_stroke(
+                capture,
+                corner(chrome.thumb_radius),
+                Stroke::new(1.0, fade(palette.thumb_border, alpha)),
+                StrokeKind::Inside,
+            );
+        }
+    } else {
         // No pixels yet, so use the same silhouette the cover-filled thumbnail
-        // will occupy when its texture arrives.
+        // will occupy when its texture arrives. The landing treatment below
+        // still runs: it announces the card's arrival, and the card has
+        // arrived whether or not its thumbnail has finished decoding.
         let fill = fade(palette.card_fill, alpha * 0.9);
         if angle.abs() > f32::EPSILON {
             paint::fill_rot_round_rect(
@@ -529,29 +591,19 @@ fn draw_capture(
         } else {
             painter.rect_filled(capture, corner(CardChrome::OUTER_RADIUS), fill);
         }
-        return;
-    };
+    }
 
-    // Every capture type fills the same preview frame. Cropping exists only in
-    // this texture mapping; the capture itself is never mutated.
-    let uv = cover_uv(capture, content.source_px);
-    let tint = Color32::WHITE.gamma_multiply(alpha);
-    textured_round_rect_uv(
-        painter,
-        texture,
-        capture,
-        uv,
-        chrome.thumb_radius,
-        angle,
-        tint,
-    );
-
-    if chrome.capture_border {
-        painter.rect_stroke(
+    // Only on an upright card: the glow's rim is baked as an axis-aligned
+    // rounded rect, and a tilted card is being dragged, which is a different
+    // thing for the card to be saying about itself.
+    if let Some(landed) = landed.filter(|_| angle.abs() <= f32::EPSILON) {
+        glow::draw_landing_glow(
+            painter,
             capture,
-            corner(chrome.thumb_radius),
-            Stroke::new(1.0, fade(palette.thumb_border, alpha)),
-            StrokeKind::Inside,
+            chrome.thumb_radius,
+            landed,
+            content.accent.as_ref(),
+            palette.is_dark(),
         );
     }
 }
@@ -671,6 +723,18 @@ fn draw_chrome(
 
     let inner = container.shrink(CHROME_INSET);
 
+    if content.editing {
+        // A card whose editor is open offers exactly one thing: the pill that
+        // focuses it. Copy, Save, Pin, Upload and Close are not merely
+        // disabled here, they are absent — the card's pixels are frozen at
+        // their pre-edit revision for the whole session, so every one of
+        // those actions would either answer with content the thumbnail is no
+        // longer showing or dismiss a card the open editor still needs. The
+        // hover scrim above stays: it is what makes the pill legible over a
+        // bright capture.
+        return None;
+    }
+
     let lift = Reveal::new(opacity, vec2(0.0, (1.0 - opacity) * 6.0));
     let settle = Reveal::new(opacity, vec2(0.0, (1.0 - opacity) * -3.0));
     let mut pressed = None;
@@ -724,7 +788,7 @@ fn draw_chrome(
     // Smaller matching controls occupy the corners. Close follows native window
     // convention: left on macOS, right on Windows and Linux.
     let size = vec2(ICON_BTN, ICON_BTN);
-    let corners = corner_actions(media, content.editing);
+    let corners = corner_actions(media);
     let origins = [
         inner.left_top(),
         pos2(inner.right() - ICON_BTN, inner.top()),
@@ -738,15 +802,8 @@ fn draw_chrome(
         let r = Rect::from_min_size(origin, size);
         // A control that is drawn and then always fails is worse than one that
         // was never offered — but Upload keeps its slot so the reason can be
-        // read on hover instead of the button silently vanishing. Close is
-        // the one corner action that is not proven revision-safe while a
-        // card's editor is open, so it is the one that gets blocked rather
-        // than deferred: dismissing a card whose thumbnail is deliberately
-        // frozen would either silently lose the pending edit or orphan the
-        // editor with no card left to raise it from.
-        let state = if (action == CardAction::Upload && !content.upload_enabled)
-            || (action == CardAction::Close && content.editing)
-        {
+        // read on hover instead of the button silently vanishing.
+        let state = if action == CardAction::Upload && !content.upload_enabled {
             ControlState::disabled()
         } else {
             ControlState::new()
@@ -765,10 +822,6 @@ fn draw_chrome(
             && let Some(reason) = content.upload_unavailable_reason
         {
             resp = resp.on_disabled_hover_text(reason);
-        } else if action == CardAction::Close && content.editing {
-            resp = resp.on_disabled_hover_text(
-                "Finish editing (Done or Cancel) before closing this card.",
-            );
         }
         if resp.clicked() {
             pressed = Some(action);
@@ -829,18 +882,15 @@ fn draw_editing_pill(
 ///
 /// * **Bottom-left** is the edit affordance. A still gets **Annotate**, a
 ///   recording gets **Edit**; [`CardMedia::edit_action`] is the one place that
-///   decision is made. It is dropped entirely while `editing` is `true`: the
-///   always-visible pill ([`draw_editing_pill`]) is the one control a card
-///   offers for "focus my editor" once that editor exists, so there is never
-///   a moment with two controls claiming the same job.
+///   decision is made.
 /// * **Pin** is empty for a recording. Pin to Screen holds a still image in a
 ///   floating window and has nothing to show for a video, which is exactly what
 ///   the After Capture matrix already says about `record.pin-to-screen`.
-fn corner_actions_for(
-    close_on_left: bool,
-    media: CardMedia,
-    editing: bool,
-) -> [Option<CardAction>; 4] {
+///
+/// None of this is reached while a card's editor is open: [`draw_chrome`]
+/// returns before it, and the always-visible pill ([`draw_editing_pill`]) is
+/// the only control an editing card offers.
+fn corner_actions_for(close_on_left: bool, media: CardMedia) -> [Option<CardAction>; 4] {
     let pin = (!media.is_video()).then_some(CardAction::Pin);
     let close = Some(CardAction::Close);
     let top = if close_on_left {
@@ -851,13 +901,13 @@ fn corner_actions_for(
     [
         top[0],
         top[1],
-        (!editing).then_some(media.edit_action()),
+        Some(media.edit_action()),
         Some(CardAction::Upload),
     ]
 }
 
-fn corner_actions(media: CardMedia, editing: bool) -> [Option<CardAction>; 4] {
-    corner_actions_for(cfg!(target_os = "macos"), media, editing)
+fn corner_actions(media: CardMedia) -> [Option<CardAction>; 4] {
+    corner_actions_for(cfg!(target_os = "macos"), media)
 }
 
 fn primary_pill_rects(inner: Rect) -> Option<[Rect; 2]> {
@@ -1081,7 +1131,7 @@ mod tests {
     #[test]
     fn close_follows_mac_and_windows_corner_conventions() {
         assert_eq!(
-            corner_actions_for(true, CardMedia::Image, false),
+            corner_actions_for(true, CardMedia::Image),
             [
                 Some(CardAction::Close),
                 Some(CardAction::Pin),
@@ -1090,7 +1140,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            corner_actions_for(false, CardMedia::Image, false),
+            corner_actions_for(false, CardMedia::Image),
             [
                 Some(CardAction::Pin),
                 Some(CardAction::Close),
@@ -1104,7 +1154,7 @@ mod tests {
     fn a_recording_card_offers_edit_and_never_offers_pin() {
         let video = CardMedia::video(Duration::from_secs(9), false);
         for close_on_left in [true, false] {
-            let corners = corner_actions_for(close_on_left, video, false);
+            let corners = corner_actions_for(close_on_left, video);
             assert!(
                 !corners.contains(&Some(CardAction::Pin)),
                 "Pin to Screen holds a still image and would always fail here"
@@ -1120,33 +1170,20 @@ mod tests {
     }
 
     #[test]
-    fn editing_suppresses_only_the_redundant_edit_corner() {
-        // The bottom-left "open the editor" corner button disappears once an
-        // editor already exists for this capture -- the always-visible pill
-        // is the one control that offers that job now, and a card must never
-        // show two controls claiming it at once. Every other corner
-        // (Close/Pin/Upload) is untouched: Close is merely disabled later at
-        // draw time, not removed from the slot map, and Pin/Upload stay
-        // fully live because they are already revision-safe.
+    fn every_corner_slot_is_offered_when_no_editor_is_open() {
+        // The slot map itself knows nothing about editing: a card whose
+        // editor is open draws no chrome at all (`draw_chrome` returns before
+        // reaching here), so there is no such thing as a partially offered
+        // corner. See `tests/card_landing.rs` for that contract end to end.
         for media in [
             CardMedia::Image,
             CardMedia::video(Duration::from_secs(4), false),
         ] {
             for close_on_left in [true, false] {
-                let idle = corner_actions_for(close_on_left, media, false);
-                let editing = corner_actions_for(close_on_left, media, true);
-                assert_eq!(editing[2], None, "edit corner is suppressed while editing");
-                assert_eq!(idle[0], editing[0], "top-left corner is unaffected");
-                assert_eq!(idle[1], editing[1], "top-right corner is unaffected");
-                assert_eq!(
-                    idle[3], editing[3],
-                    "upload stays offered while editing: it is revision-safe"
-                );
-                assert!(
-                    idle.contains(&Some(CardAction::Close))
-                        && editing.contains(&Some(CardAction::Close)),
-                    "Close stays present in the slot map; it is disabled at draw time, not removed"
-                );
+                let corners = corner_actions_for(close_on_left, media);
+                assert_eq!(corners[2], Some(media.edit_action()));
+                assert!(corners.contains(&Some(CardAction::Close)));
+                assert!(corners.contains(&Some(CardAction::Upload)));
             }
         }
     }

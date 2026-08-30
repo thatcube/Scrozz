@@ -46,6 +46,12 @@ const NORMALIZED_MAX: u16 = 10_000;
 const FOREGROUND_DISTANCE: u32 = 24;
 const UNIFORM_DISTANCE: u32 = 8;
 
+/// The confidence an automatic inner inset must reach before it is applied.
+///
+/// Below this the detector says nothing rather than guessing: the complete
+/// source is always a correct framing, an over-crop never is.
+const MIN_INSET_CONFIDENCE: u8 = 70;
+
 /// Cooperative cancellation checked throughout image analysis.
 #[derive(Debug, Clone, Default)]
 pub struct AnalysisCancellation {
@@ -698,6 +704,10 @@ pub fn analyze_with_style(
     cancellation.check()?;
 
     let edge = edge_reference(&image, cancellation)?;
+    // The inner inset: how much of the capture's own outer margin to hold back
+    // so the meaningful content sits centred inside the Scene. D9 makes this
+    // unconditional for a window — its silhouette, transparent corners and
+    // shadow are the OS's pixels, and nothing here may trim them.
     let inset = if provenance == Provenance::Window {
         InsetAnalysis {
             inset: SourceInsets::default(),
@@ -705,11 +715,7 @@ pub fn analyze_with_style(
             confidence: 100,
         }
     } else {
-        InsetAnalysis {
-            inset: SourceInsets::default(),
-            decision: InsetDecision::NoExcessMargin,
-            confidence: 100,
-        }
+        detect_inset(&image, frame.scale.get(), edge, cancellation)?
     };
     let focus = visual_focus(&image, inset.inset, frame.scale.get(), edge, cancellation)?;
     let stats = sampled_stats(&image, edge, cancellation)?;
@@ -773,11 +779,7 @@ pub fn analyze_with_style(
     beautification.validate()?;
     Ok(SmartFrameAnalysis {
         beautification,
-        inset_explanation: if provenance == Provenance::Window {
-            inset.decision.explanation().to_owned()
-        } else {
-            "Complete source composition preserved".to_owned()
-        },
+        inset_explanation: inset.decision.explanation().to_owned(),
     })
 }
 
@@ -883,7 +885,21 @@ fn detect_inset(
     let right = image.width.saturating_sub(right);
     let bottom = image.height.saturating_sub(bottom);
     let minimum = (image.width.min(image.height) / 100).clamp(3, 16);
-    let mut px = [left, top, right, bottom];
+    // Never take more than a quarter of an axis from one edge, whatever the
+    // scan found. Past that the "margin" is far more likely to be content the
+    // user framed deliberately than dead space, and over-cropping a screenshot
+    // is the one failure this feature must not have.
+    let ceiling = |extent: u32| {
+        (f64::from(extent) * SourceInsets::MAX_EDGE_FRACTION)
+            .floor()
+            .max(0.0) as u32
+    };
+    let mut px = [
+        left.min(ceiling(image.width)),
+        top.min(ceiling(image.height)),
+        right.min(ceiling(image.width)),
+        bottom.min(ceiling(image.height)),
+    ];
     for value in &mut px {
         if *value < minimum {
             *value = 0;
@@ -895,6 +911,22 @@ fn detect_inset(
         px = [0; 4];
     }
     let has_inset = px.iter().any(|value| *value > 0);
+    let confidence = if !has_inset {
+        0
+    } else if edge.transparent {
+        100
+    } else {
+        96_u8.saturating_sub(edge.spread.saturating_mul(4))
+    };
+    // A merely plausible margin is not good enough: an unsure detector falls
+    // back to the complete source, which is always a correct answer.
+    if has_inset && confidence < MIN_INSET_CONFIDENCE {
+        return Ok(InsetAnalysis {
+            inset: SourceInsets::default(),
+            decision: InsetDecision::LowConfidence,
+            confidence,
+        });
+    }
     let decision = if has_inset {
         if edge.transparent {
             InsetDecision::TransparentMargin
@@ -903,13 +935,6 @@ fn detect_inset(
         }
     } else {
         InsetDecision::NoExcessMargin
-    };
-    let confidence = if !has_inset {
-        0
-    } else if edge.transparent {
-        100
-    } else {
-        96_u8.saturating_sub(edge.spread.saturating_mul(4))
     };
     let to_logical = |value: u32| f64::from(value) / source_scale;
     Ok(InsetAnalysis {

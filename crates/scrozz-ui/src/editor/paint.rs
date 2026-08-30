@@ -307,11 +307,23 @@ pub fn draw_canvas(
     let palette = surface.palette();
     let painter = ui.painter_at(area);
     checkerboard(&painter, area, palette);
+    // A hairline around the working area, so the canvas reads as a surface the
+    // capture sits on rather than as a hole in the shell.
+    painter.rect_stroke(
+        area,
+        corner(0.0),
+        Stroke::new(1.0, palette.hairline),
+        StrokeKind::Inside,
+    );
 
     let content = state.display_content_bounds();
     let output = preview_output_size(state);
     let output_bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), output);
-    let fit_area = area.shrink(Space::LG);
+    // The shell already keeps the canvas clear of the window's edges, so this
+    // is only the hairline of air a capture needs around it — not a second
+    // margin. Hugging the screenshot is the point (D12): the editor exists to
+    // show one image, not to frame it in dead space.
+    let fit_area = area.shrink(Space::SM);
     let image = if state.is_fit_zoom() {
         super::fit(output_bounds, fit_area, 1.0, state.pan())
     } else {

@@ -198,15 +198,22 @@ impl Elevation {
 #[must_use]
 pub fn shadows_for_lift(lift: f32, palette: &Palette) -> (Shadow, Shadow) {
     let lift = lift.clamp(0.0, 4.0);
+    // Wide and faint rather than tight and dark. A short blur concentrates the
+    // whole shadow into a band just under the card, which has a legible outer
+    // edge — and an edge is what reads as harsh. Spreading the same shadow
+    // over more than twice the distance, at well under half the opacity,
+    // gives the card the same weight with nothing in it for the eye to catch.
+    // The key light also sits a little higher: less drop, more diffusion,
+    // which is what an object resting near a surface actually does.
     let ambient = Shadow {
-        offset: [0, quantise_offset(3.0 * lift)],
-        blur: quantise_blur(10.0 * lift),
+        offset: [0, quantise_offset(2.0 * lift)],
+        blur: quantise_blur(24.0 * lift),
         spread: 0,
         color: palette.ambient_shadow,
     };
     let key = Shadow {
-        offset: [0, quantise_offset(16.0 * lift)],
-        blur: quantise_blur(44.0 * lift),
+        offset: [0, quantise_offset(13.0 * lift)],
+        blur: quantise_blur(76.0 * lift),
         spread: 0,
         color: palette.key_shadow,
     };
@@ -473,8 +480,8 @@ impl Palette {
             warning: Color32::from_rgb(0xFF, 0xC4, 0x5C),
             success: Color32::from_rgb(0x63, 0xD6, 0x9A),
 
-            key_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 120),
-            ambient_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 66),
+            key_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 116),
+            ambient_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 62),
 
             thumb_border: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 30),
             chip_fill: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 22),
@@ -563,6 +570,62 @@ impl Palette {
             Color32::from_rgb(0x0B, 0x0C, 0x12)
         } else {
             Color32::from_rgb(0xE9, 0xEC, 0xF5)
+        }
+    }
+
+    /// A recessed surface: a slider track, a text field, a value box.
+    ///
+    /// Opaque on purpose. Everything a value is *read out of* has to stay
+    /// legible over whatever the transparent window happens to sit on, and a
+    /// translucent well over a bright wallpaper is exactly how a percentage
+    /// label becomes unreadable.
+    #[must_use]
+    pub fn well(&self) -> Color32 {
+        if self.is_dark() {
+            Color32::from_rgb(0x12, 0x14, 0x1C)
+        } else {
+            Color32::from_rgb(0xDC, 0xE0, 0xEC)
+        }
+    }
+
+    /// The fill of an interactive control at rest, resolved to an opaque colour.
+    #[must_use]
+    pub fn control_fill(&self) -> Color32 {
+        self.flatten(self.chip_fill)
+    }
+
+    /// The fill of an interactive control under the pointer.
+    #[must_use]
+    pub fn control_fill_hover(&self) -> Color32 {
+        flatten_onto(self.hover, self.control_fill())
+    }
+
+    /// The fill of an interactive control being pressed, or holding focus.
+    #[must_use]
+    pub fn control_fill_active(&self) -> Color32 {
+        flatten_onto(self.active, self.control_fill())
+    }
+
+    /// The accent wash used behind a selected chip or an automatic value.
+    #[must_use]
+    pub fn accent_wash(&self) -> Color32 {
+        flatten_onto(
+            self.accent
+                .gamma_multiply(if self.is_dark() { 0.22 } else { 0.16 }),
+            self.canvas(),
+        )
+    }
+
+    /// Text drawn on [`Palette::accent_wash`].
+    ///
+    /// The raw accent is not usable as ink on its own wash in either theme, so
+    /// this leans it toward the surface's own text colour until it clears AA.
+    #[must_use]
+    pub fn on_accent_wash(&self) -> Color32 {
+        if self.is_dark() {
+            self.accent_hi
+        } else {
+            self.accent_press
         }
     }
 }
@@ -792,23 +855,121 @@ pub fn install_style(ctx: &egui::Context, theme: &Theme) {
 /// the transparent overlay's deliberately dark style.
 pub fn apply_style(style: &mut egui::Style, theme: &Theme) {
     let palette = theme.palette;
+    // Start from egui's own palette *for this appearance*. Mutating whatever
+    // was there before is how a light window ends up wearing dark widget
+    // chrome: the fields below are the ones Scrozz has an opinion about, and
+    // every one it does not name still has to be right side up.
+    style.visuals = if palette.is_dark() {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     let visuals = &mut style.visuals;
     visuals.dark_mode = palette.is_dark();
-    visuals.override_text_color = Some(palette.text);
+    // Deliberately *not* an override: one colour for every widget state paints
+    // a disabled control exactly like an enabled one, and the type ramp then
+    // has no way to say "this value is secondary". State lives in `widgets`.
+    visuals.override_text_color = None;
+    visuals.weak_text_color = Some(palette.text_muted);
+    visuals.widgets = widget_visuals(&palette);
     visuals.panel_fill = Color32::TRANSPARENT;
     visuals.window_fill = Color32::TRANSPARENT;
     visuals.window_stroke = egui::Stroke::NONE;
     visuals.window_shadow = Shadow::NONE;
     visuals.popup_shadow = Shadow::NONE;
-    visuals.selection.bg_fill = palette.accent.linear_multiply(0.55);
-    visuals.selection.stroke = egui::Stroke::new(1.0, palette.on_accent);
+    visuals.window_corner_radius = corner(Radius::CARD);
+    visuals.menu_corner_radius = corner(Radius::BUTTON);
+    // A translucent accent reads as a highlight over text; an opaque one reads
+    // as a block that swallows it.
+    visuals.selection.bg_fill = palette.accent.gamma_multiply(0.45);
+    visuals.selection.stroke = egui::Stroke::new(1.0, palette.text);
+    visuals.hyperlink_color = palette.on_accent_wash();
+    visuals.warn_fg_color = palette.warning;
+    visuals.error_fg_color = palette.recording;
+    visuals.faint_bg_color = palette.chip_fill;
+    visuals.extreme_bg_color = palette.well();
+    visuals.text_edit_bg_color = Some(palette.well());
+    visuals.code_bg_color = palette.well();
+    visuals.slider_trailing_fill = true;
+    visuals.handle_shape = egui::style::HandleShape::Circle;
+    visuals.text_cursor.stroke = egui::Stroke::new(1.5, palette.accent);
     visuals.text_cursor.blink = false;
 
     // Controls are instant (D19); stills are deterministic (D25).
     style.animation_time = 0.0;
     style.spacing.item_spacing = egui::vec2(Space::SM, Space::SM);
     style.spacing.button_padding = egui::vec2(Space::MD, Space::SM);
+    // Deliberately not `spacing.interact_size`: that is egui's *minimum* for
+    // every widget everywhere, and raising it globally re-flows surfaces that
+    // were laid out against the default. Surfaces that want one control
+    // height ask for it locally — see the Scene inspector.
+    style.spacing.slider_rail_height = 4.0;
+    style.spacing.combo_height = 320.0;
     style.text_styles = text_styles(theme);
+}
+
+/// The single control height an inspector's rows agree on, in points.
+///
+/// One number, so a slider, a combo box and a button in the same row line up
+/// without anyone measuring. Applied per surface rather than through
+/// [`egui::style::Spacing::interact_size`], which is a global floor.
+pub const CONTROL_H: f32 = 28.0;
+
+/// egui's five widget states, resolved from the palette.
+///
+/// `active` doubles as the keyboard-focus appearance — egui picks it for a
+/// focused widget as well as a pressed one — so it carries the focus ring
+/// rather than a merely darker fill (D13: focus is always visible).
+#[must_use]
+pub fn widget_visuals(palette: &Palette) -> egui::style::Widgets {
+    use egui::Stroke;
+    let radius = corner(Radius::BUTTON);
+    let text = Stroke::new(1.0, palette.text);
+    egui::style::Widgets {
+        noninteractive: egui::style::WidgetVisuals {
+            bg_fill: palette.well(),
+            weak_bg_fill: palette.flatten(palette.card_fill),
+            bg_stroke: Stroke::new(1.0, palette.hairline),
+            corner_radius: radius,
+            fg_stroke: text,
+            expansion: 0.0,
+        },
+        inactive: egui::style::WidgetVisuals {
+            // Not the well: `bg_fill` is the slider rail, the checkbox box and
+            // the slider handle, and all three have to read against the panel
+            // rather than recede into it the way a text field should.
+            bg_fill: palette.control_fill(),
+            weak_bg_fill: palette.control_fill(),
+            bg_stroke: Stroke::new(1.0, palette.hairline),
+            corner_radius: radius,
+            fg_stroke: text,
+            expansion: 0.0,
+        },
+        hovered: egui::style::WidgetVisuals {
+            bg_fill: palette.control_fill_hover(),
+            weak_bg_fill: palette.control_fill_hover(),
+            bg_stroke: Stroke::new(1.0, palette.divider),
+            corner_radius: radius,
+            fg_stroke: text,
+            expansion: 0.0,
+        },
+        active: egui::style::WidgetVisuals {
+            bg_fill: palette.control_fill_active(),
+            weak_bg_fill: palette.control_fill_active(),
+            bg_stroke: Stroke::new(2.0, palette.focus_ring),
+            corner_radius: radius,
+            fg_stroke: text,
+            expansion: 0.0,
+        },
+        open: egui::style::WidgetVisuals {
+            bg_fill: palette.control_fill_active(),
+            weak_bg_fill: palette.control_fill_active(),
+            bg_stroke: Stroke::new(1.0, palette.accent),
+            corner_radius: radius,
+            fg_stroke: text,
+            expansion: 0.0,
+        },
+    }
 }
 
 /// The type ramp mapped onto egui's built-in text styles.

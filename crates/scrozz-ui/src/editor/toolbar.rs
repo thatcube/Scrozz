@@ -21,7 +21,7 @@ use super::paint::CanvasView;
 use super::state::{Command, CropAspect, EditorState, Intent, Tool};
 use scrozz_annotate::{
     Alignment, AspectPreset, Background, Beautification, BeautificationPreset, BuiltInBackground,
-    ExactOutputSize, GeneratedStyle,
+    ExactOutputSize, GeneratedStyle, SourceInsets,
 };
 
 /// The height of one row of controls, in points.
@@ -62,6 +62,9 @@ const ARROW_ROW: f32 = 40.0;
 /// Maximum quick-palette height before its swatch rail scrolls.
 const POPOVER_MAX_HEIGHT: f32 = 560.0;
 
+/// The height of the canvas zoom readout, in points.
+const ZOOM_H: f32 = 26.0;
+
 /// The stroke-width slider's length, in points.
 const STROKE: f32 = 104.0;
 const REDACT_INTENSITY: f32 = 212.0;
@@ -89,10 +92,23 @@ const ARROW_W: f32 = ARROW_CONTROL;
 /// The space a divider needs: the gap before it, and the gap after.
 const DIVIDER_W: f32 = Space::SM + Space::SM + Space::XS;
 
+/// The width of a text action in the toolbar's commit group.
+const COMMIT_BUTTON_W: f32 = 72.0;
+
+/// The height of every text and icon control on a toolbar row.
+const CONTROL_H: f32 = BUTTON;
+
 /// The width of the right-hand action group, at its widest.
 ///
-/// Four right-aligned document actions.
-const ACTIONS_W: f32 = 4.0f32.mul_add(BUTTON, 3.0 * Space::HAIR);
+/// Four icon document actions, then the session's own Cancel and Done. There
+/// is exactly one place in the editor to finish or abandon a session, and this
+/// is it — no separate chrome bar above the canvas, and nothing inside the
+/// Scene or Crop panels claiming the same job.
+const ACTIONS_W: f32 = 4.0f32.mul_add(BUTTON, 3.0 * Space::HAIR)
+    + DIVIDER_W
+    + COMMIT_BUTTON_W
+    + Space::XS
+    + COMMIT_BUTTON_W;
 
 /// The width the whole toolbar needs to sit on a single row.
 ///
@@ -615,9 +631,57 @@ pub fn draw(
         arrow_popover.close();
     }
 
-    // Actions, right-aligned. Laid out from the right so the group stays
-    // anchored to the window edge as the toolbar grows and shrinks.
-    let mut rx = bar.right() - Space::MD - BUTTON;
+    // The session's own two decisions, right-aligned and furthest from the
+    // tools: Done commits the edited pixels, Cancel abandons them. Both are
+    // unconditional, and both live here and nowhere else.
+    let done_rect = Rect::from_center_size(
+        pos2(bar.right() - Space::MD - COMMIT_BUTTON_W / 2.0, cy),
+        vec2(COMMIT_BUTTON_W, CONTROL_H),
+    );
+    let done = crate::paint::text_button(
+        ui,
+        surface,
+        done_rect,
+        ui.id().with("editor-done"),
+        "Done",
+        true,
+        ControlState::new(),
+    );
+    if done.clicked() && !input_blocked {
+        intent = Some(Intent::Commit);
+    }
+    done.on_hover_text("Finish editing and update this capture");
+
+    let cancel_rect = Rect::from_center_size(
+        pos2(done_rect.left() - Space::XS - COMMIT_BUTTON_W / 2.0, cy),
+        vec2(COMMIT_BUTTON_W, CONTROL_H),
+    );
+    let cancel = crate::paint::text_button(
+        ui,
+        surface,
+        cancel_rect,
+        ui.id().with("editor-cancel"),
+        "Cancel",
+        false,
+        ControlState::new(),
+    );
+    if cancel.clicked() && !input_blocked {
+        intent = Some(Intent::Discard);
+    }
+    cancel.on_hover_text("Discard this editing session");
+
+    let commit_left = cancel_rect.left() - Space::SM;
+    divider_v(
+        ui.painter(),
+        commit_left,
+        row_top(cy),
+        row_bottom(cy),
+        palette,
+    );
+
+    // Document actions, right-aligned. Laid out from the right so the group
+    // stays anchored to the commit pair as the toolbar grows and shrinks.
+    let mut rx = commit_left - Space::SM - Space::XS - BUTTON;
     debug_assert!(
         actions_left(bar) >= controls_right(bar),
         "the toolbar overlapped itself at {}pt",
@@ -696,21 +760,45 @@ fn draw_zoom_control(
     let palette = surface.palette();
     let position = pos2(
         canvas.left() + Space::SM,
-        canvas.bottom() - BUTTON - Space::SM,
+        canvas.bottom() - ZOOM_H - Space::SM,
     );
     egui::Area::new(egui::Id::new("editor-zoom-control"))
         .order(egui::Order::Foreground)
         .fixed_pos(position)
         .show(ui.ctx(), |ui| {
             ui.set_opacity(1.0);
+            // Opaque, not the usual translucent card: this sits over whatever
+            // the capture happens to contain, and a readout that dissolves
+            // into a bright screenshot is the one thing it must never do.
             let frame = Frame::new()
-                .fill(palette.card_fill_raised)
+                .fill(palette.flatten(palette.card_fill_raised))
                 .stroke(Stroke::new(1.0, palette.hairline))
                 .corner_radius(corner(Radius::BUTTON))
-                .inner_margin(Margin::symmetric(Space::SM as i8, Space::XS as i8));
+                .inner_margin(Margin::symmetric(Space::XS as i8, 0));
             frame.show(ui, |ui| {
-                let label = format!("{:.0}%", view.scale() * 100.0);
+                // The frame *is* the indicator, so the control inside it wears
+                // no chrome of its own until it is hovered or focused.
+                {
+                    let widgets = &mut ui.style_mut().visuals.widgets;
+                    widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                    widgets.inactive.bg_stroke = Stroke::NONE;
+                    widgets.hovered.bg_stroke = Stroke::NONE;
+                    widgets.open.bg_stroke = Stroke::NONE;
+                    for state in [
+                        &mut widgets.inactive,
+                        &mut widgets.hovered,
+                        &mut widgets.active,
+                        &mut widgets.open,
+                    ] {
+                        state.corner_radius = corner(Radius::CHIP);
+                        state.fg_stroke = Stroke::new(1.0, palette.text);
+                    }
+                }
+                ui.spacing_mut().button_padding = vec2(Space::XS, Space::XS);
+                let label = egui::RichText::new(format!("{:.0}%", view.scale() * 100.0))
+                    .font(surface.font(Text::Label));
                 ui.menu_button(label, |ui| {
+                    ui.style_mut().visuals.widgets = crate::theme::widget_visuals(palette);
                     if ui
                         .selectable_label(state.is_fit_zoom() && state.pan() == (0.0, 0.0), "Fit")
                         .on_hover_text("Fit the whole image in the editor")
@@ -889,13 +977,13 @@ fn draw_crop_controls(ui: &Ui, surface: &Surface<'_>, state: &mut EditorState, c
                         let _ = state.command(Command::FlipCropVertical);
                     }
 
+                    // No percentage read-out here: the canvas keeps exactly
+                    // one zoom indicator, in its own corner, and a second copy
+                    // in this bar is the duplicate that used to disagree with
+                    // it while being harder to read.
                     if ui.button("Zoom -").clicked() {
                         let _ = state.command(Command::ZoomOut);
                     }
-                    ui.add(
-                        egui::Label::new(format!("{:.0}%", state.effective_zoom() * 100.0))
-                            .sense(Sense::focusable_noninteractive()),
-                    );
                     if ui.button("Zoom +").clicked() {
                         let _ = state.command(Command::ZoomIn);
                     }
@@ -911,7 +999,11 @@ fn draw_crop_controls(ui: &Ui, surface: &Surface<'_>, state: &mut EditorState, c
                     snap_response
                         .on_hover_text("Hold Command/Ctrl while dragging to disable snapping");
 
-                    if ui.button("Cancel").clicked() {
+                    // Named for what they act on. The editor session's own
+                    // Cancel and Done live in the toolbar, and two controls a
+                    // few points apart both saying "Cancel" while meaning
+                    // different things is not a bar worth shipping.
+                    if ui.button("Cancel Crop").clicked() {
                         let _ = state.command(Command::CancelCrop);
                     }
                     if state.document().crop().is_some()
@@ -919,7 +1011,7 @@ fn draw_crop_controls(ui: &Ui, surface: &Surface<'_>, state: &mut EditorState, c
                     {
                         let _ = state.command(Command::RevertCrop);
                     }
-                    if ui.button("Apply").clicked() {
+                    if ui.button("Apply Crop").clicked() {
                         let _ = state.command(Command::ApplyCrop);
                     }
                 });
@@ -1805,13 +1897,37 @@ fn row_top(cy: f32) -> f32 {
 fn row_bottom(cy: f32) -> f32 {
     cy + ROW / 2.0 - Space::XS
 }
+// ── Scene inspector ──────────────────────────────────────────────
+//
+// One spacing rhythm, one radius family, one control height. Every row below
+// is built from the same four slots — label, control, value, Automatic — so a
+// column of them lines up without anyone measuring, and a new property cannot
+// invent its own geometry.
 
-// ── Scene toolbar integration ────────────────────────────────────
+/// Padding between the inspector's own edges and its content.
+const PANEL_PAD: f32 = Space::LG;
+
+/// The height every inspector control shares.
+const PANEL_ROW_H: f32 = crate::theme::CONTROL_H;
+
+/// The width of a metric row's leading label.
+const PANEL_LABEL_W: f32 = 74.0;
+
+/// The width of a metric row's resolved-value read-out.
+const PANEL_VALUE_W: f32 = 58.0;
+
+/// The width of a metric row's Automatic toggle.
+const PANEL_AUTO_W: f32 = 46.0;
+
+/// The height a slider is laid out at inside a metric row.
+const PANEL_SLIDER_H: f32 = 18.0;
 
 /// Draws the Scene controls in the given `panel` rectangle.
 ///
 /// Returns an [`Intent`] if the user triggered something the host must act on
-/// (analysis request, preset save/delete, etc.).
+/// (analysis request, preset save/delete, etc.). Finishing or abandoning the
+/// *editing session* is not one of them: Cancel and Done live in the toolbar,
+/// and this panel never grows a second pair.
 pub fn draw_scene_panel(
     ui: &mut Ui,
     surface: &Surface<'_>,
@@ -1821,72 +1937,41 @@ pub fn draw_scene_panel(
     let palette = surface.palette();
     let mut intent: Option<Intent> = None;
 
-    ui.painter().rect_filled(panel, 0.0, palette.canvas());
+    ui.painter()
+        .rect_filled(panel, 0.0, palette.flatten(palette.card_fill));
     ui.painter().line_segment(
         [panel.left_top(), panel.left_bottom()],
         Stroke::new(1.0, palette.divider),
     );
 
-    // Clip to panel bounds.
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel));
     let child_ui = &mut child;
     ScrollArea::vertical()
         .id_salt("scene-panel")
         .show(child_ui, |ui| {
-            ui.set_min_width(panel.width() - Space::MD * 2.0);
-            ui.add_space(Space::SM);
-
-            if !state.has_smart_frame_draft() {
-                smart_frame_intro(ui, palette);
-                ui.add_space(Space::SM);
-                let label = "Apply Automatic Scene";
-                let btn = ui.add_sized(
-                    [ui.available_width(), 44.0],
-                    egui::Button::new(
-                        egui::RichText::new(label)
-                            .size(14.0)
-                            .color(palette.on_accent)
-                            .strong(),
-                    )
-                    .fill(palette.accent)
-                    .corner_radius(egui::CornerRadius::same(10)),
-                );
-                if btn.clicked() {
-                    intent = Some(state.begin_smart_frame());
-                }
-                ui.add_space(Space::SM);
-                starting_points(ui, state, palette, &mut intent);
-            } else {
-                draft_header(ui, state, palette, &mut intent);
-                ui.add_space(Space::SM);
-
-                section_label(ui, "CURATED BACKGROUNDS", palette);
-                starting_points(ui, state, palette, &mut intent);
-                ui.add_space(Space::SM);
-
-                section_label(ui, "GENERATED FOR THIS CAPTURE", palette);
-                generated_suggestions(ui, state, palette, &mut intent);
-
-                advanced_controls(ui, state, palette, &mut intent);
-                preset_library(ui, state, palette, &mut intent);
-
-                section_rule(ui, palette);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(state.can_undo_framing(), egui::Button::new("Undo Scene"))
-                        .clicked()
-                    {
-                        state.undo_framing();
+            ui.set_min_width(panel.width());
+            ui.set_max_width(panel.width());
+            Frame::new()
+                .inner_margin(Margin {
+                    left: PANEL_PAD as i8,
+                    right: PANEL_PAD as i8,
+                    top: PANEL_PAD as i8,
+                    bottom: (PANEL_PAD * 2.0) as i8,
+                })
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(Space::SM, Space::SM);
+                    ui.spacing_mut().interact_size.y = PANEL_ROW_H;
+                    scene_header(ui, surface, state, &mut intent);
+                    if !state.has_smart_frame_draft() {
+                        return;
                     }
-                    if ui
-                        .add_enabled(state.can_redo_framing(), egui::Button::new("Redo"))
-                        .clicked()
-                    {
-                        state.redo_framing();
-                    }
+                    section_rule(ui, palette);
+                    background_section(ui, state, palette, &mut intent);
+                    section_rule(ui, palette);
+                    frame_section(ui, state, palette, &mut intent);
+                    section_rule(ui, palette);
+                    advanced_section(ui, state, palette, &mut intent);
                 });
-            }
-            ui.add_space(Space::MD);
         });
 
     intent
@@ -1902,106 +1987,708 @@ pub fn draw_smart_frame_panel(
     draw_scene_panel(ui, surface, state, panel)
 }
 
-fn smart_frame_intro(ui: &mut Ui, palette: &crate::theme::Palette) {
-    Frame::new()
-        .fill(palette.card_fill)
-        .corner_radius(egui::CornerRadius::same(12))
-        .inner_margin(Margin::same(14))
-        .stroke(Stroke::new(1.0, palette.hairline))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("SCENE")
-                    .font(egui::FontId::monospace(10.0))
-                    .color(palette.accent)
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("Present the capture without changing it")
-                    .size(17.0)
-                    .color(palette.text)
-                    .strong(),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(
-                    "Scene adds a reversible canvas around untouched capture pixels. \
-                     Export flattens a copy; Remove Scene restores the source.",
+/// Title, current state, and the two controls that scope the whole Scene.
+fn scene_header(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    state: &mut EditorState,
+    intent: &mut Option<Intent>,
+) {
+    let palette = surface.palette();
+    let has_draft = state.has_smart_frame_draft();
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("Scene")
+                    .font(surface.font(Text::Title))
+                    .color(palette.text),
+            )
+            .selectable(false),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if has_draft {
+                if ghost_button(ui, palette, "Remove")
+                    .on_hover_text("Return exactly to the source, with no Scene")
+                    .clicked()
+                {
+                    state.remove_scene();
+                }
+                // Scene keeps its own history, separate from the document's
+                // (D-Scene): undoing a background choice must not also undo an
+                // arrow. These are that history, and nothing else in the
+                // editor offers it.
+                if inspector_icon_button(
+                    ui,
+                    surface,
+                    Icon::ArrowForwardUp,
+                    "Redo Scene change",
+                    "scene-redo",
+                    state.can_redo_framing(),
                 )
-                .small()
+                .clicked()
+                {
+                    state.redo_framing();
+                }
+                if inspector_icon_button(
+                    ui,
+                    surface,
+                    Icon::ArrowBackUp,
+                    "Undo Scene change",
+                    "scene-undo",
+                    state.can_undo_framing(),
+                )
+                .clicked()
+                {
+                    state.undo_framing();
+                }
+            }
+        });
+    });
+
+    if !has_draft {
+        ui.add_space(Space::SM);
+        ui.label(
+            egui::RichText::new("Present this capture on a canvas of its own.")
                 .color(palette.text_muted),
+        );
+        ui.add_space(Space::MD);
+        if accent_button(ui, palette, "Add a Scene", ui.available_width()).clicked() {
+            *intent = Some(state.begin_smart_frame());
+        }
+        return;
+    }
+
+    ui.add_space(Space::SM);
+    ui.horizontal(|ui| {
+        let pending = state.smart_frame_analysis_pending();
+        let automatic = state
+            .document()
+            .scene()
+            .is_some_and(|scene| scene.automatic.any());
+        let (text, accent) = if pending {
+            ("Resolving…", true)
+        } else if automatic {
+            ("Automatic", true)
+        } else {
+            ("Edited", false)
+        };
+        status_chip(ui, palette, text, accent);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(scene_size_summary(state)).color(palette.text_muted),
+                )
+                .selectable(false),
             );
         });
+    });
+    if let Some(explanation) = state
+        .smart_frame_inset_explanation()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+    {
+        ui.add_space(Space::XS);
+        ui.label(
+            egui::RichText::new(explanation)
+                .small()
+                .color(palette.text_muted),
+        );
+    }
 }
 
-fn draft_header(
+/// `1432 × 978 → 1636 × 1182`, in output pixels.
+fn scene_size_summary(state: &EditorState) -> String {
+    let document = state.document();
+    let scale = document.source().frame.scale.get();
+    let px = |value: f64| (value * scale).round().max(1.0) as u64;
+    let content = document.content_size();
+    let output = document.output_logical_size();
+    format!(
+        "{} × {} → {} × {}",
+        px(content.width),
+        px(content.height),
+        px(output.width),
+        px(output.height)
+    )
+}
+
+fn background_section(
     ui: &mut Ui,
     state: &mut EditorState,
     palette: &crate::theme::Palette,
     intent: &mut Option<Intent>,
 ) {
-    let analysis_pending = state.smart_frame_analysis_pending();
-    let inset_explanation = state
-        .smart_frame_inset_explanation()
-        .unwrap_or("")
-        .to_owned();
+    let automatic = state
+        .document()
+        .scene()
+        .is_some_and(|scene| scene.automatic.background);
+    label_row(
+        ui,
+        palette,
+        "Background",
+        &background_summary(state),
+        automatic,
+    );
 
-    Frame::new()
-        .fill(palette.accent.gamma_multiply(0.10))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(Margin::same(14))
-        .stroke(Stroke::new(1.0, palette.accent.gamma_multiply(0.55)))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("SCENE")
-                    .font(egui::FontId::monospace(10.0))
-                    .color(palette.accent)
-                    .strong(),
-            );
-            ui.add_space(5.0);
-            ui.label(
-                egui::RichText::new(if analysis_pending {
-                    "Resolving automatic choices..."
-                } else {
-                    "Editable and reversible"
-                })
-                .color(palette.text)
-                .strong(),
-            );
-            ui.label(
-                egui::RichText::new(inset_explanation)
-                    .small()
-                    .color(palette.text_muted),
-            );
-            if !analysis_pending
-                && ui.small_button("Reset to Automatic").clicked()
-                && let Some(i) = state.reset_scene_to_auto()
+    if !automatic
+        && accent_button(ui, palette, "Automatic background", ui.available_width()).clicked()
+    {
+        let mut scene = state.document().scene().cloned().unwrap_or_default();
+        scene.automatic.background = true;
+        if let Some(next) = state.apply_scene_edit(scene) {
+            *intent = Some(next);
+        } else if let Some(next) = state.request_automatic_background_analysis() {
+            *intent = Some(next);
+        }
+    }
+
+    caption(ui, palette, "Curated");
+    starting_points(ui, state, palette, intent);
+    caption(ui, palette, "Generated from this capture");
+    generated_suggestions(ui, state, palette, intent);
+    caption(ui, palette, "Source");
+
+    let mut config = state.document().scene().cloned().unwrap_or_default();
+    let before = config.clone();
+    ui.horizontal(|ui| {
+        background_selector(ui, &mut config, palette);
+    });
+    if ui
+        .add_sized(
+            [ui.available_width(), PANEL_ROW_H],
+            egui::Button::new("Choose an image…"),
+        )
+        .on_hover_text("Use a picture of your own as the Scene canvas")
+        .clicked()
+    {
+        *intent = Some(Intent::AddImage);
+    }
+    if config != before
+        && let Some(next) = state.apply_scene_edit(config)
+    {
+        *intent = Some(next);
+    }
+}
+
+fn background_summary(state: &EditorState) -> String {
+    let Some(scene) = state.document().scene() else {
+        return "None".to_owned();
+    };
+    match &scene.background {
+        Background::Automatic(background) => match background.style {
+            GeneratedStyle::Balanced => "Balanced".to_owned(),
+            GeneratedStyle::Soft => "Soft".to_owned(),
+            GeneratedStyle::Vibrant => "Vibrant".to_owned(),
+            GeneratedStyle::Neutral => "Neutral".to_owned(),
+        },
+        Background::BuiltIn(background) => built_in_name(*background).to_owned(),
+        Background::BlurredSource { .. } => "Blurred source".to_owned(),
+        Background::Solid(_) => "Colour".to_owned(),
+        Background::Gradient { .. } => "Gradient".to_owned(),
+        Background::Transparent => "Clear".to_owned(),
+        Background::Desktop(_) => "Desktop".to_owned(),
+        Background::Image(_) => "Image".to_owned(),
+    }
+}
+
+const fn built_in_name(background: BuiltInBackground) -> &'static str {
+    match background {
+        BuiltInBackground::Mist => "Mist",
+        BuiltInBackground::Iris => "Iris",
+        BuiltInBackground::Midnight => "Midnight",
+        BuiltInBackground::Sunrise => "Sunrise",
+        BuiltInBackground::Lagoon => "Lagoon",
+        BuiltInBackground::Sand => "Sand",
+    }
+}
+
+/// The two spacings, and the subject's own treatment.
+///
+/// *Inner* is the capture's own margin, held back so its content sits centred
+/// inside the Scene. *Outer* is the space between that content and the Scene
+/// background. They are different distances and they get different rows.
+fn frame_section(
+    ui: &mut Ui,
+    state: &mut EditorState,
+    palette: &crate::theme::Palette,
+    intent: &mut Option<Intent>,
+) {
+    let mut config = state.document().scene().cloned().unwrap_or_default();
+    let before = config.clone();
+    let stylable = state.document().may_style_subject();
+    let content = state.document().content_size();
+    let inset_limit = SourceInsets::limit_for(content.width)
+        .min(SourceInsets::limit_for(content.height))
+        .max(1.0);
+    // Set when a property is handed *back* to Automatic, which is the one
+    // inspector edit that needs the capture looked at again rather than just
+    // stored.
+    let mut resolve_again = false;
+
+    label_row(ui, palette, "Frame", "", false);
+
+    if stylable {
+        // One slider for four edges. An automatic inset can be asymmetric —
+        // the detector measures each edge on its own — and touching this
+        // control replaces it with a uniform one, which is exactly what fixing
+        // a value by hand means everywhere else in this panel.
+        let mut inner = config.inset.largest();
+        let row = metric_row(
+            ui,
+            palette,
+            "Inner",
+            &mut inner,
+            0.0..=inset_limit,
+            config.automatic.inset,
+            true,
+        );
+        if row.changed {
+            config.inset = SourceInsets::uniform(inner);
+        }
+        if let Some(automatic) = row.automatic {
+            config.automatic.inset = automatic;
+            resolve_again |= automatic;
+        }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Holds back the capture's own outer margin. Nothing is discarded.",
+                )
+                .small()
+                .color(palette.text_muted),
+            )
+            .selectable(false),
+        );
+    }
+
+    let mut padding = config.padding;
+    let row = metric_row(
+        ui,
+        palette,
+        "Outer",
+        &mut padding,
+        0.0..=220.0,
+        config.automatic.padding,
+        true,
+    );
+    if row.changed {
+        config.set_uniform_padding(padding);
+    }
+    if let Some(automatic) = row.automatic {
+        config.automatic.padding = automatic;
+        resolve_again |= automatic;
+    }
+
+    if stylable {
+        let mut corners = config.corner_radius;
+        let row = metric_row(
+            ui,
+            palette,
+            "Corners",
+            &mut corners,
+            0.0..=80.0,
+            config.automatic.corners,
+            true,
+        );
+        if row.changed {
+            config.corner_radius = corners;
+        }
+        if let Some(automatic) = row.automatic {
+            config.automatic.corners = automatic;
+            resolve_again |= automatic;
+        }
+
+        let mut shadow = config.shadow;
+        let row = metric_row(
+            ui,
+            palette,
+            "Shadow",
+            &mut shadow,
+            0.0..=80.0,
+            config.automatic.shadow,
+            true,
+        );
+        if row.changed {
+            config.shadow = shadow;
+        }
+        if let Some(automatic) = row.automatic {
+            config.automatic.shadow = automatic;
+            resolve_again |= automatic;
+        }
+    } else {
+        native_subject_note(ui, palette);
+        config.inset = SourceInsets::default();
+        config.corner_radius = 0.0;
+        config.shadow = 0.0;
+        config.border_width = 0.0;
+    }
+
+    label_row(
+        ui,
+        palette,
+        "Placement",
+        if config.auto_balance {
+            "Optically balanced"
+        } else {
+            alignment_name(config.alignment)
+        },
+        config.automatic.placement,
+    );
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut config.auto_balance, "Optical balance");
+    });
+    if !config.auto_balance {
+        alignment_row(ui, &mut config.alignment);
+    }
+
+    if config != before {
+        let edit = state.apply_scene_edit(config);
+        // A property handed back to Automatic has no resolved value until the
+        // capture is analysed again, so asking for that analysis is part of
+        // the same edit rather than something the user has to trigger.
+        *intent = if resolve_again {
+            state.request_scene_automatic_analysis().or(edit)
+        } else {
+            edit
+        };
+    }
+}
+
+/// Everything that is a deliberate choice rather than a first impression.
+fn advanced_section(
+    ui: &mut Ui,
+    state: &mut EditorState,
+    palette: &crate::theme::Palette,
+    intent: &mut Option<Intent>,
+) {
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Output and presets")
+            .color(palette.text)
+            .strong(),
+    )
+    .id_salt("scene-advanced")
+    .default_open(false)
+    .show_unindented(ui, |ui| {
+        ui.spacing_mut().item_spacing = vec2(Space::SM, Space::SM);
+        output_controls(ui, state, palette, intent);
+        section_rule(ui, palette);
+        preset_library(ui, state, palette, intent);
+        section_rule(ui, palette);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_sized(
+                    [ui.available_width(), PANEL_ROW_H],
+                    egui::Button::new("Reset to Automatic"),
+                )
+                .on_hover_text("Resolve every Scene value from this capture again")
+                .clicked()
+                && let Some(next) = state.reset_scene_to_auto()
             {
-                *intent = Some(i);
+                *intent = Some(next);
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let apply = ui.add_sized(
-                    [112.0, 34.0],
-                    egui::Button::new(
-                        egui::RichText::new("Done")
-                            .strong()
-                            .color(palette.on_accent),
-                    )
-                    .fill(palette.accent)
-                    .corner_radius(egui::CornerRadius::same(8)),
-                );
-                if apply.clicked() {
-                    state.apply_scene();
-                }
-                if ui
-                    .add_sized([92.0, 34.0], egui::Button::new("Cancel"))
-                    .clicked()
-                {
-                    state.cancel_scene();
-                }
-            });
         });
+        if ui
+            .add_sized(
+                [ui.available_width(), PANEL_ROW_H],
+                egui::Button::new("Clear canvas"),
+            )
+            .on_hover_text("Keep Scene spacing and controls, but use a transparent canvas")
+            .clicked()
+        {
+            state.clear_scene_canvas();
+        }
+    });
+}
+
+fn output_controls(
+    ui: &mut Ui,
+    state: &mut EditorState,
+    palette: &crate::theme::Palette,
+    intent: &mut Option<Intent>,
+) {
+    let mut config = state.document().scene().cloned().unwrap_or_default();
+    let before = config.clone();
+
+    label_row(ui, palette, "Ratio", aspect_name(config.aspect), false);
+    aspect_row(ui, &mut config.aspect);
+    if config.aspect != AspectPreset::Original {
+        config.output_size = None;
+    }
+
+    let mut exact = config.output_size.is_some();
+    ui.checkbox(&mut exact, "Minimum output size");
+    if exact {
+        let default = config.output_size.unwrap_or_else(|| {
+            let scale = state.document().source().frame.scale.get();
+            let size = config.output_size(state.document().content_size());
+            ExactOutputSize {
+                width: (size.width * scale).round().max(1.0) as u32,
+                height: (size.height * scale).round().max(1.0) as u32,
+            }
+        });
+        let mut width = default.width;
+        let mut height = default.height;
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut width)
+                    .range(1..=16_384)
+                    .prefix("W "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut height)
+                    .range(1..=16_384)
+                    .prefix("H "),
+            );
+        });
+        config.output_size = Some(ExactOutputSize { width, height });
+    } else {
+        config.output_size = None;
+    }
+
+    if config != before
+        && let Some(next) = state.apply_scene_edit(config)
+    {
+        *intent = Some(next);
+    }
+}
+
+const fn aspect_name(aspect: AspectPreset) -> &'static str {
+    match aspect {
+        AspectPreset::Original => "Original",
+        AspectPreset::Square => "1:1",
+        AspectPreset::Portrait => "4:5",
+        AspectPreset::Story => "9:16",
+        AspectPreset::Landscape => "16:9",
+        AspectPreset::Wide => "3:1",
+    }
+}
+
+// ── Inspector primitives ─────────────────────────────────────────
+
+/// What one [`metric_row`] decided this frame.
+struct MetricRow {
+    /// The slider moved.
+    changed: bool,
+    /// The Automatic toggle was pressed, and this is its new state.
+    automatic: Option<bool>,
+}
+
+/// Label, slider, value and Automatic, at fixed widths.
+fn metric_row(
+    ui: &mut Ui,
+    palette: &crate::theme::Palette,
+    label: &str,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+    automatic: bool,
+    supports_auto: bool,
+) -> MetricRow {
+    let mut outcome = MetricRow {
+        changed: false,
+        automatic: None,
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = Space::SM;
+        ui.add_sized(
+            [PANEL_LABEL_W, PANEL_ROW_H],
+            egui::Label::new(egui::RichText::new(label).color(palette.text))
+                .selectable(false)
+                .halign(Align::LEFT),
+        );
+        let auto_w = if supports_auto {
+            PANEL_AUTO_W + Space::SM
+        } else {
+            0.0
+        };
+        let slider_w =
+            (ui.available_width() - PANEL_VALUE_W - auto_w - Space::SM).clamp(40.0, 400.0);
+        // Shorter than the row on purpose: egui derives the handle radius
+        // from the height it is given, so a full-height slider grows a handle
+        // that dwarfs the value beside it.
+        let response = ui.add_sized(
+            [slider_w, PANEL_SLIDER_H],
+            egui::Slider::new(value, range).show_value(false),
+        );
+        response.widget_info(|| {
+            WidgetInfo::labeled(WidgetType::Slider, true, format!("{label}: {value:.0} pt"))
+        });
+        outcome.changed = response.changed();
+        value_box(ui, palette, &format!("{value:.0} pt"));
+        if supports_auto {
+            let toggle = auto_toggle(ui, palette, automatic);
+            if toggle.clicked() {
+                outcome.automatic = Some(!automatic);
+            }
+        }
+    });
+    outcome
+}
+
+/// A section's name and the value it currently resolves to.
+fn label_row(
+    ui: &mut Ui,
+    palette: &crate::theme::Palette,
+    label: &str,
+    resolved: &str,
+    automatic: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(egui::RichText::new(label).color(palette.text).strong())
+                .selectable(false),
+        );
+        if resolved.is_empty() {
+            return;
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(resolved).small().color(if automatic {
+                    palette.on_accent_wash()
+                } else {
+                    palette.text_muted
+                }))
+                .selectable(false),
+            );
+        });
+    });
+}
+
+/// A read-only numeric read-out, on the one recessed surface.
+fn value_box(ui: &mut Ui, palette: &crate::theme::Palette, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(vec2(PANEL_VALUE_W, PANEL_ROW_H), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, corner(Radius::CHIP), palette.well());
+    painter.rect_stroke(
+        rect,
+        corner(Radius::CHIP),
+        Stroke::new(1.0, palette.hairline),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        Text::Caption.font(),
+        palette.text,
+    );
+}
+
+/// The per-property Automatic switch.
+fn auto_toggle(ui: &mut Ui, palette: &crate::theme::Palette, on: bool) -> Response {
+    let (fill, ink, edge) = if on {
+        (
+            palette.accent_wash(),
+            palette.on_accent_wash(),
+            palette.accent,
+        )
+    } else {
+        (palette.control_fill(), palette.text_muted, palette.hairline)
+    };
+    let response = ui.add_sized(
+        [PANEL_AUTO_W, PANEL_ROW_H],
+        egui::Button::new(egui::RichText::new("Auto").small().color(ink))
+            .fill(fill)
+            .stroke(Stroke::new(1.0, edge))
+            .corner_radius(corner(Radius::CHIP)),
+    );
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Button,
+            true,
+            if on {
+                "Automatic: on"
+            } else {
+                "Automatic: off"
+            },
+        )
+    });
+    if on {
+        response.on_hover_text("Resolved from this capture. Press to fix the current value.")
+    } else {
+        response.on_hover_text("Fixed. Press to resolve this from the capture again.")
+    }
+}
+
+/// A full-width primary action.
+fn accent_button(
+    ui: &mut Ui,
+    palette: &crate::theme::Palette,
+    label: &str,
+    width: f32,
+) -> Response {
+    ui.add_sized(
+        [width, PANEL_ROW_H + 6.0],
+        egui::Button::new(egui::RichText::new(label).color(palette.on_accent).strong())
+            .fill(palette.accent)
+            .corner_radius(corner(Radius::BUTTON)),
+    )
+}
+
+/// One square icon action on an inspector row.
+fn inspector_icon_button(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    icon: Icon,
+    label: &str,
+    salt: &'static str,
+    enabled: bool,
+) -> Response {
+    let (rect, _) = ui.allocate_exact_size(vec2(PANEL_ROW_H, PANEL_ROW_H), Sense::hover());
+    let flags = if enabled {
+        ControlState::new()
+    } else {
+        ControlState::disabled()
+    };
+    let response = icon_button(
+        ui,
+        surface,
+        rect,
+        ui.id().with(salt),
+        icon,
+        label,
+        flags,
+        Reveal::SHOWN,
+    );
+    response.on_hover_text(label)
+}
+
+/// A quiet text action that carries no fill until it is hovered.
+fn ghost_button(ui: &mut Ui, palette: &crate::theme::Palette, label: &str) -> Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(palette.text_muted))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .corner_radius(corner(Radius::CHIP))
+            .min_size(vec2(0.0, PANEL_ROW_H)),
+    )
+}
+
+/// The draft's current disposition, as one small badge.
+fn status_chip(ui: &mut Ui, palette: &crate::theme::Palette, text: &str, accent: bool) {
+    let (fill, ink) = if accent {
+        (palette.accent_wash(), palette.on_accent_wash())
+    } else {
+        (palette.control_fill(), palette.text)
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), Text::Caption.font(), ink);
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(galley.size().x + Space::MD, PANEL_ROW_H - 6.0),
+        Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, corner(Radius::pill(rect.height())), fill);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
+}
+
+/// A small all-caps group heading inside a section.
+fn caption(ui: &mut Ui, palette: &crate::theme::Palette, text: &str) {
+    ui.add_space(Space::XS);
+    ui.add(
+        egui::Label::new(egui::RichText::new(text).small().color(palette.text_faint))
+            .selectable(false),
+    );
 }
 
 fn starting_points(
@@ -2011,21 +2698,21 @@ fn starting_points(
     intent: &mut Option<Intent>,
 ) {
     ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing = vec2(Space::XS, Space::XS);
         ui.horizontal_wrapped(|ui| {
-            for (label, background) in [
-                ("Mist", BuiltInBackground::Mist),
-                ("Iris", BuiltInBackground::Iris),
-                ("Midnight", BuiltInBackground::Midnight),
-                ("Sunrise", BuiltInBackground::Sunrise),
-                ("Lagoon", BuiltInBackground::Lagoon),
-                ("Sand", BuiltInBackground::Sand),
+            for background in [
+                BuiltInBackground::Mist,
+                BuiltInBackground::Iris,
+                BuiltInBackground::Midnight,
+                BuiltInBackground::Sunrise,
+                BuiltInBackground::Lagoon,
+                BuiltInBackground::Sand,
             ] {
                 let selected = matches!(
                     state.document().scene(),
                     Some(scene) if scene.background == Background::BuiltIn(background)
                 );
-                let response = pill_button(ui, label, selected, palette);
+                let response = pill_button(ui, built_in_name(background), selected, palette);
                 if response.clicked() {
                     let mut scene = state
                         .document()
@@ -2054,7 +2741,7 @@ fn generated_suggestions(
     intent: &mut Option<Intent>,
 ) {
     ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing = vec2(Space::XS, Space::XS);
         ui.horizontal_wrapped(|ui| {
             for (label, style) in [
                 ("Balanced", GeneratedStyle::Balanced),
@@ -2086,22 +2773,12 @@ fn preset_library(
     if presets.is_empty() && !allow_save {
         return;
     }
-    ui.label(
-        egui::RichText::new("Your presets")
-            .color(palette.text)
-            .strong(),
-    );
-    if presets.is_empty() {
-        ui.label(
-            egui::RichText::new("Save the current draft to reuse it on another capture.")
-                .small()
-                .color(palette.text_muted),
-        );
-    } else {
+    label_row(ui, palette, "Presets", "", false);
+    if !presets.is_empty() {
         let selected_name = state
             .selected_preset()
             .and_then(|id| presets.iter().find(|p| p.id == id))
-            .map_or("Choose a custom preset", |p| p.name.as_str())
+            .map_or("Choose a preset", |p| p.name.as_str())
             .to_owned();
         egui::ComboBox::from_id_salt("smart-frame-custom-preset")
             .selected_text(&selected_name)
@@ -2125,12 +2802,10 @@ fn preset_library(
     if !allow_save {
         return;
     }
-    ui.add_space(7.0);
     let mut name = state.preset_name().to_owned();
-    ui.add(
-        egui::TextEdit::singleline(&mut name)
-            .hint_text("Preset name")
-            .desired_width(ui.available_width()),
+    ui.add_sized(
+        [ui.available_width(), PANEL_ROW_H],
+        egui::TextEdit::singleline(&mut name).hint_text("Preset name"),
     );
     state.set_preset_name(name);
 
@@ -2138,16 +2813,14 @@ fn preset_library(
         .selected_preset()
         .and_then(|id| presets.iter().find(|p| p.id == id))
         .is_some_and(|p| p.name == state.preset_name().trim());
-    let save_label = if updates_selected {
-        "Update Scene preset"
-    } else {
-        "Save Scene as Preset"
-    };
-    ui.horizontal_wrapped(|ui| {
+    let save_label = if updates_selected { "Update" } else { "Save" };
+    ui.horizontal(|ui| {
+        let slots = 1.0 + f32::from(u8::from(state.selected_preset().is_some())) * 2.0;
+        let width = ((ui.available_width() - Space::SM * (slots - 1.0)) / slots).max(40.0);
         if ui
             .add_enabled(
                 !state.preset_name().trim().is_empty(),
-                egui::Button::new(save_label),
+                egui::Button::new(save_label).min_size(vec2(width, PANEL_ROW_H)),
             )
             .clicked()
         {
@@ -2159,198 +2832,28 @@ fn preset_library(
                 Err(error) => tracing::warn!(%error, "preset build failed"),
             }
         }
-        if state.selected_preset().is_some() && ui.small_button("Duplicate").clicked() {
-            match state.build_preset(true) {
-                Ok(preset) => {
-                    state.upsert_local_preset(preset.clone());
-                    *intent = Some(Intent::UpsertPreset(Box::new(preset)));
+        if state.selected_preset().is_some() {
+            if ui
+                .add(egui::Button::new("Duplicate").min_size(vec2(width, PANEL_ROW_H)))
+                .clicked()
+            {
+                match state.build_preset(true) {
+                    Ok(preset) => {
+                        state.upsert_local_preset(preset.clone());
+                        *intent = Some(Intent::UpsertPreset(Box::new(preset)));
+                    }
+                    Err(error) => tracing::warn!(%error, "preset duplicate failed"),
                 }
-                Err(error) => tracing::warn!(%error, "preset duplicate failed"),
+            }
+            if let Some(id) = state.selected_preset().map(str::to_owned)
+                && ui
+                    .add(egui::Button::new("Delete").min_size(vec2(width, PANEL_ROW_H)))
+                    .clicked()
+            {
+                state.delete_preset(&id);
+                *intent = Some(Intent::DeletePreset(id));
             }
         }
-        if let Some(id) = state.selected_preset().map(str::to_owned)
-            && ui.small_button("Delete").clicked()
-        {
-            state.delete_preset(&id);
-            *intent = Some(Intent::DeletePreset(id));
-        }
-    });
-}
-
-fn advanced_controls(
-    ui: &mut Ui,
-    state: &mut EditorState,
-    palette: &crate::theme::Palette,
-    intent: &mut Option<Intent>,
-) {
-    let mut config = state
-        .document()
-        .beautification()
-        .cloned()
-        .unwrap_or_default();
-    let before = config.clone();
-
-    section_rule(ui, palette);
-    section_label(ui, "BACKGROUND", palette);
-    background_selector(ui, &mut config, palette);
-
-    section_rule(ui, palette);
-    section_label(ui, "CANVAS", palette);
-    let mut padding = config.padding;
-    property_status(
-        ui,
-        "Padding",
-        config.automatic.padding,
-        format!("{padding:.0} pt"),
-        palette,
-    );
-    if ui
-        .add(egui::Slider::new(&mut padding, 0.0..=220.0).show_value(false))
-        .changed()
-    {
-        config.set_uniform_padding(padding);
-    }
-
-    ui.add_space(6.0);
-    property_status(
-        ui,
-        "Placement",
-        config.automatic.placement,
-        if config.auto_balance {
-            "Subtle optical balance"
-        } else {
-            alignment_name(config.alignment)
-        },
-        palette,
-    );
-    ui.checkbox(&mut config.auto_balance, "Automatic balance");
-    if !config.auto_balance {
-        alignment_row(ui, &mut config.alignment);
-    }
-
-    ui.add_space(8.0);
-    ui.label(
-        egui::RichText::new("Aspect ratio")
-            .color(palette.text)
-            .strong(),
-    );
-    aspect_row(ui, &mut config.aspect);
-    if config.aspect != AspectPreset::Original {
-        config.output_size = None;
-    }
-
-    ui.add_space(8.0);
-    let mut exact = config.output_size.is_some();
-    ui.checkbox(&mut exact, "Minimum output size");
-    if exact {
-        let default = config.output_size.unwrap_or_else(|| {
-            let scale = state.document().source().frame.scale.get();
-            let size = config.output_size(state.document().content_size());
-            ExactOutputSize {
-                width: (size.width * scale).round().max(1.0) as u32,
-                height: (size.height * scale).round().max(1.0) as u32,
-            }
-        });
-        let mut width = default.width;
-        let mut height = default.height;
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::DragValue::new(&mut width)
-                    .range(1..=16_384)
-                    .prefix("W "),
-            );
-            ui.add(
-                egui::DragValue::new(&mut height)
-                    .range(1..=16_384)
-                    .prefix("H "),
-            );
-        });
-        config.output_size = Some(ExactOutputSize { width, height });
-    } else {
-        config.output_size = None;
-    }
-
-    section_rule(ui, palette);
-    section_label(ui, "APPEARANCE", palette);
-    ui.add_enabled_ui(state.document().may_style_subject(), |ui| {
-        property_status(
-            ui,
-            "Corners",
-            config.automatic.corners,
-            format!("{:.0} pt", config.corner_radius),
-            palette,
-        );
-        ui.add(egui::Slider::new(&mut config.corner_radius, 0.0..=80.0).show_value(false));
-        property_status(
-            ui,
-            "Shadow",
-            config.automatic.shadow,
-            format!("{:.0} pt", config.shadow),
-            palette,
-        );
-        ui.add(egui::Slider::new(&mut config.shadow, 0.0..=80.0).show_value(false));
-    });
-    if !state.document().may_style_subject() {
-        d9_outer_canvas_note(ui, palette);
-        config.corner_radius = 0.0;
-        config.shadow = 0.0;
-        config.border_width = 0.0;
-    }
-
-    if config != before
-        && let Some(i) = state.apply_scene_edit(config)
-    {
-        *intent = Some(i);
-    }
-
-    section_rule(ui, palette);
-    ui.horizontal_wrapped(|ui| {
-        if ui.button("Reset to Automatic").clicked()
-            && let Some(next) = state.reset_scene_to_auto()
-        {
-            *intent = Some(next);
-        }
-        if ui
-            .button("Clear canvas")
-            .on_hover_text("Keep Scene spacing and controls, but use a transparent canvas.")
-            .clicked()
-        {
-            state.clear_scene_canvas();
-        }
-        if ui
-            .button("Remove Scene")
-            .on_hover_text("Return exactly to the source without Scene.")
-            .clicked()
-        {
-            state.remove_scene();
-        }
-    });
-}
-
-fn property_status(
-    ui: &mut Ui,
-    label: &str,
-    automatic: bool,
-    resolved: impl std::fmt::Display,
-    palette: &crate::theme::Palette,
-) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(palette.text).strong());
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(if automatic {
-                    format!("Automatic · {resolved}")
-                } else {
-                    resolved.to_string()
-                })
-                .small()
-                .color(if automatic {
-                    palette.accent
-                } else {
-                    palette.text_muted
-                }),
-            );
-        });
     });
 }
 
@@ -2389,11 +2892,11 @@ fn alignment_row(ui: &mut Ui, alignment: &mut Alignment) {
         });
 }
 
-fn background_selector(ui: &mut Ui, config: &mut Beautification, palette: &crate::theme::Palette) {
+fn background_selector(ui: &mut Ui, config: &mut Beautification, _palette: &crate::theme::Palette) {
     let choices = [
         ("Automatic", 0u8),
         ("Blurred source", 1),
-        ("Color", 2),
+        ("Colour", 2),
         ("Gradient", 3),
         ("Clear", 4),
     ];
@@ -2408,14 +2911,7 @@ fn background_selector(ui: &mut Ui, config: &mut Beautification, palette: &crate
     let current_label = match &config.background {
         Background::Desktop(_) => "Desktop",
         Background::Image(_) => "Image",
-        Background::BuiltIn(background) => match background {
-            BuiltInBackground::Mist => "Mist",
-            BuiltInBackground::Iris => "Iris",
-            BuiltInBackground::Midnight => "Midnight",
-            BuiltInBackground::Sunrise => "Sunrise",
-            BuiltInBackground::Lagoon => "Lagoon",
-            BuiltInBackground::Sand => "Sand",
-        },
+        Background::BuiltIn(background) => built_in_name(*background),
         _ => choices[current as usize].0,
     };
     egui::ComboBox::from_id_salt("scene-background")
@@ -2443,125 +2939,58 @@ fn background_selector(ui: &mut Ui, config: &mut Beautification, palette: &crate
                 }
             }
         });
-    ui.label(
-        egui::RichText::new("Desktop and Image appear here after the host supplies pixels.")
-            .small()
-            .color(palette.text_muted),
-    );
 }
 
 fn aspect_row(ui: &mut Ui, aspect: &mut AspectPreset) {
     let choices = [
-        ("Original", AspectPreset::Original),
-        ("16:9", AspectPreset::Landscape),
-        ("1:1", AspectPreset::Square),
-        ("9:16", AspectPreset::Story),
+        AspectPreset::Original,
+        AspectPreset::Landscape,
+        AspectPreset::Square,
+        AspectPreset::Portrait,
+        AspectPreset::Story,
+        AspectPreset::Wide,
     ];
     egui::ComboBox::from_id_salt("scene-aspect")
-        .selected_text(
-            choices
-                .iter()
-                .find(|(_, a)| a == aspect)
-                .map_or("Custom", |(l, _)| l),
-        )
+        .selected_text(aspect_name(*aspect))
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
-            for (label, candidate) in &choices {
-                if ui.selectable_label(*aspect == *candidate, *label).clicked() {
-                    *aspect = *candidate;
+            for candidate in choices {
+                if ui
+                    .selectable_label(*aspect == candidate, aspect_name(candidate))
+                    .clicked()
+                {
+                    *aspect = candidate;
                 }
             }
         });
 }
 
 fn section_rule(ui: &mut Ui, palette: &crate::theme::Palette) {
-    ui.add_space(10.0);
+    ui.add_space(Space::MD);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter().line_segment(
         [
-            pos2(ui.cursor().left(), ui.cursor().top()),
-            pos2(ui.cursor().left() + ui.available_width(), ui.cursor().top()),
+            pos2(rect.left(), rect.center().y),
+            pos2(rect.right(), rect.center().y),
         ],
         Stroke::new(1.0, palette.hairline),
     );
-    ui.add_space(10.0);
+    ui.add_space(Space::MD);
 }
 
-fn section_label(ui: &mut Ui, text: &str, palette: &crate::theme::Palette) {
-    ui.label(
-        egui::RichText::new(text)
-            .font(egui::FontId::monospace(10.0))
-            .color(palette.text_muted)
-            .strong(),
+/// The one thing a native window capture will not do, said once.
+fn native_subject_note(ui: &mut Ui, palette: &crate::theme::Palette) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "This window keeps its own silhouette, corners and shadow. \
+                 Only the canvas around it changes.",
+            )
+            .small()
+            .color(palette.text_muted),
+        )
+        .selectable(false),
     );
-    ui.add_space(6.0);
-}
-
-fn d9_outer_canvas_note(ui: &mut Ui, palette: &crate::theme::Palette) {
-    let danger = if palette.is_dark() {
-        Color32::from_rgb(0xFF, 0x7A, 0x70)
-    } else {
-        Color32::from_rgb(0xB4, 0x23, 0x18)
-    };
-    ui.add_space(8.0);
-    Frame::new()
-        .fill(danger.gamma_multiply(0.10))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(Margin::same(16))
-        .stroke(Stroke::new(1.0, danger.gamma_multiply(0.7)))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("NATIVE APPEARANCE")
-                    .font(egui::FontId::monospace(10.0))
-                    .color(danger)
-                    .strong(),
-            );
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Only the outer presentation canvas changes.")
-                    .color(palette.text)
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(
-                    "The captured silhouette, corners, and shadow stay byte-stable. \
-                     Scene can change only background, padding, placement, ratio, and \
-                     output size.",
-                )
-                .color(palette.text_muted),
-            );
-        });
-}
-
-fn sensitive_suggestions(ui: &mut Ui, state: &EditorState, palette: &crate::theme::Palette) {
-    section_label(ui, "PRIVACY REVIEW", palette);
-    match state.sensitive_review() {
-        Some(review) if !review.suggestions.is_empty() => {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} suggestion{} awaiting review",
-                    review.suggestions.len(),
-                    if review.suggestions.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                ))
-                .color(palette.text),
-            );
-            ui.label(
-                egui::RichText::new("Smart Frame never redacts suggested regions automatically.")
-                    .small()
-                    .color(palette.text_muted),
-            );
-        }
-        _ => {
-            ui.label(
-                egui::RichText::new("No reviewed sensitive-region suggestions")
-                    .small()
-                    .color(palette.text_muted),
-            );
-        }
-    }
 }
 
 fn pill_button(
@@ -2570,24 +2999,20 @@ fn pill_button(
     selected: bool,
     palette: &crate::theme::Palette,
 ) -> Response {
-    let fill = if selected {
-        palette.accent.gamma_multiply(0.25)
+    let (fill, ink, edge) = if selected {
+        (
+            palette.accent_wash(),
+            palette.on_accent_wash(),
+            palette.accent,
+        )
     } else {
-        palette.chip_fill
-    };
-    let stroke = if selected {
-        Stroke::new(1.0, palette.accent)
-    } else {
-        Stroke::new(1.0, palette.hairline)
+        (palette.control_fill(), palette.text, palette.hairline)
     };
     ui.add(
-        egui::Button::new(egui::RichText::new(label).color(if selected {
-            palette.accent
-        } else {
-            palette.text
-        }))
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(egui::CornerRadius::same(8)),
+        egui::Button::new(egui::RichText::new(label).color(ink))
+            .fill(fill)
+            .stroke(Stroke::new(1.0, edge))
+            .corner_radius(corner(Radius::CHIP))
+            .min_size(vec2(0.0, PANEL_ROW_H)),
     )
 }

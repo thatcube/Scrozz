@@ -674,6 +674,14 @@ pub struct SourceInsets {
 }
 
 impl SourceInsets {
+    /// The largest share of one axis a single edge may ever remove.
+    ///
+    /// The inner inset exists to centre real content, not to become a second
+    /// crop tool: a quarter of an axis per edge still leaves half the capture
+    /// under the most aggressive setting the inspector can express, and the
+    /// automatic detector is far more conservative than that again.
+    pub const MAX_EDGE_FRACTION: f64 = 0.25;
+
     /// Equal inset on every edge.
     #[must_use]
     pub const fn uniform(value: f64) -> Self {
@@ -691,6 +699,50 @@ impl SourceInsets {
         [self.left, self.top, self.right, self.bottom]
             .into_iter()
             .all(|value| value <= 0.0)
+    }
+
+    /// The largest inset one edge may take on an axis of `extent` points.
+    #[must_use]
+    pub fn limit_for(extent: f64) -> f64 {
+        if extent.is_finite() && extent > 0.0 {
+            (extent * Self::MAX_EDGE_FRACTION).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// This inset clamped into the bounds `size` allows, with NaN treated as
+    /// zero.
+    ///
+    /// Every path that stores an inset goes through here, so a hand-edited
+    /// sidecar, a preset authored against a larger capture, or a slider driven
+    /// to its end all land on the same conservative envelope.
+    #[must_use]
+    pub fn clamped_within(self, size: LogicalSize) -> Self {
+        let horizontal = Self::limit_for(size.width);
+        let vertical = Self::limit_for(size.height);
+        let clamp = |value: f64, limit: f64| {
+            if value.is_finite() {
+                value.clamp(0.0, limit)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            left: clamp(self.left, horizontal),
+            top: clamp(self.top, vertical),
+            right: clamp(self.right, horizontal),
+            bottom: clamp(self.bottom, vertical),
+        }
+    }
+
+    /// The largest single-edge inset, in logical points.
+    #[must_use]
+    pub fn largest(self) -> f64 {
+        [self.left, self.top, self.right, self.bottom]
+            .into_iter()
+            .filter(|value| value.is_finite())
+            .fold(0.0_f64, f64::max)
     }
 }
 
@@ -892,6 +944,8 @@ pub enum BeautificationPreset {
 pub enum SceneProperty {
     /// Capture-derived or curated background.
     Background,
+    /// Inner content inset around the meaningful part of the capture.
+    Inset,
     /// Canvas padding.
     Padding,
     /// Optical placement.
@@ -910,6 +964,12 @@ pub enum SceneProperty {
 pub struct SceneAutomatic {
     /// Resolve the background from capture colours.
     pub background: bool,
+    /// Resolve the inner content inset from the capture's own margins.
+    ///
+    /// Absent from a sidecar or preset written before the inner inset existed,
+    /// where `serde`'s `false` is exactly right: those Scenes were authored
+    /// against a fixed, zero inset and must keep rendering that way.
+    pub inset: bool,
     /// Resolve proportional canvas padding.
     pub padding: bool,
     /// Resolve subtle confidence-gated optical placement.
@@ -928,6 +988,7 @@ impl SceneAutomatic {
     pub const fn ordinary() -> Self {
         Self {
             background: true,
+            inset: true,
             padding: true,
             placement: true,
             corners: true,
@@ -940,6 +1001,10 @@ impl SceneAutomatic {
     #[must_use]
     pub const fn native_window() -> Self {
         Self {
+            // D9: a window's own silhouette, transparent corners and shadow are
+            // the OS's pixels. Nothing may trim them, so the inner inset is not
+            // merely fixed at zero here — it is never resolved at all.
+            inset: false,
             corners: false,
             shadow: false,
             ..Self::ordinary()
@@ -950,6 +1015,7 @@ impl SceneAutomatic {
     pub fn disable(&mut self, property: SceneProperty) {
         match property {
             SceneProperty::Background => self.background = false,
+            SceneProperty::Inset => self.inset = false,
             SceneProperty::Padding => self.padding = false,
             SceneProperty::Placement => self.placement = false,
             SceneProperty::Corners => self.corners = false,
@@ -962,6 +1028,7 @@ impl SceneAutomatic {
     #[must_use]
     pub const fn any(self) -> bool {
         self.background
+            || self.inset
             || self.padding
             || self.placement
             || self.corners
@@ -2191,17 +2258,29 @@ impl Document {
 
     /// Applies or removes the nondestructive Scene around the source pixels.
     ///
+    /// A Scene has two independent spacings, and this is where the inner one is
+    /// made safe. [`Beautification::inset`] is the *content* inset: the margin
+    /// the capture already carries around its own subject, held back so the
+    /// subject sits centred inside the Scene rather than adrift in whatever
+    /// dead space the screenshot happened to include.
+    /// [`Beautification::padding`] is the outer one, between that subject and
+    /// the Scene background. Neither destroys anything: the complete source
+    /// stays in the document, and clearing the inset restores it exactly.
+    ///
+    /// The inset is clamped to [`SourceInsets::MAX_EDGE_FRACTION`] of the
+    /// content on each axis rather than rejected, so a preset authored against
+    /// a larger capture, or a sidecar edited by hand, degrades to the nearest
+    /// safe framing instead of refusing to open.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidRequest`] when a Scene would alter native window
     /// pixels or exceed render bounds.
     pub fn set_scene(&mut self, scene: Option<Scene>) -> Result<()> {
-        if scene.as_ref().is_some_and(|scene| !scene.inset.is_zero()) {
-            return Err(Error::InvalidRequest(
-                "Scene preserves the complete source composition; source inset is a legacy Smart Frame setting"
-                    .to_owned(),
-            ));
-        }
+        let scene = scene.map(|mut scene| {
+            scene.inset = scene.inset.clamped_within(self.content_size());
+            scene
+        });
         self.set_beautification(scene)
     }
 

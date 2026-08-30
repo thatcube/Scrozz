@@ -679,6 +679,70 @@ pub fn pill_button_with_state(
     response
 }
 
+/// A compact labelled button drawn into an explicit rectangle.
+///
+/// The toolbar's own commit controls use this: text only, one control height,
+/// one radius, and both fills resolved from the palette so the pair reads the
+/// same in either appearance. `accent` marks the primary of a pair.
+pub fn text_button(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    id: Id,
+    label: &str,
+    accent: bool,
+    state: ControlState,
+) -> Response {
+    let response = ui.interact(rect, id, sense_for(state));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, state.enabled, label));
+
+    let p = pointer_state(surface, &response, state, Reveal::SHOWN);
+    let palette = surface.palette();
+    let radius = Radius::BUTTON;
+    let painter = ui.painter();
+
+    let h = f32::from(u8::from(p.hovered));
+    let d = f32::from(u8::from(p.pressed));
+    let fill = if accent {
+        lerp_color(
+            lerp_color(palette.accent, palette.accent_hi, h),
+            palette.accent_press,
+            d,
+        )
+    } else {
+        lerp_color(
+            lerp_color(palette.control_fill(), palette.control_fill_hover(), h),
+            palette.control_fill_active(),
+            d,
+        )
+    };
+    let opacity = if state.enabled { 1.0 } else { 0.4 };
+
+    if p.focused {
+        focus_ring(painter, rect, radius, palette);
+    }
+    painter.rect_filled(rect, corner(radius), fade(fill, opacity));
+    if !accent {
+        painter.rect_stroke(
+            rect,
+            corner(radius),
+            Stroke::new(1.0, fade(palette.hairline, opacity)),
+            StrokeKind::Inside,
+        );
+    }
+    let fg = fade(
+        if accent {
+            palette.on_accent
+        } else {
+            palette.text
+        },
+        opacity,
+    );
+    let galley = painter.layout_no_wrap(label.to_owned(), surface.font(Text::Button), fg);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, fg);
+    response
+}
+
 /// A flat neutral labelled button used for equally weighted card actions.
 #[allow(clippy::too_many_arguments)]
 pub fn card_pill_button(

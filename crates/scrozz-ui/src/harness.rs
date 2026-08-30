@@ -1352,9 +1352,15 @@ impl Fixture {
         let size_pt = match scenario {
             Scenario::SensitiveReview => (1080.0, 680.0),
             Scenario::ScrollingCapture => (640.0, 260.0),
+            // Every editor scenario is rendered at a width the editor window
+            // can actually be: `MIN_WINDOW_SIZE` is the floor under a real
+            // one, and a golden narrower than that asserts a layout the user
+            // can never reach.
             Scenario::EditorAnnotating
             | Scenario::EditorColorPopover
-            | Scenario::EditorArrowStyles => (900.0, 620.0),
+            | Scenario::EditorArrowStyles
+            | Scenario::EditorCrop
+            | Scenario::EditorRedact => (900.0, 620.0),
             Scenario::SmartFrameUntouched
             | Scenario::SmartFrameOneClick
             | Scenario::SmartFrameExpanded => (1100.0, 700.0),

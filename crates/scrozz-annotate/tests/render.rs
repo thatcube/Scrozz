@@ -3,12 +3,13 @@
 mod common;
 
 use common::{
-    capture_with, document, flat, near, pixel, pixels, rect, region_capture, window_capture,
+    capture_with, document, flat, frame_with, near, pixel, pixels, rect, region_capture,
+    window_capture,
 };
 use scrozz_annotate::{
     Annotation, AspectPreset, AutomaticBackground, Background, Beautification, Color, Document,
     ExactOutputSize, GeneratedStyle, Renderer, ResolvedFocus, SkiaRenderer, SmartFrameMetadata,
-    Style,
+    SourceInsets, Style,
 };
 use scrozz_core::{Frame, LogicalPoint, PixelFormat, Provenance, ScaleFactor};
 
@@ -732,4 +733,76 @@ fn column_ink(frame: &Frame, x: u32) -> u32 {
             p[0] < 128 && p[1] < 128 && p[2] < 128
         })
         .count() as u32
+}
+
+#[test]
+fn the_inner_inset_holds_back_the_capture_s_own_margin() {
+    // A red subject inside a blue margin: the inset's job is to leave the
+    // margin out of the Scene so the subject is what gets centred.
+    let source = frame_with(60, 60, 1.0, |x, y| {
+        if (10..50).contains(&x) && (10..50).contains(&y) {
+            [220, 40, 60, 255]
+        } else {
+            [20, 40, 180, 255]
+        }
+    });
+    let mut doc = Document::new(capture_with(source, Provenance::Region));
+    doc.set_scene(Some(Beautification {
+        padding: 5.0,
+        inset: SourceInsets::uniform(10.0),
+        background: Background::Solid(Color::rgb(0, 200, 0)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    // 60 less 10 either side, plus 5 of Scene padding either side.
+    assert_eq!((out.width(), out.height()), (50, 50));
+    assert!(
+        near(pixel(&out, 1, 1), [0, 200, 0, 255], 2),
+        "the Scene's own background fills the padding"
+    );
+    assert!(
+        near(pixel(&out, 25, 25), [220, 40, 60, 255], 2),
+        "the subject survives untouched"
+    );
+    assert!(
+        near(pixel(&out, 6, 6), [220, 40, 60, 255], 2),
+        "the capture's blue margin was held back, not framed"
+    );
+}
+
+#[test]
+fn preview_and_export_apply_the_same_inner_inset() {
+    // The editor previews through `render_to_width_with_layout` and exports
+    // through `render`. If those ever disagreed about the inset, what the user
+    // approved would not be what left the app.
+    let mut doc = Document::new(capture_with(
+        flat(80, 40, [220, 40, 60, 255]),
+        Provenance::Region,
+    ));
+    doc.set_scene(Some(Beautification {
+        padding: 4.0,
+        inset: SourceInsets::uniform(8.0),
+        background: Background::Solid(Color::rgb(20, 40, 180)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let export = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((export.width(), export.height()), (72, 32));
+
+    let (preview, layout) = SkiaRenderer::new()
+        .render_to_width_with_layout(&doc, 144)
+        .unwrap();
+    assert_eq!((preview.width(), preview.height()), (144, 64));
+    let layout = layout.expect("a Scene reports where its subject landed");
+    // Same proportions at both sizes: the subject occupies the same share of
+    // the canvas whatever it is rendered at.
+    let share = layout.subject.size.width / f64::from(layout.width);
+    assert!(
+        (share - 64.0 / 72.0).abs() < 0.01,
+        "subject occupied {share} of the preview, expected {}",
+        64.0 / 72.0
+    );
 }

@@ -155,6 +155,7 @@ impl Scene for CardScene {
             lift: self.lift,
             angle: self.angle,
             state: CardState::Resting,
+            landed: None,
         };
         let content =
             CardContent::new(self.name, self.source_px, self.provenance).with_media(self.media);
@@ -639,4 +640,121 @@ fn images_differ(left: &Image, right: &Image) -> bool {
 fn luminance_at(image: &Image, x: f32, y: f32) -> u32 {
     let [r, g, b, _] = image.pixel(px(x), px(y));
     u32::from(r) + u32::from(g) + u32::from(b)
+}
+
+// ---------------------------------------------------------------------------
+// An editing card offers exactly one control
+// ---------------------------------------------------------------------------
+
+/// Draws one card into a real accessibility tree and returns every control's
+/// accessible name.
+///
+/// Names, not pixels: "is Copy reachable" is a question about what the card
+/// offers, and a control that is merely painted somewhere else on the card
+/// would still be reachable by keyboard and by assistive technology.
+fn control_labels(editing: bool) -> Vec<String> {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    theme::install_fonts(&ctx);
+    let theme = Theme::for_appearance(Appearance::Dark);
+    theme::install_style(&ctx, &theme);
+    let icons = IconStore::new(&ctx);
+
+    let mut labels = Vec::new();
+    // Two passes: the first installs fonts and textures, the second draws
+    // against them. A single pass reports an empty tree.
+    for _ in 0..2 {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                time: Some(1.0),
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    vec2(SURFACE.0, SURFACE.1),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let surface = Surface::still(&theme, &icons, Motion::at(1.0));
+                let frame = CardFrame {
+                    id: CardId(1),
+                    slot: 0,
+                    rect: card_rect(),
+                    alpha: 1.0,
+                    // Fully revealed: the hover chrome is showing, which is
+                    // exactly the state this contract is about.
+                    reveal: 1.0,
+                    lift: 0.0,
+                    angle: 0.0,
+                    state: CardState::Resting,
+                    landed: None,
+                };
+                let mut content =
+                    CardContent::new("capture-01.png", (1600, 1000), Provenance::Display)
+                        .with_media(CardMedia::Image);
+                content.editing = editing;
+                card::draw_card(ui, &surface, &frame, &content);
+            },
+        );
+        output.textures_delta.clear();
+        labels = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("the card exposes an accessibility tree")
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label())
+            .map(str::to_owned)
+            .collect();
+    }
+    labels
+}
+
+#[test]
+fn a_hovered_card_offers_its_full_action_set() {
+    let labels = control_labels(false);
+    for expected in [
+        CardAction::Copy,
+        CardAction::Save,
+        CardAction::Pin,
+        CardAction::Upload,
+        CardAction::Close,
+        CardAction::Annotate,
+    ] {
+        assert!(
+            labels.iter().any(|label| label == expected.label()),
+            "a resting card should offer {:?}: {labels:?}",
+            expected.label()
+        );
+    }
+}
+
+#[test]
+fn an_editing_card_offers_only_continue() {
+    // The card's pixels are frozen at their pre-edit revision for the whole
+    // session, so every one of these would either answer with content the
+    // thumbnail is no longer showing or dismiss a card the open editor still
+    // needs to be raised from. They are absent, not disabled.
+    let labels = control_labels(true);
+    for forbidden in [
+        CardAction::Copy,
+        CardAction::Save,
+        CardAction::Pin,
+        CardAction::Upload,
+        CardAction::Close,
+        CardAction::Annotate,
+        CardAction::Edit,
+    ] {
+        assert!(
+            !labels.iter().any(|label| label == forbidden.label()),
+            "an editing card must not expose {:?}: {labels:?}",
+            forbidden.label()
+        );
+    }
+    assert_eq!(
+        labels,
+        vec!["Continue editing".to_owned()],
+        "the one control an editing card offers is its own Editing/Continue \
+         pill, whose accessible name states both facts at once"
+    );
 }

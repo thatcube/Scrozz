@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use scrozz_annotate::{
     AnalysisCancellation, AutomaticBackground, Background, Beautification, GeneratedStyle,
-    InsetDecision, MAX_ANALYSIS_SAMPLES, PresetBackground, SmartFramePreset,
+    InsetDecision, MAX_ANALYSIS_SAMPLES, PresetBackground, SceneAutomatic, SmartFramePreset,
     SmartFramePresetSettings, analyze_scene_with_style, analyze_smart_frame, contrast_ratio,
 };
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
@@ -52,22 +52,26 @@ fn analysis_is_byte_deterministic() {
 }
 
 #[test]
-fn transparent_outer_margin_remains_part_of_the_source_composition() {
+fn a_transparent_outer_margin_is_held_back_by_the_inner_inset() {
+    // Nothing is destroyed: the inset is a number stored beside an untouched
+    // source, and clearing it brings the margin back. What it buys is that the
+    // orange subject, not the dead transparent border, is what the Scene
+    // centres and pads.
     let mut frame = rgba_frame(100, 80, [0, 0, 0, 0], ColorSpace::DisplayP3);
     paint_rect(&mut frame, 10, 8, 90, 72, [220, 80, 40, 255]);
 
     let result =
         analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
     let inset = result.beautification.inset;
-    assert!(inset.is_zero());
+    assert_eq!((inset.left, inset.right), (10.0, 10.0));
+    assert_eq!((inset.top, inset.bottom), (8.0, 8.0));
+    assert!(result.beautification.automatic.inset);
+    let metadata = result.beautification.smart_frame.as_ref().unwrap();
+    assert_eq!(metadata.inset_decision, InsetDecision::TransparentMargin);
+    assert_eq!(metadata.inset_confidence, 100);
     assert_eq!(
-        result
-            .beautification
-            .smart_frame
-            .as_ref()
-            .unwrap()
-            .inset_decision,
-        InsetDecision::NoExcessMargin
+        result.inset_explanation,
+        InsetDecision::TransparentMargin.explanation()
     );
 }
 
@@ -248,7 +252,7 @@ fn cancellation_is_an_outcome_not_a_partial_result() {
 }
 
 #[test]
-fn scene_api_refuses_legacy_source_inset() {
+fn scene_keeps_the_inner_inset_inside_its_bounds() {
     let mut document = scrozz_annotate::Document::new(scrozz_core::Capture {
         frame: rgba_frame(100, 80, [20, 30, 40, 255], ColorSpace::Srgb),
         provenance: Provenance::Region,
@@ -262,11 +266,55 @@ fn scene_api_refuses_legacy_source_inset() {
         ..Beautification::default()
     };
 
-    assert!(document.set_scene(Some(scene.clone())).is_err());
-    assert!(
-        document.set_beautification(Some(scene)).is_ok(),
-        "legacy Smart Frame documents remain readable during migration"
+    document.set_scene(Some(scene)).unwrap();
+    assert_eq!(
+        document.scene().unwrap().inset,
+        scrozz_annotate::SourceInsets::uniform(4.0),
+        "a modest inner inset is stored verbatim"
     );
+
+    // An inset authored against a much larger capture must degrade to the
+    // nearest safe framing rather than refuse to open, and never past a
+    // quarter of either axis.
+    document
+        .set_scene(Some(Beautification {
+            inset: scrozz_annotate::SourceInsets::uniform(900.0),
+            ..Beautification::default()
+        }))
+        .unwrap();
+    assert_eq!(
+        document.scene().unwrap().inset,
+        scrozz_annotate::SourceInsets {
+            left: 25.0,
+            top: 20.0,
+            right: 25.0,
+            bottom: 20.0,
+        }
+    );
+
+    // Clearing it restores the complete source: nothing was destroyed.
+    document.set_scene(Some(Beautification::default())).unwrap();
+    assert!(document.scene().unwrap().inset.is_zero());
+}
+
+#[test]
+fn a_window_capture_never_takes_an_inner_inset() {
+    let mut document = scrozz_annotate::Document::new(scrozz_core::Capture {
+        frame: rgba_frame(100, 80, [20, 30, 40, 255], ColorSpace::Srgb),
+        provenance: Provenance::Window,
+        target: scrozz_core::CaptureTarget::Window(scrozz_core::WindowId("window-1".into())),
+    });
+
+    assert!(
+        document
+            .set_scene(Some(Beautification {
+                inset: scrozz_annotate::SourceInsets::uniform(4.0),
+                ..Beautification::default()
+            }))
+            .is_err(),
+        "D9: the OS supplied this silhouette, corners and shadow"
+    );
+    assert!(!SceneAutomatic::native_window().inset);
 }
 
 #[test]
@@ -460,7 +508,9 @@ fn detailed_photo_like_edges_disable_automatic_inset() {
     assert!(result.beautification.inset.is_zero());
     assert_eq!(
         result.beautification.smart_frame.unwrap().inset_decision,
-        InsetDecision::NoExcessMargin
+        InsetDecision::LowConfidence,
+        "a noisy edge is not a margin, and the detector says so rather than \
+         guessing at one"
     );
 }
 

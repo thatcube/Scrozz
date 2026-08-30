@@ -1633,6 +1633,9 @@ struct Entry {
     media: CaptureMedia,
     texture: Option<egui::TextureHandle>,
     pending: Option<egui::ColorImage>,
+    /// The colours this capture is made of, for its landing glow. Taken once,
+    /// on the frame its thumbnail is uploaded.
+    accent: Option<card::glow::Accent>,
     pin_notice: Option<String>,
     auto_close_started_at: f64,
     /// Whether this card's editor is open. Freezes the auto-close timer at
@@ -1711,6 +1714,11 @@ pub struct RecentCapturesOverlayApp {
     armed: Option<CardId>,
     settings: RecentCapturesOverlaySettings,
     pending_settings: Option<RecentCapturesOverlaySettings>,
+    /// Whether this overlay has completed a pass yet.
+    ///
+    /// Everything ingested before the first one was already there when the
+    /// overlay opened, so it is seeded settled rather than animated in.
+    painted_a_frame: bool,
 }
 
 /// Keeps screen-anchored overlay geometry in native logical points.
@@ -1809,6 +1817,7 @@ impl RecentCapturesOverlayApp {
             armed: None,
             settings: options.settings.normalized(),
             pending_settings: None,
+            painted_a_frame: false,
         }
     }
 
@@ -2000,7 +2009,14 @@ impl RecentCapturesOverlayApp {
 
     fn ingest(&mut self, m: &Motion) {
         for request in self.take_inbox() {
-            let id = self.stack.push(m);
+            // Whatever was already queued when the overlay drew its first
+            // frame was not just captured — it was already there. Those cards
+            // arrive settled and never announce themselves.
+            let id = if self.painted_a_frame {
+                self.stack.push(m)
+            } else {
+                self.stack.push_settled(m)
+            };
             let thumb = request
                 .thumbnail
                 .and_then(|image| downscale(&image, self.thumbnail_px));
@@ -2015,6 +2031,7 @@ impl RecentCapturesOverlayApp {
                     media: request.media,
                     texture: None,
                     pending: thumb,
+                    accent: None,
                     pin_notice: request.content_error,
                     auto_close_started_at: m.now(),
                     editing: false,
@@ -2184,6 +2201,10 @@ impl RecentCapturesOverlayApp {
 
         for (id, entry) in &mut self.content {
             if let Some(image) = entry.pending.take() {
+                // The only moment the pixels are in hand: once this is a
+                // texture there is no reading it back, so the landing glow's
+                // colours have to be taken here.
+                entry.accent = Some(card::glow::sample_accent(&image));
                 entry.texture = Some(ctx.load_texture(
                     format!("scrozz.card.{}", id.0),
                     image,
@@ -3106,8 +3127,16 @@ impl eframe::App for RecentCapturesOverlayApp {
             .geometry_locked
             .store(self.dragging.is_some(), Ordering::Release);
         // The single place repainting is requested: idle costs nothing, an
-        // animation gets a continuous repaint, and a pending wake gets a timer.
-        self.stack.activity(&m).apply(&ctx);
+        // animation gets a continuous repaint, and a pending wake gets a
+        // timer. The landing glow joins that schedule and leaves it: once
+        // every card's window is over — and immediately, under reduce-motion
+        // or while a card is being edited — this is idle again, so a settled
+        // or hidden overlay asks for no frames at all.
+        let glow = self.stack.glow_activity(&m, |id| {
+            self.content.get(&id).is_some_and(|entry| entry.editing)
+        });
+        (self.stack.activity(&m) | glow).apply(&ctx);
+        self.painted_a_frame = true;
     }
 }
 
@@ -3414,6 +3443,7 @@ mod tests {
             lift: 0.0,
             angle: 0.0,
             state,
+            landed: None,
         };
         let mut frames = vec![
             frame(1, 0, CardState::Resting),

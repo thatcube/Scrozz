@@ -466,8 +466,10 @@ fn crop_panel_exposes_dimensions_transforms_zoom_snap_and_transaction_actions() 
             "missing {expected:?} from crop controls: {labels:?}"
         );
     }
-    let (tree, cancel, _) = access_node(&output, |label| label == "Cancel");
-    let _ = access_node(&output, |label| label == "Apply");
+    // Distinct from the toolbar's own session Cancel/Done, which are the only
+    // controls that end an editing session.
+    let (tree, cancel, _) = access_node(&output, |label| label == "Cancel Crop");
+    let _ = access_node(&output, |label| label == "Apply Crop");
 
     let _ = driver.frame(&mut editor, SIZE, vec![activate(tree, cancel)]);
     assert!(!editor.state().crop_mode());
@@ -497,7 +499,7 @@ fn crop_canvas_uses_default_inside_and_resize_cursors_only_on_edges() {
     let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(SIZE[0], SIZE[1]));
     let (_, canvas) = editor_layout(full);
     let content = editor.state().display_content_bounds();
-    let image = fit(content, canvas.shrink(Space::LG), 1.0, (0.0, 0.0));
+    let image = fit(content, canvas.shrink(Space::SM), 1.0, (0.0, 0.0));
     let crop = rect_to_screen(
         editor.state().pending_crop_display().unwrap(),
         image,

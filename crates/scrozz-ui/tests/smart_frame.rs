@@ -588,3 +588,171 @@ fn revert_framing_is_undoable() {
     state.undo_framing();
     assert!(state.document().beautification().is_some());
 }
+
+// ---------------------------------------------------------------------------
+// The inner content inset
+// ---------------------------------------------------------------------------
+//
+// Two spacings, not one. `inset` holds back the capture's own outer margin so
+// the content inside it sits centred in the Scene; `padding` is the space
+// between that content and the Scene background. Both are non-destructive:
+// the complete source stays in the document either way.
+
+#[test]
+fn inner_inset_and_outer_padding_are_independent_and_both_reversible() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let source = state.document().data();
+    let _ = state.begin_scene();
+
+    let mut scene = state.document().scene().cloned().unwrap();
+    scene.inset = SourceInsets::uniform(12.0);
+    scene.padding = 40.0;
+    let _ = state.apply_scene_edit(scene);
+
+    let stored = state.document().scene().cloned().unwrap();
+    assert_eq!(stored.inset, SourceInsets::uniform(12.0));
+    assert!((stored.padding - 40.0).abs() < f64::EPSILON);
+    assert!(
+        !stored.automatic.inset,
+        "editing the inner inset fixes it, exactly like every other property"
+    );
+
+    // Nothing was destroyed: the source is still whole underneath.
+    state.cancel_scene();
+    assert_eq!(state.document().data(), source);
+}
+
+#[test]
+fn an_applied_inner_inset_is_one_undoable_scene_step() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let _ = state.begin_scene();
+    let mut scene = state.document().scene().cloned().unwrap();
+    scene.inset = SourceInsets::uniform(9.0);
+    let _ = state.apply_scene_edit(scene);
+    state.apply_scene();
+
+    assert!(state.can_undo_framing());
+    state.undo_framing();
+    assert!(
+        state
+            .document()
+            .scene()
+            .is_none_or(|scene| scene.inset.is_zero()),
+        "undoing the Scene step takes the inner inset with it"
+    );
+    state.redo_framing();
+    assert_eq!(
+        state.document().scene().unwrap().inset,
+        SourceInsets::uniform(9.0)
+    );
+}
+
+#[test]
+fn the_inner_inset_is_bounded_rather_than_refused() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let _ = state.begin_scene();
+    let mut scene = state.document().scene().cloned().unwrap();
+    // Far past anything the inspector can express, as a preset authored
+    // against a much larger capture would be.
+    scene.inset = SourceInsets::uniform(10_000.0);
+    let _ = state.apply_scene_edit(scene);
+
+    let stored = state.document().scene().cloned().unwrap();
+    let content = state.document().content_size();
+    assert!(stored.inset.left <= SourceInsets::limit_for(content.width) + 0.001);
+    assert!(stored.inset.top <= SourceInsets::limit_for(content.height) + 0.001);
+    assert!(
+        !stored.inset.is_zero(),
+        "an over-large inset degrades to the nearest safe framing rather than \
+         being dropped or refused"
+    );
+}
+
+#[test]
+fn a_native_window_never_takes_an_inner_inset() {
+    // D9: the OS supplied this silhouette, its transparent corners and its
+    // shadow. Nothing in Scene may trim them.
+    let mut state = EditorState::new(document(Provenance::Window));
+    let _ = state.begin_scene();
+    assert!(!state.document().may_style_subject());
+    assert_eq!(
+        state.document().subject_appearance(),
+        SubjectAppearance::Native
+    );
+
+    let mut scene = state.document().scene().cloned().unwrap();
+    scene.inset = SourceInsets::uniform(8.0);
+    let _ = state.apply_scene_edit(scene);
+
+    let stored = state.document().scene().cloned().unwrap();
+    assert!(stored.inset.is_zero());
+    assert!(!stored.automatic.inset);
+    assert!((stored.corner_radius).abs() < f64::EPSILON);
+    assert!((stored.shadow).abs() < f64::EPSILON);
+}
+
+#[test]
+fn the_inner_inset_round_trips_through_a_preset() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let _ = state.begin_scene();
+    let mut scene = state.document().scene().cloned().unwrap();
+    scene.inset = SourceInsets {
+        left: 6.0,
+        top: 4.0,
+        right: 6.0,
+        bottom: 4.0,
+    };
+    let _ = state.apply_scene_edit(scene.clone());
+
+    let settings =
+        SmartFramePresetSettings::from_beautification(state.document().scene().unwrap()).unwrap();
+    assert_eq!(settings.inset, scene.inset);
+
+    let json = serde_json::to_string(&settings).unwrap();
+    let back: SmartFramePresetSettings = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.inset, scene.inset);
+    assert_eq!(back.to_beautification().inset, scene.inset);
+}
+
+#[test]
+fn an_automatic_inner_inset_is_resolved_by_analysis_and_bound_to_the_revision() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let intent = state.begin_scene();
+    let Intent::AnalyzeSmartFrame { revision, .. } = intent else {
+        panic!("a fresh draft asks for analysis");
+    };
+    assert!(
+        state.document().scene().unwrap().automatic.inset,
+        "an ordinary capture resolves its own inner inset until the user says \
+         otherwise"
+    );
+
+    let mut resolved = state.document().scene().cloned().unwrap();
+    resolved.inset = SourceInsets::uniform(5.0);
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: resolved,
+            inset_explanation: "Trimmed a high-confidence uniform margin".to_owned(),
+        }),
+    );
+    assert_eq!(
+        state.document().scene().unwrap().inset,
+        SourceInsets::uniform(5.0)
+    );
+
+    // Stale results for an older revision are dropped, inset included.
+    let mut stale = state.document().scene().cloned().unwrap();
+    stale.inset = SourceInsets::uniform(80.0);
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: stale,
+            inset_explanation: String::new(),
+        }),
+    );
+    assert_eq!(
+        state.document().scene().unwrap().inset,
+        SourceInsets::uniform(5.0)
+    );
+}

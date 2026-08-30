@@ -1249,13 +1249,24 @@ impl Driver {
             let mut intent = Intent::None;
             let mut exit = window.show(ctx, dirty, |ui| {
                 let got = editor.update(ui);
+                // The toolbar owns Done and Cancel now, so the window's exit
+                // comes back out of the editor's own frame rather than from a
+                // separate chrome bar drawn above it.
+                let decided = match got {
+                    Intent::Commit => EditorWindowExit::Done,
+                    Intent::Discard => EditorWindowExit::Cancel,
+                    _ => EditorWindowExit::None,
+                };
                 if got != Intent::None {
                     intent = got;
                 }
+                decided
             });
 
             match intent {
                 Intent::None | Intent::ToggleSmartFrame => {}
+                // Already reported through the window's own exit above.
+                Intent::Commit | Intent::Discard => {}
                 // Shares the window's own no-silent-loss guarantee with the
                 // native close button: a clean document closes immediately,
                 // a dirty one is held open behind the confirm-discard
@@ -4489,8 +4500,14 @@ mod tests {
         let one = card_surface_geometry(base, 1);
         let three = card_surface_geometry(base, 3);
 
+        // Bounded to the column the cards actually occupy, not to the whole
+        // work area: a single card plus the room its gestures, its shadow and
+        // its landing glow need. That last one is why the height bound is
+        // where it is — `card::SHADOW_BLEED` covers everything a card paints
+        // outside itself, and a card now casts light as well as shadow.
         assert!(one.viewport().width() < 600.0);
-        assert!(one.viewport().height() < 500.0);
+        assert!(one.viewport().height() < 560.0);
+        assert!(one.viewport().height() < base.viewport().height() / 2.0);
         assert_eq!(one.viewport().width(), three.viewport().width());
         assert!(three.viewport().height() > one.viewport().height());
         assert!(three.viewport().height() < base.viewport().height());

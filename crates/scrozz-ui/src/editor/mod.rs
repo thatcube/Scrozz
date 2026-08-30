@@ -35,6 +35,7 @@ pub mod scene;
 pub mod state;
 pub mod toolbar;
 
+use crate::theme::Space;
 use egui::{Key, Modifiers, Ui};
 use scrozz_annotate::Document;
 use scrozz_core::{Frame, LogicalPoint, LogicalRect, PixelFormat};
@@ -315,6 +316,16 @@ impl EditorUi {
         let show_sf_panel = self.show_smart_frame || self.state.has_smart_frame_draft();
         let (bar, canvas, sf_panel) = editor_layout_with_smart_frame(full, show_sf_panel);
 
+        // The editor is an ordinary opaque window, so its shell is painted
+        // rather than left transparent. Without this the space the canvas is
+        // deliberately inset from would be a hole rather than a margin, and
+        // the padding that is supposed to make the capture the subject would
+        // instead read as the window failing to draw.
+        let shell =
+            egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + bar.height()), full.max);
+        ui.painter()
+            .rect_filled(shell, 0.0, surface.palette().canvas());
+
         let view = paint::draw_canvas(
             ui,
             &surface,
@@ -332,7 +343,15 @@ impl EditorUi {
             bar,
             inspector_was_open,
         ) {
-            if action == Intent::ToggleSmartFrame {
+            if action == Intent::Commit {
+                // A Scene draft is already live on the document; what it has
+                // not done is spend an undo step or mark the session dirty.
+                // Done commits it as one, so finishing the session and
+                // finishing the Scene are the same gesture and the inspector
+                // needs no Apply of its own.
+                self.state.apply_scene();
+                self.pending = Some(action);
+            } else if action == Intent::ToggleSmartFrame {
                 if self.state.has_smart_frame_draft() {
                     self.show_smart_frame = true;
                 } else if self.show_smart_frame {
@@ -494,17 +513,36 @@ impl Drop for CropBoundaryPreprocessor {
 /// The stable toolbar/canvas split. Foreground popups never participate.
 #[must_use]
 pub fn editor_layout(full: egui::Rect) -> (egui::Rect, egui::Rect) {
-    let toolbar_h = toolbar::height_for(full.width());
-    let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), toolbar_h));
-    let canvas =
-        egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + toolbar_h), full.max);
+    let (bar, canvas, _) = editor_layout_with_smart_frame(full, false);
     (bar, canvas)
 }
 
 /// Width of the compact Scene side panel in points.
-const SMART_FRAME_PANEL_W: f32 = 320.0;
+///
+/// Wide enough for a label, a slider, a value and an Automatic toggle on one
+/// row without any of them shrinking, which is what keeps the inspector's
+/// control widths consistent down its whole length.
+const SMART_FRAME_PANEL_W: f32 = 336.0;
 
-/// Layout with an optional Smart Frame right panel.
+/// Breathing room between the window's edges and the canvas.
+const SHELL_PAD: f32 = Space::MD;
+
+/// The gutter between the canvas and the inspector.
+///
+/// A real gap, not a hairline: the capture is the subject of this window, and
+/// an inspector butted straight against it reads as a frame around the image
+/// rather than a panel beside it.
+const PANEL_GAP: f32 = Space::LG;
+
+/// The narrowest canvas worth splitting the window for.
+const MIN_CANVAS_W: f32 = 200.0;
+
+/// Layout with an optional Scene right panel.
+///
+/// The panel stays flush with the window's right, top and bottom edges — its
+/// own generous internal padding is what separates its controls from those
+/// edges — while the canvas keeps [`SHELL_PAD`] all round and a [`PANEL_GAP`]
+/// gutter before the panel begins.
 #[must_use]
 fn editor_layout_with_smart_frame(
     full: egui::Rect,
@@ -513,13 +551,25 @@ fn editor_layout_with_smart_frame(
     let toolbar_h = toolbar::height_for(full.width());
     let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), toolbar_h));
     let below = egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + toolbar_h), full.max);
-    if show_panel && below.width() > SMART_FRAME_PANEL_W + 200.0 {
+    let inset = |rect: egui::Rect| {
+        // `shrink` on a rectangle narrower than twice the padding inverts it;
+        // an editor squeezed to nothing must still hand back something sane.
+        let pad = SHELL_PAD
+            .min(rect.width() / 4.0)
+            .min(rect.height() / 4.0)
+            .max(0.0);
+        rect.shrink(pad)
+    };
+    if show_panel && below.width() > SMART_FRAME_PANEL_W + MIN_CANVAS_W + PANEL_GAP {
         let panel_left = below.right() - SMART_FRAME_PANEL_W;
-        let canvas = egui::Rect::from_min_max(below.min, egui::pos2(panel_left, below.bottom()));
+        let workspace = egui::Rect::from_min_max(
+            below.min,
+            egui::pos2(panel_left - PANEL_GAP, below.bottom()),
+        );
         let panel = egui::Rect::from_min_max(egui::pos2(panel_left, below.top()), below.max);
-        (bar, canvas, Some(panel))
+        (bar, inset(workspace), Some(panel))
     } else {
-        (bar, below, None)
+        (bar, inset(below), None)
     }
 }
 
@@ -850,16 +900,19 @@ impl EditorWindow {
     /// native close is harmless and closes immediately, a dirty one is held
     /// open behind a confirm-discard prompt instead of being lost silently.
     ///
-    /// Draws Done/Cancel chrome above `build`'s content whenever the prompt
-    /// is not showing. Cancel and Done are both unconditional and need no
-    /// confirmation of their own — they are the user's own explicit choice,
+    /// `build` draws the editor and reports whatever its own toolbar decided:
+    /// [`EditorWindowExit::Done`] to commit, [`EditorWindowExit::Cancel`] to
+    /// discard, [`EditorWindowExit::None`] otherwise. There is no separate
+    /// chrome bar — the editor has exactly one toolbar, and Cancel and Done
+    /// sit in it beside every other action. Both are unconditional and need no
+    /// confirmation of their own: they are the user's own explicit choice,
     /// unlike a native close or `Escape`, which might be an absent-minded
     /// reflex on a document the user still wants.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         dirty: bool,
-        build: impl FnMut(&mut Ui),
+        build: impl FnMut(&mut Ui) -> EditorWindowExit,
     ) -> EditorWindowExit {
         if !self.open {
             return EditorWindowExit::None;
@@ -884,8 +937,7 @@ impl EditorWindow {
             if confirm_discard {
                 prompt_outcome = Self::show_confirm_discard(editor_ui);
             } else {
-                Self::show_done_cancel_chrome(editor_ui, &mut chrome_exit);
-                build(editor_ui);
+                chrome_exit = build(editor_ui);
             }
         });
 
@@ -964,20 +1016,6 @@ impl EditorWindow {
             // repaints and worker completions do not keep stealing the foreground.
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
-    }
-
-    /// Draws the Done/Cancel chrome above the editor's own content.
-    fn show_done_cancel_chrome(ui: &mut Ui, exit: &mut EditorWindowExit) {
-        egui::Panel::top("scrozz-editor-chrome").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    *exit = EditorWindowExit::Cancel;
-                }
-                if ui.button("Done").clicked() {
-                    *exit = EditorWindowExit::Done;
-                }
-            });
-        });
     }
 
     /// Draws the "discard your changes?" prompt in place of the editor.
@@ -1111,6 +1149,7 @@ mod window_tests {
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             exit = window.show(ui.ctx(), true, |ui| {
                 ui.label("editing");
+                EditorWindowExit::None
             });
         });
         output.textures_delta.clear();

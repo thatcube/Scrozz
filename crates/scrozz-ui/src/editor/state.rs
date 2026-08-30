@@ -632,6 +632,15 @@ pub enum Intent {
     None,
     /// Close the editor.
     Close,
+    /// Finish the session: commit the edited pixels and close.
+    ///
+    /// Unconditional, unlike [`Intent::Close`]. Done and Discard are the
+    /// user's own explicit choice about a document they are looking at, so
+    /// neither is held behind the confirm-discard prompt that guards an
+    /// absent-minded window close.
+    Commit,
+    /// Abandon the session: close without touching the card.
+    Discard,
     /// Copy the flattened render to the clipboard.
     Copy,
     /// Save the flattened render.
@@ -675,6 +684,8 @@ impl PartialEq for Intent {
         match (self, other) {
             (Self::None, Self::None)
             | (Self::Close, Self::Close)
+            | (Self::Commit, Self::Commit)
+            | (Self::Discard, Self::Discard)
             | (Self::Copy, Self::Copy)
             | (Self::Save, Self::Save)
             | (Self::CustomColor, Self::CustomColor)
@@ -3253,11 +3264,15 @@ impl EditorState {
             |draft| (draft.before.clone(), draft.source_geometry),
         );
         self.cancel_analysis();
-        config.inset = SourceInsets::default();
         if !self.document.may_style_subject() {
+            // D9: the OS supplied this window's silhouette, transparent
+            // corners and shadow. A preset authored on an ordinary capture
+            // still applies here, minus everything that would touch them.
+            config.inset = SourceInsets::default();
             config.corner_radius = 0.0;
             config.shadow = 0.0;
             config.border_width = 0.0;
+            config.automatic.inset = false;
             config.automatic.corners = false;
             config.automatic.shadow = false;
         }
@@ -3631,10 +3646,16 @@ impl EditorState {
 
     /// Applies one Scene inspector edit and fixes every changed automatic property.
     pub fn apply_scene_edit(&mut self, mut config: Beautification) -> Option<Intent> {
-        config.inset = SourceInsets::default();
+        if !self.document.may_style_subject() {
+            config.inset = SourceInsets::default();
+            config.automatic.inset = false;
+        }
         if let Some(current) = self.document.scene() {
             if current.background != config.background {
                 config.automatic.background = matches!(config.background, Background::Automatic(_));
+            }
+            if current.inset != config.inset {
+                config.automatic.inset = false;
             }
             if current.padding != config.padding || current.canvas_padding != config.canvas_padding
             {
@@ -3685,7 +3706,6 @@ impl EditorState {
             )
             .restyled(style),
         };
-        scene.inset = SourceInsets::default();
         scene.background = Background::Automatic(generated);
         scene.automatic.background = true;
         if let Err(error) = self.document.set_scene(Some(scene)) {
@@ -3742,6 +3762,9 @@ fn merge_automatic_scene(mut current: Beautification, analyzed: Beautification) 
     let automatic = current.automatic;
     if automatic.background {
         current.background = analyzed.background;
+    }
+    if automatic.inset {
+        current.inset = analyzed.inset;
     }
     if automatic.padding {
         current.padding = analyzed.padding;

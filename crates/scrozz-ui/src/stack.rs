@@ -743,6 +743,16 @@ pub enum CardState {
 pub struct Card {
     id: CardId,
     born_slot: usize,
+    /// When the entry animation settles, as an absolute [`Motion::now`]
+    /// instant — fixed at birth, independent of `entry` below, and `None` for
+    /// a card the stack was seeded with rather than one that arrived.
+    ///
+    /// `entry` is a GC'd transient: [`CaptureStack::advance`] nulls it the
+    /// first frame it is no longer active, which is exactly the instant a
+    /// landing effect would want to start reading it. This field exists so
+    /// painting has something to measure "time since landed" against that
+    /// survives that collection.
+    landed_at: Option<f64>,
     entry: Option<Timeline>,
     fall: Option<(Timeline, Vec2)>,
     ret: Option<ReturnTransition>,
@@ -773,6 +783,17 @@ impl AlphaTransition {
             .mul_add(self.to - self.from, self.from)
             .clamp(0.0, 1.0)
     }
+}
+
+/// Seconds since `card` settled, or `None` if it never announced itself.
+///
+/// Reads `landed_at`, which is fixed at birth and outlives `entry`'s
+/// collection, so this stays correct for as long as the card is resident
+/// rather than for the one frame after it settles.
+fn landed_since(card: &Card, m: &Motion) -> Option<f32> {
+    let since = m.now() - card.landed_at?;
+    #[allow(clippy::cast_possible_truncation)]
+    (since >= 0.0).then_some(since as f32)
 }
 
 fn drag_alpha(card: &Card, m: &Motion) -> f32 {
@@ -899,6 +920,13 @@ pub struct CardFrame {
     pub angle: f32,
     /// What the card is doing.
     pub state: CardState,
+    /// Seconds since this card's entry animation settled, or `None` if it
+    /// never had one (a card the stack was seeded with at startup) or has not
+    /// settled yet.
+    ///
+    /// The landing glow's whole clock. `None` is what keeps a restored pile
+    /// from lighting up as though every capture in it had just been taken.
+    pub landed: Option<f32>,
 }
 
 /// The outcome of releasing a drag.
@@ -1162,6 +1190,7 @@ impl CaptureStack {
         self.cards.push(Card {
             id,
             born_slot: slot,
+            landed_at: Some(m.now() + f64::from(m.resolve(self.timing.enter))),
             entry: Some(Timeline::starting(
                 m,
                 self.timing.enter,
@@ -1175,6 +1204,21 @@ impl CaptureStack {
             hover_since: m.now(),
             lifted: false,
         });
+        id
+    }
+
+    /// Adds a capture that is already there: no entry animation, and no
+    /// landing announcement.
+    ///
+    /// For a pile restored rather than captured — whatever was already
+    /// waiting when the overlay drew its first frame. Those cards did not
+    /// just arrive, and animating them would say they had.
+    pub fn push_settled(&mut self, m: &Motion) -> CardId {
+        let id = self.push(m);
+        if let Some(card) = self.cards.last_mut() {
+            card.entry = None;
+            card.landed_at = None;
+        }
         id
     }
 
@@ -1701,6 +1745,28 @@ impl CaptureStack {
         self.activity(m).is_animating()
     }
 
+    /// What the landing glow contributes to the frame schedule.
+    ///
+    /// Separate from [`CaptureStack::activity`] because the one rule the
+    /// stack cannot know is whether a card's editor is open: `suppressed`
+    /// answers that, and a suppressed card schedules nothing, exactly as it
+    /// draws nothing. Under reduce-motion this is idle for every card.
+    ///
+    /// Keeping the predicate here rather than in the caller is what stops a
+    /// card drawing light nobody is scheduling frames for.
+    #[must_use]
+    pub fn glow_activity(&self, m: &Motion, suppressed: impl Fn(CardId) -> bool) -> Activity {
+        let mut a = Activity::IDLE;
+        for card in &self.cards {
+            a |= Activity::when_animating(crate::card::glow::is_active(
+                landed_since(card, m),
+                suppressed(card.id),
+                m.is_reduced(),
+            ));
+        }
+        a
+    }
+
     /// Every card to draw at this instant, bottom slot first, departing cards
     /// last.
     ///
@@ -1808,6 +1874,7 @@ impl CaptureStack {
             lift: if card.lifted { 1.0 } else { 0.0 },
             angle,
             state,
+            landed: landed_since(card, m),
         }
     }
 
@@ -1834,6 +1901,8 @@ impl CaptureStack {
             lift: 0.0,
             angle: 0.0,
             state: CardState::Departing,
+            // A card on its way out is not arriving.
+            landed: None,
         }
     }
 
