@@ -47,6 +47,8 @@ use crate::{
         ShareArgs, Sink, TargetSpec,
     },
     fault::{CliError, CliResult},
+    gui::action::CaptureKind,
+    gui::pipeline::capture_kind,
     gui::selection::CaptureSelector,
     hotkey_config, ipc,
     json::Json,
@@ -56,6 +58,24 @@ use crate::{
     shortcuts::{ShortcutAction, ShortcutStore},
 };
 
+/// Somewhere for a dispatched capture's pixels to go, besides its own sinks.
+///
+/// A capture typed at a terminal while the menu-bar app is running executes
+/// *inside* that app — that is what forwarding is for. Its pixels must
+/// therefore be able to join the capture stack the user is already looking at,
+/// and everything downstream of the stack: history identity, a bounded texture,
+/// and Pin to Screen.
+///
+/// Without this seam the command wrote its file and the pixels ended there,
+/// which quietly made pinning a fullscreen-only feature. Region and window
+/// captures had a working backend and durable storage, and no route to a pin,
+/// because the only producer that reached the card pipeline was the hotkey.
+///
+/// The capture is handed over **by value**: the running app moves the frame
+/// into its own pipeline rather than keeping a second full-resolution copy
+/// alive for the duration of the reply.
+pub type CaptureSink<'a> = &'a mut dyn FnMut(CaptureKind, scrozz_core::Capture) -> CliResult<()>;
+
 /// Runs a command locally.
 ///
 /// # Errors
@@ -63,24 +83,50 @@ use crate::{
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
-    dispatch_inner(command, None)
+    dispatch_inner(command, None, &mut |_, _| Ok(()), true)
+}
+
+/// Runs a command locally, offering any capture it takes to `observed`.
+///
+/// A run with nowhere to put pixels uses [`dispatch`]; the observer exists for
+/// the one caller that has a live capture stack to put them in.
+///
+/// # Errors
+///
+/// The observer runs only after capture and requested sinks succeed. Its own
+/// admission failure is propagated so an IPC caller is not acknowledged before
+/// the running app has accepted the pixels.
+pub fn dispatch_observed(command: &Command, observed: CaptureSink<'_>) -> CliResult<Report> {
+    dispatch_inner(command, None, observed, false)
 }
 
 /// Runs a command with an existing-loop selector supplied by the GUI.
 ///
 /// Forwarded interactive captures use this entry point from a worker thread, so
 /// the synchronous selector contract can wait while the main eframe loop paints
-/// and handles input.
-pub fn dispatch_with_selector(
+/// and handles input. The observer is the same seam [`dispatch_observed`] uses,
+/// so an interactively chosen target reaches the capture stack exactly as a
+/// named one does.
+///
+/// # Errors
+///
+/// As [`dispatch_observed`].
+pub fn dispatch_observed_with_selector(
     command: &Command,
     selector: &dyn CaptureSelector,
+    observed: CaptureSink<'_>,
 ) -> CliResult<Report> {
-    dispatch_inner(command, Some(selector))
+    dispatch_inner(command, Some(selector), observed, false)
 }
 
-fn dispatch_inner(command: &Command, selector: Option<&dyn CaptureSelector>) -> CliResult<Report> {
+fn dispatch_inner(
+    command: &Command,
+    selector: Option<&dyn CaptureSelector>,
+    observed: CaptureSink<'_>,
+    sound_at_source: bool,
+) -> CliResult<Report> {
     match command {
-        Command::Capture(args) => capture(args, selector),
+        Command::Capture(args) => capture(args, selector, observed, sound_at_source),
         Command::Record(args) => record(args, selector),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
@@ -176,9 +222,34 @@ impl CapturedFrame {
             Self::Rendered { provenance, .. } => *provenance,
         }
     }
+
+    /// Yields the one owned capture this frame represents.
+    ///
+    /// Takes `self` so the full-resolution pixels are **moved** into whatever
+    /// accepts them. A beautified capture consumed its source [`Capture`] while
+    /// building the [`Document`], so its rendered frame is re-attached to the
+    /// target and provenance it came from rather than cloned back out.
+    fn into_capture(self, target: CaptureTarget) -> Capture {
+        match self {
+            Self::Direct(capture) => capture,
+            Self::Rendered {
+                provenance,
+                rendered,
+            } => Capture {
+                frame: rendered,
+                provenance,
+                target,
+            },
+        }
+    }
 }
 
-fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliResult<Report> {
+fn capture(
+    args: &CaptureArgs,
+    selector: Option<&dyn CaptureSelector>,
+    observed: CaptureSink<'_>,
+    sound_at_source: bool,
+) -> CliResult<Report> {
     args.validate()?;
     let requested_target = args.target.resolve()?;
     let sinks = args.sinks();
@@ -342,7 +413,7 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
             }
         }
     }
-    if let Err(error) = scrozz_shell::play_screenshot_sound(&screenshot_sound) {
+    if sound_at_source && let Err(error) = scrozz_shell::play_screenshot_sound(&screenshot_sound) {
         tracing::warn!(%error, "the screenshot succeeded but its sound could not play");
     }
 
@@ -378,6 +449,15 @@ fn capture(args: &CaptureArgs, selector: Option<&dyn CaptureSelector>) -> CliRes
             format!(" → {}", written.join(", "))
         }
     );
+
+    // After the sinks, so a capture that could not be written never reaches the
+    // stack claiming it was, and after the report is built, so the observer
+    // cannot change what a script sees. The frame is *moved*: a forwarded
+    // caller is not told the capture succeeded until the running app has taken
+    // ownership of the pixels, and no second full-resolution copy is kept alive
+    // while the reply is written.
+    let card_kind = capture_kind(frame_source.provenance());
+    observed(card_kind, frame_source.into_capture(request.target.clone()))?;
 
     let mut report = Report::new(data, human);
     report.raw = raw;
@@ -841,8 +921,6 @@ fn run_owned_recording(prepared: PreparedRecording) -> CliResult<Report> {
         }
         std::thread::sleep(OWNED_RECORDING_POLL);
     };
-    drop(server);
-
     let report = outcome.and_then(|output| match output {
         Some(recording) => finish_recording_report(recording, Some(&fallback_target)),
         None => Err(machine.failure().map_or_else(
@@ -855,8 +933,9 @@ fn run_owned_recording(prepared: PreparedRecording) -> CliResult<Report> {
         )),
     });
     if let Some(reply) = stop_reply {
-        reply.answer(&report);
+        reply.answer_and_wait_delivery(&report);
     }
+    drop(server);
     report
 }
 
@@ -897,7 +976,7 @@ fn owned_recording_stop(
     }
     // Anything else reaching an owned recording is served normally, so a
     // concurrent `scrozz list displays` is not silently dropped.
-    request.serve();
+    request.serve_with(|_, _| Ok(()));
     None
 }
 
@@ -2333,6 +2412,42 @@ mod tests {
 
     fn json_of(argv: &[&str]) -> String {
         run(argv).expect("should succeed").data.to_compact_string()
+    }
+
+    #[test]
+    fn every_capture_provenance_maps_to_the_card_kind_that_decides_its_chrome() {
+        // The pin's chrome policy is chosen from the card kind, and D9 forbids
+        // synthetic chrome on a window capture. A window capture that arrived
+        // as a "fullscreen" card would gain a shadow and a corner radius the
+        // real window never had. The mapping reads provenance rather than the
+        // requested target, because an interactive request does not know what
+        // the user will pick.
+        assert_eq!(capture_kind(Provenance::Window), CaptureKind::Window);
+        assert_eq!(capture_kind(Provenance::Region), CaptureKind::Region);
+        assert_eq!(capture_kind(Provenance::Stitched), CaptureKind::Region);
+        assert_eq!(capture_kind(Provenance::Display), CaptureKind::Fullscreen);
+        assert_eq!(
+            capture_kind(Provenance::AllDisplays),
+            CaptureKind::Fullscreen
+        );
+    }
+
+    #[test]
+    fn a_dry_run_hands_no_pixels_to_the_capture_stack() {
+        // A dry run returns before the backend is even opened. Offering the
+        // observer anything here would put a card on screen for a capture that
+        // never happened.
+        let cli = Cli::try_parse_from(["scrozz", "capture", "--dry-run", "--region", "0,0,4,4"])
+            .expect("valid dry run");
+        let command = cli.command.expect("a command");
+        let mut seen = Vec::new();
+        let report = dispatch_observed(&command, &mut |kind, _| {
+            seen.push(kind);
+            Ok(())
+        })
+        .expect("a dry run always succeeds");
+        assert!(report.human.starts_with("Would capture"));
+        assert!(seen.is_empty(), "a dry run took no pixels to hand over");
     }
 
     #[test]

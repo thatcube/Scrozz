@@ -47,6 +47,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
@@ -89,6 +90,57 @@ use crate::{
 };
 
 const MAX_ANALYSIS_CACHE_ENTRIES: usize = 32;
+
+/// The strict ceiling on full-resolution frames the capture worker may hold.
+///
+/// A forwarded `scrozz capture` hands over whole uncompressed frames. Without a
+/// ceiling a burst of terminal invocations would grow the job queue — and
+/// therefore resident memory — without limit, because the worker is slower than
+/// the socket. Two is one being processed plus one waiting.
+const MAX_QUEUED_CAPTURE_FRAMES: usize = 2;
+
+#[derive(Clone)]
+struct CaptureBudget {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl CaptureBudget {
+    fn new() -> Self {
+        Self {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<CapturePermit> {
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_QUEUED_CAPTURE_FRAMES).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| CapturePermit {
+                in_flight: Arc::clone(&self.in_flight),
+            })
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire) < MAX_QUEUED_CAPTURE_FRAMES
+    }
+}
+
+/// Proof that one admitted frame is accounted for.
+///
+/// Held by the queued job, so the budget is released exactly when the worker
+/// drops the job — including when the worker exits with jobs still queued.
+#[derive(Debug)]
+pub(crate) struct CapturePermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for CapturePermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Geometry the native drag backend needs from the source window.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,6 +314,9 @@ pub(crate) enum Job {
         capture: Capture,
         /// Persisted GUI policy snapshotted with the request.
         policy: AfterCaptureSettings,
+        /// Admission token that strictly bounds full-resolution frames waiting
+        /// for or being processed by the worker.
+        _permit: CapturePermit,
     },
     /// Put a card's capture on the clipboard.
     Copy(CardId),
@@ -753,6 +808,7 @@ pub struct ReadyCapture {
 /// A handle to the capture and history threads.
 pub struct Pipeline {
     jobs: Sender<Job>,
+    capture_budget: CaptureBudget,
     pending_pin_updates: Arc<PendingPinUpdates>,
     history_queries: Sender<HistoryQuery>,
     uploads: Sender<UploadJob>,
@@ -827,6 +883,7 @@ impl Pipeline {
         let vault = CaptureVault::new();
         let worker_vault = vault.clone();
         let pending_pin_updates = Arc::new(PendingPinUpdates::default());
+        let capture_budget = CaptureBudget::new();
         let worker_pin_updates = Arc::clone(&pending_pin_updates);
         let history_outcomes = outcome_tx.clone();
         let history_waker = waker.clone();
@@ -898,6 +955,7 @@ impl Pipeline {
 
         Ok(Self {
             jobs,
+            capture_budget,
             pending_pin_updates,
             history_queries,
             uploads,
@@ -918,6 +976,12 @@ impl Pipeline {
     #[must_use]
     pub fn captures(&self) -> CaptureVault {
         self.vault.clone()
+    }
+
+    /// Whether one forwarded full-resolution frame can be admitted now.
+    #[must_use]
+    pub fn can_accept_forwarded_capture(&self) -> bool {
+        self.capture_budget.has_capacity()
     }
 
     /// Allocates the next card identity.
@@ -962,11 +1026,18 @@ impl Pipeline {
         self.jobs.send(job).is_ok()
     }
 
-    /// Feed a completed selector capture into the ordinary durable card pipeline.
+    /// Feed completed external capture pixels into the durable card pipeline.
     ///
-    /// Region and window selectors own their platform-specific lifecycle, but
-    /// their output must still receive history identity, a bounded texture, and
-    /// the same Pin to Screen action as a fixed display capture.
+    /// Region/window selectors and forwarded CLI captures own their capture
+    /// lifecycle, but their output must still receive history identity, a
+    /// bounded texture, and the same Pin to Screen action as a display capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the worker already holds
+    /// [`MAX_QUEUED_CAPTURE_FRAMES`] full-resolution frames, so a burst of
+    /// forwarded captures is refused explicitly rather than queued without
+    /// limit, and when the worker has stopped.
     pub fn accept_capture(
         &mut self,
         kind: CaptureKind,
@@ -974,6 +1045,12 @@ impl Pipeline {
         capture: Capture,
         policy: AfterCaptureSettings,
     ) -> CliResult<CardId> {
+        let permit = self.capture_budget.try_acquire().ok_or_else(|| {
+            CliError::Core(CoreError::Platform(format!(
+                "the capture worker already holds the maximum of \
+                 {MAX_QUEUED_CAPTURE_FRAMES} full-resolution forwarded captures"
+            )))
+        })?;
         let card = self.allocate();
         self.jobs
             .send(Job::Captured {
@@ -982,6 +1059,7 @@ impl Pipeline {
                 card,
                 capture,
                 policy,
+                _permit: permit,
             })
             .map_err(|_| {
                 CliError::Core(CoreError::Platform(
@@ -1481,6 +1559,7 @@ impl Worker {
                     card,
                     capture,
                     policy,
+                    _permit,
                 } => self.accept_captured(kind, origin, card, capture, &policy),
                 Job::Copy(card) => self.copy(card),
                 Job::CopyImage { card, rendered } => self.copy_image(card, &rendered),
@@ -3280,7 +3359,14 @@ fn dimension(value: f64) -> u32 {
     value.round().clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
-fn capture_kind(provenance: Provenance) -> CaptureKind {
+/// The card kind a capture's provenance implies.
+///
+/// The pin's chrome policy is chosen from the card kind, and D9 forbids
+/// synthetic chrome on a window capture, so this mapping is part of the
+/// contract rather than a presentation detail. It reads the *provenance* rather
+/// than the requested target because an interactive request does not know what
+/// the user will pick.
+pub(crate) const fn capture_kind(provenance: Provenance) -> CaptureKind {
     match provenance {
         Provenance::Window => CaptureKind::Window,
         Provenance::Region | Provenance::Stitched => CaptureKind::Region,
@@ -3839,6 +3925,22 @@ mod tests {
         }
     }
 
+    fn large_capture(marker: u8) -> Capture {
+        let edge = 1_024;
+        Capture {
+            frame: Frame {
+                data: vec![marker; edge * edge * 4],
+                size: PhysicalSize::new(edge as f64, edge as f64),
+                stride: edge * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Window,
+            target: CaptureTarget::Window(WindowId(format!("large-{marker}"))),
+        }
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4165,6 +4267,134 @@ mod tests {
     fn polling_an_idle_pipeline_does_not_block() {
         let pipeline = start_pipeline();
         assert!(pipeline.poll().is_none());
+    }
+
+    #[test]
+    fn full_resolution_capture_backpressure_is_strict_and_moves_pixels() {
+        let (jobs, job_rx) = channel();
+        let (history_queries, _history_rx) = channel();
+        let (uploads, _upload_rx) = channel();
+        let (_outcome_tx, outcomes) = channel();
+        let mut pipeline = Pipeline {
+            jobs,
+            capture_budget: CaptureBudget::new(),
+            pending_pin_updates: Arc::new(PendingPinUpdates::default()),
+            history_queries,
+            uploads,
+            outcomes,
+            worker: None,
+            history_worker: None,
+            upload_worker: None,
+            upload_cancellation: crate::cloud::ShareCancellation::default(),
+            next_card: 1,
+            vault: CaptureVault::new(),
+        };
+        let policy = AfterCaptureSettings::default();
+
+        let first = large_capture(1);
+        let first_pixels = first.frame.data.as_ptr();
+        pipeline
+            .accept_capture(
+                CaptureKind::Window,
+                CaptureOrigin::Direct,
+                first,
+                policy.clone(),
+            )
+            .expect("first large frame");
+        pipeline
+            .accept_capture(
+                CaptureKind::Region,
+                CaptureOrigin::Direct,
+                large_capture(2),
+                policy.clone(),
+            )
+            .expect("second large frame");
+        let error = pipeline
+            .accept_capture(
+                CaptureKind::Window,
+                CaptureOrigin::Direct,
+                large_capture(3),
+                policy,
+            )
+            .expect_err("a burst beyond the strict frame budget must backpressure");
+        assert!(
+            error.to_string().contains("maximum"),
+            "backpressure should be explicit: {error}"
+        );
+        assert_eq!(
+            pipeline.capture_budget.in_flight.load(Ordering::Acquire),
+            MAX_QUEUED_CAPTURE_FRAMES
+        );
+
+        let Job::Captured { capture, .. } = job_rx.try_recv().expect("first queued capture") else {
+            panic!("capture admission queued the wrong job");
+        };
+        assert_eq!(
+            capture.frame.data.as_ptr(),
+            first_pixels,
+            "the full-resolution pixel allocation must move, not clone"
+        );
+    }
+
+    #[test]
+    fn a_drained_capture_permit_readmits_the_next_forwarded_frame() {
+        // The budget must be a live count, not a high-water mark: once the
+        // worker has taken a frame the next forwarded capture has to be
+        // admitted, or a single burst would wedge forwarding for the session.
+        let (jobs, job_rx) = channel();
+        let (history_queries, _history_rx) = channel();
+        let (uploads, _upload_rx) = channel();
+        let (_outcome_tx, outcomes) = channel();
+        let mut pipeline = Pipeline {
+            jobs,
+            capture_budget: CaptureBudget::new(),
+            pending_pin_updates: Arc::new(PendingPinUpdates::default()),
+            history_queries,
+            uploads,
+            outcomes,
+            worker: None,
+            history_worker: None,
+            upload_worker: None,
+            upload_cancellation: crate::cloud::ShareCancellation::default(),
+            next_card: 1,
+            vault: CaptureVault::new(),
+        };
+        let policy = AfterCaptureSettings::default();
+
+        for marker in 1..=MAX_QUEUED_CAPTURE_FRAMES {
+            pipeline
+                .accept_capture(
+                    CaptureKind::Window,
+                    CaptureOrigin::Direct,
+                    large_capture(u8::try_from(marker).expect("small marker")),
+                    policy.clone(),
+                )
+                .expect("frames within the budget");
+        }
+        assert!(
+            pipeline
+                .accept_capture(
+                    CaptureKind::Window,
+                    CaptureOrigin::Direct,
+                    large_capture(9),
+                    policy.clone()
+                )
+                .is_err()
+        );
+
+        drop(job_rx.try_recv().expect("one queued capture"));
+        pipeline
+            .accept_capture(
+                CaptureKind::Window,
+                CaptureOrigin::Direct,
+                large_capture(10),
+                policy,
+            )
+            .expect("a drained permit readmits one frame");
+        assert_eq!(
+            pipeline.capture_budget.in_flight.load(Ordering::Acquire),
+            MAX_QUEUED_CAPTURE_FRAMES
+        );
     }
 
     #[test]

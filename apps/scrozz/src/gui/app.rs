@@ -110,7 +110,7 @@ use crate::{
             PendingStart, RecordingState, SelectionStart,
         },
         selection::CaptureSelector,
-        server::{Forwarder, Request, Server},
+        server::{Admission, ForwardedCapture, Forwarder, Request, Server},
     },
     json::Json,
     report::Report,
@@ -626,6 +626,7 @@ pub struct App {
     keyboard_owners: u8,
     server: Option<Server>,
     forwarder: Option<Forwarder>,
+    pending_admissions: VecDeque<Admission>,
     selector: Arc<dyn CaptureSelector>,
     file_launcher: FileLauncher,
     active_editor_card: Option<CardId>,
@@ -966,7 +967,7 @@ impl App {
             // The one failure worth stopping for: another instance is live,
             // and a second menu-bar item is exactly what single-instance exists
             // to prevent.
-            let server = Server::bind_with_waker(waker)?;
+            let server = Server::bind_with_waker(waker.clone())?;
             notes.push(format!("listening at {}", server.path().display()));
             Some(server)
         } else {
@@ -974,7 +975,7 @@ impl App {
         };
         let forwarder = server
             .as_ref()
-            .map(|_| Forwarder::start(Arc::clone(&selector)))
+            .map(|_| Forwarder::start(Arc::clone(&selector), waker))
             .transpose()?;
 
         let tray = if config.tray {
@@ -1106,6 +1107,7 @@ impl App {
             keyboard_owners: 0,
             server,
             forwarder,
+            pending_admissions: VecDeque::new(),
             selector,
             file_launcher: default_file_launcher(),
             active_editor_card: None,
@@ -1422,16 +1424,13 @@ impl App {
     }
 
     fn drain_server(&mut self) -> Tick {
-        // Collected before any is served: serving needs `&mut self`, and the
-        // listener is borrowed for as long as it is being polled.
-        let mut pending = Vec::new();
-        if let Some(server) = &self.server {
-            while let Some(request) = server.poll() {
-                pending.push(request);
-            }
-        }
-
-        for request in pending {
+        loop {
+            // Keep the server borrow inside this expression. The request owns
+            // its response channel, so serving it can then borrow the whole app.
+            let request = self.server.as_ref().and_then(Server::poll);
+            let Some(request) = request else {
+                break;
+            };
             tracing::debug!(?request, "a forwarded command arrived");
             let mut with_argv0 = Vec::with_capacity(request.argv.len() + 1);
             with_argv0.push("scrozz".to_owned());
@@ -1453,23 +1452,16 @@ impl App {
                 continue;
             }
 
+            // Pin state lives on this thread and needs no selector, so these
+            // run here rather than on the worker.
             if needs_live_pin_state {
-                let command = request.serve_with(|command| {
-                    if let Some(id) = forwarded_unpin(command) {
-                        let capture = CaptureId(id.to_owned());
-                        let generation = self.set_pin_intent(capture.clone(), false);
-                        self.surface.discard_pin(&capture);
-                        self.pipeline.terminal_unpin(capture, generation)?;
-                        self.note(format!("pinned capture {id} closed after forwarded unpin"));
-                    }
-                    if forwarded_unlock_pins(command) {
-                        self.unlock_all_pins()?;
-                        self.note("pinned captures unlocked from the command line");
-                    }
-                    Ok(())
+                let mut accepted_capture = false;
+                let command = request.serve_with(|command, captured| {
+                    accepted_capture = captured.is_some();
+                    self.accept_forwarded(command, captured)
                 });
                 if let Some(command) = command {
-                    self.observe_forwarded_command(&command);
+                    self.observe_forwarded_command(&command, accepted_capture);
                 }
                 continue;
             }
@@ -1483,14 +1475,30 @@ impl App {
             }
         }
 
-        let mut completed = Vec::new();
+        // Everything the worker finished is waiting on this thread to take it.
+        // The worker is blocked until each is completed, which is what makes a
+        // forwarded capture's success reply mean the pixels were accepted.
         if let Some(forwarder) = &self.forwarder {
-            while let Some(command) = forwarder.poll() {
-                completed.push(command);
+            while let Some(admission) = forwarder.poll() {
+                self.pending_admissions.push_back(admission);
             }
         }
-        for command in completed.into_iter().flatten() {
-            self.observe_forwarded_command(&command);
+        while let Some(mut admission) = self.pending_admissions.pop_front() {
+            if admission.has_capture() && !self.pipeline.can_accept_forwarded_capture() {
+                self.pending_admissions.push_front(admission);
+                break;
+            }
+            let captured = admission.take_capture();
+            let accepted_capture = captured.is_some();
+            let accepted = self.accept_forwarded(admission.command(), captured);
+            if let Err(error) = &accepted {
+                self.note(format!(
+                    "a forwarded command could not be completed by this instance: {error}"
+                ));
+            }
+            if let Some(command) = admission.complete(accepted) {
+                self.observe_forwarded_command(&command, accepted_capture);
+            }
         }
 
         // A forwarded command never ends this process. `scrozz quit` is not a
@@ -1573,8 +1581,14 @@ impl App {
         Ok(report)
     }
 
-    fn observe_forwarded_command(&mut self, command: &crate::cli::Command) {
-        self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
+    fn observe_forwarded_command(&mut self, command: &crate::cli::Command, accepted_capture: bool) {
+        // A capture whose pixels reached the pipeline is counted when its card
+        // arrives, like every other capture. Counting it here as well would
+        // report one screenshot as two. What remains for this branch is the
+        // capture that produced no card at all — a dry run, or a plan that
+        // never opened a backend.
+        self.captures +=
+            u64::from(matches!(command, crate::cli::Command::Capture(_)) && !accepted_capture);
         if matches!(
             command,
             crate::cli::Command::Settings(crate::cli::SettingsArgs {
@@ -1630,6 +1644,35 @@ impl App {
                 ));
             }
         }
+    }
+
+    /// Completes, on this thread, everything a forwarded command asked the app
+    /// for — before its caller is told the command succeeded.
+    ///
+    /// The pixels are *moved* into the capture pipeline here, so a burst that
+    /// the pipeline refuses becomes a failure the caller sees rather than a
+    /// capture that quietly vanished.
+    fn accept_forwarded(
+        &mut self,
+        command: &crate::cli::Command,
+        captured: Option<ForwardedCapture>,
+    ) -> CliResult<()> {
+        if let Some(ForwardedCapture { kind, capture }) = captured {
+            let card = self.accept_capture(kind, capture)?;
+            self.note(format!("{card} accepted from a forwarded capture"));
+        }
+        if let Some(id) = forwarded_unpin(command) {
+            let capture = CaptureId(id.to_owned());
+            let generation = self.set_pin_intent(capture.clone(), false);
+            self.surface.discard_pin(&capture);
+            self.pipeline.terminal_unpin(capture, generation)?;
+            self.note(format!("pinned capture {id} closed after forwarded unpin"));
+        }
+        if forwarded_unlock_pins(command) {
+            self.unlock_all_pins()?;
+            self.note("pinned captures unlocked from the command line");
+        }
+        Ok(())
     }
 
     fn drain_pipeline(&mut self) {
@@ -3366,7 +3409,7 @@ impl App {
             kind,
             CaptureOrigin::Direct,
             capture,
-            self.config.after_capture.clone(),
+            AfterCaptureSettings::direct_command(),
         )
     }
 
@@ -4347,6 +4390,11 @@ impl App {
             self.apple_picker = None;
         }
         if let Some(mut forwarder) = self.forwarder.take() {
+            while let Some(admission) = self.pending_admissions.pop_front() {
+                let _ = admission.complete(Err(CliError::ipc(
+                    "the running instance shut down before capture admission completed",
+                )));
+            }
             forwarder.stop();
         }
         self.pipeline.stop();
@@ -5983,8 +6031,8 @@ mod tests {
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
     use scrozz_core::{
-        CaptureTarget, ColorSpace, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize,
-        PixelFormat, Provenance, ScaleFactor,
+        Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
+        PhysicalSize, PixelFormat, Provenance, ScaleFactor, WindowId,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5999,6 +6047,45 @@ mod tests {
         )
         .expect("a sealed app must start");
         (app, handle)
+    }
+
+    fn forwarded_capture(kind: CaptureKind) -> ForwardedCapture {
+        let (provenance, target) = match kind {
+            CaptureKind::Fullscreen => (
+                Provenance::Display,
+                CaptureTarget::Region(LogicalRect::new(
+                    LogicalPoint::new(0.0, 0.0),
+                    LogicalSize::new(4.0, 4.0),
+                )),
+            ),
+            CaptureKind::Region => (
+                Provenance::Region,
+                CaptureTarget::Region(LogicalRect::new(
+                    LogicalPoint::new(0.0, 0.0),
+                    LogicalSize::new(4.0, 4.0),
+                )),
+            ),
+            CaptureKind::Window | CaptureKind::AllInOne => (
+                Provenance::Window,
+                CaptureTarget::Window(WindowId("forwarded-window".into())),
+            ),
+            CaptureKind::AllDisplays => (Provenance::AllDisplays, CaptureTarget::AllDisplays),
+        };
+        ForwardedCapture {
+            kind,
+            capture: Capture {
+                frame: Frame {
+                    data: vec![255; 4 * 4 * 4],
+                    size: PhysicalSize::new(4.0, 4.0),
+                    stride: 16,
+                    format: PixelFormat::Rgba8,
+                    color_space: ColorSpace::Srgb,
+                    scale: ScaleFactor::IDENTITY,
+                },
+                provenance,
+                target,
+            },
+        }
     }
 
     #[test]
@@ -7067,9 +7154,12 @@ mod tests {
             false,
         );
         store.save(&changed).unwrap();
-        app.observe_forwarded_command(&crate::cli::Command::Settings(crate::cli::SettingsArgs {
-            command: SettingsCommand::Reload,
-        }));
+        app.observe_forwarded_command(
+            &crate::cli::Command::Settings(crate::cli::SettingsArgs {
+                command: SettingsCommand::Reload,
+            }),
+            false,
+        );
 
         assert!(!app.config.after_capture.is_enabled(
             MediaKind::Screenshot,
@@ -7705,6 +7795,47 @@ mod tests {
             app.pin_lock_escapes().is_empty(),
             "configured resources are not lock escapes until they exist"
         );
+    }
+
+    #[test]
+    fn forwarded_region_and_window_pixels_bypass_ambient_presentation_actions() {
+        let (mut app, surface) = app();
+        for (arguments, kind) in [
+            (
+                vec!["scrozz", "capture", "--region", "0,0,4,4"],
+                CaptureKind::Region,
+            ),
+            (
+                vec!["scrozz", "capture", "--window", "forwarded-window"],
+                CaptureKind::Window,
+            ),
+        ] {
+            let command = Cli::try_parse_from(arguments)
+                .expect("valid forwarded capture")
+                .command
+                .expect("capture command");
+            app.accept_forwarded(&command, Some(forwarded_capture(kind)))
+                .expect("forwarded pixels accepted");
+        }
+
+        for _ in 0..200 {
+            app.drain_pipeline();
+            if app.captures >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            surface.presented().is_empty(),
+            "an explicit command must not inherit the GUI's overlay action"
+        );
+        assert_eq!(
+            app.captures, 2,
+            "the app still accepted both moved captures"
+        );
+        // `pipeline::selector_outputs_receive_durable_identity_and_pin_ready_provenance`
+        // covers the durable Pin to Screen identity with an isolated store.
+        assert_eq!(app.captures, 2, "each capture is accounted exactly once");
     }
 
     #[test]

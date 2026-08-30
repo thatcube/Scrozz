@@ -203,8 +203,14 @@ fn notify_running_instance_settings_changed() {
 /// not a failure.
 fn try_forward(command: &Command) -> CliResult<Option<u8>> {
     let _ = command;
-    if !matches!(ipc::probe(), ipc::Status::Running) {
-        return Ok(None);
+    match ipc::probe() {
+        ipc::Status::Running => {}
+        ipc::Status::NotRunning => return Ok(None),
+        ipc::Status::Unusable(error) => {
+            return Err(CliError::ipc(format!(
+                "the running-instance endpoint is present but unusable: {error}"
+            )));
+        }
     }
 
     let argv: Vec<String> = std::env::args().skip(1).collect();

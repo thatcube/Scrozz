@@ -433,6 +433,18 @@ before the next backing surface is allocated.
 | X11 | Scrozz requests a managed Dock window, ICCCM `input = false`, removes `WM_TAKE_FOCUS`, and asks for Above, Sticky, SkipTaskbar, and SkipPager. These are window-manager policy hints, not a portable focus guarantee, so the UI says so and lock remains disabled. | The shared X11 coordinate space and detected server scale are used. A WM may ignore placement, stacking, stickiness, or focus hints. Override-redirect is deliberately not used for movable pins because it breaks WM move/resize behavior. |
 | Wayland | An ordinary `xdg_toplevel` cannot promise non-activation or an always-on-top layer. Scrozz does not infer layer-shell availability from a compositor name and does not claim support until it has actually bound the advertised protocol. | `xdg-shell` has no global positioning. wlroots/KWin compositors may offer layer-shell; GNOME/Mutter does not. Until a native adapter exists, compositor window rules are the honest workaround. XWayland is an explicit crispness/fractional-scaling trade-off, never an automatic fallback. |
 
+A capture reaches a pin from every source that can name a target. The fullscreen
+hotkey and tray entry go straight through the pipeline; a `scrozz capture` typed
+at a terminal while the app is running is executed *inside* it over a Unix
+socket or a current-user-only Windows named pipe. Its pixels are moved into the
+same capture stack before the caller receives success, so they receive history
+identity, a bounded texture, and Pin to Screen exactly as a hotkey capture does.
+The handoff admits one frame per request and at most two queued full-resolution
+frames; additional burst requests receive an explicit busy error instead of
+growing memory without limit. Choosing a region or a window *on screen* runs the
+selection overlay first and then rejoins that same handoff, so an interactively
+chosen target is bounded and identified identically to a named one.
+
 Static pins do not drive a repaint clock. Capture completion, IPC, menu/hotkey
 input, viewport interaction, animation, geometry settlement, and explicit
 content changes wake the event loop. Native pin properties are delta-applied, so

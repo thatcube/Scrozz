@@ -279,6 +279,23 @@ impl Default for AfterCaptureSettings {
 }
 
 impl AfterCaptureSettings {
+    /// Empty action policy for an explicit CLI command forwarded to the app.
+    ///
+    /// The command already owns its file/clipboard/stdout sinks. Ambient GUI
+    /// actions must not add a second save, replace the clipboard, or open UI.
+    #[must_use]
+    pub fn direct_command() -> Self {
+        Self {
+            sets: [ActionSet::empty(), ActionSet::empty()],
+            values: BTreeMap::new(),
+            unknown_values: BTreeMap::new(),
+            smart_frame_presets: Vec::new(),
+            document_version: SETTINGS_VERSION,
+            unknown_root: BTreeMap::new(),
+            unknown_after_capture: BTreeMap::new(),
+        }
+    }
+
     /// Defaults for a profile created by this version.
     #[must_use]
     pub fn fresh() -> Self {
@@ -1166,6 +1183,19 @@ mod tests {
             AfterCaptureAction::ShowRecentCapturesOverlay
         ));
         assert!(!existing.is_enabled(MediaKind::Recording, AfterCaptureAction::CopyToClipboard));
+    }
+
+    #[test]
+    fn direct_command_policy_never_runs_ambient_gui_actions() {
+        let settings = AfterCaptureSettings::direct_command();
+        for media in [MediaKind::Screenshot, MediaKind::Recording] {
+            for action in AfterCaptureAction::UI_ORDER {
+                assert!(
+                    !settings.is_enabled(media, action),
+                    "{media:?} unexpectedly enabled {action:?}"
+                );
+            }
+        }
     }
 
     #[test]
