@@ -132,8 +132,17 @@ impl PinCapabilities {
             positioning: Support::Yes,
             always_on_top: Support::Yes,
             click_through: lock_adapter_missing(),
-            native_opacity: native_adapter_missing(),
-            non_activating: native_adapter_missing(),
+            native_opacity: Support::No {
+                why: "X11 window opacity is a compositing-manager feature, and no compositing manager is required to be running",
+                remedy: "the composited image-opacity fallback is used instead, so the pin fades either way",
+            },
+            // The adapter exists and applies every non-activation instruction
+            // X11 actually has. None of them is a promise, and saying otherwise
+            // would be the silent-failure class D8 exists to prevent.
+            non_activating: Support::No {
+                why: "X11 non-activation is window-manager policy: ICCCM input=false, no WM_TAKE_FOCUS and _NET_WM_USER_TIME=0 are requests a manager may ignore",
+                remedy: "use a window rule on managers that offer one; override-redirect is refused because it takes move and resize away from the manager",
+            },
         }
     }
 
@@ -183,13 +192,6 @@ impl PinCapabilities {
     }
 }
 
-fn native_adapter_missing() -> Support {
-    Support::No {
-        why: "this build has no native pinned-window adapter for the platform",
-        remedy: "portable pinning still works, but activation and native-alpha guarantees are unavailable",
-    }
-}
-
 fn lock_adapter_missing() -> Support {
     Support::No {
         why: "this build cannot guarantee that locking releases keyboard focus as well as pointer input",
@@ -226,6 +228,33 @@ mod tests {
         assert_eq!(x11.backend, PinBackend::X11ManagedDock);
         assert!(x11.positioning.available());
         assert!(!x11.click_through.available());
+    }
+
+    #[test]
+    fn x11_states_its_real_limit_rather_than_a_missing_adapter() {
+        // The X11 adapter exists. Reporting "no adapter" sent a reader looking
+        // for code that is already there, and hid the limit that is actually
+        // load-bearing: every X11 non-activation instruction is a request the
+        // window manager may refuse.
+        let x11 = PinCapabilities::for_session(&session(DisplayServer::X11, Compositor::Other));
+        for support in [&x11.non_activating, &x11.native_opacity] {
+            let Support::No { why, remedy } = support else {
+                panic!("X11 must not claim a guarantee the window manager owns");
+            };
+            assert!(
+                !why.contains("no native pinned-window adapter"),
+                "the X11 adapter exists; the limit is window-manager policy, not missing code"
+            );
+            assert!(
+                !remedy.is_empty(),
+                "a stated limit needs a stated way around it"
+            );
+        }
+        assert!(!x11.non_activating.available());
+        assert!(
+            matches!(&x11.non_activating, Support::No { why, .. } if why.contains("_NET_WM_USER_TIME")),
+            "the honest account names the instructions the adapter actually sends"
+        );
     }
 
     #[test]

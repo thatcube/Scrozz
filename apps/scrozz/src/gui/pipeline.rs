@@ -554,15 +554,27 @@ impl Worker {
             // The one capture with nothing to choose, so it needs nothing but a
             // backend. That is why it is the default hotkey.
             CaptureKind::Fullscreen => CaptureTarget::Display(backend.active_display()?.id),
-            // Choosing a region or a window is the selection overlay's job, and
-            // per D8 a missing capability is explained rather than approximated.
-            // Silently capturing the whole display instead would be worse than
-            // refusing: the user would get a file they did not ask for.
-            CaptureKind::Region | CaptureKind::Window => {
+            // Choosing a region or a window *on screen* is the selection
+            // overlay's job, and it does not exist yet. Per D8 that is
+            // explained rather than approximated: silently capturing the whole
+            // display instead would be worse than refusing, because the user
+            // would get a file they did not ask for. Naming the target is the
+            // route that does work end to end — the result joins this capture
+            // stack and can be pinned, which is the part they wanted.
+            CaptureKind::Window => {
                 return Err(CliError::not_implemented(
                     format!("choosing a {} on screen", kind.label()),
-                    "scrozz-ui (the selection overlay); \
-                     `scrozz capture --region X,Y,W,H` takes one without it",
+                    "scrozz-ui (the selection overlay); `scrozz capture --window <id or title>` \
+                     names one without it, and its result joins this capture stack and can \
+                     be pinned",
+                ));
+            }
+            CaptureKind::Region => {
+                return Err(CliError::not_implemented(
+                    format!("choosing a {} on screen", kind.label()),
+                    "scrozz-ui (the selection overlay); `scrozz capture --region X,Y,W,H` \
+                     names one without it, and its result joins this capture stack and can \
+                     be pinned",
                 ));
             }
         };

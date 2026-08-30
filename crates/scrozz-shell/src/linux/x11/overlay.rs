@@ -18,6 +18,8 @@ use crate::{OverlayBehavior, OverlayReport, OverlayWindow};
 const ICCCM_INPUT_HINT: u32 = 1;
 const NET_WM_STATE_ADD: u32 = 1;
 const NET_WM_SOURCE_APPLICATION: u32 = 1;
+/// `_NET_WM_USER_TIME` for a window no user interaction asked for.
+const NO_USER_INTERACTION_TIME: u32 = 0;
 
 #[derive(Debug)]
 struct Atoms {
@@ -32,6 +34,8 @@ struct Atoms {
     net_wm_state_sticky: Atom,
     net_wm_state_skip_taskbar: Atom,
     net_wm_state_skip_pager: Atom,
+    net_wm_user_time: Atom,
+    net_wm_user_time_window: Atom,
     wm_hints: Atom,
     wm_protocols: Atom,
     wm_take_focus: Atom,
@@ -39,7 +43,7 @@ struct Atoms {
 
 impl Atoms {
     fn intern(conn: &RustConnection) -> Result<Self> {
-        let names: [&[u8]; 14] = [
+        let names: [&[u8]; 16] = [
             b"UTF8_STRING",
             b"_NET_CLIENT_LIST",
             b"_NET_WM_NAME",
@@ -51,6 +55,8 @@ impl Atoms {
             b"_NET_WM_STATE_STICKY",
             b"_NET_WM_STATE_SKIP_TASKBAR",
             b"_NET_WM_STATE_SKIP_PAGER",
+            b"_NET_WM_USER_TIME",
+            b"_NET_WM_USER_TIME_WINDOW",
             b"WM_HINTS",
             b"WM_PROTOCOLS",
             b"WM_TAKE_FOCUS",
@@ -75,6 +81,8 @@ impl Atoms {
             net_wm_state_sticky,
             net_wm_state_skip_taskbar,
             net_wm_state_skip_pager,
+            net_wm_user_time,
+            net_wm_user_time_window,
             wm_hints,
             wm_protocols,
             wm_take_focus,
@@ -96,6 +104,8 @@ impl Atoms {
             net_wm_state_sticky: *net_wm_state_sticky,
             net_wm_state_skip_taskbar: *net_wm_state_skip_taskbar,
             net_wm_state_skip_pager: *net_wm_state_skip_pager,
+            net_wm_user_time: *net_wm_user_time,
+            net_wm_user_time_window: *net_wm_user_time_window,
             wm_hints: *wm_hints,
             wm_protocols: *wm_protocols,
             wm_take_focus: *wm_take_focus,
@@ -218,6 +228,36 @@ impl X11Overlay {
         )
         .map_err(platform)?;
 
+        // EWMH's own answer to "do not focus this window". A zero user time is
+        // defined to mean the window was not created by user interaction, and a
+        // conforming manager must not focus it on map or on request. It is the
+        // one non-activation instruction in the specification that does not
+        // depend on override-redirect, which movable pins cannot use because it
+        // takes move and resize away from the window manager.
+        //
+        // A client may redirect the manager to read the time from a separate
+        // window, and toolkits do: writing to the toplevel while the manager is
+        // reading `_NET_WM_USER_TIME_WINDOW` would set a value nothing consults
+        // and look, from here, exactly like success.
+        let time_window = property32(
+            conn,
+            self.window,
+            atoms.net_wm_user_time_window,
+            AtomEnum::WINDOW.into(),
+        )
+        .ok()
+        .and_then(|windows| windows.first().copied())
+        .filter(|window| *window != 0)
+        .unwrap_or(self.window);
+        conn.change_property32(
+            PropMode::REPLACE,
+            time_window,
+            atoms.net_wm_user_time,
+            AtomEnum::CARDINAL,
+            &[NO_USER_INTERACTION_TIME],
+        )
+        .map_err(platform)?;
+
         let protocols = property32(conn, self.window, atoms.wm_protocols, AtomEnum::ATOM.into())?;
         let protocols = without_take_focus(protocols, atoms.wm_take_focus);
         conn.change_property32(
@@ -254,7 +294,7 @@ impl X11Overlay {
 
         Ok(OverlayReport {
             non_activating: false,
-            detail: "X11 ICCCM input=false and EWMH dock/sticky/above hints are window-manager policy, not a focus guarantee".into(),
+            detail: "X11 ICCCM input=false, no WM_TAKE_FOCUS, _NET_WM_USER_TIME=0 and EWMH dock/sticky/above hints are window-manager policy, not a focus guarantee".into(),
         })
     }
 

@@ -448,34 +448,66 @@ impl App {
             }
         }
 
+        // Pixels taken by forwarded captures, collected rather than routed
+        // inline: the observer and the after-success hook would otherwise both
+        // want `&mut self` at once.
+        let mut captured: Vec<(CaptureKind, scrozz_core::Capture)> = Vec::new();
+
         for request in pending {
             tracing::debug!(?request, "a forwarded command arrived");
+            let taken_before = captured.len();
             // The command runs to completion here, on the main thread, because
             // it must produce byte-identical output to a local run and the
             // command layer is synchronous. A capture is tens of milliseconds;
             // a recording returns as soon as it has started.
-            let command = request.serve_with(|command| {
-                if let Some(id) = forwarded_unpin(command) {
-                    let capture = CaptureId(id.to_owned());
-                    let generation = self.set_pin_intent(capture.clone(), false);
-                    self.surface.discard_pin(&capture);
-                    self.pipeline.terminal_unpin(capture, generation)?;
-                    self.note(format!("pinned capture {id} closed after forwarded unpin"));
-                }
-                if forwarded_unlock_pins(command) {
-                    self.unlock_all_pins()?;
-                    self.note("pinned captures unlocked from the command line");
-                }
-                Ok(())
-            });
+            let command = request.serve_with(
+                &mut |kind, capture| captured.push((kind, capture.clone())),
+                |command| {
+                    if let Some(id) = forwarded_unpin(command) {
+                        let capture = CaptureId(id.to_owned());
+                        let generation = self.set_pin_intent(capture.clone(), false);
+                        self.surface.discard_pin(&capture);
+                        self.pipeline.terminal_unpin(capture, generation)?;
+                        self.note(format!("pinned capture {id} closed after forwarded unpin"));
+                    }
+                    if forwarded_unlock_pins(command) {
+                        self.unlock_all_pins()?;
+                        self.note("pinned captures unlocked from the command line");
+                    }
+                    Ok(())
+                },
+            );
             if let Some(command) = command {
-                self.captures += u64::from(matches!(command, crate::cli::Command::Capture(_)));
+                // A capture whose pixels reached the observer is counted when
+                // its card arrives, like every other capture. Counting it here
+                // as well would report one screenshot as two. What remains for
+                // this branch is the capture that produced no card at all — a
+                // dry run, or a plan that never opened a backend.
+                self.captures += u64::from(
+                    matches!(command, crate::cli::Command::Capture(_))
+                        && captured.len() == taken_before,
+                );
                 if matches!(command, crate::cli::Command::Gui) {
                     // A second `scrozz gui` means "show yourself", not "start
                     // again". There is nothing to show yet, so it is a no-op
                     // that has at least been answered rather than ignored.
                     self.note("a second launch was answered by this instance");
                 }
+            }
+        }
+
+        // A forwarded capture joins the stack the user is already looking at,
+        // and from here follows exactly the path a hotkey capture follows:
+        // durable history identity, a bounded texture, and Pin to Screen. This
+        // is what makes pinning a region or a window reachable at all — the
+        // selection overlay does not exist yet, so `--region` and `--window`
+        // are the routes those captures have.
+        for (kind, capture) in captured {
+            match self.accept_capture(kind, capture) {
+                Ok(card) => self.note(format!("{card} accepted from a forwarded capture")),
+                Err(error) => self.note(format!(
+                    "a forwarded capture could not join the capture stack: {error}"
+                )),
             }
         }
 

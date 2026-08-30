@@ -597,9 +597,16 @@ impl PinnedSurface {
         let maximum = displays
             .display_for_frame(self.state.frame)
             .or_else(|| self.state.display.as_ref().and_then(|id| displays.get(id)))
-            .map_or(MAX_PIN_SCALE, |display| {
-                maximum_scale(self.natural_size, display)
-            });
+            .map_or_else(
+                || {
+                    maximum_scale_without_a_destination(
+                        self.natural_size,
+                        displays,
+                        self.state.scale,
+                    )
+                },
+                |display| maximum_scale(self.natural_size, display),
+            );
         self.state.scale = PinScale::for_surface(scale, minimum, maximum);
         self.state.frame.size = scaled_size(self.natural_size, self.state.scale);
         let _ = self.reconcile(displays);
@@ -782,6 +789,31 @@ fn maximum_scale(size: LogicalSize, display: &Display) -> f64 {
     edge_limit
         .min(area_limit)
         .clamp(f64::MIN_POSITIVE, MAX_PIN_SCALE)
+}
+
+/// Largest scale permitted while no destination display can be named.
+///
+/// A backing surface is bounded in *physical* pixels, so enlarging one needs a
+/// real display density. When the pin's frame lands on no known display — a
+/// monitor unplugged between two frames, a topology query that has not settled
+/// — the strictest density still on the desk is used, and a desk with no
+/// displays at all caps growth at the size already allocated. Shrinking stays
+/// available in every case, because it can only release memory.
+fn maximum_scale_without_a_destination(
+    size: LogicalSize,
+    displays: &DisplaySet,
+    current: PinScale,
+) -> f64 {
+    let strictest = displays
+        .displays()
+        .iter()
+        .map(|display| maximum_scale(size, display))
+        .fold(f64::INFINITY, f64::min);
+    if strictest.is_finite() {
+        strictest
+    } else {
+        current.get()
+    }
 }
 
 fn snap_origin(origin: LogicalPoint, scale: ScaleFactor) -> LogicalPoint {
@@ -1258,6 +1290,52 @@ mod tests {
             assert!(height <= f64::from(MAX_PIN_PHYSICAL_EDGE) + 1.0e-6);
             assert!(width * height <= MAX_PIN_PHYSICAL_PIXELS as f64 + 1.0e-6);
         }
+    }
+
+    #[test]
+    fn an_unknown_destination_never_authorizes_a_larger_backing_surface() {
+        let dense = display("dense", 0.0, 4_000.0, 0.0, 4_000.0, 3.0, true);
+        let mut pin = PinnedSurface::on_display(
+            PinId::from("unplugged"),
+            LogicalSize::new(3_000.0, 2_000.0),
+            &dense,
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+        )
+        .unwrap();
+        let created = pin.state().scale;
+
+        // The desk is still populated but the frame sits on none of it: the
+        // strictest surviving density must still bound the allocation.
+        let elsewhere = DisplaySet::new(vec![display(
+            "elsewhere",
+            90_000.0,
+            4_000.0,
+            0.0,
+            4_000.0,
+            3.0,
+            true,
+        )]);
+        pin.set_scale(MAX_PIN_SCALE, &elsewhere);
+        let width = pin.state().frame.size.width * 3.0;
+        let height = pin.state().frame.size.height * 3.0;
+        assert!(width <= f64::from(MAX_PIN_PHYSICAL_EDGE) + 1.0e-6);
+        assert!(height <= f64::from(MAX_PIN_PHYSICAL_EDGE) + 1.0e-6);
+        assert!(width * height <= MAX_PIN_PHYSICAL_PIXELS as f64 + 1.0e-6);
+
+        // No display at all: growth has no density to be bounded by, so the
+        // already-allocated size is the ceiling.
+        let nothing = DisplaySet::new(Vec::new());
+        let held = pin.state().scale;
+        pin.set_scale(MAX_PIN_SCALE, &nothing);
+        assert!(
+            pin.state().scale.get() <= held.get() + 1.0e-9,
+            "an unknown desk must not authorize a larger surface"
+        );
+
+        // Shrinking only ever releases memory, so it stays available.
+        pin.set_scale(created.get() / 2.0, &nothing);
+        assert!(pin.state().scale.get() < held.get());
     }
 
     #[test]

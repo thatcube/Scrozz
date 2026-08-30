@@ -970,12 +970,11 @@ pub fn thumbnail(frame: &CaptureFrame, max_edge: u32) -> Option<egui::ColorImage
     );
     let mut output = Vec::with_capacity(output_len);
     for y in 0..nh {
-        let y0 = y.checked_mul(h)? / nh;
-        let y1 = (y + 1).checked_mul(h)?.div_ceil(nh).min(h).max(y0 + 1);
+        let (y0, y1) = box_span(y, nh, h)?;
         for x in 0..nw {
-            let x0 = x.checked_mul(w)? / nw;
-            let x1 = (x + 1).checked_mul(w)?.div_ceil(nw).min(w).max(x0 + 1);
-            let mut sums = [0u128; 4];
+            let (x0, x1) = box_span(x, nw, w)?;
+            let mut colour = [0u128; 3];
+            let mut alpha = 0u128;
             let mut count = 0u128;
             for sy in y0..y1 {
                 let row_start = sy.checked_mul(frame.stride)?;
@@ -987,31 +986,60 @@ pub fn thumbnail(frame: &CaptureFrame, max_edge: u32) -> Option<egui::ColorImage
                     } else {
                         [px[0], px[1], px[2], px[3]]
                     };
-                    for (sum, channel) in sums.iter_mut().zip(channels) {
-                        *sum += u128::from(channel);
+                    let a = u128::from(channels[3]);
+                    for (sum, channel) in colour.iter_mut().zip(&channels[..3]) {
+                        // Premultiplied samples are already alpha-weighted;
+                        // straight ones have to be weighted here, or a
+                        // transparent pixel's black drags a fringe into the
+                        // window edge D9 exists to protect.
+                        *sum += u128::from(*channel) * if premultiplied { 1 } else { a };
                     }
+                    alpha += a;
                     count += 1;
                 }
             }
-            let channels = sums.map(|sum| u8::try_from(sum / count).unwrap_or(u8::MAX));
+            let divisor = if premultiplied { count } else { alpha };
+            let channels = colour.map(|sum| {
+                match (sum + divisor / 2).checked_div(divisor) {
+                    // No coverage at all: there is no colour to report, and
+                    // inventing one is how a dark halo gets into the image.
+                    None => 0,
+                    Some(mean) => u8::try_from(mean).unwrap_or(u8::MAX),
+                }
+            });
+            let mean_alpha = u8::try_from((alpha + count / 2) / count).unwrap_or(u8::MAX);
             output.push(if premultiplied {
                 egui::Color32::from_rgba_premultiplied(
                     channels[0],
                     channels[1],
                     channels[2],
-                    channels[3],
+                    mean_alpha,
                 )
             } else {
                 egui::Color32::from_rgba_unmultiplied(
                     channels[0],
                     channels[1],
                     channels[2],
-                    channels[3],
+                    mean_alpha,
                 )
             });
         }
     }
     Some(egui::ColorImage::new([nw, nh], output))
+}
+
+/// The half-open source span one destination pixel covers.
+///
+/// Both ends floor, so consecutive spans tile the source exactly: every source
+/// pixel lands in exactly one destination pixel, and the final span always ends
+/// on `source`. A ceiling end would overlap neighbours and leave the outermost
+/// row and column supported differently from every other one — visible on a
+/// window capture as a softened, mis-weighted edge, which is the one part of a
+/// window capture D9 says must survive intact.
+fn box_span(index: usize, out: usize, source: usize) -> Option<(usize, usize)> {
+    let start = index.checked_mul(source)? / out;
+    let end = ((index + 1).checked_mul(source)? / out).min(source);
+    Some((start, end.max(start + 1)))
 }
 
 /// Box-filter an image down so its longest edge is at most `max_edge`.
@@ -1039,11 +1067,9 @@ pub fn downscale(image: &egui::ColorImage, max_edge: u32) -> Option<egui::ColorI
 
     let mut out = Vec::with_capacity(nw.checked_mul(nh)?);
     for y in 0..nh {
-        let y0 = y * h / nh;
-        let y1 = (((y + 1) * h).div_ceil(nh)).min(h).max(y0 + 1);
+        let (y0, y1) = box_span(y, nh, h)?;
         for x in 0..nw {
-            let x0 = x * w / nw;
-            let x1 = (((x + 1) * w).div_ceil(nw)).min(w).max(x0 + 1);
+            let (x0, x1) = box_span(x, nw, w)?;
             // Average in premultiplied space, which is where `Color32` already
             // lives — averaging straight alpha would darken translucent edges.
             let (mut r, mut g, mut b, mut a, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
@@ -1085,6 +1111,71 @@ struct Entry {
     pin_notice: Option<String>,
 }
 
+/// On-screen ownership of pin identities.
+///
+/// Pin lifecycle commands are asynchronous, and two of them race. A restore can
+/// be issued by the host while this overlay is closing the same pin, because
+/// the host is told about a close only after the window has already gone. If
+/// whichever command is applied last decided the outcome, one ordering would
+/// put back a pin the user dismissed and whose durable state is being cleared —
+/// a pin that reappears and cannot be explained.
+///
+/// The overlay owns the on-screen lifetime, so it settles the race rather than
+/// leaving it to arrival order: an identity it has retired stays retired until
+/// a deliberate new pin revives it. Kept pure so every ordering is testable
+/// without a window server.
+///
+/// The retired set grows with the number of pins closed in one session and is
+/// never evicted, which is deliberate: dropping a retirement is precisely what
+/// would let a stale restore land, and the cost of keeping one is a capture id.
+/// A session would have to close tens of thousands of pins before that were
+/// measurable, and it ends with the process.
+#[derive(Debug, Default)]
+struct PinLifetimes {
+    retired: HashSet<PinId>,
+}
+
+/// Why a queued pin restore no longer describes reality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleRestore {
+    /// This overlay closed the pin after the restore was issued.
+    Retired,
+    /// A live pin already owns the identity, and its geometry is newer.
+    AlreadyOnScreen,
+}
+
+impl StaleRestore {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Retired => "this overlay closed the same pin after the restore was issued",
+            Self::AlreadyOnScreen => "the pin is already on screen with newer geometry",
+        }
+    }
+}
+
+impl PinLifetimes {
+    /// A deliberate new pin starts a fresh lifetime for an identity.
+    fn opened(&mut self, id: &PinId) {
+        self.retired.remove(id);
+    }
+
+    /// The pin left the screen, so later restores of it are stale.
+    fn retired(&mut self, id: &PinId) {
+        self.retired.insert(id.clone());
+    }
+
+    /// Whether a queued restore may still open a window.
+    fn admits_restore(&self, id: &PinId, on_screen: bool) -> Result<(), StaleRestore> {
+        if self.retired.contains(id) {
+            Err(StaleRestore::Retired)
+        } else if on_screen {
+            Err(StaleRestore::AlreadyOnScreen)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 struct PinnedEntry {
     name: String,
     surface: PinnedSurface,
@@ -1118,6 +1209,7 @@ pub struct OverlayApp {
     stack: CaptureStack,
     content: HashMap<CardId, Entry>,
     pins: HashMap<PinId, PinnedEntry>,
+    pin_lifetimes: PinLifetimes,
     pending_pin_cards: HashMap<PinId, CardId>,
     pinned_cards: HashSet<CardId>,
     handle: OverlayHandle,
@@ -1186,6 +1278,7 @@ impl OverlayApp {
             stack: CaptureStack::for_work_area(options.geometry.local()),
             content: HashMap::new(),
             pins: HashMap::new(),
+            pin_lifetimes: PinLifetimes::default(),
             pending_pin_cards: HashMap::new(),
             pinned_cards: HashSet::new(),
             handle,
@@ -1395,11 +1488,24 @@ impl OverlayApp {
                 }
                 Command::RefreshPinTexture { pin, image } => {
                     if let Some(entry) = self.pins.get_mut(&pin) {
-                        entry.pending = downscale(&image, PIN_TEXTURE_PX);
-                        entry.content_error = entry
-                            .pending
-                            .is_none()
-                            .then(|| "The refreshed pin texture exceeded safe GPU limits.".into());
+                        match downscale(&image, PIN_TEXTURE_PX) {
+                            Some(image) => {
+                                entry.pending = Some(image);
+                                // Pixels arrived, so whatever explained their
+                                // absence has stopped being true.
+                                entry.content_error = None;
+                            }
+                            // A pin already showing a bounded preview keeps it:
+                            // a smaller correct image beats an error page, and
+                            // the host reports the refresh failure as a note.
+                            // A pin with nothing to draw has to say so instead.
+                            None if entry.texture.is_none() && entry.pending.is_none() => {
+                                entry.content_error = Some(
+                                    "The refreshed pin texture exceeded safe GPU limits.".into(),
+                                );
+                            }
+                            None => {}
+                        }
                     }
                 }
                 Command::CommitPin(id) => self.commit_pin(&id, m),
@@ -1551,6 +1657,7 @@ impl OverlayApp {
             positioning_notice: self.pin_support.limitation_notice(),
             native_frame_changed_at: None,
         };
+        self.pin_lifetimes.opened(&pin);
         self.pins.insert(pin.clone(), entry);
         self.pending_pin_cards.insert(pin.clone(), card);
         self.emit(OverlayEvent::PinRequested {
@@ -1580,6 +1687,13 @@ impl OverlayApp {
             tracing::warn!("persisted pin restore omitted its durable capture identity");
             return;
         };
+        if let Err(stale) = self
+            .pin_lifetimes
+            .admits_restore(&id, self.pins.contains_key(&id))
+        {
+            tracing::debug!(pin = %id, "ignoring a stale pin restore: {}", stale.reason());
+            return;
+        }
         let requested_locked = state.locked;
         let policy = chrome_policy(request.provenance);
         let scale = request.source_scale;
@@ -1626,6 +1740,7 @@ impl OverlayApp {
         if self.pins.remove(id).is_none() {
             return;
         }
+        self.pin_lifetimes.retired(id);
         ctx.send_viewport_cmd_to(pin_viewport_id(id), egui::ViewportCommand::Close);
         self.pending_pin_cards.remove(id);
         self.emit(OverlayEvent::PinClosed { pin: id.clone() });
@@ -1651,6 +1766,7 @@ impl OverlayApp {
 
     fn discard_pin(&mut self, ctx: &egui::Context, id: &PinId) {
         self.pending_pin_cards.remove(id);
+        self.pin_lifetimes.retired(id);
         if self.pins.remove(id).is_some() {
             ctx.send_viewport_cmd_to(pin_viewport_id(id), egui::ViewportCommand::Close);
         }
@@ -2232,6 +2348,113 @@ mod tests {
             source_size: egui::Vec2::new(2.0, 2.0),
         };
         assert!(downscale(&malformed, 2).is_none());
+    }
+
+    #[test]
+    fn a_restore_issued_before_a_close_cannot_resurrect_the_pin() {
+        let pin = PinId::from("capture-1");
+        let mut lifetimes = PinLifetimes::default();
+
+        // The ordinary case: nothing owns the identity, so a persisted pin opens.
+        assert_eq!(lifetimes.admits_restore(&pin, false), Ok(()));
+
+        // The user closes it. The host is told only afterwards, so a restore it
+        // had already queued arrives next — and must not be honoured.
+        lifetimes.retired(&pin);
+        assert_eq!(
+            lifetimes.admits_restore(&pin, false),
+            Err(StaleRestore::Retired)
+        );
+        // Repeating the stale restore never wears the refusal down.
+        assert_eq!(
+            lifetimes.admits_restore(&pin, false),
+            Err(StaleRestore::Retired)
+        );
+
+        // Pinning the same capture again is a deliberate new lifetime, so the
+        // identity becomes restorable once more rather than being poisoned.
+        lifetimes.opened(&pin);
+        assert_eq!(lifetimes.admits_restore(&pin, false), Ok(()));
+
+        // Retirement is per identity, never global.
+        let other = PinId::from("capture-2");
+        lifetimes.retired(&other);
+        assert_eq!(lifetimes.admits_restore(&pin, false), Ok(()));
+        assert_eq!(
+            lifetimes.admits_restore(&other, false),
+            Err(StaleRestore::Retired)
+        );
+    }
+
+    #[test]
+    fn a_late_restore_never_teleports_a_pin_the_user_is_looking_at() {
+        // The live surface carries the user's own drags; the restore carries
+        // state as it was persisted. Replacing one with the other would move a
+        // pin under the pointer for no reason the user can see.
+        let pin = PinId::from("capture-1");
+        let lifetimes = PinLifetimes::default();
+        assert_eq!(
+            lifetimes.admits_restore(&pin, true),
+            Err(StaleRestore::AlreadyOnScreen)
+        );
+    }
+
+    #[test]
+    fn box_spans_tile_a_source_exactly_including_its_outermost_pixel() {
+        for source in 1usize..=48 {
+            for out in 1..=source {
+                let mut previous_end = 0usize;
+                for index in 0..out {
+                    let (start, end) = box_span(index, out, source).expect("finite span");
+                    assert_eq!(start, previous_end, "spans must not gap or overlap");
+                    assert!(end > start, "every destination pixel needs a sample");
+                    previous_end = end;
+                }
+                assert_eq!(
+                    previous_end, source,
+                    "the final span must reach the outermost source pixel"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thumbnailing_a_straight_alpha_edge_keeps_its_colour() {
+        // One opaque white pixel beside three transparent ones: the corner of an
+        // antialiased window. A straight average would report quarter-grey and
+        // fringe the window; the alpha-weighted one reports white at quarter
+        // coverage, which is what D9 asks the pin to preserve.
+        let frame = CaptureFrame {
+            data: vec![
+                255, 255, 255, 255, 0, 0, 0, 0, // row 0
+                0, 0, 0, 0, 0, 0, 0, 0, // row 1
+            ],
+            size: scrozz_core::PhysicalSize::new(2.0, 2.0),
+            stride: 8,
+            format: PixelFormat::Rgba8,
+            color_space: scrozz_core::ColorSpace::Srgb,
+            scale: scrozz_core::ScaleFactor::IDENTITY,
+        };
+        let img = thumbnail(&frame, 1).expect("bounded thumbnail");
+        assert_eq!(img.size, [1, 1]);
+        assert_eq!(img.pixels[0].to_srgba_unmultiplied(), [255, 255, 255, 64]);
+    }
+
+    #[test]
+    fn thumbnailing_preserves_a_solid_opaque_colour_exactly() {
+        let frame = CaptureFrame {
+            data: [10u8, 200, 30, 255].repeat(16),
+            size: scrozz_core::PhysicalSize::new(4.0, 4.0),
+            stride: 16,
+            format: PixelFormat::Rgba8,
+            color_space: scrozz_core::ColorSpace::Srgb,
+            scale: scrozz_core::ScaleFactor::IDENTITY,
+        };
+        let img = thumbnail(&frame, 2).expect("bounded thumbnail");
+        assert_eq!(img.size, [2, 2]);
+        for pixel in &img.pixels {
+            assert_eq!(pixel.to_srgba_unmultiplied(), [10, 200, 30, 255]);
+        }
     }
 
     #[test]

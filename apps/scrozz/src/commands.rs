@@ -30,12 +30,27 @@ use crate::{
         InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand, Sink, TargetSpec,
     },
     fault::{CliError, CliResult},
+    gui::CaptureKind,
     hotkey_config, ipc,
     json::Json,
     platform,
     report::Report,
     settings,
 };
+
+/// Somewhere for a dispatched capture's pixels to go, besides its own sinks.
+///
+/// A capture typed at a terminal while the menu-bar app is running executes
+/// *inside* that app — that is what forwarding is for. Its pixels must
+/// therefore be able to join the capture stack the user is already looking at,
+/// and everything downstream of the stack: history identity, a bounded texture,
+/// and Pin to Screen.
+///
+/// Without this seam the command wrote its file and the pixels ended there,
+/// which quietly made pinning a fullscreen-only feature. Region and window
+/// captures had a working backend and durable storage, and no route to a pin,
+/// because the only producer that reached the card pipeline was the hotkey.
+pub type CaptureSink<'a> = &'a mut dyn FnMut(CaptureKind, &scrozz_core::Capture);
 
 /// Runs a command locally.
 ///
@@ -44,8 +59,21 @@ use crate::{
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
+    dispatch_observed(command, &mut |_, _| {})
+}
+
+/// Runs a command locally, offering any capture it takes to `observed`.
+///
+/// A run with nowhere to put pixels uses [`dispatch`]; the observer exists for
+/// the one caller that has a live capture stack to put them in.
+///
+/// # Errors
+///
+/// Identical to [`dispatch`]. The observer runs only after the capture has
+/// already succeeded, so it can neither cause nor mask a failure.
+pub fn dispatch_observed(command: &Command, observed: CaptureSink<'_>) -> CliResult<Report> {
     match command {
-        Command::Capture(args) => capture(args),
+        Command::Capture(args) => capture(args, observed),
         Command::Record(args) => record(args),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
@@ -56,11 +84,30 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
     }
 }
 
+/// Which card kind a resolved target produces.
+///
+/// The interactive modes are included because an interactive capture that a
+/// selector eventually completes is still a region or a window capture, and its
+/// card must say so — that is what decides the pin's chrome policy under D9.
+const fn capture_kind(target: &TargetSpec) -> CaptureKind {
+    match target {
+        TargetSpec::Region(_) | TargetSpec::Interactive(InteractiveMode::Region) => {
+            CaptureKind::Region
+        }
+        TargetSpec::Window(_) | TargetSpec::Interactive(InteractiveMode::Window) => {
+            CaptureKind::Window
+        }
+        TargetSpec::Display(_)
+        | TargetSpec::AllDisplays
+        | TargetSpec::Interactive(InteractiveMode::Display) => CaptureKind::Fullscreen,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // capture
 // ---------------------------------------------------------------------------
 
-fn capture(args: &CaptureArgs) -> CliResult<Report> {
+fn capture(args: &CaptureArgs, observed: CaptureSink<'_>) -> CliResult<Report> {
     args.validate()?;
     let target = args.target.resolve()?;
     let sinks = args.sinks();
@@ -157,6 +204,11 @@ fn capture(args: &CaptureArgs) -> CliResult<Report> {
             format!(" → {}", written.join(", "))
         }
     );
+
+    // After the sinks, so a capture that could not be written never reaches the
+    // stack claiming it was, and after the report is built, so the observer
+    // cannot change what a script sees.
+    observed(capture_kind(&target), &capture);
 
     let mut report = Report::new(data, human);
     report.raw = raw;
@@ -733,6 +785,61 @@ mod tests {
 
     fn json_of(argv: &[&str]) -> String {
         run(argv).expect("should succeed").data.to_compact_string()
+    }
+
+    #[test]
+    fn every_named_target_maps_to_the_card_kind_that_decides_its_chrome() {
+        // The pin's chrome policy is chosen from the card kind, and D9 forbids
+        // synthetic chrome on a window capture. A window target that arrived as
+        // a "fullscreen" card would gain a shadow and a corner radius the real
+        // window never had.
+        use crate::cli::{DisplaySelector, InteractiveMode, TargetSpec};
+        use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize};
+
+        let region = TargetSpec::Region(LogicalRect::new(
+            LogicalPoint::new(0.0, 0.0),
+            LogicalSize::new(10.0, 10.0),
+        ));
+        assert_eq!(capture_kind(&region), CaptureKind::Region);
+        assert_eq!(
+            capture_kind(&TargetSpec::Window("Mail".into())),
+            CaptureKind::Window
+        );
+        assert_eq!(
+            capture_kind(&TargetSpec::Display(DisplaySelector::Primary)),
+            CaptureKind::Fullscreen
+        );
+        assert_eq!(
+            capture_kind(&TargetSpec::AllDisplays),
+            CaptureKind::Fullscreen
+        );
+        assert_eq!(
+            capture_kind(&TargetSpec::Interactive(InteractiveMode::Window)),
+            CaptureKind::Window
+        );
+        assert_eq!(
+            capture_kind(&TargetSpec::Interactive(InteractiveMode::Region)),
+            CaptureKind::Region
+        );
+        assert_eq!(
+            capture_kind(&TargetSpec::Interactive(InteractiveMode::Display)),
+            CaptureKind::Fullscreen
+        );
+    }
+
+    #[test]
+    fn a_dry_run_hands_no_pixels_to_the_capture_stack() {
+        // A dry run returns before the backend is even opened. Offering the
+        // observer anything here would put a card on screen for a capture that
+        // never happened.
+        let cli = Cli::try_parse_from(["scrozz", "capture", "--dry-run", "--region", "0,0,4,4"])
+            .expect("valid dry run");
+        let command = cli.command.expect("a command");
+        let mut seen = Vec::new();
+        let report = dispatch_observed(&command, &mut |kind, _| seen.push(kind))
+            .expect("a dry run always succeeds");
+        assert!(report.human.starts_with("Would capture"));
+        assert!(seen.is_empty(), "a dry run took no pixels to hand over");
     }
 
     #[test]

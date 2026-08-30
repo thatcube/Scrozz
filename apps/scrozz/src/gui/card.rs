@@ -111,6 +111,19 @@ impl Thumbnail {
     /// pure minification and the one that does not need a filter kernel
     /// dependency this crate does not have.
     ///
+    /// # D9 edges
+    ///
+    /// The average is **alpha-weighted**, which is not a refinement — it is the
+    /// difference between a correct window capture and a wrong one. A window's
+    /// outermost pixels are its antialiasing: low alpha, and once
+    /// un-premultiplied a fully transparent pixel carries the colour black
+    /// (there is no other honest answer for `c / 0`). Averaging those straight
+    /// channels alongside an opaque neighbour drags that black into the result
+    /// and rings the whole window in a dark fringe — D9 acceptance criterion 3,
+    /// failed, and the exact artefact that separates a clean window capture
+    /// from an unclean one. Weighting each sample by its own alpha lets a
+    /// transparent pixel contribute its transparency and nothing else.
+    ///
     /// # Errors
     ///
     /// Returns whatever [`scrozz_export::to_straight_rgba8`] returns for a
@@ -153,7 +166,8 @@ impl Thumbnail {
             let (y0, y1) = span(y, out_h, height);
             for x in 0..out_w {
                 let (x0, x1) = span(x, out_w, width);
-                let mut sums = [0u64; 4];
+                let mut weighted = [0u64; 3];
+                let mut alpha = 0u64;
                 let mut count = 0u64;
                 for sy in y0..y1 {
                     let row = (sy as usize) * (width as usize) * 4;
@@ -164,9 +178,11 @@ impl Thumbnail {
                         let Some(px) = rgba.get(i..i + 4) else {
                             continue;
                         };
-                        for (sum, channel) in sums.iter_mut().zip(px) {
-                            *sum += u64::from(*channel);
+                        let a = u64::from(px[3]);
+                        for (sum, channel) in weighted.iter_mut().zip(&px[..3]) {
+                            *sum += u64::from(*channel) * a;
                         }
+                        alpha += a;
                         count += 1;
                     }
                 }
@@ -174,11 +190,19 @@ impl Thumbnail {
                 if count == 0 {
                     continue;
                 }
-                for (channel, sum) in sums.iter().enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        pixels[out + channel] = (sum / count) as u8;
+                for (channel, sum) in weighted.iter().enumerate() {
+                    // A fully transparent block has no colour to report, and
+                    // inventing one is how a dark halo gets into the image.
+                    if let Some(mean) = (sum + alpha / 2).checked_div(alpha) {
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            pixels[out + channel] = mean.min(255) as u8;
+                        }
                     }
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    pixels[out + 3] = ((alpha + count / 2) / count).min(255) as u8;
                 }
             }
         }
@@ -622,6 +646,61 @@ mod tests {
         assert!(Thumbnail::from_rgba(2, 2, vec![0; 16]).is_some());
         assert!(Thumbnail::from_rgba(2, 2, vec![0; 15]).is_none());
         assert!(Thumbnail::from_rgba(0, 2, vec![]).is_none());
+    }
+
+    #[test]
+    fn a_transparent_window_edge_keeps_its_colour_instead_of_gaining_a_dark_fringe() {
+        // The D9 case, at the smallest size that exercises it: one opaque white
+        // pixel beside three fully transparent ones, which is what the corner of
+        // an antialiased window looks like after un-premultiplication. Averaging
+        // the straight channels would report a quarter-grey and ring the window
+        // in black; weighting by alpha reports white at quarter coverage.
+        let mut source = vec![0u8; 2 * 2 * 4];
+        source[0..4].copy_from_slice(&[255, 255, 255, 255]);
+
+        let thumb = Thumbnail::downscale(2, 2, &source, 1).expect("bounded thumbnail");
+        assert_eq!((thumb.width(), thumb.height()), (1, 1));
+        let px = thumb.pixels();
+        assert_eq!(
+            [px[0], px[1], px[2]],
+            [255, 255, 255],
+            "an alpha-weighted average must not darken a partly transparent edge"
+        );
+        assert_eq!(
+            px[3], 64,
+            "coverage is what a transparent neighbour reduces"
+        );
+    }
+
+    #[test]
+    fn a_fully_transparent_block_reports_no_invented_colour() {
+        let source = solid(4, 4, [0, 0, 0, 0]);
+        let thumb = Thumbnail::downscale(4, 4, &source, 2).expect("bounded thumbnail");
+        for px in thumb.pixels().as_chunks::<4>().0 {
+            assert_eq!(*px, [0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn box_spans_tile_the_source_exactly_including_its_outermost_pixel() {
+        for source in 1u32..=64 {
+            for out in 1..=source {
+                let mut covered = 0u32;
+                let mut previous_end = 0u32;
+                for index in 0..out {
+                    let (start, end) = span(index, out, source);
+                    assert_eq!(start, previous_end, "spans must not gap or overlap");
+                    assert!(end > start, "every destination pixel needs a sample");
+                    covered += end - start;
+                    previous_end = end;
+                }
+                assert_eq!(
+                    previous_end, source,
+                    "the final span must reach the outermost source pixel"
+                );
+                assert_eq!(covered, source);
+            }
+        }
     }
 
     #[test]

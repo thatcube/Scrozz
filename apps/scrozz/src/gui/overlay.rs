@@ -98,33 +98,8 @@ impl CardSurface for OverlayCards {
     }
 
     fn restore_pin(&mut self, pin: PinnedCapture) -> scrozz_core::Result<()> {
-        let mut request = match pin.texture.as_ref().and_then(Thumb::frame) {
-            Some(frame) => CaptureRequest::from_frame(
-                pin.name.clone(),
-                pin.provenance,
-                &frame,
-                crate::gui::card::PIN_TEXTURE_MAX_EDGE,
-            )
-            .unwrap_or_else(|| {
-                CaptureRequest::new(
-                    "Pinned capture",
-                    pin.provenance,
-                    (pin.source_width, pin.source_height),
-                )
-            }),
-            None => CaptureRequest::new(
-                pin.name,
-                pin.provenance,
-                (pin.source_width, pin.source_height),
-            ),
-        }
-        .with_pin_id(pin.id.0.clone())
-        .with_source_scale(pin.scale);
-        if let Some(error) = pin.content_error {
-            request = request.with_content_error(error);
-        }
-        request.source_px = (pin.source_width, pin.source_height);
-        self.handle.restore_pin(request, pin.state);
+        let state = pin.state.clone();
+        self.handle.restore_pin(pin_restore_request(pin), state);
         Ok(())
     }
 
@@ -338,6 +313,60 @@ fn request_for_card(card: &Card) -> CaptureRequest {
     request
 }
 
+/// Build the overlay request for a persisted pin: pixels, or the explanation.
+///
+/// A restore has two ways to end up without pixels — the worker could not load
+/// them, or the loaded texture could not be turned into one this window can
+/// upload — and neither may reach the screen as an untextured window with
+/// nothing to say. A pin that opens blank looks like a bug in the pin; a pin
+/// that opens carrying its reason is a capture whose pixels are gone, which is
+/// a different and recoverable thing. So every path that loses the image also
+/// produces the sentence that explains it, and the pin keeps its own name
+/// either way, so the user can still tell which capture they are looking at.
+fn pin_restore_request(pin: PinnedCapture) -> CaptureRequest {
+    let source_px = (pin.source_width, pin.source_height);
+    let mut conversion_error = None;
+    let mut request = match pin.texture.as_ref() {
+        Some(texture) => match Thumb::frame(texture) {
+            Some(frame) => CaptureRequest::from_frame(
+                pin.name.clone(),
+                pin.provenance,
+                &frame,
+                crate::gui::card::PIN_TEXTURE_MAX_EDGE,
+            )
+            .unwrap_or_else(|| {
+                conversion_error = Some(format!(
+                    "the stored {}x{} preview exceeded the safe texture limits of this window",
+                    texture.width(),
+                    texture.height()
+                ));
+                CaptureRequest::new(pin.name.clone(), pin.provenance, source_px)
+            }),
+            None => {
+                conversion_error =
+                    Some("the stored preview reported no pixels to upload".to_owned());
+                CaptureRequest::new(pin.name.clone(), pin.provenance, source_px)
+            }
+        },
+        None => CaptureRequest::new(pin.name.clone(), pin.provenance, source_px),
+    }
+    .with_pin_id(pin.id.0.clone())
+    .with_source_scale(pin.scale);
+
+    // Both causes are worth saying when both happened: "the pixels could
+    // not be read" and "and the preview could not be uploaded either" are
+    // different repairs.
+    if let Some(error) = [pin.content_error, conversion_error]
+        .into_iter()
+        .flatten()
+        .reduce(|left, right| format!("{left}; {right}"))
+    {
+        request = request.with_content_error(error);
+    }
+    request.source_px = source_px;
+    request
+}
+
 /// Reading a [`crate::gui::Thumbnail`] as a frame the UI can scale.
 trait Thumb {
     /// Wraps the thumbnail's pixels as a frame, without copying more than once.
@@ -393,6 +422,57 @@ mod tests {
         assert_eq!(surface.pending.len(), 2);
         assert_eq!(surface.pending[0], CardId(7));
         assert_eq!(surface.pending[1], CardId(8));
+    }
+
+    fn pinned(texture: Option<Thumbnail>, content_error: Option<String>) -> PinnedCapture {
+        PinnedCapture {
+            id: CaptureId("capture-1".into()),
+            name: "Mail — Inbox".into(),
+            provenance: Provenance::Window,
+            source_width: 1_280,
+            source_height: 800,
+            scale: 2.0,
+            state: scrozz_core::PinState::new(
+                scrozz_core::LogicalRect::new(
+                    scrozz_core::LogicalPoint::new(10.0, 20.0),
+                    scrozz_core::LogicalSize::new(320.0, 200.0),
+                ),
+                scrozz_core::PinScale::ORIGINAL,
+                None,
+            ),
+            texture,
+            content_error,
+        }
+    }
+
+    #[test]
+    fn a_pin_with_pixels_restores_with_no_failure_attached() {
+        let request = pin_restore_request(pinned(Thumbnail::from_rgba(2, 2, vec![255; 16]), None));
+        assert!(request.thumbnail.is_some());
+        assert_eq!(request.content_error, None);
+        assert_eq!(request.name, "Mail — Inbox");
+        assert_eq!(request.source_px, (1_280, 800));
+        assert_eq!(request.source_scale, 2.0);
+    }
+
+    #[test]
+    fn a_pin_without_pixels_carries_its_reason_rather_than_opening_blank() {
+        // The worker could not read the source. A window with no texture and no
+        // sentence is indistinguishable from a broken pin.
+        let request = pin_restore_request(pinned(
+            None,
+            Some("source pixels are unavailable".to_owned()),
+        ));
+        assert!(request.thumbnail.is_none());
+        assert_eq!(
+            request.content_error.as_deref(),
+            Some("source pixels are unavailable")
+        );
+        assert_eq!(
+            request.name, "Mail — Inbox",
+            "a pin that lost its pixels still has to say which capture it is"
+        );
+        assert_eq!(request.source_px, (1_280, 800));
     }
 
     #[test]
