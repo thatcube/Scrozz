@@ -1228,15 +1228,10 @@ pub fn stored_shortcuts() -> Shortcuts {
 pub fn stored_settings() -> CliResult<(AfterCaptureSettings, AfterCaptureStore)> {
     let store = AfterCaptureStore::default_location().map_err(CliError::Core)?;
     let profile = store.inferred_profile();
-    let mut settings = store.load(profile).map_err(CliError::Core)?;
-    // Folding the retired Smart Frame flag into Scenes happens here rather than
-    // in the store's own version migration: the store is shared with the CLI and
-    // knows nothing about which keys supersede which.
-    if migrate_scenes(&mut settings)
-        && let Err(error) = store.save(&settings)
-    {
-        tracing::warn!(%error, "Scenes migration could not be written back");
-    }
+    // Schema migration, including folding the retired Smart Frame flag into
+    // Scenes, belongs to the store's versioned load. Doing it here would miss
+    // every other caller that loads the document directly, the GUI included.
+    let settings = store.load(profile).map_err(CliError::Core)?;
     Ok((settings, store))
 }
 
@@ -1350,29 +1345,31 @@ pub fn window_shadow(persisted: &AfterCaptureSettings) -> CliResult<bool> {
 
 /// Folds the retired `after-capture.apply-smart-frame` flag into `scenes.default`.
 ///
-/// Runs once per document. An explicit `true` becomes `auto` — the framing the
-/// flag actually produced — and an explicit `false` becomes `none`, so a user
-/// who deliberately turned Smart Frame off does not find it back on. A document
-/// that never stored the flag is left alone and picks up the schema default,
-/// which is `auto` for a new install.
+/// Call this only for a document that predates Scenes — the settings store
+/// decides that from the document version, which is the one place that can tell
+/// an existing install from a new one.
+///
+/// The distinction matters because the two have opposite defaults. The retired
+/// flag defaulted to `false`, so an existing user who never touched it had
+/// framing off and must keep it off; a new install has no history to preserve
+/// and takes the schema default of `auto`. Folding forward therefore maps an
+/// explicit `true` to `auto`, and both an explicit `false` and an absent flag to
+/// `none`.
 ///
 /// Returns whether anything changed, so the caller can skip a pointless write.
 pub fn migrate_scenes(persisted: &mut AfterCaptureSettings) -> bool {
     if persisted.value(SCENES_DEFAULT_KEY).is_some() {
         return false;
     }
-    let Some(legacy) = persisted
+    let legacy = persisted
         .value(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)
         .map(str::to_owned)
         .or_else(|| {
             persisted
                 .value_for_key(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)
                 .map(|value| value.to_string())
-        })
-    else {
-        return false;
-    };
-    let resolved = if legacy.trim() == "true" {
+        });
+    let resolved = if legacy.is_some_and(|value| value.trim() == "true") {
         "auto"
     } else {
         "none"
@@ -2121,11 +2118,15 @@ mod tests {
     }
 
     #[test]
-    fn a_document_that_never_stored_the_legacy_flag_is_left_alone() {
+    fn an_existing_install_that_never_stored_the_legacy_flag_keeps_framing_off() {
+        // The retired flag defaulted to `false`, so silence in an existing
+        // document means the user had framing off — not that they want the new
+        // install default. Only the store decides a document is "existing";
+        // this asserts what happens once it has.
         let mut persisted = AfterCaptureSettings::fresh();
+        assert!(migrate_scenes(&mut persisted));
+        assert_eq!(scene_default(&persisted).unwrap(), "none");
         assert!(!migrate_scenes(&mut persisted));
-        assert!(persisted.value(SCENES_DEFAULT_KEY).is_none());
-        assert_eq!(scene_default(&persisted).unwrap(), "auto");
     }
 
     #[test]

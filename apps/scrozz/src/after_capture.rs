@@ -17,7 +17,12 @@ use scrozz_annotate::SmartFramePreset;
 use scrozz_core::{Error, Frame, Result};
 use serde_json::{Map, Value};
 
-const SETTINGS_VERSION: u32 = 2;
+/// Bumped to 3 when Scenes replaced the `after-capture.apply-smart-frame`
+/// flag: the two have opposite defaults, so an existing document has to be
+/// recognised as existing before its absent flag can be read as "off".
+const SETTINGS_VERSION: u32 = 3;
+/// The first version whose documents record Scene assignments explicitly.
+const SCENES_SETTINGS_VERSION: u32 = 3;
 const APP_DIR: &str = "Scrozz";
 const FILE_NAME: &str = "settings.json";
 const LOCK_FILE_NAME: &str = ".settings.lock";
@@ -314,6 +319,11 @@ impl AfterCaptureSettings {
     ///
     /// Scrozz is unreleased, so an absent value takes the confirmed product
     /// default. Explicit legacy values are applied over this seed while parsing.
+    ///
+    /// Scenes are deliberately left unseeded here: this is also the seed
+    /// [`Self::from_json`] parses an older document over, and pre-setting
+    /// `scenes.default` would hide the very flag the migration needs to read.
+    /// [`AfterCaptureStore::load`] migrates the profile when no document exists.
     #[must_use]
     pub fn legacy() -> Self {
         Self {
@@ -548,6 +558,12 @@ impl AfterCaptureSettings {
                     }
                 }
             }
+        }
+
+        if version < SCENES_SETTINGS_VERSION {
+            // This document predates Scenes, so the retired Smart Frame flag —
+            // present or absent — is what the user actually chose.
+            crate::settings::migrate_scenes(&mut settings);
         }
 
         settings.document_version = version.max(SETTINGS_VERSION);
@@ -795,7 +811,13 @@ impl AfterCaptureStore {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let settings = profile.defaults();
+                let mut settings = profile.defaults();
+                if profile == InstallProfile::Existing {
+                    // A config directory with no settings document is still an
+                    // existing install, and its Scenes default is the retired
+                    // flag's default rather than the new one.
+                    crate::settings::migrate_scenes(&mut settings);
+                }
                 self.save_unlocked(&settings)?;
                 return Ok(settings);
             }
@@ -1225,12 +1247,84 @@ mod tests {
             AfterCaptureAction::ShowRecentCapturesOverlay
         ));
         let rewritten = fs::read_to_string(&path).unwrap();
-        assert!(rewritten.contains("\"version\": 2"), "{rewritten}");
+        assert!(rewritten.contains("\"version\": 3"), "{rewritten}");
         assert!(
             rewritten.contains("\"show-recent-captures-overlay\""),
             "{rewritten}"
         );
         assert!(!rewritten.contains("quick-access"), "{rewritten}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_existing_document_keeps_smart_frame_off_but_a_new_install_frames() {
+        // The retired flag defaulted to off and `scenes.default` defaults to
+        // `auto`, so loading is the only place that can tell the two apart. Get
+        // it wrong and every existing user silently starts framing captures.
+        let root = scratch("scenes-migration");
+        fs::create_dir_all(&root).unwrap();
+
+        let existing = root.join("existing.json");
+        fs::write(&existing, "{\n  \"version\": 2,\n  \"values\": {}\n}").unwrap();
+        let loaded = AfterCaptureStore::new(&existing)
+            .load(InstallProfile::Existing)
+            .expect("loads");
+        assert_eq!(
+            loaded.value(crate::settings::SCENES_DEFAULT_KEY),
+            Some("none")
+        );
+
+        let opted_in = root.join("opted-in.json");
+        fs::write(
+            &opted_in,
+            "{\n  \"version\": 2,\n  \"values\": {\"after-capture.apply-smart-frame\": \"true\"}\n}",
+        )
+        .unwrap();
+        let loaded = AfterCaptureStore::new(&opted_in)
+            .load(InstallProfile::Existing)
+            .expect("loads");
+        assert_eq!(
+            loaded.value(crate::settings::SCENES_DEFAULT_KEY),
+            Some("auto")
+        );
+
+        // A document already written by this version is left exactly as found.
+        let chosen = root.join("chosen.json");
+        fs::write(
+            &chosen,
+            "{\n  \"version\": 3,\n  \"values\": {\"scenes.default\": \"preset:studio\"}\n}",
+        )
+        .unwrap();
+        let loaded = AfterCaptureStore::new(&chosen)
+            .load(InstallProfile::Existing)
+            .expect("loads");
+        assert_eq!(
+            loaded.value(crate::settings::SCENES_DEFAULT_KEY),
+            Some("preset:studio")
+        );
+
+        // No document at all, and no prior config: a genuinely new install.
+        let fresh = root.join("fresh.json");
+        let loaded = AfterCaptureStore::new(&fresh)
+            .load(InstallProfile::Fresh)
+            .expect("seeds");
+        assert_eq!(loaded.value(crate::settings::SCENES_DEFAULT_KEY), None);
+        assert_eq!(
+            crate::settings::scene_default(&loaded).unwrap(),
+            "auto",
+            "a new install frames by default"
+        );
+
+        // A config directory that predates the settings document is existing.
+        let seeded = root.join("seeded.json");
+        let loaded = AfterCaptureStore::new(&seeded)
+            .load(InstallProfile::Existing)
+            .expect("seeds");
+        assert_eq!(
+            loaded.value(crate::settings::SCENES_DEFAULT_KEY),
+            Some("none")
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 
