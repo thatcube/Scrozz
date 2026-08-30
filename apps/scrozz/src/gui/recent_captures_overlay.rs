@@ -140,6 +140,24 @@ impl CardSurface for RecentCapturesOverlayCards {
         }
     }
 
+    fn set_editing(&mut self, id: CardId, editing: bool) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .set_editing(scrozz_ui::stack::CardId(theirs), editing);
+        }
+    }
+
+    fn refresh_card_image(&mut self, id: CardId, frame: &Frame) {
+        let Some(theirs) = self.reverse.get(&id).copied() else {
+            return;
+        };
+        let Some(image) = scrozz_ui::recent_captures_overlay::thumbnail(frame, THUMBNAIL_PX) else {
+            return;
+        };
+        self.handle
+            .set_card_image(scrozz_ui::stack::CardId(theirs), image);
+    }
+
     fn settle_drag(&mut self, id: CardId, accepted: bool) {
         // Deliberately does *not* `forget` the card: a rejected drop leaves it
         // on the pile, and an accepted one is retired by the separate dismiss

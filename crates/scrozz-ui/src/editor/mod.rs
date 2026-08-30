@@ -562,10 +562,17 @@ fn theme_for(ui: &Ui) -> crate::theme::Theme {
 /// same reason: the capture overlay is a transparent, non-activating panel with
 /// mouse passthrough, so an editor drawn inside it could never take keyboard
 /// focus. A separate viewport is a real, focusable, resizable window.
-#[derive(Debug, Default)]
+///
+/// One instance exists per open editor, not one for the whole app: several
+/// captures may each have their own editor open at once, and each needs its
+/// own stable [`egui::ViewportId`] or egui would collapse them into a single
+/// viewport and one card's editor would silently steal another's window.
+#[derive(Debug)]
 pub struct EditorWindow {
+    id: egui::ViewportId,
     open: bool,
     focus_requested: bool,
+    confirm_discard: bool,
     title: String,
 }
 
@@ -578,11 +585,58 @@ pub enum OpenDisposition {
     Reused,
 }
 
+/// What the user decided about the document this frame.
+///
+/// Returned by [`EditorWindow::show`] (and [`EditorWindow::request_close`])
+/// so the caller — which alone knows how to render, persist and refresh a
+/// card's thumbnail — can act on the decision without `EditorWindow` needing
+/// to know anything about documents at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorWindowExit {
+    /// Nothing was decided; the window stays open.
+    None,
+    /// Commit: render the document, persist it, and refresh the card's
+    /// thumbnail. The window has already closed.
+    Done,
+    /// Discard: close without touching the card. Reached by an explicit
+    /// Cancel, by a clean (non-dirty) close of any kind, or by choosing
+    /// "Discard" from the confirm-discard prompt.
+    Cancel,
+}
+
+/// The outcome of the confirm-discard prompt for one frame.
+///
+/// A tri-state rather than a plain `bool`, and returned from a free function
+/// rather than a method: the prompt is drawn from inside the viewport
+/// closure below, which has already borrowed pieces of `self` by value (not
+/// `&mut self`) to draw at all, so it cannot clear `confirm_discard` on
+/// `self` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscardPromptOutcome {
+    /// Still showing; no button has been clicked yet.
+    Waiting,
+    /// "Keep Editing": stay open, dismiss the prompt.
+    KeepEditing,
+    /// "Discard": close without saving.
+    Discard,
+}
+
 impl EditorWindow {
-    /// A closed editor window.
+    /// A closed editor window identified by `id`.
+    ///
+    /// `id` distinguishes this window's viewport from every other editor's —
+    /// callers pass their card's own identity so two cards never collide on
+    /// the same viewport, while the same card's window stays stable across
+    /// repeated opens.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(id: u64) -> Self {
+        Self {
+            id: egui::ViewportId::from_hash_of(("scrozz-editor", id)),
+            open: false,
+            focus_requested: false,
+            confirm_discard: false,
+            title: String::new(),
+        }
     }
 
     /// Whether the window is showing.
@@ -601,12 +655,32 @@ impl EditorWindow {
         self.title = title.into();
         self.open = true;
         self.focus_requested = true;
+        // A freshly (re)opened session never starts behind a stale prompt.
+        self.confirm_discard = false;
         disposition
     }
 
     /// Closes the window.
     pub fn close(&mut self) {
         self.open = false;
+        self.confirm_discard = false;
+    }
+
+    /// Reopens the window immediately after [`Self::show`] returned
+    /// [`EditorWindowExit::Done`] but the caller could not actually commit
+    /// the render, so the window must not appear to have closed at all.
+    ///
+    /// `show` already closed the native viewport for this frame before
+    /// returning `Done` (its own doc comment says as much), so nothing here
+    /// undoes that first close -- it only asks the *next* frame's `show`
+    /// call to draw the same viewport again, which looks identical to the
+    /// window never having closed. Kept free of a title argument on
+    /// purpose: the caller only just learned the close needs to be undone,
+    /// not what the window used to be titled, and the title is unchanged.
+    pub fn reopen(&mut self) {
+        self.open = true;
+        self.focus_requested = true;
+        self.confirm_discard = false;
     }
 
     /// Returns keyboard focus after a system picker closes.
@@ -616,10 +690,46 @@ impl EditorWindow {
         }
     }
 
+    /// Asks the window to close exactly as its own native close button would.
+    ///
+    /// Shared by the native close button (handled inside [`Self::show`]) and
+    /// by `Escape` (`Intent::Close`), so a keyboard dismissal can never
+    /// bypass the same no-silent-loss guarantee a click on the close button
+    /// gets: a clean document closes immediately and reports [`EditorWindowExit::Cancel`];
+    /// a dirty one is held open behind the confirm-discard prompt and
+    /// reports [`EditorWindowExit::None`] until the prompt is resolved on a
+    /// later call to [`Self::show`].
+    pub fn request_close(&mut self, dirty: bool) -> EditorWindowExit {
+        if !dirty {
+            self.close();
+            return EditorWindowExit::Cancel;
+        }
+        if !self.confirm_discard {
+            self.confirm_discard = true;
+            self.focus_requested = true;
+        }
+        EditorWindowExit::None
+    }
+
     /// Shows the window, calling `build` to draw its contents.
-    pub fn show(&mut self, ctx: &egui::Context, build: impl FnMut(&mut Ui)) {
+    ///
+    /// `dirty` says whether the document has unconfirmed changes: a clean
+    /// native close is harmless and closes immediately, a dirty one is held
+    /// open behind a confirm-discard prompt instead of being lost silently.
+    ///
+    /// Draws Done/Cancel chrome above `build`'s content whenever the prompt
+    /// is not showing. Cancel and Done are both unconditional and need no
+    /// confirmation of their own — they are the user's own explicit choice,
+    /// unlike a native close or `Escape`, which might be an absent-minded
+    /// reflex on a document the user still wants.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        dirty: bool,
+        build: impl FnMut(&mut Ui),
+    ) -> EditorWindowExit {
         if !self.open {
-            return;
+            return EditorWindowExit::None;
         }
         let focus = std::mem::take(&mut self.focus_requested);
         let title = if self.title.is_empty() {
@@ -628,25 +738,75 @@ impl EditorWindow {
             format!("Annotate — {}", self.title)
         };
         let builder = Self::viewport_builder(title, focus);
-        let mut close = false;
+        let confirm_discard = self.confirm_discard;
+        let mut chrome_exit = EditorWindowExit::None;
+        let mut native_close_requested = false;
+        let mut prompt_outcome = DiscardPromptOutcome::Waiting;
         let mut build = build;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("scrozz-editor"),
-            builder,
-            |editor_ui, _class| {
-                if editor_ui
-                    .ctx()
-                    .input(|input| input.viewport().close_requested())
-                {
-                    close = true;
-                }
-                Self::emit_foreground(editor_ui.ctx(), focus);
+        ctx.show_viewport_immediate(self.id, builder, |editor_ui, _class| {
+            native_close_requested = editor_ui
+                .ctx()
+                .input(|input| input.viewport().close_requested());
+            Self::emit_foreground(editor_ui.ctx(), focus);
+            if confirm_discard {
+                prompt_outcome = Self::show_confirm_discard(editor_ui);
+            } else {
+                Self::show_done_cancel_chrome(editor_ui, &mut chrome_exit);
                 build(editor_ui);
-            },
+            }
+        });
+
+        let was_prompting = confirm_discard;
+        let exit = Self::reconcile(
+            dirty,
+            native_close_requested,
+            chrome_exit,
+            prompt_outcome,
+            &mut self.confirm_discard,
         );
-        if close {
-            self.open = false;
+        // Focus follows only the *transition* into the prompt, not every
+        // repaint while it's already showing — mirroring `emit_foreground`'s
+        // own "not on every repaint" rule.
+        if !was_prompting && self.confirm_discard {
+            self.focus_requested = true;
         }
+        if matches!(exit, EditorWindowExit::Done | EditorWindowExit::Cancel) {
+            self.close();
+        }
+        exit
+    }
+
+    /// Combines one frame's raw signals into the window's exit decision.
+    ///
+    /// Pure and separate from [`Self::show`]'s viewport plumbing so the full
+    /// decision table — chrome buttons, native close, and the confirm-discard
+    /// prompt, each possibly firing on the same frame — can be exercised
+    /// directly in tests, without rendering or simulating a real button
+    /// click through egui's immediate-viewport machinery.
+    fn reconcile(
+        dirty: bool,
+        native_close_requested: bool,
+        chrome_exit: EditorWindowExit,
+        prompt_outcome: DiscardPromptOutcome,
+        confirm_discard: &mut bool,
+    ) -> EditorWindowExit {
+        let mut exit = chrome_exit;
+        match prompt_outcome {
+            DiscardPromptOutcome::Waiting => {}
+            DiscardPromptOutcome::KeepEditing => *confirm_discard = false,
+            DiscardPromptOutcome::Discard => {
+                *confirm_discard = false;
+                exit = EditorWindowExit::Cancel;
+            }
+        }
+        if matches!(exit, EditorWindowExit::None) && native_close_requested {
+            if dirty {
+                *confirm_discard = true;
+            } else {
+                exit = EditorWindowExit::Cancel;
+            }
+        }
+        exit
     }
 
     fn viewport_builder(title: String, active: bool) -> egui::ViewportBuilder {
@@ -672,6 +832,43 @@ impl EditorWindow {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
+
+    /// Draws the Done/Cancel chrome above the editor's own content.
+    fn show_done_cancel_chrome(ui: &mut Ui, exit: &mut EditorWindowExit) {
+        egui::Panel::top("scrozz-editor-chrome").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    *exit = EditorWindowExit::Cancel;
+                }
+                if ui.button("Done").clicked() {
+                    *exit = EditorWindowExit::Done;
+                }
+            });
+        });
+    }
+
+    /// Draws the "discard your changes?" prompt in place of the editor.
+    fn show_confirm_discard(ui: &mut Ui) -> DiscardPromptOutcome {
+        let mut outcome = DiscardPromptOutcome::Waiting;
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(48.0);
+                ui.heading("Discard your changes?");
+                ui.label("Closing now will lose the annotations made in this session.");
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space((ui.available_width() - 240.0).max(0.0) / 2.0);
+                    if ui.button("Keep Editing").clicked() {
+                        outcome = DiscardPromptOutcome::KeepEditing;
+                    }
+                    if ui.button("Discard").clicked() {
+                        outcome = DiscardPromptOutcome::Discard;
+                    }
+                });
+            });
+        });
+        outcome
+    }
 }
 
 #[cfg(test)]
@@ -680,12 +877,23 @@ mod window_tests {
 
     #[test]
     fn first_open_and_reuse_both_request_foregrounding() {
-        let mut window = EditorWindow::new();
+        let mut window = EditorWindow::new(1);
         assert_eq!(window.open("card:1"), OpenDisposition::FirstOpen);
         assert!(std::mem::take(&mut window.focus_requested));
 
         assert_eq!(window.open("card:1"), OpenDisposition::Reused);
         assert!(std::mem::take(&mut window.focus_requested));
+    }
+
+    #[test]
+    fn two_windows_get_distinct_viewport_ids() {
+        // The whole point of taking an id: two cards editing at once must
+        // never collapse onto the same egui viewport.
+        let a = EditorWindow::new(1);
+        let b = EditorWindow::new(2);
+        assert_ne!(a.id, b.id);
+        // And the same id is stable across constructions.
+        assert_eq!(EditorWindow::new(7).id, EditorWindow::new(7).id);
     }
 
     #[test]
@@ -720,10 +928,186 @@ mod window_tests {
 
     #[test]
     fn repainting_does_not_rearm_foreground_focus() {
-        let mut window = EditorWindow::new();
+        let mut window = EditorWindow::new(1);
         let _ = window.open("card:1");
         assert!(std::mem::take(&mut window.focus_requested));
         assert!(!window.focus_requested);
+    }
+
+    #[test]
+    fn reopen_undoes_a_close_show_already_committed_for_this_frame() {
+        // `show` closes the viewport itself the instant it decides Done or
+        // Cancel, before the caller ever sees the exit value -- so this is
+        // the only lever a caller has to say "actually, keep going" when a
+        // Done's render turned out to fail. It must look exactly like the
+        // window never closed: open again, refocused, and with no stale
+        // discard prompt left over from whatever `show` was doing.
+        let mut window = EditorWindow::new(1);
+        let _ = window.open("card:1");
+        std::mem::take(&mut window.focus_requested);
+        window.confirm_discard = true;
+        window.close();
+        assert!(!window.is_open());
+
+        window.reopen();
+        assert!(window.is_open());
+        assert!(std::mem::take(&mut window.focus_requested));
+        assert!(!window.confirm_discard);
+    }
+
+    #[test]
+    fn a_plain_frame_with_nothing_clicked_stays_open_and_undecided() {
+        // `reconcile`'s own tests below cover every decision branch as pure
+        // state transitions. `show()` itself is exercised here only for the
+        // one frame shape that's safe to run through the real (embedded,
+        // backend-less) viewport in a unit test: nothing clicked, no native
+        // close. Simulating an actual button click or a native close signal
+        // would require driving egui's pointer/viewport-info input state
+        // through the immediate-viewport machinery frame-by-frame, which
+        // has no reliable headless harness in this codebase (confirmed: a
+        // `ViewportCommand::Close` sent by the app is the *opposite*
+        // direction of a real close request — it does not set
+        // `close_requested()`, which only a live backend can do). The whole
+        // call is wrapped in `run_ui` because `show_viewport_immediate`
+        // needs a pass already under way (fonts installed etc.) — calling it
+        // against a bare, never-run `Context` panics.
+        let mut window = EditorWindow::new(1);
+        let _ = window.open("card:1");
+        let ctx = egui::Context::default();
+        let mut exit = EditorWindowExit::None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            exit = window.show(ui.ctx(), true, |ui| {
+                ui.label("editing");
+            });
+        });
+        output.textures_delta.clear();
+        assert_eq!(exit, EditorWindowExit::None);
+        assert!(window.is_open());
+    }
+
+    #[test]
+    fn reconcile_lets_an_unconditional_done_click_win() {
+        let mut confirm_discard = false;
+        let exit = EditorWindow::reconcile(
+            true,
+            false,
+            EditorWindowExit::Done,
+            DiscardPromptOutcome::Waiting,
+            &mut confirm_discard,
+        );
+        assert_eq!(exit, EditorWindowExit::Done);
+        assert!(!confirm_discard);
+    }
+
+    #[test]
+    fn reconcile_lets_an_unconditional_cancel_click_win() {
+        let mut confirm_discard = false;
+        let exit = EditorWindow::reconcile(
+            true,
+            false,
+            EditorWindowExit::Cancel,
+            DiscardPromptOutcome::Waiting,
+            &mut confirm_discard,
+        );
+        assert_eq!(exit, EditorWindowExit::Cancel);
+    }
+
+    #[test]
+    fn reconcile_closes_a_clean_document_on_native_close_without_prompting() {
+        let mut confirm_discard = false;
+        let exit = EditorWindow::reconcile(
+            false,
+            true,
+            EditorWindowExit::None,
+            DiscardPromptOutcome::Waiting,
+            &mut confirm_discard,
+        );
+        assert_eq!(exit, EditorWindowExit::Cancel);
+        assert!(!confirm_discard);
+    }
+
+    #[test]
+    fn reconcile_holds_a_dirty_document_open_behind_the_prompt_on_native_close() {
+        let mut confirm_discard = false;
+        let exit = EditorWindow::reconcile(
+            true,
+            true,
+            EditorWindowExit::None,
+            DiscardPromptOutcome::Waiting,
+            &mut confirm_discard,
+        );
+        assert_eq!(exit, EditorWindowExit::None);
+        assert!(confirm_discard);
+    }
+
+    #[test]
+    fn reconcile_repeated_native_close_while_prompting_stays_armed_and_open() {
+        let mut confirm_discard = true;
+        let exit = EditorWindow::reconcile(
+            true,
+            true,
+            EditorWindowExit::None,
+            DiscardPromptOutcome::Waiting,
+            &mut confirm_discard,
+        );
+        assert_eq!(exit, EditorWindowExit::None);
+        assert!(confirm_discard);
+    }
+
+    #[test]
+    fn reconcile_keep_editing_clears_the_prompt_and_stays_open() {
+        let mut confirm_discard = true;
+        let exit = EditorWindow::reconcile(
+            true,
+            false,
+            EditorWindowExit::None,
+            DiscardPromptOutcome::KeepEditing,
+            &mut confirm_discard,
+        );
+        assert_eq!(exit, EditorWindowExit::None);
+        assert!(!confirm_discard);
+    }
+
+    #[test]
+    fn reconcile_discard_from_the_prompt_closes_without_committing() {
+        let mut confirm_discard = true;
+        let exit = EditorWindow::reconcile(
+            true,
+            false,
+            EditorWindowExit::None,
+            DiscardPromptOutcome::Discard,
+            &mut confirm_discard,
+        );
+        assert_eq!(exit, EditorWindowExit::Cancel);
+        assert!(!confirm_discard);
+    }
+
+    #[test]
+    fn request_close_mirrors_native_close_semantics() {
+        let mut clean = EditorWindow::new(1);
+        let _ = clean.open("card:1");
+        assert_eq!(clean.request_close(false), EditorWindowExit::Cancel);
+        assert!(!clean.is_open());
+
+        let mut dirty = EditorWindow::new(2);
+        let _ = dirty.open("card:2");
+        assert_eq!(dirty.request_close(true), EditorWindowExit::None);
+        assert!(dirty.is_open());
+        assert!(dirty.confirm_discard);
+
+        // A repeated request while already prompting does not re-arm or
+        // otherwise change anything.
+        assert_eq!(dirty.request_close(true), EditorWindowExit::None);
+        assert!(dirty.confirm_discard);
+    }
+
+    #[test]
+    fn a_fresh_open_never_starts_behind_a_stale_prompt() {
+        let mut window = EditorWindow::new(1);
+        let _ = window.open("card:1");
+        window.confirm_discard = true;
+        let _ = window.open("card:1");
+        assert!(!window.confirm_discard);
     }
 }
 

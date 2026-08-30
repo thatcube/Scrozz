@@ -300,6 +300,31 @@ pub(crate) enum Job {
         /// Editable scene graph; source pixels remain in the existing record.
         data: Box<DocumentData>,
     },
+    /// File a committed editor revision into the card's own exportable bytes.
+    ///
+    /// Posted once, alongside [`Job::PersistDocument`], when Done commits a
+    /// dirty document — never for a cancelled or discarded one. After this a
+    /// plain [`Job::Copy`], [`Job::Save`] or [`Job::Upload`] — posted once no
+    /// editor is open — reads this exact committed revision instead of the
+    /// pre-edit original, so a destructive redaction the card's thumbnail
+    /// already shows committed cannot resurface through a card output that
+    /// outlives the editor that applied it.
+    CommitCardOutput {
+        /// Which card's own bytes to replace.
+        card: CardId,
+        /// Editor lifetime that produced the render.
+        generation: u64,
+        /// The flattened image and the exact document revision it represents.
+        rendered: Box<RevisionedFrame>,
+        /// The same document the render came from.
+        ///
+        /// Kept alongside the pixels so the worker can also refresh its
+        /// in-memory reopen document in the same step -- [`Job::PersistDocument`]
+        /// writes the durable history copy separately and can fail or lag
+        /// independently, and a later [`Job::Open`] must never reconstruct an
+        /// older document than the one this job just committed here.
+        data: Box<DocumentData>,
+    },
     /// Analyse one immutable editor revision without blocking capture work.
     AnalyzeSmartFrame {
         /// Which card owns the editor.
@@ -350,7 +375,17 @@ pub(crate) enum Job {
         acquisition_cancellation: scrozz_capture::CaptureCancellation,
     },
     /// Put a card's capture on the clipboard.
-    Copy(CardId),
+    Copy {
+        /// Card whose immutable bytes are being copied.
+        card: CardId,
+        /// The dispatching action id this completion answers for (round 12).
+        /// See [`Job::Upload::action`] for why every output family, not
+        /// just Upload, now carries one: a card-level dispatch racing an
+        /// editor's own in-editor Copy/Save for the same card must resolve
+        /// only the exact action it belongs to, never any other
+        /// concurrently outstanding one.
+        action: u64,
+    },
     /// Put an already-rendered image on the clipboard.
     ///
     /// Used by the editor, which has flattened its own annotations and must not
@@ -358,33 +393,58 @@ pub(crate) enum Job {
     CopyImage {
         /// Which card the image came from, for the log line.
         card: CardId,
+        /// Editor lifetime that produced the render, so the completion can be
+        /// matched against the card's currently-committed revision rather
+        /// than trusted blindly (round 5, Finding #2).
+        generation: u64,
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
+        /// See [`Job::Copy::action`].
+        action: u64,
     },
     /// Write an already-rendered image to the configured folder.
     SaveImage {
         /// Which card the image came from, for the log line.
         card: CardId,
+        /// Editor lifetime that produced the render, so the completion can be
+        /// matched against the card's currently-committed revision rather
+        /// than trusted blindly (round 5, Finding #2).
+        generation: u64,
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
+        /// See [`Job::Copy::action`].
+        action: u64,
     },
     /// Write an already-rendered image to an explicitly chosen path.
     SaveImageTo {
         /// Which card the image came from, for the log line.
         card: CardId,
+        /// Editor lifetime that produced the render, so the completion can be
+        /// matched against the card's currently-committed revision rather
+        /// than trusted blindly (round 5, Finding #2).
+        generation: u64,
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
         /// Native-dialog destination.
         path: std::path::PathBuf,
+        /// See [`Job::Copy::action`].
+        action: u64,
     },
     /// Write a card's capture to the configured folder.
-    Save(CardId),
+    Save {
+        /// Card whose immutable bytes are being exported.
+        card: CardId,
+        /// See [`Job::Copy::action`].
+        action: u64,
+    },
     /// Write a card's capture to an explicitly chosen path.
     SaveTo {
         /// Card whose immutable bytes are being exported.
         card: CardId,
         /// Native-dialog destination.
         path: std::path::PathBuf,
+        /// See [`Job::Copy::action`].
+        action: u64,
     },
     /// Restore a stored capture into a new live card.
     Restore {
@@ -430,7 +490,15 @@ pub(crate) enum Job {
     /// The worker also applies this policy after every future capture.
     EnforceRetention(RetentionPolicy),
     /// Upload a card's untouched capture and copy the returned link.
-    Upload(CardId),
+    Upload {
+        /// Which card.
+        card: CardId,
+        /// The dispatching action id this upload answers for (round 7,
+        /// Finding #2). Travels back on `Outcome::UploadDone`/
+        /// `Outcome::UploadRefused` so a completion for a since-superseded
+        /// Upload request can be told apart from the card's current one.
+        action: u64,
+    },
     /// Upload an already-rendered editor revision instead of the original.
     ///
     /// The counterpart of [`Job::CopyImage`] and [`Job::SaveImage`], and it
@@ -443,6 +511,8 @@ pub(crate) enum Job {
         generation: u64,
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
+        /// See [`Job::Upload::action`].
+        action: u64,
     },
     /// Upload the durable media a recording card is showing.
     UploadRecording {
@@ -456,6 +526,8 @@ pub(crate) enum Job {
         content_type: String,
         /// Safe file name for the remote object.
         file_name: String,
+        /// See [`Job::Upload::action`].
+        action: u64,
     },
     /// Persist successful remote metadata on the store-owning worker.
     RememberShare {
@@ -737,6 +809,21 @@ pub enum Outcome {
         card: CardId,
         /// What happened, e.g. "copied to the clipboard".
         detail: String,
+        /// The editor generation and document revision the completed output
+        /// was rendered from, when a live editor produced it. `None` when
+        /// the output was read from the card's own cache with no editor
+        /// involved. Lets the main thread refuse to mark a *newer*,
+        /// since-committed revision as retained/exported just because an
+        /// older revision's save happened to finish after Done moved the
+        /// card on (round 5, Finding #2).
+        version: Option<(u64, u64)>,
+        /// The dispatching action id this completion answers for (round 12).
+        /// See [`Job::Copy::action`]: a card-level Copy/Save/Save-As can
+        /// now be concurrently outstanding alongside an editor's own
+        /// in-editor Copy/Save (or another card-level dispatch of a
+        /// different kind) for the same card, so `card` alone no longer
+        /// identifies which dispatch this answers for.
+        action: u64,
     },
     /// A cloud upload completed and its share link reached the clipboard.
     UploadDone {
@@ -744,6 +831,18 @@ pub enum Outcome {
         card: CardId,
         /// User-facing completion detail.
         detail: String,
+        /// The editor generation and document revision the uploaded image
+        /// was rendered from, when a live editor produced it. See
+        /// [`Outcome::Done::version`].
+        version: Option<(u64, u64)>,
+        /// The dispatching action id this completion answers for (round 7,
+        /// Finding #2). A second Upload request can be dispatched for the
+        /// same card before an earlier one's outcome is drained; comparing
+        /// this against the card's *current* action lets the main thread
+        /// tell the two apart and ignore a stale answer instead of acting on
+        /// bookkeeping (`close_after_upload`/`overflow_recovery_in_flight`)
+        /// that now belongs to the newer request.
+        action: u64,
     },
     /// A card action failed.
     Refused {
@@ -758,6 +857,8 @@ pub enum Outcome {
         card: CardId,
         /// Why.
         error: CliError,
+        /// See [`Outcome::UploadDone::action`].
+        action: u64,
     },
     /// A requested card output failed.
     OutputRefused {
@@ -765,6 +866,8 @@ pub enum Outcome {
         card: CardId,
         /// Why.
         error: CliError,
+        /// See [`Outcome::Done::action`].
+        action: u64,
     },
     /// Result of an atomic durable-source check and live-byte release.
     RetentionRelease {
@@ -842,6 +945,77 @@ pub enum Outcome {
         /// Rendered bytes and stable file label.
         prepared: PreparedHistoryDrag,
     },
+    /// A Done exit's card-output commit -- the bytes a plain Copy, Save,
+    /// Upload or drag reads once the editor is gone -- has been durably
+    /// filed, for the exact editor generation and document revision it was
+    /// posted for.
+    ///
+    /// Finding #1 (round 5): the window this belongs to must not finalize
+    /// closed, and no output on this card may read its own bytes, until this
+    /// arrives (or [`Self::CardOutputCommitFailed`] does): posting the job
+    /// is not the same as it having landed, and a delayed or refused commit
+    /// must never let a plain export still see the pre-edit pixels the
+    /// thumbnail already told the user were replaced.
+    CardOutputCommitted {
+        /// Which card.
+        card: CardId,
+        /// Which opening of the editor produced the commit.
+        generation: u64,
+        /// The document revision now filed as the card's own bytes.
+        revision: u64,
+    },
+    /// A Done exit's card-output commit could not be filed (e.g. the card
+    /// had already left the vault, or the revision could not be encoded).
+    ///
+    /// The editor this was posted for must not finalize closed: it stays
+    /// open (or reopens, if the native viewport already closed for this
+    /// frame) with the failure surfaced, exactly as if `render` itself had
+    /// failed -- never silently treated as if Done had succeeded.
+    CardOutputCommitFailed {
+        /// Which card.
+        card: CardId,
+        /// Which opening of the editor attempted the commit.
+        generation: u64,
+        /// The document revision that failed to file.
+        revision: u64,
+        /// Why it failed.
+        error: CliError,
+    },
+    /// A Done exit's (or a history-only editor's) scene graph has been
+    /// durably persisted to capture history, for the exact editor
+    /// generation and document revision it was posted for.
+    ///
+    /// Emitted in addition to (after) [`Self::HistoryDone`], which continues
+    /// to drive only the History browser panel. This variant exists so an
+    /// editor's close can be gated on the exact write it is waiting for
+    /// without depending on `HistoryDone`'s broader, multi-operation shape,
+    /// or on it firing for every kind of history mutation.
+    EditorClosePersisted {
+        /// Which card.
+        card: CardId,
+        /// Which opening of the editor produced the write.
+        generation: u64,
+        /// The document revision now durably persisted.
+        revision: u64,
+    },
+    /// A Done exit's (or a history-only editor's) scene graph could not be
+    /// persisted (Finding #4, round 5).
+    ///
+    /// The editor this was posted for must not release its editor-only
+    /// cache, nor finalize closed: an unconditional release right after a
+    /// failed persist would discard the exact edit the write was trying to
+    /// save. The editor instead stays open (or reopens) with the failure
+    /// surfaced.
+    EditorClosePersistFailed {
+        /// Which card.
+        card: CardId,
+        /// Which opening of the editor attempted the write.
+        generation: u64,
+        /// The document revision that failed to persist.
+        revision: u64,
+        /// Why it failed.
+        error: CliError,
+    },
 }
 
 /// A finalized card plus every isolated ambient action result.
@@ -872,6 +1046,13 @@ pub struct Pipeline {
     history_queries: Sender<HistoryQuery>,
     uploads: Sender<UploadJob>,
     outcomes: Receiver<Outcome>,
+    /// A clone of the outcome sender, kept only so tests can inject an
+    /// outcome the real workers cannot produce hermetically — an uploaded
+    /// share, which needs a network and (without the `cloud` feature) a
+    /// backend that is not compiled in at all. Every other job's outcome is
+    /// exercised by actually posting the job and draining the real worker.
+    #[cfg(test)]
+    test_outcomes: Sender<Outcome>,
     worker: Option<JoinHandle<()>>,
     history_worker: Option<JoinHandle<()>>,
     upload_worker: Option<JoinHandle<()>>,
@@ -945,11 +1126,14 @@ impl Pipeline {
         let pending_pin_updates = Arc::new(PendingPinUpdates::default());
         let capture_budget = CaptureBudget::new();
         let worker_pin_updates = Arc::clone(&pending_pin_updates);
+        #[cfg(test)]
+        let test_outcomes = outcome_tx.clone();
         let history_outcomes = outcome_tx.clone();
         let history_waker = waker.clone();
         let upload_cancellation = crate::cloud::ShareCancellation::default();
         let upload_cancel = upload_cancellation.clone();
         let upload_outcomes = outcome_tx.clone();
+        let upload_waker = waker.clone();
         let upload_history = jobs.clone();
 
         // Uploading is the one job that can block on a remote host for minutes,
@@ -960,7 +1144,8 @@ impl Pipeline {
         let upload_worker = std::thread::Builder::new()
             .name("scrozz-upload".to_owned())
             .spawn(move || {
-                UploadWorker::new(upload_outcomes, upload_cancel, upload_history).run(&upload_rx);
+                UploadWorker::new(upload_outcomes, upload_waker, upload_cancel, upload_history)
+                    .run(&upload_rx);
             })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
@@ -1029,6 +1214,8 @@ impl Pipeline {
             history_queries,
             uploads,
             outcomes,
+            #[cfg(test)]
+            test_outcomes,
             worker: Some(worker),
             history_worker: Some(history_worker),
             upload_worker: Some(upload_worker),
@@ -1256,6 +1443,18 @@ impl Pipeline {
         self.outcomes.try_recv().ok()
     }
 
+    /// Injects an outcome as though a worker had produced it.
+    ///
+    /// Only an upload actually needs this: a real [`Outcome::UploadDone`]
+    /// needs a network and, without the `cloud` feature, a backend that is
+    /// not even compiled in, so it cannot be exercised hermetically by
+    /// posting a real job. Every other outcome in these tests comes from
+    /// posting a real [`Job`] and draining the real worker.
+    #[cfg(test)]
+    pub fn inject_outcome_for_test(&self, outcome: Outcome) {
+        let _ = self.test_outcomes.send(outcome);
+    }
+
     /// Cancels interactive acquisition, then stops and joins the worker.
     ///
     /// Called from `Drop`, but exposed so a host can shut down deterministically
@@ -1305,8 +1504,16 @@ impl Drop for Pipeline {
 /// What the worker remembers about a card it produced.
 #[derive(Clone)]
 struct Cached {
-    /// The untouched card capture. This remains the default after the editor
-    /// closes, per D14.
+    /// The card's own exportable capture — what a plain Copy, Save or Upload
+    /// reads once no editor is open.
+    ///
+    /// Stays the untouched original through Cancel and a clean close. Per
+    /// D14 that only changes on an explicit save, and Done is that explicit
+    /// action ([`Worker::commit_card_output`] mirrors
+    /// `App::refresh_card_thumbnail`'s Done-only call site exactly): a
+    /// destructive redaction the card's thumbnail now shows committed must
+    /// never be reachable through a card output that still hands back these
+    /// pre-edit pixels.
     bytes: CaptureBytes,
     /// Original source pixels for rebuilding an editable history document.
     ///
@@ -1533,9 +1740,77 @@ impl CaptureVault {
         true
     }
 
+    /// Replaces a card's own bytes with a committed editor revision.
+    ///
+    /// Unlike [`Self::store_rendered`], which stages a revision alongside the
+    /// untouched capture for a drag that might still be cancelled, this is
+    /// the one path that overwrites what a plain Copy, Save or Upload --
+    /// posted once no editor is open -- actually reads. Called only for a
+    /// committed (Done) edit, mirroring `App::refresh_card_thumbnail`'s
+    /// Done-only call site; a cancelled or discarded edit must never reach
+    /// this. The now-superseded staged revision is cleared with it, since
+    /// keeping it would let a stale `get_revision` answer outlive the commit
+    /// it was staged for.
+    /// Replaces a card's own bytes with a committed editor revision.
+    ///
+    /// Unlike [`Self::store_rendered`], which stages a revision alongside the
+    /// untouched capture for a drag that might still be cancelled, this is
+    /// the one path that overwrites what a plain Copy, Save or Upload --
+    /// posted once no editor is open -- actually reads. Called only for a
+    /// committed (Done) edit, mirroring `App::refresh_card_thumbnail`'s
+    /// Done-only call site; a cancelled or discarded edit must never reach
+    /// this. The now-superseded staged revision is cleared with it, since
+    /// keeping it would let a stale `get_revision` answer outlive the commit
+    /// it was staged for.
+    ///
+    /// Backfills [`Cached::editor_source`] from the pre-commit bytes the
+    /// first time a card without one (Smart Frame was off at capture)
+    /// commits an edit. Once this returns, `bytes` is the flattened,
+    /// annotated revision and can no longer serve as a reconstruction base;
+    /// without this backfill a later reopen built from a freshly tracked
+    /// document (see `Worker::commit_card_output`) would draw that
+    /// document's own layer a second time over pixels that already show it.
+    fn commit_rendered(&self, card: CardId, bytes: CaptureBytes) -> bool {
+        let Ok(mut map) = self.inner.lock() else {
+            return false;
+        };
+        let Some(cached) = map.get_mut(&card) else {
+            return false;
+        };
+        if cached.editor_source.is_none() {
+            cached.editor_source = Some(Arc::clone(&cached.bytes.full));
+        }
+        cached.bytes = bytes;
+        cached.rendered = None;
+        true
+    }
+
     /// The full cached entry, including metadata needed to reopen the editor.
     fn cached(&self, card: CardId) -> Option<Cached> {
         self.inner.lock().ok()?.get(&card).cloned()
+    }
+
+    /// Clears a stale reconstruction base before a document is built directly
+    /// from the card's current flattened pixels.
+    ///
+    /// Finding #3 (round 5): `Worker::open_cached_document`'s no-derived-
+    /// document fallback builds a brand-new zero-history [`Document`] straight
+    /// from [`Cached::bytes`]`.full` -- today's visible pixels -- not from
+    /// whatever [`Cached::editor_source`] happens to still hold (a restore or
+    /// an earlier session's edit can leave one in place). Leaving that stale
+    /// value there would let [`Self::commit_rendered`]'s backfill-once guard
+    /// skip updating it once this document is edited and committed, so a
+    /// still-later reopen would draw the newly committed layers over an
+    /// older, unrelated base -- potentially undoing a redaction that had
+    /// already been flattened into `bytes.full`. Clearing it here means the
+    /// very next commit backfills from exactly the pixels this document was
+    /// actually built from.
+    fn clear_editor_source(&self, card: CardId) {
+        if let Ok(mut map) = self.inner.lock()
+            && let Some(cached) = map.get_mut(&card)
+        {
+            cached.editor_source = None;
+        }
     }
 
     /// Drops a card's bytes. Called when the card leaves the pile.
@@ -1727,6 +2002,12 @@ impl Worker {
                     revision,
                     data,
                 } => self.persist_document(card, generation, revision, &data),
+                Job::CommitCardOutput {
+                    card,
+                    generation,
+                    rendered,
+                    data,
+                } => self.commit_card_output(card, generation, &rendered, &data),
                 Job::AnalyzeSmartFrame {
                     card,
                     generation,
@@ -1742,29 +2023,43 @@ impl Worker {
                     policy,
                     _permit,
                 } => self.accept_captured(kind, origin, card, capture, &policy),
-                Job::Copy(card) => self.copy(card),
-                Job::CopyImage { card, rendered } => self.copy_image(card, &rendered),
-                Job::SaveImage { card, rendered } => self.save_image(card, &rendered),
+                Job::Copy { card, action } => self.copy(card, action),
+                Job::CopyImage {
+                    card,
+                    generation,
+                    rendered,
+                    action,
+                } => self.copy_image(card, generation, &rendered, action),
+                Job::SaveImage {
+                    card,
+                    generation,
+                    rendered,
+                    action,
+                } => self.save_image(card, generation, &rendered, action),
                 Job::SaveImageTo {
                     card,
+                    generation,
                     rendered,
                     path,
-                } => self.save_image_to(card, &rendered, &path),
-                Job::Save(card) => self.save(card),
-                Job::SaveTo { card, path } => self.save_to(card, &path),
-                Job::Upload(card) => self.upload(card),
+                    action,
+                } => self.save_image_to(card, generation, &rendered, &path, action),
+                Job::Save { card, action } => self.save(card, action),
+                Job::SaveTo { card, path, action } => self.save_to(card, &path, action),
+                Job::Upload { card, action } => self.upload(card, action),
                 Job::UploadImage {
                     card,
                     generation,
                     rendered,
-                } => self.upload_image(card, generation, &rendered),
+                    action,
+                } => self.upload_image(card, generation, &rendered, action),
                 Job::UploadRecording {
                     card,
                     capture,
                     path,
                     content_type,
                     file_name,
-                } => self.upload_recording(card, capture, &path, content_type, file_name),
+                    action,
+                } => self.upload_recording(card, capture, &path, content_type, file_name, action),
                 Job::RememberShare {
                     capture_id,
                     sharing,
@@ -2262,13 +2557,103 @@ impl Worker {
                 Ok(capture)
             });
         match result {
-            Ok(capture) => self.history_done(
-                HistoryOperation::Edit,
-                Some(capture),
-                None,
-                format!("{card} editor {generation} revision {revision} saved to capture history"),
-            ),
-            Err(error) => self.emit(Outcome::Refused { card, error }),
+            Ok(capture) => {
+                self.history_done(
+                    HistoryOperation::Edit,
+                    Some(capture),
+                    None,
+                    format!(
+                        "{card} editor {generation} revision {revision} saved to capture history"
+                    ),
+                );
+                // Ahead of `HistoryDone`, this is the ack an editor's close
+                // actually gates on -- see `Outcome::EditorClosePersisted`.
+                self.emit(Outcome::EditorClosePersisted {
+                    card,
+                    generation,
+                    revision,
+                });
+            }
+            Err(error) => {
+                // The editor waiting on this must not release its
+                // editor-only cache nor finalize closed on the strength of
+                // this failure -- see `Outcome::EditorClosePersistFailed`.
+                self.emit(Outcome::EditorClosePersistFailed {
+                    card,
+                    generation,
+                    revision,
+                    error,
+                });
+            }
+        }
+    }
+
+    /// Files a Done-committed editor revision into the card's own bytes.
+    ///
+    /// Companion to [`Self::persist_document`], posted for the same commit:
+    /// that call persists the editable scene to history, this one replaces
+    /// what a plain Copy, Save or Upload actually reads once the editor is
+    /// gone. Emits [`Outcome::CardOutputCommitted`] or
+    /// [`Outcome::CardOutputCommitFailed`] either way (Finding #1, round 5):
+    /// the caller's window must not finalize closed, nor let any output on
+    /// this card read its own bytes, until it hears back -- posting this job
+    /// is not the same as it having landed, and a stale card output would
+    /// otherwise resurrect pixels a destructive redaction was meant to
+    /// remove.
+    ///
+    /// Also refreshes [`Self::derived_documents`] with `data` in the same
+    /// step as the bytes: `persist_document`'s history write can fail or
+    /// lag independently, and [`Self::open`] must never reconstruct a
+    /// document older than what was just committed here.
+    fn commit_card_output(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        data: &DocumentData,
+    ) {
+        let revision = rendered.revision();
+        match CaptureBytes::from_rendered(generation, rendered) {
+            Ok(bytes) => {
+                if self.vault.commit_rendered(card, bytes) {
+                    self.derived_documents.insert(card, data.clone());
+                    // The window this belongs to is waiting on exactly this
+                    // ack before it finalizes closed -- see
+                    // `Outcome::CardOutputCommitted` (Finding #1, round 5).
+                    self.emit(Outcome::CardOutputCommitted {
+                        card,
+                        generation,
+                        revision,
+                    });
+                } else {
+                    let error = CliError::Core(CoreError::Storage(format!(
+                        "{card} had already left the vault"
+                    )));
+                    tracing::warn!(
+                        %card,
+                        "a committed edit could not be filed: the card had already left the vault"
+                    );
+                    self.emit(Outcome::CardOutputCommitFailed {
+                        card,
+                        generation,
+                        revision,
+                        error,
+                    });
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %card,
+                    %error,
+                    "a committed edit could not be encoded for the card's own bytes"
+                );
+                self.emit(Outcome::CardOutputCommitFailed {
+                    card,
+                    generation,
+                    revision,
+                    error,
+                });
+            }
         }
     }
 
@@ -2304,20 +2689,33 @@ impl Worker {
     /// presentation canvas for window captures; the editor must know which kind
     /// it holds rather than guess.
     fn open(&mut self, card: CardId) {
-        let durable = self.vault.cached(card).and_then(|cached| cached.capture_id);
-        let document = match durable {
-            Some(capture) => match self.load_document(&capture) {
-                Ok(document) => Ok(document),
-                Err(error) => {
-                    tracing::warn!(
-                        %card,
-                        %error,
-                        "stored document could not be loaded; opening its flattened visible pixels"
-                    );
-                    self.open_cached_document(card)
-                }
-            },
-            None => self.open_cached_document(card),
+        // A committed edit refreshes this in the very same worker step that
+        // replaces the card's own bytes (see `Worker::commit_card_output`),
+        // so whenever an entry exists here it is always at least as fresh
+        // as anything durable history might return -- including when the
+        // history write posted alongside it (`Job::PersistDocument`) is
+        // still pending or has failed outright. Trusting history over this
+        // would risk resurrecting a stale, unredacted document even though
+        // the card's own bytes and thumbnail already show the redaction
+        // committed.
+        let document = if self.derived_documents.contains_key(&card) {
+            self.open_cached_document(card)
+        } else {
+            let durable = self.vault.cached(card).and_then(|cached| cached.capture_id);
+            match durable {
+                Some(capture) => match self.load_document(&capture) {
+                    Ok(document) => Ok(document),
+                    Err(error) => {
+                        tracing::warn!(
+                            %card,
+                            %error,
+                            "stored document could not be loaded; opening its flattened visible pixels"
+                        );
+                        self.open_cached_document(card)
+                    }
+                },
+                None => self.open_cached_document(card),
+            }
         };
         match document {
             Ok(document) => {
@@ -2338,9 +2736,16 @@ impl Worker {
             Some(data) => self
                 .capture_from_cache(card, "open")
                 .and_then(|capture| Document::from_data(capture, data).map_err(CliError::Core)),
-            None => self
-                .capture_from_visible_cache(card, "open")
-                .map(Document::new),
+            None => {
+                // No in-memory document survives for this card, so the
+                // document about to be built is a fresh, zero-history one
+                // over today's flattened pixels -- not over whatever
+                // `editor_source` still remembers. See
+                // `CaptureVault::clear_editor_source`.
+                self.vault.clear_editor_source(card);
+                self.capture_from_visible_cache(card, "open")
+                    .map(Document::new)
+            }
         }
     }
 
@@ -2467,7 +2872,13 @@ impl Worker {
         }))
     }
 
-    fn copy_image(&mut self, card: CardId, rendered: &RevisionedFrame) {
+    fn copy_image(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        action: u64,
+    ) {
         tracing::debug!(
             %card,
             revision = rendered.revision(),
@@ -2480,10 +2891,21 @@ impl Worker {
             })
             .map(|()| "copied the annotated image".to_owned())
             .map_err(CliError::from);
-        self.answer(card, result);
+        self.answer(
+            card,
+            Some((generation, rendered.revision())),
+            action,
+            result,
+        );
     }
 
-    fn save_image(&mut self, card: CardId, rendered: &RevisionedFrame) {
+    fn save_image(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        action: u64,
+    ) {
         tracing::debug!(
             %card,
             revision = rendered.revision(),
@@ -2496,10 +2918,22 @@ impl Worker {
                 let path = crate::output::export_default(&bytes)?;
                 Ok(format!("saved the annotated image to {}", path.display()))
             });
-        self.answer(card, result);
+        self.answer(
+            card,
+            Some((generation, rendered.revision())),
+            action,
+            result,
+        );
     }
 
-    fn save_image_to(&mut self, card: CardId, rendered: &RevisionedFrame, path: &std::path::Path) {
+    fn save_image_to(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        path: &std::path::Path,
+        action: u64,
+    ) {
         tracing::debug!(
             %card,
             revision = rendered.revision(),
@@ -2513,10 +2947,15 @@ impl Worker {
                 let path = crate::output::export_to_path(&bytes, path)?;
                 Ok(format!("saved the annotated image to {}", path.display()))
             });
-        self.answer(card, result);
+        self.answer(
+            card,
+            Some((generation, rendered.revision())),
+            action,
+            result,
+        );
     }
 
-    fn copy(&mut self, card: CardId) {
+    fn copy(&mut self, card: CardId, action: u64) {
         // The round trip through PNG is deliberate — see the module docs — and
         // is also what will make "copy" work for a card whose capture arrived
         // over IPC, where the worker never held a `Frame` at all.
@@ -2527,23 +2966,23 @@ impl Worker {
             scrozz_shell::write_capture_to_clipboard(&frame, &cached.bytes.full)?;
             Ok("copied to the clipboard".to_owned())
         });
-        self.answer(card, result);
+        self.answer(card, None, action, result);
     }
 
-    fn save(&mut self, card: CardId) {
+    fn save(&mut self, card: CardId, action: u64) {
         let result = self.cached(card, "save").and_then(|cached| {
             let path = crate::output::export_default(&cached.full)?;
             Ok(format!("saved to {}", path.display()))
         });
-        self.answer(card, result);
+        self.answer(card, None, action, result);
     }
 
-    fn save_to(&mut self, card: CardId, path: &std::path::Path) {
+    fn save_to(&mut self, card: CardId, path: &std::path::Path, action: u64) {
         let result = self.cached(card, "save").and_then(|cached| {
             let path = crate::output::export_to_path(&cached.full, path)?;
             Ok(format!("saved to {}", path.display()))
         });
-        self.answer(card, result);
+        self.answer(card, None, action, result);
     }
 
     /// Hands the card's *current* bytes to the upload worker.
@@ -2553,7 +2992,7 @@ impl Worker {
     /// into a channel. The revision travelling with the bytes is the vault's
     /// own, so a share can never be attributed to a revision the user did not
     /// approve — see [`CaptureBytes`].
-    fn upload(&mut self, card: CardId) {
+    fn upload(&mut self, card: CardId, action: u64) {
         let result = self.cached_entry(card, "upload").and_then(|cached| {
             let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
                 cached.bytes.full.as_ref().clone(),
@@ -2564,9 +3003,10 @@ impl Worker {
                 cached.capture_id.clone(),
                 ShareVersion::of(&cached.bytes),
                 artifact,
+                action,
             )
         });
-        self.answer_upload(card, result);
+        self.answer_upload(card, action, result);
     }
 
     /// Uploads the exact revision an open editor produced, never the original.
@@ -2574,7 +3014,13 @@ impl Worker {
     /// The revision travels with the bytes, so a share can only ever be
     /// attributed to the pixels the user approved — the same rule Copy, Save
     /// and drag already follow for a destructively redacted document.
-    fn upload_image(&mut self, card: CardId, generation: u64, rendered: &RevisionedFrame) {
+    fn upload_image(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        action: u64,
+    ) {
         let capture_id = self.vault.cached(card).and_then(|cached| cached.capture_id);
         let result = FrameEncoder::new()
             .encode(rendered.frame(), ImageFormat::Png)
@@ -2594,9 +3040,10 @@ impl Worker {
                         revision: rendered.revision(),
                     },
                     artifact,
+                    action,
                 )
             });
-        self.answer_upload(card, result);
+        self.answer_upload(card, action, result);
     }
 
     /// Uploads a durable recording a card is showing.
@@ -2610,6 +3057,7 @@ impl Worker {
         path: &std::path::Path,
         content_type: String,
         file_name: String,
+        action: u64,
     ) {
         let result = std::fs::read(path)
             .map_err(|error| {
@@ -2624,9 +3072,9 @@ impl Worker {
             .and_then(|artifact| {
                 // A finished recording's durable file is immutable for the
                 // lifetime of its card, so it is always revision zero.
-                self.queue_upload(card, capture, ShareVersion::original(), artifact)
+                self.queue_upload(card, capture, ShareVersion::original(), artifact, action)
             });
-        self.answer_upload(card, result);
+        self.answer_upload(card, action, result);
     }
 
     fn queue_upload(
@@ -2635,6 +3083,7 @@ impl Worker {
         capture_id: Option<CaptureId>,
         version: ShareVersion,
         artifact: crate::cloud::FinalizedArtifact,
+        action: u64,
     ) -> CliResult<()> {
         self.uploads
             .send(UploadJob::Share {
@@ -2642,6 +3091,7 @@ impl Worker {
                 capture_id,
                 version,
                 artifact,
+                action,
             })
             .map_err(|_| {
                 CliError::Core(CoreError::Platform("the upload worker has gone".to_owned()))
@@ -2653,15 +3103,26 @@ impl Worker {
     /// A refusal here is [`Outcome::UploadRefused`] rather than
     /// [`Outcome::OutputRefused`] so the card shows the reason: the user
     /// pressed Upload and is watching that card for an answer.
-    fn answer_upload(&mut self, card: CardId, result: CliResult<()>) {
+    fn answer_upload(&mut self, card: CardId, action: u64, result: CliResult<()>) {
         let outcome = match result {
             Ok(()) => Outcome::Started {
                 card,
                 detail: "upload queued".to_owned(),
             },
-            Err(error) => Outcome::UploadRefused { card, error },
+            Err(error) => Outcome::UploadRefused {
+                card,
+                error,
+                action,
+            },
         };
-        let _ = self.outcomes.send(outcome);
+        // Round 9, Finding #2: this local refusal (encoding failure, a
+        // missing cache entry, a read failure, or the upload worker's queue
+        // having gone) previously sent straight to `self.outcomes` rather
+        // than through the wake-aware `Self::emit` every other outcome in
+        // this worker uses. In a reactive event loop that is woken only by
+        // `SurfaceWaker`, that left the answer sitting in the channel with
+        // nothing to prompt draining it.
+        self.emit(outcome);
     }
 
     /// Attaches secret-free remote metadata to the capture's history row.
@@ -3234,10 +3695,25 @@ impl Worker {
         }
     }
 
-    fn answer(&self, card: CardId, result: CliResult<String>) {
+    fn answer(
+        &self,
+        card: CardId,
+        version: Option<(u64, u64)>,
+        action: u64,
+        result: CliResult<String>,
+    ) {
         let message = match result {
-            Ok(detail) => Outcome::Done { card, detail },
-            Err(error) => Outcome::OutputRefused { card, error },
+            Ok(detail) => Outcome::Done {
+                card,
+                detail,
+                version,
+                action,
+            },
+            Err(error) => Outcome::OutputRefused {
+                card,
+                error,
+                action,
+            },
         };
         self.emit(message);
     }
@@ -3649,6 +4125,8 @@ enum UploadJob {
         capture_id: Option<CaptureId>,
         version: ShareVersion,
         artifact: crate::cloud::FinalizedArtifact,
+        /// See [`Outcome::UploadDone::action`].
+        action: u64,
     },
     Release(CardId),
     Stop,
@@ -3656,6 +4134,17 @@ enum UploadJob {
 
 struct UploadWorker {
     outcomes: Sender<Outcome>,
+    /// Wakes the reactive event loop after every outcome send, mirroring
+    /// [`HistoryReader`]'s own wake-on-send (round 8, Finding #5).
+    ///
+    /// Without this, a success or refusal delivered here sits in the
+    /// channel until *something else* happens to wake the window (a mouse
+    /// move, a repaint the OS scheduled for an unrelated reason, ...); on a
+    /// genuinely idle window the reactive loop can be parked indefinitely
+    /// and never drains it at all, leaving an upload silently "stuck"
+    /// forever from the user's perspective even though the worker finished
+    /// long ago.
+    waker: Option<SurfaceWaker>,
     cancellation: crate::cloud::ShareCancellation,
     history: Sender<Job>,
     links: HashMap<CardId, CachedShare>,
@@ -3692,14 +4181,27 @@ impl CachedShare {
 impl UploadWorker {
     fn new(
         outcomes: Sender<Outcome>,
+        waker: Option<SurfaceWaker>,
         cancellation: crate::cloud::ShareCancellation,
         history: Sender<Job>,
     ) -> Self {
         Self {
             outcomes,
+            waker,
             cancellation,
             history,
             links: HashMap::new(),
+        }
+    }
+
+    /// Sends `outcome` and, only once it actually landed, wakes the
+    /// reactive event loop so it drains promptly rather than waiting on
+    /// some unrelated repaint (round 8, Finding #5).
+    fn send_outcome(&self, outcome: Outcome) {
+        if self.outcomes.send(outcome).is_ok()
+            && let Some(waker) = &self.waker
+        {
+            waker();
         }
     }
 
@@ -3711,11 +4213,12 @@ impl UploadWorker {
                     capture_id,
                     version,
                     artifact,
+                    action,
                 } => {
                     if self.cancellation.is_cancelled() {
                         break;
                     }
-                    self.upload(card, capture_id, version, &artifact);
+                    self.upload(card, capture_id, version, &artifact, action);
                 }
                 UploadJob::Release(card) => {
                     self.links.remove(&card);
@@ -3732,6 +4235,7 @@ impl UploadWorker {
         capture_id: Option<CaptureId>,
         version: ShareVersion,
         artifact: &crate::cloud::FinalizedArtifact,
+        action: u64,
     ) {
         if self
             .links
@@ -3752,17 +4256,22 @@ impl UploadWorker {
                     self.links.insert(card, CachedShare::new(shared, version));
                 }
                 Err(error) => {
-                    let _ = self.outcomes.send(Outcome::UploadRefused { card, error });
+                    self.send_outcome(Outcome::UploadRefused {
+                        card,
+                        error,
+                        action,
+                    });
                     return;
                 }
             }
         }
         let Some(shared) = self.links.get(&card) else {
-            let _ = self.outcomes.send(Outcome::UploadRefused {
+            self.send_outcome(Outcome::UploadRefused {
                 card,
                 error: CliError::Core(CoreError::Platform(
                     "the upload completed without a retained share link".to_owned(),
                 )),
+                action,
             });
             return;
         };
@@ -3770,6 +4279,11 @@ impl UploadWorker {
             Ok(()) => Outcome::UploadDone {
                 card,
                 detail: "uploaded and copied the private share link".to_owned(),
+                version: shared
+                    .version
+                    .generation
+                    .map(|g| (g, shared.version.revision)),
+                action,
             },
             Err(error) => Outcome::UploadRefused {
                 card,
@@ -3778,9 +4292,10 @@ impl UploadWorker {
                      Press Upload again to retry the clipboard; Scrozz reuses the object while \
                      its signed URL remains valid"
                 ))),
+                action,
             },
         };
-        let _ = self.outcomes.send(outcome);
+        self.send_outcome(outcome);
     }
 }
 
@@ -4488,7 +5003,7 @@ mod tests {
         let (jobs, job_rx) = channel();
         let (history_queries, _history_rx) = channel();
         let (uploads, _upload_rx) = channel();
-        let (_outcome_tx, outcomes) = channel();
+        let (outcome_tx, outcomes) = channel();
         let mut pipeline = Pipeline {
             jobs,
             capture_budget: CaptureBudget::new(),
@@ -4499,6 +5014,8 @@ mod tests {
             history_queries,
             uploads,
             outcomes,
+            #[cfg(test)]
+            test_outcomes: outcome_tx,
             worker: None,
             history_worker: None,
             upload_worker: None,
@@ -4561,7 +5078,7 @@ mod tests {
         let (jobs, job_rx) = channel();
         let (history_queries, _history_rx) = channel();
         let (uploads, _upload_rx) = channel();
-        let (_outcome_tx, outcomes) = channel();
+        let (outcome_tx, outcomes) = channel();
         let mut pipeline = Pipeline {
             jobs,
             capture_budget: CaptureBudget::new(),
@@ -4572,6 +5089,8 @@ mod tests {
             history_queries,
             uploads,
             outcomes,
+            #[cfg(test)]
+            test_outcomes: outcome_tx,
             worker: None,
             history_worker: None,
             upload_worker: None,
@@ -4627,9 +5146,49 @@ mod tests {
         let pipeline =
             Pipeline::start_with_history_and_waker(Arc::new(RefusingSelector), false, Some(waker))
                 .expect("worker");
-        assert!(pipeline.post(Job::Copy(CardId(404))));
+        assert!(pipeline.post(Job::Copy {
+            card: CardId(404),
+            action: 1,
+        }));
         let _ = wait_for(&pipeline);
         assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// Round 9, Finding #2: `Worker::answer_upload`'s local refusal path (a
+    /// missing cache entry here, but the same fix also covers an encoding
+    /// failure, a read failure, and the upload worker's queue having gone)
+    /// previously sent straight to the outcome channel, bypassing
+    /// `Worker::emit`'s wake-aware send every other outcome in this worker
+    /// uses. A reactive event loop woken only by `SurfaceWaker` could then
+    /// leave the refusal sitting undrained in the channel.
+    #[test]
+    fn a_locally_refused_upload_wakes_the_window_event_loop() {
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let pipeline =
+            Pipeline::start_with_history_and_waker(Arc::new(RefusingSelector), false, Some(waker))
+                .expect("worker");
+        // Never captured, so `cached_entry` refuses before the upload ever
+        // reaches the upload worker -- exactly the local-refusal branch of
+        // `answer_upload` this finding covers.
+        assert!(pipeline.post(Job::Upload {
+            card: CardId(9001),
+            action: 1,
+        }));
+        match wait_for(&pipeline) {
+            Some(Outcome::UploadRefused { card, action, .. }) => {
+                assert_eq!(card, CardId(9001));
+                assert_eq!(action, 1);
+            }
+            other => panic!("expected a local upload refusal, got {other:?}"),
+        }
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "a locally refused upload must wake the event loop"
+        );
     }
 
     #[test]
@@ -4927,6 +5486,261 @@ mod tests {
     }
 
     #[test]
+    fn committing_a_card_output_replaces_its_exportable_bytes_with_the_edited_revision() {
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-commit-output");
+        let original = richly_annotated_document(1);
+        let card = CardId(21);
+        worker
+            .vault
+            .store_test_capture(card, original.source())
+            .expect("seed the card's own capture");
+        let original_bytes = worker.vault.get(card).expect("seeded capture").full;
+
+        let edited = richly_annotated_document(9);
+        let rendered = RevisionedFrame::from_document(&edited, 3).expect("render edited revision");
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
+
+        let committed = worker.vault.get(card).expect("card remains in the vault");
+        assert_eq!(
+            committed.revision(),
+            3,
+            "the committed revision must be recorded"
+        );
+        assert_eq!(
+            committed.generation(),
+            Some(1),
+            "the committed bytes must be attributed to the editor that produced them"
+        );
+        assert_ne!(
+            committed.full, original_bytes,
+            "a plain Copy, Save or Upload posted after Done must not fall back to the pre-edit \
+             capture -- exactly the pixels a destructive redaction was meant to remove"
+        );
+        let decoded = scrozz_export::decode(&committed.full).expect("decode committed bytes");
+        let expected = SkiaRenderer::new()
+            .render(&edited)
+            .expect("reference render");
+        assert_eq!(
+            decoded.data, expected.data,
+            "the committed bytes must be the exact edited revision, not a different render"
+        );
+        assert!(
+            worker.vault.get_revision(card, 1, 3).is_none(),
+            "the staged revision is superseded by the commit and must not linger"
+        );
+    }
+
+    #[test]
+    fn a_committed_card_output_for_a_vault_entry_that_has_left_is_a_harmless_no_op() {
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-commit-output-gone");
+        let card = CardId(22);
+        let edited = richly_annotated_document(2);
+        let rendered = RevisionedFrame::from_document(&edited, 1).expect("render edited revision");
+
+        // The card already left the vault (its editor-only release beat the
+        // commit, or it was never captured through this worker) -- filing the
+        // commit must not panic and must leave nothing behind.
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
+
+        assert!(worker.vault.get(card).is_none());
+    }
+
+    #[test]
+    fn a_first_commit_backfills_editor_source_from_the_pre_edit_pixels() {
+        // Finding #3 (round 4), the corruption this backfill exists to
+        // prevent: once a commit overwrites `bytes` with the flattened,
+        // annotated render, that render can no longer serve as the base a
+        // reopen rebuilds a document on top of -- doing so would draw the
+        // very same annotations a second time. `editor_source` is the base
+        // a reopen actually uses (see `capture_from_cache`); a card whose
+        // Smart Frame was off at capture never had one populated at all.
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-commit-backfill-source");
+        let card = CardId(23);
+        let original = richly_annotated_document(1);
+        worker
+            .vault
+            .store_test_capture(card, original.source())
+            .expect("seed the card's own capture");
+        let pre_commit_bytes = worker.vault.get(card).expect("seeded capture").full;
+        assert!(
+            worker
+                .vault
+                .cached(card)
+                .expect("seeded")
+                .editor_source
+                .is_none(),
+            "sanity: a card with Smart Frame off at capture starts without editor_source"
+        );
+
+        let edited = richly_annotated_document(9);
+        let rendered = RevisionedFrame::from_document(&edited, 1).expect("render edited revision");
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
+
+        let after = worker
+            .vault
+            .cached(card)
+            .expect("card remains in the vault");
+        assert_eq!(
+            after.editor_source,
+            Some(pre_commit_bytes),
+            "editor_source must be backfilled with the pre-commit pixels, not left empty or \
+             overwritten with the committed (already annotated) bytes"
+        );
+        assert_ne!(
+            after.bytes.full,
+            after.editor_source.expect("checked above"),
+            "the card's own bytes must still be the newly committed render, not the backfilled \
+             source"
+        );
+    }
+
+    #[test]
+    fn opening_a_committed_card_never_resurrects_a_stale_durable_document() {
+        // Finding #3 (round 4): `Job::PersistDocument` (durable history) and
+        // `Job::CommitCardOutput` (the vault's own bytes) are two
+        // independently-failable jobs posted from the same Done. If
+        // history's write lags or silently fails, `load_document` would
+        // otherwise keep handing back whatever it last held -- an older,
+        // possibly unredacted document -- even though the card's own bytes
+        // already show the edit committed. `derived_documents` is refreshed
+        // in the very same step that replaces those bytes, so `open` must
+        // prefer it whenever both an entry and durable history exist.
+        let (_dir, mut worker, receiver) = worker_with_store("worker-open-prefers-derived");
+        let stale = richly_annotated_document(1);
+        let capture_id = worker
+            .remember_document(&stale)
+            .expect("seed the stale durable history entry");
+
+        let card = CardId(30);
+        let seed_capture = stale.source();
+        let full = FrameEncoder::new()
+            .encode(&seed_capture.frame, ImageFormat::Png)
+            .map(Arc::new)
+            .expect("encode seed capture");
+        worker.vault.store(
+            card,
+            Cached {
+                bytes: CaptureBytes {
+                    generation: None,
+                    revision: 0,
+                    full,
+                    preview: None,
+                },
+                editor_source: None,
+                rendered: None,
+                provenance: seed_capture.provenance,
+                target: seed_capture.target.clone(),
+                scale: seed_capture.frame.scale,
+                color_space: seed_capture.frame.color_space,
+                capture_id: Some(capture_id),
+            },
+        );
+
+        let edited = richly_annotated_document(9);
+        let rendered = RevisionedFrame::from_document(&edited, 2).expect("render edited revision");
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
+        assert!(
+            matches!(received(&receiver), Outcome::CardOutputCommitted { .. }),
+            "the commit itself must be acknowledged before the reopen below (round 5, Finding #1)"
+        );
+
+        worker.open(card);
+        let Outcome::Opened { document, .. } = received(&receiver) else {
+            panic!("opening a committed card should still produce a document");
+        };
+        assert_eq!(
+            document.data(),
+            edited.data(),
+            "a reopen must never be older than the bytes it just committed, even when \
+             durable history still holds a stale pre-edit document"
+        );
+    }
+
+    #[test]
+    fn a_flattened_visible_fallback_reopen_refreshes_the_reconstruction_source_before_it_next_commits()
+     {
+        // Finding #3 (round 5): a card can carry a stale `editor_source` --
+        // left behind by an earlier restore or a since-forgotten edit --
+        // while `derived_documents` no longer has an in-memory document and
+        // there is no durable capture to load from. The next open then falls
+        // back to a brand-new zero-history document built straight from the
+        // card's *current* flattened pixels (`bytes.full`), which need not
+        // be anything like that stale `editor_source`. Before this fix, the
+        // stale value survived the open untouched, and the very next commit's
+        // backfill-once guard would then skip updating it -- so a still
+        // later reopen would draw the new commit's layers over years-old,
+        // unrelated (possibly unredacted) pixels instead of the ones this
+        // document was actually built from.
+        let (_dir, mut worker, receiver) = worker_with_store("worker-fallback-source-refresh");
+        let card = CardId(31);
+        let stale_original = richly_annotated_document(1).source().clone();
+        let flattened_redacted = richly_annotated_document(2).source().clone();
+        let stale_original_bytes = FrameEncoder::new()
+            .encode(&stale_original.frame, ImageFormat::Png)
+            .map(Arc::new)
+            .expect("encode stale original");
+        let flattened_bytes = FrameEncoder::new()
+            .encode(&flattened_redacted.frame, ImageFormat::Png)
+            .map(Arc::new)
+            .expect("encode flattened pixels");
+        worker.vault.store(
+            card,
+            Cached {
+                bytes: CaptureBytes {
+                    generation: None,
+                    revision: 0,
+                    full: Arc::clone(&flattened_bytes),
+                    preview: None,
+                },
+                editor_source: Some(Arc::clone(&stale_original_bytes)),
+                rendered: None,
+                provenance: flattened_redacted.provenance,
+                target: flattened_redacted.target.clone(),
+                scale: flattened_redacted.frame.scale,
+                color_space: flattened_redacted.frame.color_space,
+                capture_id: None,
+            },
+        );
+
+        worker.open(card);
+        assert!(
+            matches!(received(&receiver), Outcome::Opened { .. }),
+            "the flattened-visible fallback must still open successfully"
+        );
+        assert!(
+            worker
+                .vault
+                .cached(card)
+                .expect("card remains cached")
+                .editor_source
+                .is_none(),
+            "opening the fallback document must clear the stale reconstruction source, not \
+             leave it pointing at pixels the new document was never built from"
+        );
+
+        let edited = richly_annotated_document(9);
+        let rendered = RevisionedFrame::from_document(&edited, 1).expect("render edited revision");
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
+
+        let after_commit = worker
+            .vault
+            .cached(card)
+            .expect("card remains cached after commit");
+        assert_eq!(
+            after_commit.editor_source,
+            Some(flattened_bytes),
+            "the backfill after this commit must use the pixels the fallback document was \
+             actually built from"
+        );
+        assert_ne!(
+            after_commit.editor_source,
+            Some(stale_original_bytes),
+            "the backfilled source must never regress to the older, unrelated pixels the stale \
+             editor_source pointed at"
+        );
+    }
+
+    #[test]
     fn selected_history_drag_is_fully_rendered_before_the_gesture() {
         let (dir, mut worker, receiver) = worker_with_store("worker-drag-preload");
         let id = worker
@@ -5151,6 +5965,181 @@ mod tests {
     }
 
     #[test]
+    fn upload_done_carries_the_exact_revision_the_cached_link_was_made_from() {
+        // Round 5, Finding #2: `Outcome::UploadDone` must carry the editor
+        // generation and document revision the uploaded object actually
+        // represents, the same way `Outcome::Done` does for Copy/Save --
+        // otherwise the main thread cannot tell a completion for a
+        // since-superseded revision apart from one for the card's current
+        // committed content, and could mark a stale revision retained.
+        // A cache hit (no network call) is the deterministic way to exercise
+        // this without a live `cloud` backend.
+        let (outcomes, outcome_rx) = std::sync::mpsc::channel();
+        let (history, _history_rx) = std::sync::mpsc::channel();
+        let version = ShareVersion {
+            generation: Some(3),
+            revision: 11,
+        };
+        let mut worker = UploadWorker::new(
+            outcomes,
+            None,
+            crate::cloud::ShareCancellation::default(),
+            history,
+        );
+        worker.links.insert(
+            CardId(50),
+            CachedShare {
+                shared: crate::cloud::Shared {
+                    url: "https://example.test/cached".to_owned(),
+                    key: "capture.png".to_owned(),
+                    provider: "aws",
+                    expires_seconds: None,
+                    expires_at: None,
+                    lifecycle_rule: None,
+                    encrypted: false,
+                    tags: Vec::new(),
+                    media_kind: crate::cloud::ArtifactKind::Screenshot,
+                },
+                expires_at: None,
+                version,
+            },
+        );
+
+        let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
+            one_pixel_png(),
+            "capture.png".to_owned(),
+        )
+        .expect("a nonempty PNG is a valid artifact");
+        worker.upload(CardId(50), None, version, &artifact, 21);
+
+        match outcome_rx.try_recv() {
+            Ok(Outcome::UploadDone {
+                card,
+                version: got,
+                action,
+                ..
+            }) => {
+                assert_eq!(card, CardId(50));
+                assert_eq!(
+                    got,
+                    Some((3, 11)),
+                    "UploadDone must report the exact (generation, revision) the \
+                     reused cached link was made from, not an absent or stale pair"
+                );
+                assert_eq!(
+                    action, 21,
+                    "UploadDone must report the exact action id it answers for \
+                     (round 7, Finding #2)"
+                );
+            }
+            other => panic!("expected an UploadDone from the cached link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_successful_upload_wakes_the_window_event_loop() {
+        // Round 8, Finding #5: unlike `HistoryReader`, `UploadWorker` sent its
+        // outcomes without a `SurfaceWaker`, so a success or refusal it
+        // delivered could sit undrained until something unrelated woke the
+        // window. A cache hit exercises the success path deterministically,
+        // with no live `cloud` backend and no network call.
+        let (outcomes, outcome_rx) = std::sync::mpsc::channel();
+        let (history, _history_rx) = std::sync::mpsc::channel();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let version = ShareVersion {
+            generation: Some(1),
+            revision: 1,
+        };
+        let mut worker = UploadWorker::new(
+            outcomes,
+            Some(waker),
+            crate::cloud::ShareCancellation::default(),
+            history,
+        );
+        worker.links.insert(
+            CardId(60),
+            CachedShare {
+                shared: crate::cloud::Shared {
+                    url: "https://example.test/cached-wake".to_owned(),
+                    key: "capture.png".to_owned(),
+                    provider: "aws",
+                    expires_seconds: None,
+                    expires_at: None,
+                    lifecycle_rule: None,
+                    encrypted: false,
+                    tags: Vec::new(),
+                    media_kind: crate::cloud::ArtifactKind::Screenshot,
+                },
+                expires_at: None,
+                version,
+            },
+        );
+        let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
+            one_pixel_png(),
+            "capture.png".to_owned(),
+        )
+        .expect("a nonempty PNG is a valid artifact");
+
+        worker.upload(CardId(60), None, version, &artifact, 7);
+
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Ok(Outcome::UploadDone { .. })
+        ));
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "a successful upload must wake the reactive event loop so its \
+             outcome is drained promptly rather than waiting on an unrelated repaint"
+        );
+    }
+
+    #[test]
+    fn a_refused_upload_wakes_the_window_event_loop() {
+        // Round 8, Finding #5, refusal side: the "cloud" feature is off by
+        // default in this workspace's test build, so a fresh (uncached)
+        // upload deterministically refuses without any network call --
+        // this exercises the same wake requirement on the refusal path.
+        let (outcomes, outcome_rx) = std::sync::mpsc::channel();
+        let (history, _history_rx) = std::sync::mpsc::channel();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mut worker = UploadWorker::new(
+            outcomes,
+            Some(waker),
+            crate::cloud::ShareCancellation::default(),
+            history,
+        );
+        let version = ShareVersion {
+            generation: Some(2),
+            revision: 2,
+        };
+        let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
+            one_pixel_png(),
+            "capture.png".to_owned(),
+        )
+        .expect("a nonempty PNG is a valid artifact");
+
+        worker.upload(CardId(61), None, version, &artifact, 8);
+
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Ok(Outcome::UploadRefused { .. })
+        ));
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "a refused upload must also wake the reactive event loop, not \
+             just a successful one"
+        );
+    }
+
+    #[test]
     fn a_pipeline_stops_cleanly_and_twice_is_harmless() {
         // Drop also stops it, so the second call must be a no-op rather than a
         // join on an already-joined handle.
@@ -5162,11 +6151,20 @@ mod tests {
     #[test]
     fn copying_a_card_that_was_never_captured_is_refused_not_ignored() {
         let pipeline = start_pipeline();
-        assert!(pipeline.post(Job::Copy(CardId(404))));
+        assert!(pipeline.post(Job::Copy {
+            card: CardId(404),
+            action: 1,
+        }));
 
         match wait_for(&pipeline) {
-            Some(Outcome::OutputRefused { card, error }) => {
+            Some(Outcome::OutputRefused {
+                card,
+                error,
+                action,
+                ..
+            }) => {
                 assert_eq!(card, CardId(404));
+                assert_eq!(action, 1);
                 assert!(error.to_string().contains("404"), "{error}");
             }
             other => panic!("expected a refusal, got {other:?}"),
@@ -5176,10 +6174,16 @@ mod tests {
     #[test]
     fn saving_a_card_that_was_never_captured_is_refused_too() {
         let pipeline = start_pipeline();
-        assert!(pipeline.post(Job::Save(CardId(7))));
+        assert!(pipeline.post(Job::Save {
+            card: CardId(7),
+            action: 2,
+        }));
 
         match wait_for(&pipeline) {
-            Some(Outcome::OutputRefused { card, .. }) => assert_eq!(card, CardId(7)),
+            Some(Outcome::OutputRefused { card, action, .. }) => {
+                assert_eq!(card, CardId(7));
+                assert_eq!(action, 2);
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
@@ -5187,10 +6191,19 @@ mod tests {
     #[test]
     fn uploading_a_card_that_was_never_captured_is_refused_too() {
         let pipeline = start_pipeline();
-        assert!(pipeline.post(Job::Upload(CardId(8))));
+        assert!(pipeline.post(Job::Upload {
+            card: CardId(8),
+            action: 1,
+        }));
 
         match wait_for(&pipeline) {
-            Some(Outcome::UploadRefused { card, .. }) => assert_eq!(card, CardId(8)),
+            Some(Outcome::UploadRefused { card, action, .. }) => {
+                assert_eq!(card, CardId(8));
+                assert_eq!(
+                    action, 1,
+                    "a refusal must report the exact action id it answers for"
+                );
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
@@ -5221,12 +6234,13 @@ mod tests {
             },
         );
 
-        worker.upload(CardId(9));
+        worker.upload(CardId(9), 5);
 
         let UploadJob::Share {
             card,
             artifact,
             version,
+            action,
             ..
         } = upload_rx.try_recv().unwrap()
         else {
@@ -5237,6 +6251,10 @@ mod tests {
         assert_eq!(artifact.content_type(), "image/png");
         assert_eq!(version.generation, Some(4));
         assert_eq!(version.revision, 7);
+        assert_eq!(
+            action, 5,
+            "the action id must travel from the capture worker to the upload worker unchanged"
+        );
         assert!(matches!(
             outcome_rx.try_recv(),
             Ok(Outcome::Started {

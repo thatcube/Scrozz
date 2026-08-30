@@ -614,6 +614,24 @@ pub trait CardSurface {
     /// Updates one card's Upload capability.
     fn set_upload_availability(&mut self, _id: CardId, _enabled: bool, _reason: Option<String>) {}
 
+    /// Tells the surface whether a card's editor is open.
+    ///
+    /// Drives the card's morphing Editing/Continue pill and pauses its
+    /// auto-close timer for as long as `editing` is `true`; the timer resumes
+    /// with its full configured duration once `editing` goes back to `false`.
+    /// A no-op default so surfaces without a Recent Captures stack (such as
+    /// tests that only exercise output actions) never need to implement it.
+    fn set_editing(&mut self, _id: CardId, _editing: bool) {}
+
+    /// Replaces a card's visible thumbnail with a freshly rendered document.
+    ///
+    /// Called only when an editor commits (Done) a dirty session, never while
+    /// editing is in progress: the card must show its pre-edit thumbnail
+    /// unchanged for the whole session, with no ambiguous intermediate
+    /// revision. A no-op default so surfaces without a Recent Captures stack
+    /// never need to implement it.
+    fn refresh_card_image(&mut self, _id: CardId, _frame: &Frame) {}
+
     /// Takes one pending interaction, if there is one. Never blocks.
     ///
     /// Polled rather than delivered through a callback, for the same reason
@@ -717,6 +735,22 @@ pub enum SurfaceCall {
         id: CardId,
         /// Whether something took the drop.
         accepted: bool,
+    },
+    /// [`CardSurface::set_editing`] toggled a card's pill/timer state.
+    SetEditing {
+        /// Which card's editing state changed.
+        id: CardId,
+        /// The new editing state.
+        editing: bool,
+    },
+    /// [`CardSurface::refresh_card_image`] replaced a card's thumbnail.
+    RefreshCardImage(CardId),
+    /// [`CardSurface::set_status`] showed or cleared a card's action status.
+    SetStatus {
+        /// Which card's status changed.
+        id: CardId,
+        /// The status text now shown, or `None` if it was cleared.
+        status: Option<String>,
     },
 }
 
@@ -878,6 +912,18 @@ impl CardSurface for Recording {
 
     fn settle_drag(&mut self, id: CardId, accepted: bool) {
         self.record(SurfaceCall::Settle { id, accepted });
+    }
+
+    fn set_editing(&mut self, id: CardId, editing: bool) {
+        self.record(SurfaceCall::SetEditing { id, editing });
+    }
+
+    fn refresh_card_image(&mut self, id: CardId, _frame: &Frame) {
+        self.record(SurfaceCall::RefreshCardImage(id));
+    }
+
+    fn set_status(&mut self, id: CardId, status: Option<String>) {
+        self.record(SurfaceCall::SetStatus { id, status });
     }
 
     fn poll_drag_starts(&mut self) -> Vec<CardEvent> {

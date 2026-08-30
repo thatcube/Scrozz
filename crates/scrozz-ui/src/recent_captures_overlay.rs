@@ -909,6 +909,14 @@ enum Command {
         available: bool,
         reason: Option<String>,
     },
+    SetEditing {
+        id: CardId,
+        editing: bool,
+    },
+    SetCardImage {
+        id: CardId,
+        image: egui::ColorImage,
+    },
     SettleDrag {
         id: CardId,
         accepted: bool,
@@ -1085,6 +1093,27 @@ impl RecentCapturesOverlayHandle {
             available,
             reason,
         });
+    }
+
+    /// Tells the overlay whether a card's editor is open.
+    ///
+    /// Drives the card's morphing Editing/Continue pill and pauses its
+    /// auto-close timer for as long as `editing` is `true`; the timer resumes
+    /// with its full configured duration once it goes back to `false`.
+    pub fn set_editing(&self, id: CardId, editing: bool) {
+        self.command(Command::SetEditing { id, editing });
+    }
+
+    /// Replaces a card's visible thumbnail with a freshly rendered image.
+    ///
+    /// The card keeps its pre-edit thumbnail for the entire editing session —
+    /// this is only ever called once, when the editor commits (Done), so the
+    /// card never shows an ambiguous intermediate revision while a document
+    /// is still being annotated. Downscaled the same way an incoming capture
+    /// is, so a committed edit cannot suddenly demand a larger GPU texture
+    /// than the card ever needed before.
+    pub fn set_card_image(&self, id: CardId, image: egui::ColorImage) {
+        self.command(Command::SetCardImage { id, image });
     }
 
     /// Reports that the native drag for `id` has finished.
@@ -1606,6 +1635,11 @@ struct Entry {
     pending: Option<egui::ColorImage>,
     pin_notice: Option<String>,
     auto_close_started_at: f64,
+    /// Whether this card's editor is open. Freezes the auto-close timer at
+    /// its current elapsed time while `true`; going back to `false` restarts
+    /// it with the full configured duration, so an edit never eats into the
+    /// window the user gets to look at the result afterward.
+    editing: bool,
     upload_available: bool,
     upload_unavailable_reason: Option<String>,
     status: Option<String>,
@@ -1983,6 +2017,7 @@ impl RecentCapturesOverlayApp {
                     pending: thumb,
                     pin_notice: request.content_error,
                     auto_close_started_at: m.now(),
+                    editing: false,
                     upload_available: request.upload_available,
                     upload_unavailable_reason: request.upload_unavailable_reason,
                     status: None,
@@ -2016,6 +2051,24 @@ impl RecentCapturesOverlayApp {
                     if let Some(entry) = self.content.get_mut(&id) {
                         entry.upload_available = available;
                         entry.upload_unavailable_reason = reason;
+                    }
+                }
+                Command::SetEditing { id, editing } => {
+                    if let Some(entry) = self.content.get_mut(&id)
+                        && entry.editing != editing
+                    {
+                        entry.auto_close_started_at = auto_close_restart_on_edit_end(
+                            entry.editing,
+                            editing,
+                            entry.auto_close_started_at,
+                            m.now(),
+                        );
+                        entry.editing = editing;
+                    }
+                }
+                Command::SetCardImage { id, image } => {
+                    if let Some(entry) = self.content.get_mut(&id) {
+                        entry.pending = downscale(&image, self.thumbnail_px);
                     }
                 }
                 Command::SettleDrag { id, accepted } => {
@@ -2608,6 +2661,18 @@ impl RecentCapturesOverlayApp {
                 Some(RecentCapturesOverlayEvent::EditRequested { id }),
                 false,
             ),
+            CardAction::Continue => {
+                // Not a new action: it asks for exactly what Annotate/Edit
+                // already ask for — focus the editor for this capture — so it
+                // reuses the identical event and, with it, the app's existing
+                // dedupe/focus routing. A card only ever offers Continue once
+                // an editor already exists, so there is nothing new to open.
+                let video = self
+                    .content
+                    .get(&id)
+                    .is_some_and(|entry| entry.media.is_video());
+                (Some(continue_event(id, video)), false)
+            }
             CardAction::Upload => (
                 Some(RecentCapturesOverlayEvent::UploadRequested { id }),
                 false,
@@ -2636,16 +2701,13 @@ impl RecentCapturesOverlayApp {
         }
 
         let seconds = f64::from(self.settings.auto_close_seconds);
-        let mut due = Vec::new();
-        let mut next = seconds;
-        for (&id, entry) in &self.content {
-            let elapsed = now - entry.auto_close_started_at;
-            if elapsed >= seconds {
-                due.push(id);
-            } else {
-                next = next.min(seconds - elapsed);
-            }
-        }
+        let (due, next) = auto_close_due(
+            self.content
+                .iter()
+                .map(|(&id, entry)| (id, entry.editing, entry.auto_close_started_at)),
+            now,
+            seconds,
+        );
         for id in due {
             if let Some(entry) = self.content.get_mut(&id) {
                 entry.auto_close_started_at = f64::INFINITY;
@@ -2841,7 +2903,6 @@ impl eframe::App for RecentCapturesOverlayApp {
         self.reconcile(&ctx);
         self.draw_pins(&ctx);
         self.stack.advance(&m);
-        self.emit_due_auto_close(&ctx, ctx.input(|input| input.time));
 
         let was_empty = self.stack.is_empty();
         let dock_was = self.stack.dock().is_collapsed();
@@ -2891,6 +2952,7 @@ impl eframe::App for RecentCapturesOverlayApp {
             content.upload_enabled = entry.upload_available;
             content.upload_unavailable_reason = entry.upload_unavailable_reason.as_deref();
             content.status = entry.status.as_deref();
+            content.editing = entry.editing;
             if let Some(tex) = &entry.texture {
                 content.texture = Some(tex.id());
             }
@@ -2996,6 +3058,15 @@ impl eframe::App for RecentCapturesOverlayApp {
             self.handle_action(id, a, ctx.input(|input| input.modifiers.alt), &m);
         }
 
+        // Emitted after this frame's own card interactions (drag settle and
+        // `handle_action`) so a same-frame open/annotate/edit/continue click
+        // is queued to the app *before* a same-frame expiry. `entry.editing`
+        // cannot yet reflect a click made this very frame (it only flips on
+        // the async `Command::SetEditing` round trip), so ordering, not
+        // state, is what keeps auto-close from racing and dismissing a card
+        // the same frame its editor is opening.
+        self.emit_due_auto_close(&ctx, ctx.input(|input| input.time));
+
         let dock_now = self.stack.dock().is_collapsed();
         if dock_now != dock_was {
             self.emit(if dock_now {
@@ -3046,6 +3117,72 @@ fn save_chooses_destination(behavior: RecentCapturesSaveBehavior, alt_held: bool
 
 fn keep_after_accepted_drag(close_after_drag: bool, alt_held: bool) -> bool {
     !close_after_drag || alt_held
+}
+
+/// The event `CardAction::Continue` resolves to for a given card.
+///
+/// Identical to what a fresh Annotate/Edit click on the same card would have
+/// produced, so Continue can only ever ask to focus the editor a card
+/// already has — the app's existing dedupe/focus routing on that event is
+/// what makes "never a duplicate editor" true, and this function is the one
+/// place that guarantee depends on staying wired up.
+fn continue_event(id: CardId, is_video: bool) -> RecentCapturesOverlayEvent {
+    if is_video {
+        RecentCapturesOverlayEvent::EditRequested { id }
+    } else {
+        RecentCapturesOverlayEvent::AnnotateRequested { id }
+    }
+}
+
+/// Pure decision core of the auto-close timer: given each card's editing
+/// state, its countdown start time, `now`, and the configured window,
+/// decides which cards are due to auto-close and how soon the next deadline
+/// is. Kept free of `egui::Context`/[`RecentCapturesOverlayApp`] so the
+/// pause-while-editing math is directly testable.
+///
+/// A card with `editing == true` contributes nothing here: it is neither due
+/// nor does it push `next` earlier, which is exactly "pause" — its countdown
+/// stays wherever it left off and asks for no repaint on its own behalf.
+fn auto_close_due(
+    entries: impl Iterator<Item = (CardId, bool, f64)>,
+    now: f64,
+    seconds: f64,
+) -> (Vec<CardId>, f64) {
+    let mut due = Vec::new();
+    let mut next = seconds;
+    for (id, editing, started_at) in entries {
+        if editing {
+            continue;
+        }
+        let elapsed = now - started_at;
+        if elapsed >= seconds {
+            due.push(id);
+        } else {
+            next = next.min(seconds - elapsed);
+        }
+    }
+    (due, next)
+}
+
+/// Pure core of the `Command::SetEditing` transition: the new
+/// `auto_close_started_at` for a card whose editing flag just changed.
+///
+/// Ending an edit (`was_editing && !editing`) always restarts the clock at
+/// `now`, so time spent editing never counts against the window the user
+/// gets to look at the result afterward — a full, fresh duration every time,
+/// never a partial one. Starting or continuing to edit leaves the stored
+/// start time untouched; the timer resumes it verbatim once editing ends.
+fn auto_close_restart_on_edit_end(
+    was_editing: bool,
+    editing: bool,
+    started_at: f64,
+    now: f64,
+) -> f64 {
+    if was_editing && !editing {
+        now
+    } else {
+        started_at
+    }
 }
 
 /// The rectangle the dock occupies for a given work area, without building a
@@ -3142,6 +3279,81 @@ mod tests {
         assert!(keep_after_accepted_drag(true, true));
         assert!(keep_after_accepted_drag(false, false));
         assert!(keep_after_accepted_drag(false, true));
+    }
+
+    #[test]
+    fn auto_close_timer_pauses_completely_while_editing() {
+        let a = CardId(1);
+        let b = CardId(2);
+        // `a` is mid-countdown but editing; `b` is mid-countdown and idle.
+        // Only `b` should ever contribute to `due` or to the next deadline.
+        let (due, next) = auto_close_due([(a, true, 0.0), (b, false, 0.0)].into_iter(), 3.0, 5.0);
+        assert!(due.is_empty(), "nothing is due yet");
+        assert_eq!(next, 2.0, "only the idle card's remaining time counts");
+
+        // Even an editing card whose raw elapsed time has blown past the
+        // window must not fire while editing: pause means pause.
+        let (due, next) = auto_close_due([(a, true, 999.0)].into_iter(), 1000.0, 5.0);
+        assert!(due.is_empty(), "an editing card is never due");
+        assert_eq!(
+            next, 5.0,
+            "an editing card asks for nothing on its own behalf"
+        );
+    }
+
+    #[test]
+    fn auto_close_timer_fires_only_for_idle_cards_past_the_window() {
+        let a = CardId(1);
+        let b = CardId(2);
+        let (due, _) = auto_close_due([(a, false, 0.0), (b, false, 4.0)].into_iter(), 5.0, 5.0);
+        assert_eq!(
+            due,
+            vec![a],
+            "only the card whose window has fully elapsed fires"
+        );
+    }
+
+    #[test]
+    fn ending_an_edit_restarts_the_full_configured_duration() {
+        // Editing -> not editing: always a fresh full window from `now`,
+        // regardless of how long the countdown had already run before the
+        // edit began.
+        assert_eq!(auto_close_restart_on_edit_end(true, false, 0.0, 42.0), 42.0);
+        assert_eq!(
+            auto_close_restart_on_edit_end(true, false, 999.0, 42.0),
+            42.0
+        );
+    }
+
+    #[test]
+    fn starting_or_continuing_an_edit_never_touches_the_stored_start_time() {
+        // Not editing -> editing: leave the stored start time exactly where
+        // it was, so it resumes with whatever time remained once the edit
+        // (eventually) ends.
+        assert_eq!(auto_close_restart_on_edit_end(false, true, 7.0, 100.0), 7.0);
+        // A no-op transition (same value in and out) must never reset the
+        // timer either; the caller already guards this with an equality
+        // check, but the pure function itself must agree.
+        assert_eq!(auto_close_restart_on_edit_end(true, true, 7.0, 100.0), 7.0);
+        assert_eq!(
+            auto_close_restart_on_edit_end(false, false, 7.0, 100.0),
+            7.0
+        );
+    }
+
+    #[test]
+    fn continue_resolves_to_the_same_event_a_fresh_open_click_would() {
+        let id = CardId(9);
+        assert_eq!(
+            continue_event(id, false),
+            RecentCapturesOverlayEvent::AnnotateRequested { id },
+            "a still capture's Continue is identical to a fresh Annotate click"
+        );
+        assert_eq!(
+            continue_event(id, true),
+            RecentCapturesOverlayEvent::EditRequested { id },
+            "a recording's Continue is identical to a fresh Edit click"
+        );
     }
 
     #[test]
