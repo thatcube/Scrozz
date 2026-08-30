@@ -518,6 +518,21 @@ fn preset_build_and_upsert() {
 }
 
 #[test]
+fn preset_names_generate_ids_outside_the_assignment_sentinels() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    state.begin_with(Beautification::preset(BeautificationPreset::Clean));
+    for (name, expected) in [
+        ("Auto", "auto-2"),
+        ("None", "none-2"),
+        ("Default", "default-2"),
+    ] {
+        state.set_preset_name(name.to_owned());
+        let preset = state.build_preset(false).unwrap();
+        assert_eq!(preset.id, expected);
+    }
+}
+
+#[test]
 fn renaming_selected_preset_creates_new_instead_of_overwriting() {
     let mut state = EditorState::new(document(Provenance::Region));
     state.begin_with(Beautification::preset(BeautificationPreset::Clean));

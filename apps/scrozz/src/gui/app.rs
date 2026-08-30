@@ -2533,41 +2533,24 @@ impl App {
                     version,
                     action,
                 } => {
-                    // Round 8, Finding #2: action-identity is validated
-                    // *before* any status/revision reasoning runs, so a
-                    // superseded request's answer never touches the status
-                    // line, the notes log, or the current request's own
-                    // bookkeeping -- not even the "this is stale" bookkeeping
-                    // in `resolve_stale_output_completion` below, which is
-                    // reserved for a stale answer to the *current* action.
+                    let Some(_) = self.outstanding_upload_action(card, action) else {
+                        continue;
+                    };
                     let is_current_action = self.current_upload_action.get(&card) == Some(&action);
                     if !is_current_action {
-                        self.note(format!(
-                            "{card} finished an upload request a newer one has since \
-                             replaced"
-                        ));
-                        // Round 11 / round 12, Finding #2: a superseded
-                        // request's own completion still represents one
-                        // fewer outstanding action for `card`, even though
-                        // nothing else here trusts it. Resolved by its own
-                        // exact id, idempotently -- a duplicate delivery of
-                        // this same outcome removes nothing the second time
-                        // and is a safe no-op, never double-pruning a fate
-                        // on `card`'s behalf.
+                        self.resolve_output_action(card, action);
+                        continue;
+                    }
+                    let stale = self.output_version_is_stale(card, version);
+                    if stale {
+                        // A stale upload may settle only the action it answers
+                        // for. It cannot resume overflow retirement against a
+                        // newer committed revision.
                         self.resolve_output_action(card, action);
                         continue;
                     }
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
-                    // See the matching comment on `Outcome::Done` above.
-                    let stale = self.output_version_is_stale(card, version);
-                    if stale {
-                        // Round 6, Finding #1 (upload side); round 9,
-                        // Finding #1 extends the same reasoning to a
-                        // cancelled edit.
-                        self.resolve_stale_output_completion(card, action);
-                        continue;
-                    }
                     // Round 12: a single call resolves this exact action's
                     // own entry (idempotently) and reports whether it was
                     // still outstanding and asked to close the card, in one
@@ -2684,23 +2667,12 @@ impl App {
                     error,
                     action,
                 } => {
-                    // Round 8, Finding #2 / round 12: action-identity is
-                    // validated *before* this action's own entry is
-                    // resolved, since resolving it (idempotently) also
-                    // clears `current_upload_action` when it matches --
-                    // reading "is this still current" must happen first, or
-                    // it would always read back "no" against its own,
-                    // just-cleared pointer.
+                    let Some(_) = self.outstanding_upload_action(card, action) else {
+                        continue;
+                    };
                     let is_current_action = self.current_upload_action.get(&card) == Some(&action);
-                    // Resolved unconditionally, whether current or already
-                    // superseded -- either way this exact dispatch is done,
-                    // and a duplicate delivery of the same refusal removes
-                    // nothing the second time (round 12, Finding #2).
                     let resolved = self.resolve_output_action(card, action);
                     if !is_current_action {
-                        self.note(format!(
-                            "{card} refused an upload request a newer one has since replaced"
-                        ));
                         continue;
                     }
                     let close_after = resolved.is_some_and(|resolved| resolved.close_after);
@@ -3611,6 +3583,14 @@ impl App {
         }
         self.prune_settled_generation_fates(card);
         removed
+    }
+
+    fn outstanding_upload_action(&self, card: CardId, action: u64) -> Option<OutstandingAction> {
+        self.outstanding_output_actions
+            .get(&card)
+            .and_then(|actions| actions.get(&action))
+            .copied()
+            .filter(|outstanding| outstanding.kind == OutputActionKind::Upload)
     }
 
     /// Whether a card-level (Copy/Save/Save-As) dispatch is currently
@@ -10073,6 +10053,8 @@ mod tests {
                 .and_then(|fates| fates.get(&generation)),
             Some(&GenerationFate::Committed(2))
         );
+        let trace_before = surface.trace();
+        let notes_before = app.notes().to_vec();
 
         app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
             card,
@@ -10091,6 +10073,9 @@ mod tests {
             !app.outstanding_output_actions.contains_key(&card),
             "the stale upload's own bookkeeping must still retire"
         );
+        assert!(!app.current_upload_action.contains_key(&card));
+        assert_eq!(surface.trace(), trace_before);
+        assert_eq!(app.notes(), notes_before.as_slice());
         assert_eq!(
             app.card_retention.get(&card),
             Some(&(false, false)),
@@ -11111,6 +11096,8 @@ mod tests {
         let card = CardId(59);
         app.card_retention.insert(card, (false, false));
         app.register_output_action(card, 5, OutputActionKind::Upload, true);
+        let trace_before = surface.trace();
+        let notes_before = app.notes().to_vec();
 
         app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
             card,
@@ -11134,6 +11121,8 @@ mod tests {
             Some(5),
             "a stale completion must not disturb the card's current action id"
         );
+        assert_eq!(surface.trace(), trace_before);
+        assert_eq!(app.notes(), notes_before.as_slice());
         assert!(
             !surface.trace().contains(&SurfaceCall::Dismiss(card)),
             "a stale completion must never dismiss a card whose current upload is still \
@@ -11170,7 +11159,10 @@ mod tests {
         // bookkeeping out from under it.
         let (mut app, surface) = app();
         let card = CardId(60);
+        app.card_retention.insert(card, (false, false));
         app.register_output_action(card, 5, OutputActionKind::Upload, true);
+        let trace_before = surface.trace();
+        let notes_before = app.notes().to_vec();
 
         let stale_error = CliError::Core(CoreError::Platform("stale network error".to_owned()));
         app.pipeline
@@ -11190,12 +11182,9 @@ mod tests {
             Some(5),
             "a stale refusal must not disturb the card's current action id"
         );
-        assert!(
-            !app.notes()
-                .iter()
-                .any(|note| note.contains("upload refused")),
-            "a stale refusal must not report a failure for the card's current upload"
-        );
+        assert_eq!(surface.trace(), trace_before);
+        assert_eq!(app.notes(), notes_before.as_slice());
+        assert_eq!(app.card_retention.get(&card), Some(&(false, false)));
 
         let current_error = CliError::Core(CoreError::Platform("current network error".to_owned()));
         app.pipeline
@@ -11216,6 +11205,44 @@ mod tests {
                 .any(|note| note.contains("upload refused")),
             "the current action's refusal must still be reported"
         );
+    }
+
+    #[test]
+    fn duplicate_or_absent_upload_outcomes_are_total_noops() {
+        let (mut app, surface) = app();
+        let card = CardId(601);
+        app.card_retention.insert(card, (false, true));
+        app.register_output_action(card, 10, OutputActionKind::Upload, true);
+        app.register_output_action(card, 11, OutputActionKind::Upload, false);
+        assert!(app.resolve_output_action(card, 10).is_some());
+        let trace_before = surface.trace();
+        let notes_before = app.notes().to_vec();
+
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "stale duplicate upload".to_owned(),
+            version: Some((1, 1)),
+            action: 10,
+        });
+        app.pipeline
+            .inject_outcome_for_test(Outcome::UploadRefused {
+                card,
+                error: CliError::Core(CoreError::Platform("duplicate refusal".to_owned())),
+                action: 10,
+            });
+        app.drain_pipeline();
+
+        assert_eq!(surface.trace(), trace_before);
+        assert_eq!(app.notes(), notes_before.as_slice());
+        assert_eq!(app.card_retention.get(&card), Some(&(false, true)));
+        assert_eq!(app.current_upload_action.get(&card), Some(&11));
+        assert_eq!(
+            app.outstanding_output_actions
+                .get(&card)
+                .map(|actions| actions.keys().copied().collect::<Vec<_>>()),
+            Some(vec![11])
+        );
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
     }
 
     #[test]
@@ -12822,10 +12849,9 @@ mod tests {
              leaving nothing tracked as current for this card"
         );
 
-        // The old (now-invalidated) action's outcome, arriving late, must
-        // fall through to the ordinary \"a newer one has since replaced\"
-        // no-op every upload outcome handler already applies on an action
-        // mismatch -- not be mistaken for still current.
+        // The old action no longer exists at all. Its late outcome is a total
+        // no-op, not a user-visible diagnostic about a superseded request.
+        let notes_before = app.notes().to_vec();
         app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
             card,
             detail: "uploaded and copied the private share link".to_owned(),
@@ -12838,13 +12864,7 @@ mod tests {
             "the invalidated old action's own late outcome must not resurrect any \
              bookkeeping for it"
         );
-        assert!(
-            app.notes
-                .iter()
-                .any(|note| note.contains("a newer one has since replaced")),
-            "the old action's late outcome must be recognised as superseded, not \
-             silently accepted as though it were still current"
-        );
+        assert_eq!(app.notes(), notes_before.as_slice());
     }
 
     #[test]

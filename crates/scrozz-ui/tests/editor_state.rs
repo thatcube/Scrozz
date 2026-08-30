@@ -47,6 +47,30 @@ fn state() -> EditorState {
     EditorState::new(Document::new(capture()))
 }
 
+fn focused_scene(color: Color) -> Beautification {
+    Beautification {
+        background: scrozz_annotate::Background::Solid(color),
+        auto_balance: true,
+        smart_frame: Some(SmartFrameMetadata {
+            focus: ResolvedFocus {
+                x: 8_000,
+                y: 2_000,
+                confidence: 90,
+            },
+            ..SmartFrameMetadata::default()
+        }),
+        ..Beautification::default()
+    }
+}
+
+fn focus_confidence(state: &EditorState) -> u8 {
+    state
+        .document()
+        .scene()
+        .and_then(|scene| scene.smart_frame.as_ref())
+        .map_or(0, |metadata| metadata.focus.confidence)
+}
+
 fn at(x: f64, y: f64) -> LogicalPoint {
     LogicalPoint::new(x, y)
 }
@@ -1496,23 +1520,10 @@ fn crop_history_is_orthogonal_to_applied_smart_frame_history() {
 
 #[test]
 fn crop_invalidates_focus_in_scene_undo_and_redo_lanes() {
-    let focused = |color| Beautification {
-        background: scrozz_annotate::Background::Solid(color),
-        auto_balance: true,
-        smart_frame: Some(SmartFrameMetadata {
-            focus: ResolvedFocus {
-                x: 8_000,
-                y: 2_000,
-                confidence: 90,
-            },
-            ..SmartFrameMetadata::default()
-        }),
-        ..Beautification::default()
-    };
     let mut state = state();
-    state.begin_with(focused(Color::rgb(10, 20, 30)));
+    state.begin_with(focused_scene(Color::rgb(10, 20, 30)));
     state.apply_scene();
-    state.begin_with(focused(Color::rgb(40, 50, 60)));
+    state.begin_with(focused_scene(Color::rgb(40, 50, 60)));
     state.apply_scene();
 
     state.set_tool(Tool::Crop);
@@ -1558,6 +1569,118 @@ fn crop_invalidates_focus_in_scene_undo_and_redo_lanes() {
             .confidence,
         0
     );
+}
+
+#[test]
+fn crop_history_undo_and_redo_never_reuse_crop_relative_focus() {
+    let mut state = state();
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    state.command(Command::ApplyCrop).unwrap();
+    let crop = state.document().crop().expect("committed crop");
+    state.begin_with(focused_scene(Color::rgb(20, 30, 40)));
+    state.apply_scene();
+    assert_eq!(focus_confidence(&state), 90);
+
+    state.command(Command::Undo).unwrap();
+    assert_eq!(state.document().crop(), None);
+    assert_eq!(focus_confidence(&state), 0);
+
+    state.command(Command::Redo).unwrap();
+    assert_eq!(state.document().crop(), Some(crop));
+    assert_eq!(focus_confidence(&state), 0);
+}
+
+#[test]
+fn delete_and_revert_crop_clear_crop_relative_focus() {
+    let mut state = state();
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    state.command(Command::ApplyCrop).unwrap();
+    state.begin_with(focused_scene(Color::rgb(20, 30, 40)));
+    state.apply_scene();
+    state.command(Command::Delete).unwrap();
+    assert_eq!(state.document().crop(), None);
+    assert_eq!(focus_confidence(&state), 0);
+
+    state.command(Command::Undo).unwrap();
+    state.begin_with(focused_scene(Color::rgb(50, 60, 70)));
+    state.apply_scene();
+    assert_eq!(focus_confidence(&state), 90);
+    state.set_tool(Tool::Crop);
+    state.command(Command::RevertCrop).unwrap();
+    assert_eq!(state.document().crop(), None);
+    assert_eq!(focus_confidence(&state), 0);
+}
+
+#[test]
+fn cancelling_a_scene_draft_after_crop_change_cannot_restore_old_focus() {
+    let mut state = state();
+    state.begin_with(focused_scene(Color::rgb(20, 30, 40)));
+    state.apply_scene();
+    state.edit_existing_scene();
+
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    state.command(Command::ApplyCrop).unwrap();
+    state.cancel_scene();
+
+    assert!(state.document().crop().is_some());
+    assert_eq!(focus_confidence(&state), 0);
+}
+
+#[test]
+fn cancelling_an_unapplied_crop_preserves_focus_for_unchanged_geometry() {
+    let mut state = state();
+    state.begin_with(focused_scene(Color::rgb(20, 30, 40)));
+    state.apply_scene();
+    state.set_tool(Tool::Crop);
+    state.rotate_crop_right();
+    state.command(Command::CancelCrop).unwrap();
+
+    assert_eq!(state.document().crop(), None);
+    assert_eq!(state.document().orientation(), ImageOrientation::Identity);
+    assert_eq!(focus_confidence(&state), 90);
+}
+
+#[test]
+fn orientation_history_undo_and_redo_never_reuse_rotated_focus() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.rotate_crop_right();
+    state.command(Command::ApplyCrop).unwrap();
+    assert_eq!(
+        state.document().orientation(),
+        ImageOrientation::RotateRight
+    );
+    state.begin_with(focused_scene(Color::rgb(20, 30, 40)));
+    state.apply_scene();
+    assert_eq!(focus_confidence(&state), 90);
+
+    state.command(Command::Undo).unwrap();
+    assert_eq!(state.document().orientation(), ImageOrientation::Identity);
+    assert_eq!(focus_confidence(&state), 0);
+    state.command(Command::Redo).unwrap();
+    assert_eq!(
+        state.document().orientation(),
+        ImageOrientation::RotateRight
+    );
+    assert_eq!(focus_confidence(&state), 0);
+}
+
+#[test]
+fn cancelling_a_scene_draft_after_orientation_change_invalidates_rollback_focus() {
+    let mut state = state();
+    state.begin_with(focused_scene(Color::rgb(20, 30, 40)));
+    state.apply_scene();
+    state.edit_existing_scene();
+    state.set_tool(Tool::Crop);
+    state.rotate_crop_right();
+    state.command(Command::ApplyCrop).unwrap();
+    state.cancel_scene();
+
+    assert_eq!(
+        state.document().orientation(),
+        ImageOrientation::RotateRight
+    );
+    assert_eq!(focus_confidence(&state), 0);
 }
 
 #[test]

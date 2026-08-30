@@ -305,6 +305,15 @@ fn preset_round_trip_preserves_unknown_fields_but_never_pixels() {
 }
 
 #[test]
+fn preset_ids_cannot_collide_with_scene_assignment_sentinels() {
+    for id in ["auto", "AUTO", "none", "default"] {
+        let error =
+            SmartFramePreset::new(id, "Custom", SmartFramePresetSettings::default()).unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
+    }
+}
+
+#[test]
 fn fixed_generated_background_round_trips_through_a_preset() {
     let mut generated =
         AutomaticBackground::fallback(ColorSpace::DisplayP3).restyled(GeneratedStyle::Vibrant);

@@ -24,7 +24,8 @@
 use scrozz_annotate::{
     AnalysisCancellation, Background, BackgroundImage, DocumentData, GeneratedStyle,
     ImageOrientation, SensitiveRegionReview, SmartFrameAnalysis, SmartFramePreset,
-    SmartFramePresetSettings, SourceInsets, smart_frame::provisional_with_style,
+    SmartFramePresetSettings, SourceInsets, is_reserved_smart_frame_preset_id,
+    smart_frame::provisional_with_style,
 };
 use scrozz_annotate::{
     Annotation, AnnotationId, AnnotationKind, ArrowStyle, Beautification, Color, Document, History,
@@ -701,6 +702,8 @@ impl Eq for Intent {}
 pub struct SmartFrameDraft {
     /// The beautification that was active before the draft opened.
     before: Option<Beautification>,
+    /// Source geometry the draft's rollback Scene was authored against.
+    source_geometry: SourceGeometry,
     /// Monotonic revision tag for the in-flight analysis request.
     analysis_revision: u64,
     /// Document revision the request analyzed, including the current Scene draft.
@@ -722,6 +725,12 @@ pub struct SmartFrameDraft {
 
 /// Canonical editor name for the legacy-compatible Smart Frame draft payload.
 pub type SceneDraft = SmartFrameDraft;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SourceGeometry {
+    crop: Option<LogicalRect>,
+    orientation: ImageOrientation,
+}
 
 /// What a returning analysis result should replace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2523,6 +2532,7 @@ impl EditorState {
                     // With nothing selected, delete clears the crop: it is the
                     // only other thing on screen that can be "removed".
                     let _ = self.document.set_crop(None);
+                    self.invalidate_framing_focus();
                     self.commit();
                     self.touch();
                 }
@@ -2531,12 +2541,13 @@ impl EditorState {
             Command::Undo => {
                 self.cancel_drag();
                 self.synchronize_scene_history();
+                let source_geometry = self.source_geometry();
                 // Only when the document actually moved. An undo with nothing
                 // behind it is not an edit, and treating it as one would clear
                 // a composition in flight and tell the platform IME to cancel
                 // itself over a keystroke that did nothing.
                 if self.history.undo(&mut self.document)? {
-                    self.after_history();
+                    self.after_history(source_geometry);
                     self.touch();
                 }
                 Intent::None
@@ -2544,8 +2555,9 @@ impl EditorState {
             Command::Redo => {
                 self.cancel_drag();
                 self.synchronize_scene_history();
+                let source_geometry = self.source_geometry();
                 if self.history.redo(&mut self.document)? {
-                    self.after_history();
+                    self.after_history(source_geometry);
                     self.touch();
                 }
                 Intent::None
@@ -2933,7 +2945,10 @@ impl EditorState {
     }
 
     /// Drops references to annotations that an undo or redo removed.
-    fn after_history(&mut self) {
+    fn after_history(&mut self, source_geometry: SourceGeometry) {
+        if self.source_geometry() != source_geometry {
+            self.invalidate_framing_focus();
+        }
         if self
             .selection
             .is_some_and(|id| self.document.get(id).is_none())
@@ -3005,6 +3020,11 @@ impl EditorState {
                 scene.invalidate_resolved_focus();
             }
         };
+        let mut current = self.document.beautification().cloned();
+        invalidate(&mut current);
+        self.document
+            .set_beautification(current)
+            .expect("invalidating Scene focus preserves provenance");
         for scene in &mut self.framing_undo {
             invalidate(scene);
         }
@@ -3015,6 +3035,13 @@ impl EditorState {
             invalidate(&mut draft.before);
         }
         self.synchronize_scene_history();
+    }
+
+    fn source_geometry(&self) -> SourceGeometry {
+        SourceGeometry {
+            crop: self.document.crop(),
+            orientation: self.document.orientation(),
+        }
     }
 
     /// Takes the pending instruction to interrupt the platform's composition.
@@ -3089,6 +3116,22 @@ impl EditorState {
 
     /// Loads custom presets at open time.
     pub fn set_custom_presets(&mut self, presets: Vec<SmartFramePreset>) {
+        if let Some(selected) = self.selected_preset.as_deref() {
+            let previous = self
+                .custom_presets
+                .iter()
+                .find(|preset| preset.id == selected);
+            match presets.iter().find(|preset| preset.id == selected) {
+                Some(authoritative) if previous != Some(authoritative) => {
+                    self.preset_name = authoritative.name.clone();
+                }
+                Some(_) => {}
+                None => {
+                    self.selected_preset = None;
+                    self.preset_name.clear();
+                }
+            }
+        }
         self.custom_presets = presets;
     }
 
@@ -3148,9 +3191,14 @@ impl EditorState {
 
     /// Starts Automatic Scene using a deterministic generated style direction.
     pub fn begin_scene_with_style(&mut self, style: GeneratedStyle) -> Intent {
-        let before = self.smart_frame.as_ref().map_or_else(
-            || self.document.beautification().cloned(),
-            |draft| draft.before.clone(),
+        let (before, source_geometry) = self.smart_frame.as_ref().map_or_else(
+            || {
+                (
+                    self.document.beautification().cloned(),
+                    self.source_geometry(),
+                )
+            },
+            |draft| (draft.before.clone(), draft.source_geometry),
         );
         self.cancel_analysis();
         let generation = self.next_analysis_generation;
@@ -3170,6 +3218,7 @@ impl EditorState {
         let analysis_document_revision = self.document.revision();
         self.smart_frame = Some(SmartFrameDraft {
             before,
+            source_geometry,
             analysis_revision: generation,
             analysis_document_revision: Some(analysis_document_revision),
             cancellation: cancellation.clone(),
@@ -3194,9 +3243,14 @@ impl EditorState {
     /// Cancels any in-flight analysis, preserves the original `before` snapshot,
     /// and applies D9 restrictions on window captures.
     pub fn begin_with(&mut self, mut config: Beautification) {
-        let before = self.smart_frame.as_ref().map_or_else(
-            || self.document.beautification().cloned(),
-            |d| d.before.clone(),
+        let (before, source_geometry) = self.smart_frame.as_ref().map_or_else(
+            || {
+                (
+                    self.document.beautification().cloned(),
+                    self.source_geometry(),
+                )
+            },
+            |draft| (draft.before.clone(), draft.source_geometry),
         );
         self.cancel_analysis();
         config.inset = SourceInsets::default();
@@ -3213,6 +3267,7 @@ impl EditorState {
                 self.synchronize_scene_history();
                 self.smart_frame = Some(SmartFrameDraft {
                     before,
+                    source_geometry,
                     analysis_revision: 0,
                     analysis_document_revision: None,
                     cancellation: AnalysisCancellation::default(),
@@ -3238,6 +3293,7 @@ impl EditorState {
         };
         self.smart_frame = Some(SmartFrameDraft {
             before: Some(scene.clone()),
+            source_geometry: self.source_geometry(),
             analysis_revision: 0,
             analysis_document_revision: None,
             cancellation: AnalysisCancellation::default(),
@@ -3251,7 +3307,9 @@ impl EditorState {
 
     /// Restarts analysis (e.g. after "Refresh automatic choices").
     pub fn restart_analysis(&mut self) -> Option<Intent> {
-        let before = self.smart_frame.as_ref()?.before.clone();
+        let draft = self.smart_frame.as_ref()?;
+        let before = draft.before.clone();
+        let source_geometry = draft.source_geometry;
         let style = self
             .document
             .beautification()
@@ -3274,6 +3332,7 @@ impl EditorState {
         let analysis_document_revision = self.document.revision();
         self.smart_frame = Some(SmartFrameDraft {
             before,
+            source_geometry,
             analysis_revision: generation,
             analysis_document_revision: Some(analysis_document_revision),
             cancellation: cancellation.clone(),
@@ -3439,10 +3498,15 @@ impl EditorState {
 
     /// Cancels the Smart Frame draft, restoring the exact pre-draft document.
     pub fn cancel_smart_frame(&mut self) {
-        let Some(draft) = self.smart_frame.take() else {
+        let Some(mut draft) = self.smart_frame.take() else {
             return;
         };
         draft.cancellation.cancel();
+        if draft.source_geometry != self.source_geometry()
+            && let Some(before) = &mut draft.before
+        {
+            before.invalidate_resolved_focus();
+        }
         if self.document.set_beautification(draft.before).is_ok() {
             self.synchronize_scene_history();
             self.touch();
@@ -3549,6 +3613,7 @@ impl EditorState {
         self.custom_presets.retain(|p| p.id != preset_id);
         if self.selected_preset.as_deref() == Some(preset_id) {
             self.selected_preset = None;
+            self.preset_name.clear();
         }
     }
 
@@ -4292,16 +4357,19 @@ fn unique_preset_id(name: &str, presets: &[SmartFramePreset]) -> String {
         .flat_map(char::to_lowercase)
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let base = base.trim_matches('-');
-    if base.is_empty() {
-        return format!("preset-{}", presets.len());
-    }
-    if !presets.iter().any(|p| p.id == base) {
-        return base.to_owned();
-    }
-    for n in 2u32.. {
-        let candidate = format!("{base}-{n}");
-        if !presets.iter().any(|p| p.id == candidate) {
+    let base = match base.trim_matches('-') {
+        "" => "preset",
+        base => base,
+    };
+    for n in 1u32.. {
+        let candidate = if n == 1 {
+            base.to_owned()
+        } else {
+            format!("{base}-{n}")
+        };
+        if !is_reserved_smart_frame_preset_id(&candidate)
+            && !presets.iter().any(|preset| preset.id == candidate)
+        {
             return candidate;
         }
     }

@@ -829,6 +829,58 @@ struct LoadedSceneImage {
     result: CliResult<scrozz_annotate::BackgroundImage>,
 }
 
+fn synchronize_editor_preset_library(
+    editors: &mut std::collections::HashMap<crate::gui::card::CardId, Editing>,
+    presets: &[scrozz_annotate::SmartFramePreset],
+) {
+    for editing in editors.values_mut() {
+        editing
+            .editor
+            .state_mut()
+            .set_custom_presets(presets.to_vec());
+    }
+}
+
+enum EditorPresetMutation {
+    Upsert(Box<scrozz_annotate::SmartFramePreset>),
+    Delete(String),
+}
+
+fn apply_editor_preset_mutation(
+    app: &mut App,
+    editors: &mut std::collections::HashMap<crate::gui::card::CardId, Editing>,
+    mutation: EditorPresetMutation,
+) -> CliResult<()> {
+    let result = match mutation {
+        EditorPresetMutation::Upsert(preset) => app.upsert_smart_frame_preset(*preset),
+        EditorPresetMutation::Delete(id) => app.delete_smart_frame_preset(&id),
+    };
+    match result {
+        Ok(presets) => {
+            synchronize_editor_preset_library(editors, &presets);
+            Ok(())
+        }
+        Err(error) => {
+            synchronize_editor_preset_library(editors, app.smart_frame_presets());
+            Err(error)
+        }
+    }
+}
+
+fn apply_settings_scene_events(
+    app: &mut App,
+    editors: &mut std::collections::HashMap<crate::gui::card::CardId, Editing>,
+    events: Vec<scrozz_ui::settings::ScenesEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    for event in events {
+        app.handle_scenes_event(event);
+    }
+    synchronize_editor_preset_library(editors, app.smart_frame_presets());
+}
+
 struct Driver {
     app: App,
     overlay: RecentCapturesOverlayApp,
@@ -1184,6 +1236,7 @@ impl Driver {
 
         let cards: Vec<crate::gui::card::CardId> = self.editors.keys().copied().collect();
         let mut to_remove = Vec::new();
+        let mut preset_mutations = Vec::new();
         for card in cards {
             let Some(editing) = self.editors.get_mut(&card) else {
                 continue;
@@ -1255,25 +1308,11 @@ impl Driver {
                 } => self
                     .app
                     .analyze_smart_frame(card, generation, revision, *data, cancellation),
-                Intent::UpsertPreset(preset) => match self.app.upsert_smart_frame_preset(*preset) {
-                    Ok(presets) => editor.state_mut().set_custom_presets(presets),
-                    Err(error) => {
-                        editor
-                            .state_mut()
-                            .set_custom_presets(self.app.smart_frame_presets().to_vec());
-                        tracing::warn!(%error, "Smart Frame preset could not be saved");
-                    }
-                },
+                Intent::UpsertPreset(preset) => {
+                    preset_mutations.push(EditorPresetMutation::Upsert(preset));
+                }
                 Intent::DeletePreset(preset_id) => {
-                    match self.app.delete_smart_frame_preset(&preset_id) {
-                        Ok(presets) => editor.state_mut().set_custom_presets(presets),
-                        Err(error) => {
-                            editor
-                                .state_mut()
-                                .set_custom_presets(self.app.smart_frame_presets().to_vec());
-                            tracing::warn!(%error, "Smart Frame preset could not be deleted");
-                        }
-                    }
+                    preset_mutations.push(EditorPresetMutation::Delete(preset_id));
                 }
                 Intent::RequestSensitiveReview { revision, data } => {
                     let _ = data;
@@ -1385,6 +1424,13 @@ impl Driver {
         }
         for card in to_remove {
             self.editors.remove(&card);
+        }
+        for mutation in preset_mutations {
+            if let Err(error) =
+                apply_editor_preset_mutation(&mut self.app, &mut self.editors, mutation)
+            {
+                tracing::warn!(%error, "Smart Frame preset could not be changed");
+            }
         }
 
         // Drains Done-triggered closes whose commit (and, for a
@@ -1867,9 +1913,7 @@ impl Driver {
         if let Some(capture) = edits.capture {
             self.app.edit_capture_settings(capture);
         }
-        for event in edits.scenes {
-            self.app.handle_scenes_event(event);
-        }
+        apply_settings_scene_events(&mut self.app, &mut self.editors, edits.scenes);
         if let Some(settings) = edits.recent_captures_overlay {
             self.app.edit_recent_captures_overlay(settings);
         }
@@ -3005,7 +3049,80 @@ pub fn headless_requested() -> bool {
 mod tests {
     use super::*;
     use crate::gui::panel::RecordedNativeAction;
-    use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Provenance, ScaleFactor};
+    use scrozz_core::{
+        Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
+        PhysicalSize, PixelFormat, Provenance, ScaleFactor,
+    };
+
+    fn editing_with_preset(
+        card: crate::gui::card::CardId,
+        generation: u64,
+        preset: scrozz_annotate::SmartFramePreset,
+    ) -> Editing {
+        let size = LogicalSize::new(4.0, 4.0);
+        let capture = Capture {
+            frame: Frame {
+                data: vec![0xff; 4 * 4 * 4],
+                size: PhysicalSize::new(4.0, 4.0),
+                stride: 4 * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Region,
+            target: CaptureTarget::Region(LogicalRect::new(LogicalPoint::new(0.0, 0.0), size)),
+        };
+        let mut editor = scrozz_ui::editor::EditorUi::new(scrozz_annotate::Document::new(capture));
+        editor
+            .state_mut()
+            .begin_with(scrozz_annotate::Beautification::default());
+        editor.state_mut().set_custom_presets(vec![preset.clone()]);
+        editor
+            .state_mut()
+            .set_selected_preset(Some(preset.id.clone()));
+        editor.state_mut().set_preset_name(preset.name);
+        Editing {
+            card,
+            generation,
+            editor,
+            window: scrozz_ui::editor::EditorWindow::new(card.0),
+        }
+    }
+
+    fn app_with_preset_store(label: &str) -> (App, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-host-presets-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = crate::after_capture::AfterCaptureStore::new(root.join("settings.json"));
+        let mut config = Config::sealed();
+        config.after_capture = store
+            .load(crate::after_capture::InstallProfile::Fresh)
+            .unwrap();
+        config.after_capture_store = Some(store);
+        let surface = crate::gui::card::Recording::new();
+        let app = App::new(
+            config,
+            Box::new(surface),
+            Arc::new(crate::gui::selection::UnsupportedSelector::headless()),
+            false,
+        )
+        .unwrap();
+        (app, root)
+    }
+
+    fn freeze_editor_close(app: &mut App, editing: &Editing) {
+        let rendered = editing.editor.render().unwrap();
+        app.begin_editor_close(
+            editing.card,
+            editing.generation,
+            rendered.revision(),
+            rendered.frame().clone(),
+            editing.editor.document().data(),
+        );
+        assert!(app.editor_close_frozen(editing.card));
+    }
 
     #[test]
     fn scene_image_picker_is_inert_in_tests() {
@@ -3043,6 +3160,143 @@ mod tests {
         let error = decode_scene_image(&path).unwrap_err();
         let _ = std::fs::remove_file(path);
         assert!(error.to_string().contains("encoded bytes"));
+    }
+
+    #[test]
+    fn authoritative_upsert_refreshes_two_editors_without_mutating_documents() {
+        let (mut app, root) = app_with_preset_store("upsert");
+        let original = scrozz_annotate::SmartFramePreset::new(
+            "studio",
+            "Studio",
+            scrozz_annotate::SmartFramePresetSettings::default(),
+        )
+        .unwrap();
+        app.upsert_smart_frame_preset(original.clone()).unwrap();
+        let mut updated = original.clone();
+        updated.name = "Studio Updated".to_owned();
+        let mut editors = std::collections::HashMap::from([
+            (
+                crate::gui::card::CardId(701),
+                editing_with_preset(crate::gui::card::CardId(701), 1, original.clone()),
+            ),
+            (
+                crate::gui::card::CardId(702),
+                editing_with_preset(crate::gui::card::CardId(702), 2, original),
+            ),
+        ]);
+        let before: Vec<_> = editors
+            .values()
+            .map(|editing| {
+                (
+                    editing.card,
+                    editing.editor.state().revision(),
+                    editing.editor.document().data(),
+                )
+            })
+            .collect();
+        freeze_editor_close(
+            &mut app,
+            editors.get(&crate::gui::card::CardId(702)).unwrap(),
+        );
+
+        apply_editor_preset_mutation(
+            &mut app,
+            &mut editors,
+            EditorPresetMutation::Upsert(Box::new(updated.clone())),
+        )
+        .unwrap();
+
+        for editing in editors.values() {
+            assert_eq!(editing.editor.state().selected_preset(), Some("studio"));
+            assert_eq!(editing.editor.state().preset_name(), "Studio Updated");
+            assert_eq!(editing.editor.state().custom_presets(), &[updated.clone()]);
+            let (_, revision, document) = before
+                .iter()
+                .find(|(card, _, _)| *card == editing.card)
+                .unwrap();
+            assert_eq!(editing.editor.state().revision(), *revision);
+            assert_eq!(editing.editor.document().data(), document.clone());
+        }
+        assert_eq!(app.smart_frame_presets(), &[updated]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn authoritative_delete_clears_two_editors_and_prevents_resurrection() {
+        let (mut app, root) = app_with_preset_store("delete");
+        let preset = scrozz_annotate::SmartFramePreset::new(
+            "studio",
+            "Studio",
+            scrozz_annotate::SmartFramePresetSettings::default(),
+        )
+        .unwrap();
+        app.upsert_smart_frame_preset(preset.clone()).unwrap();
+        app.handle_scenes_event(scrozz_ui::settings::ScenesEvent::SetDefault(
+            scrozz_ui::settings::SceneChoice::Preset("studio".to_owned()),
+        ));
+        app.handle_scenes_event(scrozz_ui::settings::ScenesEvent::SetAssignment(
+            scrozz_ui::settings::SceneCapture::Window,
+            scrozz_ui::settings::SceneAssignment::Explicit(
+                scrozz_ui::settings::SceneChoice::Preset("studio".to_owned()),
+            ),
+        ));
+        let mut editors = std::collections::HashMap::from([
+            (
+                crate::gui::card::CardId(703),
+                editing_with_preset(crate::gui::card::CardId(703), 1, preset.clone()),
+            ),
+            (
+                crate::gui::card::CardId(704),
+                editing_with_preset(crate::gui::card::CardId(704), 2, preset),
+            ),
+        ]);
+        let before: Vec<_> = editors
+            .values()
+            .map(|editing| {
+                (
+                    editing.card,
+                    editing.editor.state().revision(),
+                    editing.editor.document().data(),
+                )
+            })
+            .collect();
+        freeze_editor_close(
+            &mut app,
+            editors.get(&crate::gui::card::CardId(704)).unwrap(),
+        );
+
+        apply_settings_scene_events(
+            &mut app,
+            &mut editors,
+            vec![scrozz_ui::settings::ScenesEvent::DeletePreset(
+                "studio".to_owned(),
+            )],
+        );
+
+        for editing in editors.values() {
+            assert!(editing.editor.state().custom_presets().is_empty());
+            assert_eq!(editing.editor.state().selected_preset(), None);
+            assert_eq!(editing.editor.state().preset_name(), "");
+            assert!(editing.editor.state().build_preset(false).is_err());
+            let (_, revision, document) = before
+                .iter()
+                .find(|(card, _, _)| *card == editing.card)
+                .unwrap();
+            assert_eq!(editing.editor.state().revision(), *revision);
+            assert_eq!(editing.editor.document().data(), document.clone());
+        }
+        let model = app.scenes_model();
+        assert_eq!(model.default, scrozz_ui::settings::SceneChoice::Auto);
+        assert_eq!(
+            model
+                .assignments
+                .iter()
+                .find(|(capture, _)| *capture == scrozz_ui::settings::SceneCapture::Window)
+                .map(|(_, assignment)| assignment),
+            Some(&scrozz_ui::settings::SceneAssignment::UseDefault)
+        );
+        assert!(app.smart_frame_presets().is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn card_target(scale: f64, origin: egui::Pos2) -> CardSurfaceTarget {

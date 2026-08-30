@@ -28,7 +28,12 @@ value fixes only that property. **Reset to Automatic** restores the immutable
 built-in Automatic Scene.
 
 User presets are authored from the editor and preserve the Automatic/fixed
-choice for every property. They never contain capture pixels.
+choice for every property. They never contain capture pixels. `auto`, `none`,
+and `default` are reserved assignment tokens rather than user-preset IDs. The
+schema-v3 loader deterministically renames an older colliding ID and rewrites
+every `preset:<id>` assignment in the same atomic settings update. Authoritative
+preset changes are synchronized to every open editor as library metadata only;
+they never mutate an editor's pending document revision.
 
 Automatic padding is proportional to the shorter source edge and bounded to an
 empirical range. Automatic placement uses only a sufficiently confident stored

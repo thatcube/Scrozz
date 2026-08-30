@@ -30,6 +30,16 @@ pub const SMART_FRAME_PRESET_VERSION: u32 = 1;
 pub const MAX_ANALYSIS_SAMPLES: u64 = 65_536;
 /// Longest accepted preset name.
 pub const MAX_PRESET_NAME_CHARS: usize = 64;
+/// Assignment tokens that cannot identify user-authored presets.
+pub const RESERVED_SMART_FRAME_PRESET_IDS: [&str; 3] = ["auto", "none", "default"];
+
+/// Whether an identifier collides with a built-in Scene assignment token.
+#[must_use]
+pub fn is_reserved_smart_frame_preset_id(id: &str) -> bool {
+    RESERVED_SMART_FRAME_PRESET_IDS
+        .iter()
+        .any(|reserved| id.eq_ignore_ascii_case(reserved))
+}
 
 const MAX_ANALYSIS_PIXELS: u64 = 40_000_000;
 const NORMALIZED_MAX: u16 = 10_000;
@@ -626,6 +636,12 @@ impl SmartFramePreset {
             return Err(Error::InvalidRequest(
                 "preset id must contain only letters, digits, hyphens, or underscores".into(),
             ));
+        }
+        if is_reserved_smart_frame_preset_id(&self.id) {
+            return Err(Error::InvalidRequest(format!(
+                "preset id {:?} is reserved for a built-in Scene choice",
+                self.id
+            )));
         }
         self.settings.to_beautification().validate()
     }

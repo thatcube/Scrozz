@@ -88,7 +88,8 @@ pub use smart_frame::{
     SensitiveRegionSuggestion, SmartFrameAnalysis, SmartFrameMetadata, SmartFramePreset,
     SmartFramePresetSettings, analyze as analyze_scene, analyze as analyze_smart_frame,
     analyze_with_style as analyze_scene_with_style, contrast_ratio,
-    provisional as provisional_scene, provisional as provisional_smart_frame,
+    is_reserved_smart_frame_preset_id, provisional as provisional_scene,
+    provisional as provisional_smart_frame,
 };
 pub use style::{
     ArrowStyle, Color, REDACT_INTENSITY_DEFAULT, REDACT_INTENSITY_MAX, REDACT_INTENSITY_MIN, Style,

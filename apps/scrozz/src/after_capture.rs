@@ -5,7 +5,7 @@
 //! failed destination cannot suppress the others.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
@@ -472,7 +472,55 @@ impl AfterCaptureSettings {
         Ok(())
     }
 
-    fn from_json(text: &str) -> Result<(Self, u32)> {
+    fn migrate_reserved_scene_preset_ids(&mut self) -> bool {
+        let mut occupied: BTreeSet<String> = self
+            .smart_frame_presets
+            .iter()
+            .filter(|preset| !scrozz_annotate::is_reserved_smart_frame_preset_id(&preset.id))
+            .map(|preset| preset.id.clone())
+            .collect();
+        let mut assignment_renames = BTreeMap::new();
+        let mut migrated = false;
+
+        for preset in &mut self.smart_frame_presets {
+            if !scrozz_annotate::is_reserved_smart_frame_preset_id(&preset.id) {
+                continue;
+            }
+            let old = preset.id.clone();
+            let base = format!("preset-{}", old.to_ascii_lowercase());
+            let mut candidate = base.clone();
+            let mut suffix = 2u32;
+            while occupied.contains(&candidate)
+                || scrozz_annotate::is_reserved_smart_frame_preset_id(&candidate)
+            {
+                candidate = format!("{base}-{suffix}");
+                suffix = suffix.saturating_add(1);
+            }
+            assignment_renames
+                .entry(old)
+                .or_insert_with(|| candidate.clone());
+            preset.id = candidate.clone();
+            occupied.insert(candidate);
+            migrated = true;
+        }
+
+        for (old, new) in assignment_renames {
+            let old = format!("preset:{old}");
+            let new = format!("preset:{new}");
+            for key in std::iter::once(crate::settings::SCENES_DEFAULT_KEY).chain(
+                crate::settings::SCENE_CAPTURE_KEYS
+                    .iter()
+                    .map(|(_, key)| *key),
+            ) {
+                if self.value(key) == Some(old.as_str()) {
+                    self.set_value(key, new.clone());
+                }
+            }
+        }
+        migrated
+    }
+
+    fn from_json(text: &str) -> Result<(Self, u32, bool)> {
         let value: Value = serde_json::from_str(text)
             .map_err(|error| Error::Storage(format!("the settings file is unreadable: {error}")))?;
         let mut root = value.as_object().cloned().ok_or_else(|| {
@@ -565,11 +613,16 @@ impl AfterCaptureSettings {
             // present or absent — is what the user actually chose.
             crate::settings::migrate_scenes(&mut settings);
         }
+        let migrated_reserved_ids = settings.migrate_reserved_scene_preset_ids();
 
         settings.document_version = version.max(SETTINGS_VERSION);
         settings.unknown_root = root.into_iter().collect();
         settings.validate_smart_frame_presets()?;
-        Ok((settings, version))
+        Ok((
+            settings,
+            version,
+            migrated_reserved_ids && version <= SETTINGS_VERSION,
+        ))
     }
 
     fn to_json(&self) -> Result<String> {
@@ -837,8 +890,8 @@ impl AfterCaptureStore {
                 )));
             }
         };
-        let (settings, version) = AfterCaptureSettings::from_json(&text)?;
-        if version < SETTINGS_VERSION {
+        let (settings, version, rewrite_required) = AfterCaptureSettings::from_json(&text)?;
+        if version < SETTINGS_VERSION || rewrite_required {
             self.save_unlocked(&settings)?;
         }
         Ok(settings)
@@ -1653,6 +1706,85 @@ mod tests {
     }
 
     #[test]
+    fn reserved_scene_preset_ids_migrate_with_assignments_and_delete_atomically() {
+        let root = scratch("reserved-scene-preset-ids");
+        let path = root.join("settings.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "version": 3,
+  "values": {
+    "scenes.default": "preset:auto",
+    "scenes.region": "preset:default",
+    "scenes.window": "preset:none"
+  },
+  "smart_frame_presets": [
+    {"version": 1, "id": "preset-auto", "name": "Existing", "settings": {}},
+    {"version": 1, "id": "auto", "name": "Custom Auto", "settings": {}, "future": true},
+    {"version": 1, "id": "none", "name": "Custom None", "settings": {}},
+    {"version": 1, "id": "default", "name": "Custom Default", "settings": {}}
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let store = AfterCaptureStore::new(&path);
+        let migrated = store.load(InstallProfile::Fresh).unwrap();
+        let id_for = |name: &str| {
+            migrated
+                .smart_frame_presets()
+                .iter()
+                .find(|preset| preset.name == name)
+                .map(|preset| preset.id.as_str())
+                .unwrap()
+        };
+        assert_eq!(id_for("Existing"), "preset-auto");
+        assert_eq!(id_for("Custom Auto"), "preset-auto-2");
+        assert_eq!(id_for("Custom None"), "preset-none");
+        assert_eq!(id_for("Custom Default"), "preset-default");
+        assert_eq!(
+            migrated.value(crate::settings::SCENES_DEFAULT_KEY),
+            Some("preset:preset-auto-2")
+        );
+        assert_eq!(
+            migrated.value("scenes.region"),
+            Some("preset:preset-default")
+        );
+        assert_eq!(migrated.value("scenes.window"), Some("preset:preset-none"));
+        assert_eq!(
+            migrated
+                .smart_frame_presets()
+                .iter()
+                .find(|preset| preset.name == "Custom Auto")
+                .and_then(|preset| preset.extensions.get("future")),
+            Some(&serde_json::json!(true))
+        );
+
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("\"id\": \"preset-auto-2\""));
+        assert!(!rewritten.contains("\"id\": \"auto\""));
+
+        let updated = store
+            .update(InstallProfile::Fresh, |settings| {
+                crate::settings::forget_scene_preset(settings, "preset-auto-2")
+            })
+            .unwrap();
+        assert_eq!(
+            updated.value(crate::settings::SCENES_DEFAULT_KEY),
+            Some("auto")
+        );
+        assert_eq!(updated.value("scenes.window"), Some("preset:preset-none"));
+        assert!(
+            updated
+                .smart_frame_presets()
+                .iter()
+                .all(|preset| preset.id != "preset-auto-2")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn smart_frame_preset_upsert_and_delete_are_atomic() {
         let root = scratch("smart-frame-preset-mutations");
         let store = AfterCaptureStore::new(root.join("settings.json"));
@@ -2043,7 +2175,7 @@ mod tests {
     "recording": {}
   }
 }"#;
-        let (settings, _) = AfterCaptureSettings::from_json(text).expect("read future");
+        let (settings, _, _) = AfterCaptureSettings::from_json(text).expect("read future");
         let rendered = settings.to_json().expect("rewrite");
         assert!(rendered.contains("\"version\": 99"), "{rendered}");
         assert!(rendered.contains("\"future-root\""), "{rendered}");
@@ -2067,7 +2199,7 @@ mod tests {
   },
   "after_capture": {"screenshot": {}, "recording": {}}
 }"#;
-        let (settings, _) = AfterCaptureSettings::from_json(text).expect("read future");
+        let (settings, _, _) = AfterCaptureSettings::from_json(text).expect("read future");
         let rendered = settings.to_json().expect("rewrite");
         assert!(rendered.contains("\"version\": 99"), "{rendered}");
         assert!(

@@ -817,7 +817,7 @@ fn choices(presets: &[ScenePreset]) -> Vec<SceneChoice> {
     options.extend(
         presets
             .iter()
-            .filter(|preset| preset.id != AUTO_PRESET_ID)
+            .filter(|preset| !preset.builtin)
             .map(|preset| SceneChoice::Preset(preset.id.clone())),
     );
     options
@@ -918,14 +918,29 @@ mod tests {
     }
 
     #[test]
-    fn menus_never_offer_auto_twice() {
-        let options = choices(&library());
+    fn menus_filter_builtins_structurally_and_keep_user_presets() {
+        let mut presets = library();
+        presets.push(ScenePreset {
+            id: "auto-2".to_owned(),
+            name: "Auto (Custom)".to_owned(),
+            builtin: false,
+            style: ScenePreviewStyle::default(),
+        });
+        presets.push(ScenePreset {
+            id: "future-built-in".to_owned(),
+            name: "Future Built-in".to_owned(),
+            builtin: true,
+            style: ScenePreviewStyle::default(),
+        });
+        let options = choices(&presets);
         let autos = options
             .iter()
             .filter(|choice| matches!(choice, SceneChoice::Auto))
             .count();
         assert_eq!(autos, 1);
         assert!(!options.contains(&SceneChoice::Preset(AUTO_PRESET_ID.to_owned())));
+        assert!(options.contains(&SceneChoice::Preset("auto-2".to_owned())));
+        assert!(!options.contains(&SceneChoice::Preset("future-built-in".to_owned())));
     }
 
     #[test]
