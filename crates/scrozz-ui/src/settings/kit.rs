@@ -562,10 +562,67 @@ pub fn status(ui: &mut egui::Ui, theme: &Theme, tone: Tone, text: &str) {
 // Controls
 // ---------------------------------------------------------------------------
 
+/// Whether `response` was activated this frame, by pointer or by keyboard.
+///
+/// The kit's single answer to "was this pressed", because egui's own is wrong
+/// for us: it presses a focused widget on Space or Return *without looking at
+/// modifiers*. So a chord ending in one of those keys presses whatever holds
+/// focus as well as being read as a chord. This adds the bare-key press egui
+/// misses for hand-drawn controls, and takes back the modified press it should
+/// never have given, so every control in the kit agrees.
+pub(crate) fn activated(ui: &egui::Ui, response: &mut Response) -> bool {
+    if keyboard_activated(ui, response) {
+        response.flags |= egui::response::Flags::FAKE_PRIMARY_CLICKED;
+        return true;
+    }
+    if response.has_focus() && chord_pressed(ui) && !ui.input(|input| input.pointer.any_click()) {
+        // egui has already faked a primary click for the Space or Return inside
+        // the chord. Take it back: the chord was aimed at the recorder.
+        response.flags -= egui::response::Flags::FAKE_PRIMARY_CLICKED;
+        return false;
+    }
+    response.clicked()
+}
+
+/// Whether a Space or Return arrived this frame as part of a chord.
+fn chord_pressed(ui: &egui::Ui) -> bool {
+    ui.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Space | egui::Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if !modifiers.is_none()
+            )
+        })
+    })
+}
+
+/// Whether a focused control was pressed with the keyboard.
+///
+/// Only a *bare* Space or Return counts. `Key::pressed` ignores modifiers, so
+/// without this a chord that merely ends in one of those keys also activates
+/// whatever happens to hold focus. That is not hypothetical: recording a
+/// shortcut, Ctrl+Return commits the chord and — in the very same frame — the
+/// key cap behind the recorder sees a Return, re-arms, and the shortcut can
+/// never be finished. Modified keys belong to whoever is reading chords.
 fn keyboard_activated(ui: &egui::Ui, response: &Response) -> bool {
     response.has_focus()
         && ui.input(|input| {
-            input.key_pressed(egui::Key::Space) || input.key_pressed(egui::Key::Enter)
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::Space | egui::Key::Enter,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.is_none()
+                )
+            })
         })
 }
 
@@ -584,7 +641,7 @@ pub fn switch(ui: &mut egui::Ui, theme: &Theme, on: &mut bool, enabled: bool) ->
             Sense::hover()
         },
     );
-    let clicked = response.clicked() || keyboard_activated(ui, &response);
+    let clicked = activated(ui, &mut response);
     if enabled && clicked {
         *on = !*on;
         response.mark_changed();
@@ -656,7 +713,7 @@ pub fn checkbox(
             Sense::hover()
         },
     );
-    if enabled && (response.clicked() || keyboard_activated(ui, &response)) {
+    if enabled && activated(ui, &mut response) {
         *on = !*on;
         response.mark_changed();
     }
@@ -797,6 +854,10 @@ fn button_impl(
     );
     if !enabled {
         response.flags -= egui::response::Flags::ENABLED;
+    } else {
+        // Keeps a focused button from being pressed by a chord that merely ends
+        // in Space or Return; see `activated`.
+        activated(ui, &mut response);
     }
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
 
@@ -990,9 +1051,9 @@ pub fn segmented<T: Copy + PartialEq>(
             egui::pos2(track.left() + 2.0 + seg_w * index as f32, track.top() + 2.0),
             Vec2::new(seg_w, Metrics::CONTROL),
         );
-        let response = ui.interact(rect, ui.id().with(("segment", index)), Sense::click());
+        let mut response = ui.interact(rect, ui.id().with(("segment", index)), Sense::click());
         let selected = *value == *option;
-        if (response.clicked() || keyboard_activated(ui, &response)) && !selected {
+        if activated(ui, &mut response) && !selected {
             *value = *option;
             changed = true;
         }
@@ -1135,8 +1196,8 @@ fn key_cap_impl(
             Sense::hover()
         },
     );
-    if interactive && keyboard_activated(ui, &response) {
-        response.flags |= egui::response::Flags::CLICKED;
+    if interactive {
+        activated(ui, &mut response);
     }
     let hovered = interactive && response.hovered();
     let fill = if hovered {
@@ -1279,6 +1340,65 @@ mod tests {
         );
 
         assert!(clicked, "Space must arm it as well as the pointer");
+    }
+
+    #[test]
+    fn a_modified_chord_does_not_press_the_focused_cap() {
+        // The cap that starts recording is also the thing holding focus while a
+        // chord is being typed. If Ctrl+Return counted as pressing it, finishing
+        // a shortcut would immediately restart the recorder in the same frame
+        // and the shortcut could never be committed.
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let id = run(&ctx, egui::RawInput::default(), |ui| {
+            key_cap_button(ui, &theme, "Cmd+7", true).id
+        });
+        ctx.memory_mut(|memory| memory.request_focus(id));
+
+        for modifiers in [
+            egui::Modifiers::CTRL,
+            egui::Modifiers::COMMAND,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::ALT,
+        ] {
+            for key in [egui::Key::Enter, egui::Key::Space] {
+                let clicked = run(
+                    &ctx,
+                    egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        }],
+                        ..Default::default()
+                    },
+                    |ui| key_cap_button(ui, &theme, "Cmd+7", true).clicked(),
+                );
+                assert!(
+                    !clicked,
+                    "{key:?} with {modifiers:?} belongs to the chord reader, not the cap"
+                );
+            }
+        }
+
+        // The bare key still works, so nothing was thrown out with the chord.
+        let clicked = run(
+            &ctx,
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| key_cap_button(ui, &theme, "Cmd+7", true).clicked(),
+        );
+        assert!(clicked, "an unmodified Return still presses it");
     }
 
     #[test]

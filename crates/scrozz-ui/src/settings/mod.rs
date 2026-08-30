@@ -860,7 +860,8 @@ fn navigation_button(
     } else {
         Vec2::new(ui.available_width(), 28.0)
     };
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    kit::activated(ui, &mut response);
     response
         .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
     let fill = if selected {
@@ -2356,6 +2357,92 @@ mod tests {
             ctx.input(capture_chord),
             Some(Chord::Pressed("Shift+Cmd+7".to_owned()))
         );
+    }
+
+    #[test]
+    fn finishing_a_chord_on_the_armed_row_does_not_re_arm_it() {
+        // The cap that armed recording is the widget holding focus while the
+        // chord is typed, and egui presses a focused widget on Space or Return
+        // without checking modifiers. Ctrl+Return would then commit the chord
+        // and, in the same frame, re-arm the row — or press Reset or Clear if
+        // one of those held focus. Whichever control the keyboard is on, a
+        // chord belongs to the recorder and must change nothing.
+        let theme = Theme::dark();
+        let row = ShortcutRow {
+            id: "capture.region".to_owned(),
+            label: "Region".to_owned(),
+            accelerator: "Cmd+5".to_owned(),
+            symbols: "\u{2318}5".to_owned(),
+            // Not the shipped default, so Reset is live and focusable too.
+            is_default: false,
+            usable: true,
+            problem: None,
+            advisory: None,
+        };
+
+        let draw = |ctx: &egui::Context,
+                    input: egui::RawInput,
+                    recording: &mut Option<String>,
+                    edits: &mut Vec<ShortcutEdit>| {
+            let mut output = ctx.run_ui(input, |ui| {
+                draw_shortcut_row(ui, &theme, &row, recording, edits);
+            });
+            output.textures_delta.clear();
+        };
+
+        // Reset, Clear and the key cap: every focusable control in the row.
+        for stop in 1..=3 {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            let mut recording = Some(row.id.clone());
+            let mut edits = Vec::new();
+            draw(&ctx, egui::RawInput::default(), &mut recording, &mut edits);
+
+            for _ in 0..stop {
+                draw(
+                    &ctx,
+                    egui::RawInput {
+                        events: vec![key_event(Key::Tab, None, true, Modifiers::NONE)],
+                        ..Default::default()
+                    },
+                    &mut recording,
+                    &mut edits,
+                );
+            }
+            let focused = ctx.memory(egui::Memory::focused);
+            assert!(focused.is_some(), "tab {stop} should land on a control");
+            edits.clear();
+
+            for key in [Key::Enter, Key::Space] {
+                ctx.memory_mut(|memory| memory.request_focus(focused.unwrap()));
+                draw(
+                    &ctx,
+                    egui::RawInput {
+                        events: vec![key_event(
+                            key,
+                            None,
+                            true,
+                            Modifiers {
+                                ctrl: true,
+                                ..Modifiers::NONE
+                            },
+                        )],
+                        ..Default::default()
+                    },
+                    &mut recording,
+                    &mut edits,
+                );
+                assert_eq!(
+                    recording.as_deref(),
+                    Some(row.id.as_str()),
+                    "{key:?} in a chord must leave the armed row armed (control {stop})"
+                );
+                assert!(
+                    edits.is_empty(),
+                    "{key:?} in a chord must not press a focused button (control {stop})"
+                );
+            }
+        }
     }
 
     #[test]
