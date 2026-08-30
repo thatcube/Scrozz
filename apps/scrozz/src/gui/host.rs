@@ -938,12 +938,21 @@ impl Driver {
         if let Some(event) = picker_event {
             let owner = self.color_picker_generation.and_then(|generation| {
                 self.editors
-                    .values_mut()
-                    .find(|editing| editing.generation == generation)
+                    .iter_mut()
+                    .find(|(_, editing)| editing.generation == generation)
             });
             match event {
                 scrozz_shell::ColorPickerEvent::Changed([r, g, b, a]) => {
-                    if let Some(editing) = owner {
+                    // A Done pending its commit/persist ack has already
+                    // captured and frozen this card's document -- applying a
+                    // colour change now would silently advance the still-
+                    // open editor past what that Done committed, and the
+                    // next render-prep pass would then cache drag bytes for
+                    // a revision the committed thumbnail never agreed to
+                    // (round 6, Finding #4).
+                    if let Some((&card, editing)) = owner
+                        && !self.app.editor_close_pending(card)
+                    {
                         editing
                             .editor
                             .apply_external_color(scrozz_annotate::Color::rgba(r, g, b, a));
@@ -953,7 +962,9 @@ impl Driver {
                     color: [r, g, b, a],
                     changed,
                 } => {
-                    if let Some(editing) = owner {
+                    if let Some((&card, editing)) = owner
+                        && !self.app.editor_close_pending(card)
+                    {
                         if changed {
                             editing
                                 .editor
@@ -964,6 +975,8 @@ impl Driver {
                             .remember_custom_color(scrozz_annotate::Color::rgba(r, g, b, a));
                         editing.window.request_foreground();
                     }
+                    // The native panel really did close either way, so this
+                    // bookkeeping always clears regardless of the freeze.
                     self.color_picker_generation = None;
                 }
             }
@@ -1081,41 +1094,48 @@ impl Driver {
                         Ok(rendered) => {
                             let revision = rendered.revision();
                             let frame = rendered.frame().clone();
+                            let data = editor.document().data();
                             // Freezes this editor mapped (though `window.show`
                             // above may already have closed its native
                             // viewport for this frame) until the commit --
                             // and, for a history-only editor, the persist --
-                            // job posted right below actually answers.
-                            // Round 5 Finding #1/#4: finalizing immediately
-                            // let a plain Copy/Save/Upload or a native drag,
-                            // posted in the gap before that answer, read the
-                            // card's pre-edit bytes even though the
-                            // thumbnail already promised the redaction --
-                            // leaving this entry mapped keeps a frozen
-                            // `editor.render()` (unchanged since this exact
-                            // Done) as every export's source for the whole
-                            // gap instead of falling back to the card's
-                            // stale, pre-commit vault bytes.
-                            self.app
-                                .begin_editor_close(card, generation, revision, frame);
+                            // job actually answers. Round 5 Finding #1/#4:
+                            // finalizing immediately let a plain Copy/Save/
+                            // Upload or a native drag, posted in the gap
+                            // before that answer, read the card's pre-edit
+                            // bytes even though the thumbnail already
+                            // promised the redaction -- leaving this entry
+                            // mapped keeps a frozen `editor.render()`
+                            // (unchanged since this exact Done) as every
+                            // export's source for the whole gap instead of
+                            // falling back to the card's stale, pre-commit
+                            // vault bytes. `data` is stashed here rather than
+                            // persisted alongside the commit below: the
+                            // durable history write is dispatched only once
+                            // that commit is known to have succeeded (round
+                            // 6, Finding #3), never unconditionally next to
+                            // it, so a commit failure can never be followed
+                            // by a persist that durably writes the same
+                            // rejected edit to history anyway.
+                            self.app.begin_editor_close(
+                                card,
+                                generation,
+                                revision,
+                                frame,
+                                data.clone(),
+                            );
                             // Files the same committed frame into the card's
                             // own exportable bytes, so a plain Copy, Save or
                             // Upload posted once the pending close above
                             // resolves reads the redaction the thumbnail is
                             // about to commit to, never the original pixels
                             // underneath it.
-                            self.app.commit_card_output(
-                                card,
-                                generation,
-                                rendered,
-                                editor.document().data(),
-                            );
                             self.app
-                                .persist_editor(EditorSnapshot::new(card, generation, editor));
+                                .commit_card_output(card, generation, rendered, data);
                             // Finalizing (thumbnail refresh, `editor_closed`,
                             // dropping this map entry) is deferred to the
-                            // pending-close drain below, once the jobs just
-                            // posted actually answer.
+                            // pending-close drain below, once the jobs the
+                            // pending close above dispatches actually answer.
                             continue;
                         }
                         Err(error) => {
@@ -2900,6 +2920,15 @@ mod tests {
 
     #[test]
     fn dirty_editor_persistence_is_queued_before_its_cache_is_released() {
+        // Round 6, Finding #3: the durable history write a Done triggers is
+        // no longer queued directly from `show_editor` at all -- it is
+        // auto-dispatched later, only once the sibling commit's own ack
+        // succeeds (`dispatch_deferred_persist` in app.rs). What
+        // `show_editor` itself must still guarantee is that the document
+        // Done captured is handed to `begin_editor_close` -- which stashes
+        // it for that later dispatch -- strictly before the card's cache
+        // can be released by `editor_closed`, so a release can never race
+        // ahead of there being a document to eventually persist.
         let source = include_str!("host.rs");
         let editor = source
             .split("fn show_editor")
@@ -2908,10 +2937,72 @@ mod tests {
             .map(|(body, _)| body)
             .expect("editor host");
         let persist = editor
-            .find("persist_editor")
-            .expect("dirty editor persistence");
+            .find("begin_editor_close")
+            .expect("dirty editor's document is stashed for deferred persistence");
         let release = editor.find("editor_closed").expect("editor cache release");
         assert!(persist < release);
+    }
+
+    #[test]
+    fn color_picker_events_freeze_a_card_whose_close_is_pending_but_always_clear_ownership() {
+        // Round 6, Finding #4: the system colour picker is a single modeless
+        // native panel a still-open editor can keep talking to even after
+        // its own Done has captured a frame/document and is only waiting on
+        // that Done's commit/persist ack. An unguarded `Changed`/`Closed`
+        // event landing in that window would silently advance the editor
+        // past the exact revision Done already captured, so both event
+        // arms must check `editor_close_pending` before mutating the editor
+        // -- but the panel itself really did change or close either way, so
+        // `color_picker_generation` bookkeeping must clear regardless of
+        // that freeze, or a resolved close could leave the app thinking a
+        // panel it no longer owns is still open.
+        let source = include_str!("host.rs");
+        let block = source
+            .split("let picker_event = match self.color_picker.poll()")
+            .nth(1)
+            .and_then(|body| body.split_once("let cards: Vec<crate::gui::card::CardId>"))
+            .map(|(body, _)| body)
+            .expect("colour picker event handling");
+
+        let changed = block
+            .split_once("ColorPickerEvent::Changed(")
+            .and_then(|(_, after)| after.split_once("ColorPickerEvent::Closed"))
+            .map(|(body, _)| body)
+            .expect("the Changed arm");
+        let changed_guard = changed
+            .find("editor_close_pending")
+            .expect("Changed must check the pending-close freeze");
+        let changed_apply = changed
+            .find("apply_external_color")
+            .expect("Changed applies the colour change");
+        assert!(
+            changed_guard < changed_apply,
+            "Changed must check the freeze before mutating the editor's colour"
+        );
+
+        let closed = block
+            .split_once("ColorPickerEvent::Closed")
+            .map(|(_, after)| after)
+            .expect("the Closed arm");
+        let closed_guard = closed
+            .find("editor_close_pending")
+            .expect("Closed must check the pending-close freeze");
+        let closed_apply = closed
+            .find("apply_external_color")
+            .expect("Closed applies the colour change when it changed");
+        assert!(
+            closed_guard < closed_apply,
+            "Closed must check the freeze before mutating the editor's colour"
+        );
+        let generation_cleared = closed
+            .find("color_picker_generation = None")
+            .expect("the panel's ownership bookkeeping clears on Closed");
+        assert!(
+            closed_guard < generation_cleared && closed_apply < generation_cleared,
+            "the panel really did close either way, so ownership bookkeeping must \
+             clear after (and regardless of) the pending-close freeze -- never let \
+             a frozen mutation also suppress noticing the native panel is gone"
+        );
     }
 
     #[test]
@@ -3025,20 +3116,21 @@ mod tests {
         assert!(
             continue_stmt < editor_closed,
             "the continue must appear before editor_closed so a failed render \
-             never reaches commit_card_output, persist_editor, or editor_closed"
+             never reaches commit_card_output, begin_editor_close, or editor_closed"
         );
 
-        // The success arm alone may commit and persist; a failed render's
-        // `continue` must jump clean over both.
+        // The success arm alone may commit and stash the document for
+        // deferred persistence; a failed render's `continue` must jump
+        // clean over both.
         let ok_arm = editor[done_render..err_arm]
             .find("Ok(rendered) => {")
             .map(|offset| done_render + offset)
-            .expect("the successful re-render commits and persists");
+            .expect("the successful re-render commits and stashes the document to persist");
         let commit = editor[ok_arm..err_arm]
-            .find("self.app.commit_card_output(")
+            .find(".commit_card_output(")
             .map(|offset| ok_arm + offset);
         let persist = editor[ok_arm..err_arm]
-            .find(".persist_editor(")
+            .find("begin_editor_close(")
             .map(|offset| ok_arm + offset);
         assert!(
             commit.is_some_and(|at| at > ok_arm && at < err_arm),
@@ -3046,7 +3138,7 @@ mod tests {
         );
         assert!(
             persist.is_some_and(|at| at > ok_arm && at < err_arm),
-            "persist_editor must be reached only from the Ok arm"
+            "begin_editor_close must be reached only from the Ok arm"
         );
     }
 

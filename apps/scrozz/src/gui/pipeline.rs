@@ -992,6 +992,13 @@ pub struct Pipeline {
     history_queries: Sender<HistoryQuery>,
     uploads: Sender<UploadJob>,
     outcomes: Receiver<Outcome>,
+    /// A clone of the outcome sender, kept only so tests can inject an
+    /// outcome the real workers cannot produce hermetically — an uploaded
+    /// share, which needs a network and (without the `cloud` feature) a
+    /// backend that is not compiled in at all. Every other job's outcome is
+    /// exercised by actually posting the job and draining the real worker.
+    #[cfg(test)]
+    test_outcomes: Sender<Outcome>,
     worker: Option<JoinHandle<()>>,
     history_worker: Option<JoinHandle<()>>,
     upload_worker: Option<JoinHandle<()>>,
@@ -1065,6 +1072,8 @@ impl Pipeline {
         let pending_pin_updates = Arc::new(PendingPinUpdates::default());
         let capture_budget = CaptureBudget::new();
         let worker_pin_updates = Arc::clone(&pending_pin_updates);
+        #[cfg(test)]
+        let test_outcomes = outcome_tx.clone();
         let history_outcomes = outcome_tx.clone();
         let history_waker = waker.clone();
         let upload_cancellation = crate::cloud::ShareCancellation::default();
@@ -1149,6 +1158,8 @@ impl Pipeline {
             history_queries,
             uploads,
             outcomes,
+            #[cfg(test)]
+            test_outcomes,
             worker: Some(worker),
             history_worker: Some(history_worker),
             upload_worker: Some(upload_worker),
@@ -1374,6 +1385,18 @@ impl Pipeline {
     /// Takes one finished piece of work, if there is one. Never blocks.
     pub fn poll(&self) -> Option<Outcome> {
         self.outcomes.try_recv().ok()
+    }
+
+    /// Injects an outcome as though a worker had produced it.
+    ///
+    /// Only an upload actually needs this: a real [`Outcome::UploadDone`]
+    /// needs a network and, without the `cloud` feature, a backend that is
+    /// not even compiled in, so it cannot be exercised hermetically by
+    /// posting a real job. Every other outcome in these tests comes from
+    /// posting a real [`Job`] and draining the real worker.
+    #[cfg(test)]
+    pub fn inject_outcome_for_test(&self, outcome: Outcome) {
+        let _ = self.test_outcomes.send(outcome);
     }
 
     /// Cancels interactive acquisition, then stops and joins the worker.
@@ -4823,7 +4846,7 @@ mod tests {
         let (jobs, job_rx) = channel();
         let (history_queries, _history_rx) = channel();
         let (uploads, _upload_rx) = channel();
-        let (_outcome_tx, outcomes) = channel();
+        let (outcome_tx, outcomes) = channel();
         let mut pipeline = Pipeline {
             jobs,
             capture_budget: CaptureBudget::new(),
@@ -4834,6 +4857,8 @@ mod tests {
             history_queries,
             uploads,
             outcomes,
+            #[cfg(test)]
+            test_outcomes: outcome_tx,
             worker: None,
             history_worker: None,
             upload_worker: None,
@@ -4896,7 +4921,7 @@ mod tests {
         let (jobs, job_rx) = channel();
         let (history_queries, _history_rx) = channel();
         let (uploads, _upload_rx) = channel();
-        let (_outcome_tx, outcomes) = channel();
+        let (outcome_tx, outcomes) = channel();
         let mut pipeline = Pipeline {
             jobs,
             capture_budget: CaptureBudget::new(),
@@ -4907,6 +4932,8 @@ mod tests {
             history_queries,
             uploads,
             outcomes,
+            #[cfg(test)]
+            test_outcomes: outcome_tx,
             worker: None,
             history_worker: None,
             upload_worker: None,
