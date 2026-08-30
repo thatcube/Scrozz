@@ -66,29 +66,29 @@ pub const MIGRATIONS: &[Migration] = &[
             ocr_fold          TEXT
         ) STRICT;
 
-        -- History is read newest-first far more than any other way.
-        CREATE INDEX IF NOT EXISTS captures_by_recency
-            ON captures (created_at DESC, id DESC);
+            -- History is read newest-first far more than any other way.
+            CREATE INDEX IF NOT EXISTS captures_by_recency
+                ON captures (created_at DESC, id DESC);
 
-        -- Retention's exact question: the oldest unpinned capture that still
-        -- has pixels. A partial index keeps it proportional to the answer.
-        -- `image_hash` is kept after eviction so a capture remembers what its
-        -- pixels were; `image_evicted_at` is what says they are gone.
-        CREATE INDEX IF NOT EXISTS captures_evictable
-            ON captures (created_at ASC, id ASC)
-            WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL AND pinned = 0;
+            -- Retention's exact question: the oldest unpinned capture that still
+            -- has pixels. A partial index keeps it proportional to the answer.
+            -- `image_hash` is kept after eviction so a capture remembers what its
+            -- pixels were; `image_evicted_at` is what says they are gone.
+            CREATE INDEX IF NOT EXISTS captures_evictable
+                ON captures (created_at ASC, id ASC)
+                WHERE image_hash IS NOT NULL AND image_evicted_at IS NULL AND pinned = 0;
 
-        CREATE INDEX IF NOT EXISTS captures_by_app ON captures (app_fold);
-        CREATE INDEX IF NOT EXISTS captures_pinned ON captures (pinned) WHERE pinned = 1;
-        CREATE INDEX IF NOT EXISTS captures_by_hash ON captures (image_hash);
+            CREATE INDEX IF NOT EXISTS captures_by_app ON captures (app_fold);
+            CREATE INDEX IF NOT EXISTS captures_pinned ON captures (pinned) WHERE pinned = 1;
+            CREATE INDEX IF NOT EXISTS captures_by_hash ON captures (image_hash);
 
-        -- One row per distinct blob on disk. Two captures of an unchanged
-        -- window share one, so the cap measures disk rather than duplicates.
-        CREATE TABLE IF NOT EXISTS blobs (
-            hash       TEXT    NOT NULL PRIMARY KEY,
-            byte_len   INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
-        ) STRICT;
+            -- One row per distinct blob on disk. Two captures of an unchanged
+            -- window share one, so the cap measures disk rather than duplicates.
+            CREATE TABLE IF NOT EXISTS blobs (
+                hash       TEXT    NOT NULL PRIMARY KEY,
+                byte_len   INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            ) STRICT;
 
         CREATE TABLE IF NOT EXISTS store_meta (
             key   TEXT NOT NULL PRIMARY KEY,
@@ -141,6 +141,22 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "unify recording metadata and pinned window cache",
         sql: "SELECT 1;",
+    },
+    Migration {
+        // Appended, never renumbered: files already at 7 climb one more rung.
+        // A separate table rather than columns on `captures`, for the same
+        // reason `capture_pins` is separate — the rung stays idempotent on an
+        // interrupted upgrade, and a capture that was never shared costs
+        // nothing.
+        version: 8,
+        name: "capture sharing metadata",
+        sql: r"
+            CREATE TABLE IF NOT EXISTS capture_shares (
+                capture_id    TEXT NOT NULL PRIMARY KEY
+                              REFERENCES captures(id) ON DELETE CASCADE,
+                sharing_json  TEXT NOT NULL
+            ) STRICT;
+        ",
     },
 ];
 
@@ -460,7 +476,13 @@ mod tests {
         assert_eq!(version, latest_version(MIGRATIONS));
 
         let names = tables(&conn);
-        for expected in ["blobs", "capture_pins", "captures", "store_meta"] {
+        for expected in [
+            "blobs",
+            "capture_pins",
+            "capture_shares",
+            "captures",
+            "store_meta",
+        ] {
             assert!(names.contains(&expected.to_owned()), "missing {expected}");
         }
         assert_eq!(migrate(&mut conn, MIGRATIONS).expect("again"), version);

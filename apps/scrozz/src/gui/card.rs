@@ -275,6 +275,10 @@ pub struct Card {
     pub written: Vec<String>,
     /// When the shutter fired.
     pub taken_at: SystemTime,
+    /// Whether the Upload action is currently usable.
+    pub upload_available: bool,
+    /// Explanation for a disabled Upload action.
+    pub upload_unavailable_reason: Option<String>,
 }
 
 /// A persisted capture ready to restore into a native pinned window.
@@ -320,6 +324,8 @@ impl Card {
             thumbnail: None,
             written: Vec::new(),
             taken_at: SystemTime::now(),
+            upload_available: false,
+            upload_unavailable_reason: Some("Sharing is not configured.".to_owned()),
         }
     }
 
@@ -348,6 +354,8 @@ impl Card {
             thumbnail: Thumbnail::from_rgba(poster.width, poster.height, poster.bytes.clone()),
             written: vec![handoff.path.to_string_lossy().into_owned()],
             taken_at: SystemTime::now(),
+            upload_available: false,
+            upload_unavailable_reason: None,
         }
     }
 
@@ -418,7 +426,7 @@ pub enum CardEvent {
         /// Whether the platform-native destination chooser should open.
         choose_destination: bool,
     },
-    /// Upload it through the configured cloud provider.
+    /// Upload it to configured private storage and copy the link.
     Upload(CardId),
     /// A card's configured elapsed cleanup interval expired.
     AutoClose(CardId, RecentCapturesAutoCloseAction),
@@ -557,6 +565,12 @@ pub trait CardSurface {
 
     /// Unlock every pointer-transparent pin through an external escape.
     fn unlock_pins(&mut self);
+
+    /// Shows or clears action status on a card.
+    fn set_status(&mut self, _id: CardId, _status: Option<String>) {}
+
+    /// Updates one card's Upload capability.
+    fn set_upload_availability(&mut self, _id: CardId, _enabled: bool, _reason: Option<String>) {}
 
     /// Takes one pending interaction, if there is one. Never blocks.
     ///
@@ -963,6 +977,7 @@ mod tests {
                 card: id,
                 choose_destination: false,
             },
+            CardEvent::Upload(id),
             CardEvent::Dismiss(id),
             CardEvent::Drag {
                 card: id,

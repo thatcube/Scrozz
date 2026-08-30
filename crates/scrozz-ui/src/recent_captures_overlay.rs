@@ -598,6 +598,10 @@ pub struct CaptureRequest {
     pub thumbnail: Option<egui::ColorImage>,
     /// Explicit content failure for a durable pin whose state remains recoverable.
     pub content_error: Option<String>,
+    /// Whether Upload can act on this capture at all.
+    pub upload_available: bool,
+    /// Why Upload is unavailable, shown on the disabled control.
+    pub upload_unavailable_reason: Option<String>,
 }
 
 impl CaptureRequest {
@@ -613,7 +617,20 @@ impl CaptureRequest {
             media: CaptureMedia::Image,
             thumbnail: None,
             content_error: None,
+            // Off until the app says otherwise: offering Upload before the
+            // provider has been checked would put a control on the card that
+            // can only fail.
+            upload_available: false,
+            upload_unavailable_reason: None,
         }
+    }
+
+    /// Records what Upload can do for this capture.
+    #[must_use]
+    pub fn with_upload_availability(mut self, available: bool, reason: Option<String>) -> Self {
+        self.upload_available = available;
+        self.upload_unavailable_reason = reason;
+        self
     }
 
     /// Build a request from a captured frame, scaling a thumbnail from it.
@@ -638,6 +655,8 @@ impl CaptureRequest {
             media: CaptureMedia::Image,
             thumbnail: Some(thumbnail),
             content_error: None,
+            upload_available: false,
+            upload_unavailable_reason: None,
         })
     }
 
@@ -835,6 +854,15 @@ pub enum RecentCapturesOverlayEvent {
 #[derive(Clone, Debug)]
 enum Command {
     Dismiss(CardId),
+    SetStatus {
+        id: CardId,
+        status: Option<String>,
+    },
+    SetUploadAvailability {
+        id: CardId,
+        available: bool,
+        reason: Option<String>,
+    },
     SettleDrag {
         id: CardId,
         accepted: bool,
@@ -951,6 +979,23 @@ impl RecentCapturesOverlayHandle {
     /// Retire one card.
     pub fn dismiss(&self, id: CardId) {
         self.command(Command::Dismiss(id));
+    }
+
+    /// Shows or clears the action status line on one card.
+    pub fn set_status(&self, id: CardId, status: Option<String>) {
+        self.command(Command::SetStatus { id, status });
+    }
+
+    /// Updates what Upload can do for one card.
+    ///
+    /// Sent for every visible card whenever provider settings change, so a
+    /// control never claims a capability the app has since lost.
+    pub fn set_upload_availability(&self, id: CardId, available: bool, reason: Option<String>) {
+        self.command(Command::SetUploadAvailability {
+            id,
+            available,
+            reason,
+        });
     }
 
     /// Reports that the native drag for `id` has finished.
@@ -1472,6 +1517,9 @@ struct Entry {
     pending: Option<egui::ColorImage>,
     pin_notice: Option<String>,
     auto_close_started_at: f64,
+    upload_available: bool,
+    upload_unavailable_reason: Option<String>,
+    status: Option<String>,
 }
 
 struct PinnedEntry {
@@ -1823,6 +1871,9 @@ impl RecentCapturesOverlayApp {
                     pending: thumb,
                     pin_notice: request.content_error,
                     auto_close_started_at: m.now(),
+                    upload_available: request.upload_available,
+                    upload_unavailable_reason: request.upload_unavailable_reason,
+                    status: None,
                 },
             );
             self.emit(RecentCapturesOverlayEvent::Pushed { id });
@@ -1838,6 +1889,21 @@ impl RecentCapturesOverlayApp {
                             id,
                             reason: DismissReason::Programmatic,
                         });
+                    }
+                }
+                Command::SetStatus { id, status } => {
+                    if let Some(entry) = self.content.get_mut(&id) {
+                        entry.status = status;
+                    }
+                }
+                Command::SetUploadAvailability {
+                    id,
+                    available,
+                    reason,
+                } => {
+                    if let Some(entry) = self.content.get_mut(&id) {
+                        entry.upload_available = available;
+                        entry.upload_unavailable_reason = reason;
                     }
                 }
                 Command::SettleDrag { id, accepted } => {
@@ -2646,6 +2712,9 @@ impl eframe::App for RecentCapturesOverlayApp {
             };
             let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance)
                 .with_media(entry.media.card_media());
+            content.upload_enabled = entry.upload_available;
+            content.upload_unavailable_reason = entry.upload_unavailable_reason.as_deref();
+            content.status = entry.status.as_deref();
             if let Some(tex) = &entry.texture {
                 content.texture = Some(tex.id());
             }

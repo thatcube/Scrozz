@@ -85,6 +85,7 @@
 
 pub mod camera_settings;
 pub mod card;
+pub mod cloud_settings;
 pub mod editor;
 pub mod harness;
 pub mod history;
@@ -111,6 +112,11 @@ pub use camera_settings::{
     viewport_id as camera_settings_viewport_id,
 };
 pub use card::{CardAction, CardChrome, CardContent, CardMedia, CardResponse};
+pub use cloud_settings::{
+    CloudConnectionState, CloudCredentialView, CloudSettingsDraft, CloudSettingsEvent,
+    CloudSettingsModel, CloudSettingsPreview, CloudSettingsWindow, CredentialDraft,
+    SettingsPlatform,
+};
 pub use history::{
     DateFilter, HistoryAction, HistoryEntry, HistoryFilters, HistoryPage, HistoryThumbnail,
     HistoryViewModel,

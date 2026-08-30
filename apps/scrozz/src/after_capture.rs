@@ -659,9 +659,18 @@ pub const fn current_availability(
         (MediaKind::Recording, AfterCaptureAction::PinToScreen) => ActionAvailability::unavailable(
             "Pin to Screen holds a still image and does not apply to a recording.",
         ),
-        (_, AfterCaptureAction::UploadAndCopyLink) => ActionAvailability::unavailable(
-            "No cloud upload provider is implemented or configured in this build.",
-        ),
+        // Sharing itself is wired: the card's Upload control runs it on a
+        // worker of its own. What is *not* wired is doing it here, and the
+        // reason is the shutter. After Capture actions run on the capture
+        // worker, so an upload here would hold the next screenshot behind a
+        // remote host for as long as it takes to answer.
+        (_, AfterCaptureAction::UploadAndCopyLink) => {
+            ActionAvailability::unavailable(if cfg!(feature = "cloud") {
+                "Uploading here would hold the shutter open on a remote host. Press Upload on the card instead: it runs on its own worker and copies the link when it lands."
+            } else {
+                "Private sharing is not compiled into this build, so no provider can be reached."
+            })
+        }
         (
             MediaKind::Screenshot,
             AfterCaptureAction::ShowRecentCapturesOverlay

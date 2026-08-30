@@ -18,13 +18,24 @@ use crate::{
     },
     record::StoredRecord,
     schema,
+    sharing::{CaptureSharing, RemoteDeletionState, RemoteObjectStatus},
 };
 
 /// Columns every record query selects, in the order [`row_to_record`] reads.
-const RECORD_COLUMNS: &str = "id, created_at, media_kind, pinned, app_name, app_identifier, \
-     window_title, window_shadow, provenance, target_json, frame_json, video_json, image_hash, \
-     image_bytes, image_evicted_at, ocr_text, annotation_count, \
-     (SELECT pin_json FROM capture_pins WHERE capture_id = captures.id)";
+const RECORD_COLUMNS: &str = "captures.id, captures.created_at, captures.media_kind, \
+     captures.pinned, captures.app_name, captures.app_identifier, captures.window_title, \
+     captures.window_shadow, captures.provenance, captures.target_json, captures.frame_json, \
+     captures.video_json, captures.image_hash, captures.image_bytes, captures.image_evicted_at, \
+     captures.ocr_text, captures.annotation_count, \
+     (SELECT pin_json FROM capture_pins WHERE capture_pins.capture_id = captures.id), \
+     capture_shares.sharing_json";
+
+/// The table expression [`RECORD_COLUMNS`] is selected from.
+///
+/// A left join rather than another correlated subquery because sharing is read
+/// on every history page; a capture that was never shared simply yields NULL.
+const RECORD_SOURCE: &str =
+    "captures LEFT JOIN capture_shares ON capture_shares.capture_id = captures.id";
 
 /// Records that the one-time legacy sidecar/cache comparison has completed.
 const PIN_CACHE_BOOTSTRAP_KEY: &str = "pin_cache_sidecars_v1";
@@ -415,6 +426,43 @@ pub trait History: Store {
     ///
     /// Returns [`Error::Storage`] if the capture is unknown or the write fails.
     fn set_ocr_text(&mut self, id: &CaptureId, text: Option<&str>) -> Result<()>;
+
+    /// Reads the capture's sharing metadata, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture or metadata cannot be read.
+    fn share_metadata(&self, id: &CaptureId) -> Result<Option<CaptureSharing>>;
+
+    /// Replaces the capture's sharing metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture is unknown or the write fails,
+    /// or [`Error::InvalidRequest`] if the metadata is unsafe to persist.
+    fn set_share_metadata(&mut self, id: &CaptureId, sharing: Option<CaptureSharing>)
+    -> Result<()>;
+
+    /// Updates only the remote-object status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture has no sharing metadata or the
+    /// write fails.
+    fn set_share_remote_status(&mut self, id: &CaptureId, status: RemoteObjectStatus)
+    -> Result<()>;
+
+    /// Updates only the remote deletion state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the capture has no sharing metadata or the
+    /// write fails.
+    fn set_share_deletion_state(
+        &mut self,
+        id: &CaptureId,
+        deletion: RemoteDeletionState,
+    ) -> Result<()>;
 
     /// Bytes of source imagery currently on disk.
     ///
@@ -1134,7 +1182,7 @@ impl History for SqliteStore {
     fn record(&self, id: &CaptureId) -> Result<Option<CaptureRecord>> {
         self.conn
             .query_row(
-                &format!("SELECT {RECORD_COLUMNS} FROM captures WHERE id = ?1"),
+                &format!("SELECT {RECORD_COLUMNS} FROM {RECORD_SOURCE} WHERE captures.id = ?1"),
                 params![id.0],
                 |row| Ok(row_to_record(row)),
             )
@@ -1333,6 +1381,34 @@ impl History for SqliteStore {
             record.ocr_text = text.map(ToOwned::to_owned);
             Ok(())
         })
+    }
+
+    fn share_metadata(&self, id: &CaptureId) -> Result<Option<CaptureSharing>> {
+        Ok(self.record(id)?.and_then(|record| record.sharing))
+    }
+
+    fn set_share_metadata(
+        &mut self,
+        id: &CaptureId,
+        sharing: Option<CaptureSharing>,
+    ) -> Result<()> {
+        self.update_record(id, |record| record.set_sharing(sharing))
+    }
+
+    fn set_share_remote_status(
+        &mut self,
+        id: &CaptureId,
+        status: RemoteObjectStatus,
+    ) -> Result<()> {
+        self.update_record(id, |record| record.set_remote_status(status))
+    }
+
+    fn set_share_deletion_state(
+        &mut self,
+        id: &CaptureId,
+        deletion: RemoteDeletionState,
+    ) -> Result<()> {
+        self.update_record(id, |record| record.set_deletion(deletion))
     }
 
     fn stored_image_bytes(&self) -> Result<u64> {
@@ -1679,6 +1755,7 @@ fn upsert_record(conn: &Connection, record: &StoredRecord) -> Result<()> {
     )
     .map_err(store_err("cannot write capture row"))?;
     cache_screen_pin(conn, &CaptureId(record.id.clone()), pin_json.as_deref())?;
+    sync_share_row(conn, &CaptureId(record.id.clone()), record.sharing.as_ref())?;
     Ok(())
 }
 
@@ -1859,6 +1936,32 @@ fn finish_committed_index_marker(layout: &StoreLayout, marker: Option<&Path>) {
     }
 }
 
+fn sync_share_row(
+    conn: &Connection,
+    id: &CaptureId,
+    sharing: Option<&CaptureSharing>,
+) -> Result<usize> {
+    match sharing {
+        Some(sharing) => {
+            sharing.validate_for_storage()?;
+            let sharing_json = serde_json::to_string(sharing)
+                .map_err(|e| Error::Storage(format!("cannot serialise sharing metadata: {e}")))?;
+            conn.execute(
+                "INSERT INTO capture_shares (capture_id, sharing_json) VALUES (?1, ?2)
+                 ON CONFLICT (capture_id) DO UPDATE SET sharing_json = excluded.sharing_json",
+                params![id.0, sharing_json],
+            )
+            .map_err(store_err("cannot write sharing metadata"))
+        }
+        None => conn
+            .execute(
+                "DELETE FROM capture_shares WHERE capture_id = ?1",
+                params![id.0],
+            )
+            .map_err(store_err("cannot clear sharing metadata")),
+    }
+}
+
 fn drop_rows_without_records(conn: &Connection, keep: &[String]) -> Result<usize> {
     let existing: Vec<String> = {
         let mut stmt = conn
@@ -1917,11 +2020,14 @@ fn like_pattern(needle: &str) -> String {
 }
 
 fn build_search(query: &SearchQuery) -> (String, Vec<Box<dyn ToSql>>) {
-    let mut sql = format!("SELECT {RECORD_COLUMNS} FROM captures WHERE 1 = 1");
+    let mut sql = format!("SELECT {RECORD_COLUMNS} FROM {RECORD_SOURCE} WHERE 1 = 1");
     let mut args: Vec<Box<dyn ToSql>> = Vec::new();
+    // Every filtered column lives on `captures` alone, so the same unqualified
+    // predicates are valid against the joined source here and the plain table
+    // `build_count` uses.
     push_search_filters(query, &mut sql, &mut args);
 
-    sql.push_str(" ORDER BY created_at DESC, id DESC");
+    sql.push_str(" ORDER BY captures.created_at DESC, captures.id DESC");
     args.push(Box::new(i64::from(query.page.limit)));
     sql.push_str(&format!(" LIMIT ?{}", args.len()));
     args.push(Box::new(i64::from(query.page.offset)));
@@ -1996,6 +2102,7 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     let ocr_text: Option<String> = get(row, 15)?;
     let annotation_count: i64 = get(row, 16)?;
     let pin_json: Option<String> = get(row, 17)?;
+    let sharing_json: Option<String> = get(row, 18)?;
 
     let target: TargetRepr = serde_json::from_str(&target_json)
         .map_err(|e| Error::Storage(format!("cannot read target for {id}: {e}")))?;
@@ -2037,7 +2144,7 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
     };
 
     Ok(CaptureRecord {
-        id: CaptureId(id),
+        id: CaptureId(id.clone()),
         created_at: Timestamp(created_at),
         media_kind: MediaKind::from_token(&media_kind).map_err(|_| {
             Error::Storage(format!(
@@ -2057,6 +2164,13 @@ fn row_to_record(row: &Row<'_>) -> Result<CaptureRecord> {
         image,
         ocr_text,
         annotation_count: usize::try_from(annotation_count).unwrap_or(0),
+        sharing: sharing_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    Error::Storage(format!("cannot read sharing metadata for {id}: {e}"))
+                })
+            })
+            .transpose()?,
     })
 }
 

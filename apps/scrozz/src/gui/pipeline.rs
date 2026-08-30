@@ -64,8 +64,9 @@ use scrozz_core::{
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage};
 use scrozz_shell::{DragPayload, DragPreview, byte_source};
 use scrozz_store::{
-    CaptureId, CaptureRecord, DocumentState, FrameHeader, History, ImageState, NewCapture, Page,
-    RetentionPolicy, SearchQuery, SqliteStore, Store,
+    CaptureId, CaptureRecord, CaptureSharing, DocumentState, FrameHeader, History, ImageState,
+    NewCapture, Page, RemoteObjectId, RetentionPolicy, SearchQuery, ShareProvider, ShareTag,
+    ShareUrl, SharedMediaKind, SqliteStore, Store, Timestamp,
 };
 use scrozz_ui::editor::RevisionedFrame;
 use scrozz_ui::history::{HistoryEntry, HistoryPage, HistoryThumbnail};
@@ -180,7 +181,7 @@ impl HistoryOperation {
 
 /// Work posted to the capture thread.
 #[derive(Debug)]
-pub enum Job {
+pub(crate) enum Job {
     /// Take a capture and turn it into a card.
     Capture {
         /// What to capture.
@@ -342,6 +343,41 @@ pub enum Job {
     ///
     /// The worker also applies this policy after every future capture.
     EnforceRetention(RetentionPolicy),
+    /// Upload a card's untouched capture and copy the returned link.
+    Upload(CardId),
+    /// Upload an already-rendered editor revision instead of the original.
+    ///
+    /// The counterpart of [`Job::CopyImage`] and [`Job::SaveImage`], and it
+    /// exists for the same reason: an edited card must never fall back to the
+    /// pixels a destructive redaction removed.
+    UploadImage {
+        /// Which card the image came from.
+        card: CardId,
+        /// Editor lifetime that produced the render.
+        generation: u64,
+        /// The flattened image and the exact document revision it represents.
+        rendered: Box<RevisionedFrame>,
+    },
+    /// Upload the durable media a recording card is showing.
+    UploadRecording {
+        /// Card the recording belongs to.
+        card: CardId,
+        /// Durable history identity, when the recording was remembered.
+        capture: Option<CaptureId>,
+        /// Canonical file written by the recorder or the video editor.
+        path: std::path::PathBuf,
+        /// IANA type matching the durable file and codec.
+        content_type: String,
+        /// Safe file name for the remote object.
+        file_name: String,
+    },
+    /// Persist successful remote metadata on the store-owning worker.
+    RememberShare {
+        /// Durable capture the share belongs to.
+        capture_id: CaptureId,
+        /// Secret-free remote metadata.
+        sharing: RememberedShare,
+    },
     /// Forget a card's cached bytes. The card itself is the surface's business.
     Release(CardId),
     /// Release live bytes only if durable history still owns the source pixels.
@@ -450,6 +486,82 @@ impl PendingPinUpdates {
     }
 }
 
+/// Secret-safe handoff from the upload worker to history.
+#[derive(Clone)]
+pub(crate) struct RememberedShare {
+    url: String,
+    key: String,
+    provider: &'static str,
+    expires_at: Option<SystemTime>,
+    encrypted: bool,
+    tags: Vec<(String, String)>,
+    media_kind: crate::cloud::ArtifactKind,
+}
+
+impl std::fmt::Debug for RememberedShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RememberedShare")
+            .field("url", &"[BEARER URL REDACTED]")
+            .field("key", &self.key)
+            .field("provider", &self.provider)
+            .field("expires_at", &self.expires_at)
+            .field("encrypted", &self.encrypted)
+            .field("tags", &self.tags)
+            .field("media_kind", &self.media_kind)
+            .finish()
+    }
+}
+
+impl RememberedShare {
+    fn from_shared(shared: &crate::cloud::Shared) -> Self {
+        Self {
+            url: shared.url.clone(),
+            key: shared.key.clone(),
+            provider: shared.provider,
+            expires_at: shared.expires_at,
+            encrypted: shared.encrypted,
+            tags: shared.tags.clone(),
+            media_kind: shared.media_kind,
+        }
+    }
+
+    fn into_history(self) -> scrozz_core::Result<CaptureSharing> {
+        let provider = match self.provider {
+            "aws" => ShareProvider::Aws,
+            "r2" => ShareProvider::R2,
+            "b2" => ShareProvider::B2,
+            "minio" => ShareProvider::Minio,
+            other => ShareProvider::Unknown(other.to_owned()),
+        };
+        let media_kind = if self.encrypted {
+            SharedMediaKind::ViewerPage
+        } else {
+            match self.media_kind {
+                crate::cloud::ArtifactKind::Screenshot => SharedMediaKind::Image,
+                crate::cloud::ArtifactKind::Recording => {
+                    SharedMediaKind::Unknown("video".to_owned())
+                }
+            }
+        };
+        let mut sharing = CaptureSharing::new(
+            ShareUrl::new(self.url)?,
+            provider,
+            RemoteObjectId::new(self.key)?,
+            media_kind,
+        )
+        .tagged(
+            self.tags
+                .into_iter()
+                .map(|(key, value)| ShareTag::new(key, value))
+                .collect::<scrozz_core::Result<Vec<_>>>()?,
+        );
+        if let Some(expires_at) = self.expires_at {
+            sharing = sharing.expiring_at(Timestamp::from_system_time(expires_at));
+        }
+        Ok(sharing)
+    }
+}
+
 /// What the capture thread produced.
 #[derive(Debug)]
 pub enum Outcome {
@@ -518,6 +630,13 @@ pub enum Outcome {
         origin: CaptureOrigin,
         /// Why it will not arrive.
         error: CliError,
+    },
+    /// A slower card action was accepted by its dedicated worker.
+    Started {
+        /// Which card.
+        card: CardId,
+        /// What began.
+        detail: String,
     },
     /// A card action completed, with a phrase for the log.
     Done {
@@ -636,9 +755,12 @@ pub struct Pipeline {
     jobs: Sender<Job>,
     pending_pin_updates: Arc<PendingPinUpdates>,
     history_queries: Sender<HistoryQuery>,
+    uploads: Sender<UploadJob>,
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
     history_worker: Option<JoinHandle<()>>,
+    upload_worker: Option<JoinHandle<()>>,
+    upload_cancellation: crate::cloud::ShareCancellation,
     next_card: u64,
     vault: CaptureVault,
 }
@@ -700,6 +822,7 @@ impl Pipeline {
     ) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
         let (history_queries, history_rx) = channel();
+        let (uploads, upload_rx) = channel();
         let (outcome_tx, outcomes) = channel();
         let vault = CaptureVault::new();
         let worker_vault = vault.clone();
@@ -707,12 +830,34 @@ impl Pipeline {
         let worker_pin_updates = Arc::clone(&pending_pin_updates);
         let history_outcomes = outcome_tx.clone();
         let history_waker = waker.clone();
+        let upload_cancellation = crate::cloud::ShareCancellation::default();
+        let upload_cancel = upload_cancellation.clone();
+        let upload_outcomes = outcome_tx.clone();
+        let upload_history = jobs.clone();
 
-        let worker = std::thread::Builder::new()
+        // Uploading is the one job that can block on a remote host for minutes,
+        // so it gets a worker of its own: a stalled or failing share must never
+        // hold up the shutter, the clipboard, or a history read. It is started
+        // first and stopped last, because it is the only worker that posts work
+        // back to the store-owning capture worker.
+        let upload_worker = std::thread::Builder::new()
+            .name("scrozz-upload".to_owned())
+            .spawn(move || {
+                UploadWorker::new(upload_outcomes, upload_cancel, upload_history).run(&upload_rx);
+            })
+            .map_err(|err| {
+                CliError::Core(CoreError::Platform(format!(
+                    "could not start the upload worker: {err}"
+                )))
+            })?;
+
+        let capture_uploads = uploads.clone();
+        let worker = match std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
             .spawn(move || {
                 Worker::new(
                     outcome_tx,
+                    capture_uploads,
                     selector,
                     worker_vault,
                     history_enabled,
@@ -720,12 +865,18 @@ impl Pipeline {
                     retention_policy,
                 )
                 .run(&job_rx, &worker_pin_updates);
-            })
-            .map_err(|err| {
-                CliError::Core(CoreError::Platform(format!(
+            }) {
+            Ok(worker) => worker,
+            Err(err) => {
+                upload_cancellation.cancel();
+                let _ = uploads.send(UploadJob::Stop);
+                let _ = upload_worker.join();
+                return Err(CliError::Core(CoreError::Platform(format!(
                     "could not start the capture worker: {err}"
-                )))
-            })?;
+                ))));
+            }
+        };
+
         let history_worker = match std::thread::Builder::new()
             .name("scrozz-history".to_owned())
             .spawn(move || {
@@ -734,6 +885,9 @@ impl Pipeline {
             }) {
             Ok(worker) => worker,
             Err(err) => {
+                upload_cancellation.cancel();
+                let _ = uploads.send(UploadJob::Stop);
+                let _ = upload_worker.join();
                 let _ = jobs.send(Job::Stop);
                 let _ = worker.join();
                 return Err(CliError::Core(CoreError::Platform(format!(
@@ -746,9 +900,12 @@ impl Pipeline {
             jobs,
             pending_pin_updates,
             history_queries,
+            uploads,
             outcomes,
             worker: Some(worker),
             history_worker: Some(history_worker),
+            upload_worker: Some(upload_worker),
+            upload_cancellation,
             next_card: 1,
             vault,
         })
@@ -897,11 +1054,21 @@ impl Pipeline {
     /// Called from `Drop`, but exposed so a host can shut down deterministically
     /// rather than at an unspecified point during teardown.
     pub fn stop(&mut self) {
+        // The upload worker can still post work to the store-owning capture
+        // worker, so it is drained first and the capture worker is stopped only
+        // once no further jobs can arrive from it.
+        self.upload_cancellation.cancel();
+        let _ = self.uploads.send(UploadJob::Stop);
+        if let Some(worker) = self.upload_worker.take() {
+            let _ = worker.join();
+        }
+        // The upload worker can enqueue a final history update. Stop the
+        // store-owning worker only after uploads are fully drained.
         let _ = self.jobs.send(Job::Stop);
-        let _ = self.history_queries.send(HistoryQuery::Stop);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        let _ = self.history_queries.send(HistoryQuery::Stop);
         if let Some(worker) = self.history_worker.take() {
             let _ = worker.join();
         }
@@ -975,8 +1142,13 @@ impl ActionExecutor<FinalizedScreenshot<'_>> for ScreenshotExecutor<'_> {
                     .map(ActionEffect::Saved)
                     .map_err(|error| error.to_string())
             }
+            // Kept in step with `current_availability`: this executor runs on
+            // the capture worker, and the upload worker exists precisely so a
+            // slow provider cannot delay the next capture.
             AfterCaptureAction::UploadAndCopyLink => Err(
-                "no cloud upload provider is implemented or configured in this build".to_owned(),
+                "uploading during After Capture would hold the capture worker on a remote host; \
+                 press Upload on the card instead"
+                    .to_owned(),
             ),
             AfterCaptureAction::ShowRecentCapturesOverlay => {
                 Ok(ActionEffect::ShowRecentCapturesOverlay)
@@ -1170,6 +1342,7 @@ impl CaptureVault {
 
 struct Worker {
     outcomes: Sender<Outcome>,
+    uploads: Sender<UploadJob>,
     waker: Option<SurfaceWaker>,
     selector: Arc<dyn CaptureSelector>,
     store: Option<SqliteStore>,
@@ -1217,6 +1390,7 @@ impl Drop for CaptureLifecycle {
 impl Worker {
     fn new(
         outcomes: Sender<Outcome>,
+        uploads: Sender<UploadJob>,
         selector: Arc<dyn CaptureSelector>,
         vault: CaptureVault,
         history_enabled: bool,
@@ -1245,6 +1419,7 @@ impl Worker {
 
         let mut worker = Self {
             outcomes,
+            uploads,
             waker,
             selector,
             store,
@@ -1317,9 +1492,27 @@ impl Worker {
                 } => self.save_image_to(card, &rendered, &path),
                 Job::Save(card) => self.save(card),
                 Job::SaveTo { card, path } => self.save_to(card, &path),
+                Job::Upload(card) => self.upload(card),
+                Job::UploadImage {
+                    card,
+                    generation,
+                    rendered,
+                } => self.upload_image(card, generation, &rendered),
+                Job::UploadRecording {
+                    card,
+                    capture,
+                    path,
+                    content_type,
+                    file_name,
+                } => self.upload_recording(card, capture, &path, content_type, file_name),
+                Job::RememberShare {
+                    capture_id,
+                    sharing,
+                } => self.remember_share(&capture_id, sharing),
                 Job::Release(card) => {
                     self.vault.forget(card);
                     self.derived_documents.remove(&card);
+                    let _ = self.uploads.send(UploadJob::Release(card));
                 }
                 Job::ReleaseIfRetained { card, capture } => {
                     let released = self
@@ -1678,6 +1871,8 @@ impl Worker {
                 // one here made Save create a duplicate a few seconds later.
                 written,
                 taken_at: SystemTime::now(),
+                upload_available: false,
+                upload_unavailable_reason: None,
             },
             actions,
             retained_elsewhere,
@@ -2061,6 +2256,141 @@ impl Worker {
         self.answer(card, result);
     }
 
+    /// Hands the card's *current* bytes to the upload worker.
+    ///
+    /// Nothing about the remote host is touched here: this worker owns the
+    /// store connection and the shutter path, so all it does is copy an `Arc`
+    /// into a channel. The revision travelling with the bytes is the vault's
+    /// own, so a share can never be attributed to a revision the user did not
+    /// approve — see [`CaptureBytes`].
+    fn upload(&mut self, card: CardId) {
+        let result = self.cached_entry(card, "upload").and_then(|cached| {
+            let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
+                cached.bytes.full.as_ref().clone(),
+                format!("Screenshot-{}.png", card.0),
+            )?;
+            self.queue_upload(
+                card,
+                cached.capture_id.clone(),
+                ShareVersion::of(&cached.bytes),
+                artifact,
+            )
+        });
+        self.answer_upload(card, result);
+    }
+
+    /// Uploads the exact revision an open editor produced, never the original.
+    ///
+    /// The revision travels with the bytes, so a share can only ever be
+    /// attributed to the pixels the user approved — the same rule Copy, Save
+    /// and drag already follow for a destructively redacted document.
+    fn upload_image(&mut self, card: CardId, generation: u64, rendered: &RevisionedFrame) {
+        let capture_id = self.vault.cached(card).and_then(|cached| cached.capture_id);
+        let result = FrameEncoder::new()
+            .encode(rendered.frame(), ImageFormat::Png)
+            .map_err(CliError::from)
+            .and_then(|png| {
+                crate::cloud::FinalizedArtifact::screenshot_png(
+                    png,
+                    format!("Screenshot-{}.png", card.0),
+                )
+            })
+            .and_then(|artifact| {
+                self.queue_upload(
+                    card,
+                    capture_id,
+                    ShareVersion {
+                        generation: Some(generation),
+                        revision: rendered.revision(),
+                    },
+                    artifact,
+                )
+            });
+        self.answer_upload(card, result);
+    }
+
+    /// Uploads a durable recording a card is showing.
+    ///
+    /// The file is read here rather than on the main thread: a screen recording
+    /// is tens of megabytes, and the frame that reads it is the frame that drops.
+    fn upload_recording(
+        &mut self,
+        card: CardId,
+        capture: Option<CaptureId>,
+        path: &std::path::Path,
+        content_type: String,
+        file_name: String,
+    ) {
+        let result = std::fs::read(path)
+            .map_err(|error| {
+                CliError::Core(CoreError::Platform(format!(
+                    "could not read {} to upload it: {error}",
+                    path.display()
+                )))
+            })
+            .and_then(|bytes| {
+                crate::cloud::FinalizedArtifact::recording(bytes, content_type, file_name)
+            })
+            .and_then(|artifact| {
+                // A finished recording's durable file is immutable for the
+                // lifetime of its card, so it is always revision zero.
+                self.queue_upload(card, capture, ShareVersion::original(), artifact)
+            });
+        self.answer_upload(card, result);
+    }
+
+    fn queue_upload(
+        &self,
+        card: CardId,
+        capture_id: Option<CaptureId>,
+        version: ShareVersion,
+        artifact: crate::cloud::FinalizedArtifact,
+    ) -> CliResult<()> {
+        self.uploads
+            .send(UploadJob::Share {
+                card,
+                capture_id,
+                version,
+                artifact,
+            })
+            .map_err(|_| {
+                CliError::Core(CoreError::Platform("the upload worker has gone".to_owned()))
+            })
+    }
+
+    /// Reports whether the upload reached its worker.
+    ///
+    /// A refusal here is [`Outcome::Refused`] rather than
+    /// [`Outcome::OutputRefused`] so the card shows the reason: the user
+    /// pressed Upload and is watching that card for an answer.
+    fn answer_upload(&mut self, card: CardId, result: CliResult<()>) {
+        let outcome = match result {
+            Ok(()) => Outcome::Started {
+                card,
+                detail: "upload queued".to_owned(),
+            },
+            Err(error) => Outcome::Refused { card, error },
+        };
+        let _ = self.outcomes.send(outcome);
+    }
+
+    /// Attaches secret-free remote metadata to the capture's history row.
+    ///
+    /// Runs here because this worker owns the store connection. A failure is a
+    /// warning, not a refusal: the share itself already succeeded, and losing
+    /// its bookkeeping must not read to the user as a failed upload.
+    fn remember_share(&mut self, capture_id: &CaptureId, sharing: RememberedShare) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        let result = sharing
+            .into_history()
+            .and_then(|sharing| store.set_share_metadata(capture_id, Some(sharing)));
+        if let Err(error) = result {
+            tracing::warn!(capture = %capture_id.0, "could not attach share metadata to history: {error}");
+        }
+    }
+
     fn cached(&self, card: CardId, verb: &str) -> CliResult<CaptureBytes> {
         self.vault
             .get(card)
@@ -2083,6 +2413,8 @@ impl Worker {
                 scale: rendered.frame.scale.get(),
                 thumbnail,
                 written: Vec::new(),
+                upload_available: false,
+                upload_unavailable_reason: None,
                 taken_at: rendered.record.created_at.to_system_time(),
             };
             self.vault.store(
@@ -2986,6 +3318,175 @@ fn history_image_evicted(capture: &CaptureId) -> CliError {
     )))
 }
 
+/// The exact revision a share was made from.
+///
+/// Taken straight from the vault's [`CaptureBytes`] or the editor's
+/// [`RevisionedFrame`] rather than counted separately here: one authority for
+/// "which pixels is this" means a cached link can never be handed out for a
+/// revision the user has since replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShareVersion {
+    generation: Option<u64>,
+    revision: u64,
+}
+
+impl ShareVersion {
+    const fn original() -> Self {
+        Self {
+            generation: None,
+            revision: 0,
+        }
+    }
+
+    const fn of(bytes: &CaptureBytes) -> Self {
+        Self {
+            generation: bytes.generation(),
+            revision: bytes.revision(),
+        }
+    }
+}
+
+enum UploadJob {
+    Share {
+        card: CardId,
+        capture_id: Option<CaptureId>,
+        version: ShareVersion,
+        artifact: crate::cloud::FinalizedArtifact,
+    },
+    Release(CardId),
+    Stop,
+}
+
+struct UploadWorker {
+    outcomes: Sender<Outcome>,
+    cancellation: crate::cloud::ShareCancellation,
+    history: Sender<Job>,
+    links: HashMap<CardId, CachedShare>,
+}
+
+struct CachedShare {
+    shared: crate::cloud::Shared,
+    expires_at: Option<SystemTime>,
+    /// Editor lifetime and document revision the remote object was made from.
+    ///
+    /// Reusing a link is only safe while it still points at the pixels on the
+    /// card. A destructive redaction bumps the revision, so comparing this
+    /// against the incoming artifact is what stops a second Upload from handing
+    /// out a link to the *previous* revision.
+    version: ShareVersion,
+}
+
+impl CachedShare {
+    fn new(shared: crate::cloud::Shared, version: ShareVersion) -> Self {
+        let expires_at = shared.expires_at;
+        Self {
+            shared,
+            expires_at,
+            version,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| SystemTime::now() >= expires_at)
+    }
+}
+
+impl UploadWorker {
+    fn new(
+        outcomes: Sender<Outcome>,
+        cancellation: crate::cloud::ShareCancellation,
+        history: Sender<Job>,
+    ) -> Self {
+        Self {
+            outcomes,
+            cancellation,
+            history,
+            links: HashMap::new(),
+        }
+    }
+
+    fn run(mut self, jobs: &Receiver<UploadJob>) {
+        while let Ok(job) = jobs.recv() {
+            match job {
+                UploadJob::Share {
+                    card,
+                    capture_id,
+                    version,
+                    artifact,
+                } => {
+                    if self.cancellation.is_cancelled() {
+                        break;
+                    }
+                    self.upload(card, capture_id, version, &artifact);
+                }
+                UploadJob::Release(card) => {
+                    self.links.remove(&card);
+                }
+                UploadJob::Stop => break,
+            }
+        }
+        tracing::debug!("upload worker stopped");
+    }
+
+    fn upload(
+        &mut self,
+        card: CardId,
+        capture_id: Option<CaptureId>,
+        version: ShareVersion,
+        artifact: &crate::cloud::FinalizedArtifact,
+    ) {
+        if self
+            .links
+            .get(&card)
+            .is_some_and(|shared| shared.is_expired() || shared.version != version)
+        {
+            self.links.remove(&card);
+        }
+        if !self.links.contains_key(&card) {
+            match crate::cloud::share_artifact(artifact, card.0, &self.cancellation) {
+                Ok(shared) => {
+                    if let Some(capture_id) = capture_id {
+                        let _ = self.history.send(Job::RememberShare {
+                            capture_id,
+                            sharing: RememberedShare::from_shared(&shared),
+                        });
+                    }
+                    self.links.insert(card, CachedShare::new(shared, version));
+                }
+                Err(error) => {
+                    let _ = self.outcomes.send(Outcome::Refused { card, error });
+                    return;
+                }
+            }
+        }
+        let Some(shared) = self.links.get(&card) else {
+            let _ = self.outcomes.send(Outcome::Refused {
+                card,
+                error: CliError::Core(CoreError::Platform(
+                    "the upload completed without a retained share link".to_owned(),
+                )),
+            });
+            return;
+        };
+        let outcome = match scrozz_export::SystemClipboard::new().write_text(&shared.shared.url) {
+            Ok(()) => Outcome::Done {
+                card,
+                detail: "uploaded and copied the private share link".to_owned(),
+            },
+            Err(error) => Outcome::Refused {
+                card,
+                error: CliError::Core(CoreError::Platform(format!(
+                    "the upload succeeded, but its link could not be copied: {error}. \
+                     Press Upload again to retry the clipboard; Scrozz reuses the object while \
+                     its signed URL remains valid"
+                ))),
+            },
+        };
+        let _ = self.outcomes.send(outcome);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -3031,11 +3532,22 @@ mod tests {
     /// The real cache is filled by an actual capture, which a unit test has no
     /// way to perform, so the reconstruction path is exercised directly.
     fn worker_holding(card: CardId, cached: Cached) -> (Worker, Receiver<Outcome>) {
+        let (worker, inbox, _uploads) = worker_holding_with_uploads(card, cached);
+        (worker, inbox)
+    }
+
+    /// The same worker, with the upload channel kept so a test can read it.
+    fn worker_holding_with_uploads(
+        card: CardId,
+        cached: Cached,
+    ) -> (Worker, Receiver<Outcome>, Receiver<UploadJob>) {
         let (outcomes, inbox) = std::sync::mpsc::channel();
+        let (uploads, upload_inbox) = std::sync::mpsc::channel();
         let vault = CaptureVault::new();
         vault.store(card, cached);
         let worker = Worker {
             outcomes,
+            uploads,
             waker: None,
             selector: Arc::new(RefusingSelector),
             store: None,
@@ -3045,7 +3557,7 @@ mod tests {
             derived_documents: HashMap::new(),
             analysis_cache: Arc::new(Mutex::new(HashMap::new())),
         };
-        (worker, inbox)
+        (worker, inbox, upload_inbox)
     }
 
     fn one_pixel_png() -> Vec<u8> {
@@ -3351,6 +3863,7 @@ mod tests {
             dir,
             Worker {
                 outcomes,
+                uploads: channel().0,
                 waker: None,
                 selector: Arc::new(RefusingSelector),
                 store: Some(store),
@@ -4162,6 +4675,32 @@ mod tests {
     }
 
     #[test]
+    fn cached_share_expiry_is_enforced_before_clipboard_retry() {
+        let expiring = CachedShare {
+            shared: crate::cloud::Shared {
+                url: "https://example.test/private".to_owned(),
+                key: "capture.png".to_owned(),
+                provider: "aws",
+                expires_seconds: Some(1),
+                expires_at: Some(std::time::UNIX_EPOCH),
+                lifecycle_rule: None,
+                encrypted: false,
+                tags: Vec::new(),
+                media_kind: crate::cloud::ArtifactKind::Screenshot,
+            },
+            expires_at: Some(std::time::UNIX_EPOCH),
+            version: ShareVersion::original(),
+        };
+        assert!(expiring.is_expired());
+
+        let public = CachedShare {
+            expires_at: None,
+            ..expiring
+        };
+        assert!(!public.is_expired());
+    }
+
+    #[test]
     fn a_pipeline_stops_cleanly_and_twice_is_harmless() {
         // Drop also stops it, so the second call must be a no-op rather than a
         // join on an already-joined handle.
@@ -4196,6 +4735,68 @@ mod tests {
     }
 
     #[test]
+    fn uploading_a_card_that_was_never_captured_is_refused_too() {
+        let pipeline = start_pipeline();
+        assert!(pipeline.post(Job::Upload(CardId(8))));
+
+        match wait_for(&pipeline) {
+            Some(Outcome::Refused { card, .. }) => assert_eq!(card, CardId(8)),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upload_is_forwarded_without_running_network_work_on_the_capture_worker() {
+        // The capture worker owns the store connection and the shutter path, so
+        // the only thing an Upload may do on it is hand the bytes to a separate
+        // worker. The exact revision travels with them: a share must never be
+        // attributed to pixels the user did not approve.
+        let encoded = one_pixel_png();
+        let (mut worker, outcome_rx, upload_rx) = worker_holding_with_uploads(
+            CardId(9),
+            Cached {
+                bytes: CaptureBytes {
+                    generation: Some(4),
+                    revision: 7,
+                    full: Arc::new(encoded.clone()),
+                    preview: None,
+                },
+                editor_source: None,
+                rendered: None,
+                provenance: Provenance::Region,
+                target: CaptureTarget::AllDisplays,
+                scale: ScaleFactor::new(1.0),
+                color_space: ColorSpace::Srgb,
+                capture_id: None,
+            },
+        );
+
+        worker.upload(CardId(9));
+
+        let UploadJob::Share {
+            card,
+            artifact,
+            version,
+            ..
+        } = upload_rx.try_recv().unwrap()
+        else {
+            panic!("capture worker did not forward the upload")
+        };
+        assert_eq!(card, CardId(9));
+        assert_eq!(artifact.bytes(), encoded.as_slice());
+        assert_eq!(artifact.content_type(), "image/png");
+        assert_eq!(version.generation, Some(4));
+        assert_eq!(version.revision, 7);
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Ok(Outcome::Started {
+                card: CardId(9),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn releasing_an_unknown_card_is_harmless() {
         let pipeline = start_pipeline();
         assert!(pipeline.post(Job::Release(CardId(1))));
@@ -4210,6 +4811,7 @@ mod tests {
         let vault = CaptureVault::new();
         let mut worker = Worker {
             outcomes,
+            uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
             store: Some(store),
@@ -4260,6 +4862,7 @@ mod tests {
         let (outcomes, _outcome_rx) = channel();
         let mut worker = Worker {
             outcomes,
+            uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
             store: Some(store),
@@ -4297,6 +4900,7 @@ mod tests {
         let vault = CaptureVault::new();
         let mut worker = Worker {
             outcomes,
+            uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
             store: Some(store),
@@ -4384,6 +4988,7 @@ mod tests {
         );
         let mut worker = Worker {
             outcomes,
+            uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
             store: None,
@@ -4503,6 +5108,7 @@ mod tests {
         let capture = CaptureId("capture-generation".into());
         let mut worker = Worker {
             outcomes,
+            uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
             store: None,

@@ -28,8 +28,8 @@ use scrozz_shell::{
     native_surface_for_window,
 };
 use scrozz_ui::{
-    CameraSettingsAction, RecentCapturesOverlayHandle, Theme, camera_settings_viewport_builder,
-    camera_settings_viewport_id,
+    CameraSettingsAction, CloudSettingsWindow, RecentCapturesOverlayHandle, Theme,
+    camera_settings_viewport_builder, camera_settings_viewport_id,
     history::{WINDOW_TITLE as HISTORY_WINDOW_TITLE, viewport_builder, viewport_id},
     recent_captures_overlay::{
         PinSupport, PinTopology, RecentCapturesOverlayApp, RecentCapturesOverlayGeometry,
@@ -529,6 +529,7 @@ impl Host for Windowed {
                 Ok(Box::new(Driver {
                     app,
                     overlay,
+                    cloud_settings: CloudSettingsWindow::default(),
                     sink,
                     handle: reporting,
                     selection,
@@ -749,6 +750,8 @@ struct Editing {
 struct Driver {
     app: App,
     overlay: RecentCapturesOverlayApp,
+    /// The Sharing settings viewport, beside the aggregate's own Settings window.
+    cloud_settings: CloudSettingsWindow,
     sink: Arc<Mutex<Option<Report>>>,
     handle: RecentCapturesOverlayHandle,
     selection: ClientOverlayController,
@@ -1404,6 +1407,21 @@ impl Driver {
         }
     }
 
+    /// Draws the Sharing settings viewport and applies what it asks for.
+    ///
+    /// A viewport of its own rather than a pane inside the main Settings
+    /// window: it owns transient credential fields that are zeroized when it
+    /// closes, and those must not live for as long as the Settings window does.
+    fn show_cloud_settings(&mut self, ctx: &egui::Context) {
+        if !self.cloud_settings.is_open() {
+            return;
+        }
+        let model = self.app.cloud_settings().clone();
+        for event in self.cloud_settings.show(ctx, &model) {
+            self.app.apply_cloud_settings(event);
+        }
+    }
+
     fn show_settings(&mut self, ctx: &egui::Context) {
         let edits = self.settings.show(
             ctx,
@@ -1425,6 +1443,9 @@ impl Driver {
         self.app.edit_recording_settings(&edits.recording);
         if let Some(settings) = edits.recent_captures_overlay {
             self.app.edit_recent_captures_overlay(settings);
+        }
+        if edits.open_sharing {
+            self.app.request_sharing_settings();
         }
     }
 
@@ -1941,6 +1962,9 @@ impl eframe::App for Driver {
             }
         }
         self.announce_panel();
+        if self.app.take_sharing_settings_request() {
+            self.cloud_settings.open(self.app.cloud_settings());
+        }
         self.overlay.logic(ctx);
         if std::mem::take(&mut self.permission_resume_armed) {
             self.app.dispatch_permission_resume();
@@ -2092,6 +2116,7 @@ impl eframe::App for Driver {
         }
 
         self.show_settings(ui.ctx());
+        self.show_cloud_settings(ui.ctx());
         self.show_editor(ui.ctx());
         self.show_video_editor(ui.ctx());
         self.show_camera_settings(ui.ctx());

@@ -76,6 +76,10 @@ allow = [
     # --- Data, not code ---------------------------------------------------
     # Unicode character tables (`unicode-ident`).
     "Unicode-3.0",
+    # Mozilla's public root-certificate dataset (`webpki-roots`, reached by the
+    # rustls transport in cloud-enabled releases). CDLA-Permissive-2.0 permits
+    # redistribution and modification of the data without code-license terms.
+    "CDLA-Permissive-2.0",
     # Bundled default fonts inside egui's `epaint_default_fonts`. Both are
     # redistributable font licences and neither restricts the code they ship
     # alongside.

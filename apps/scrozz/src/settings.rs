@@ -13,11 +13,23 @@
 //! malformed state is an error rather than a reason to silently enable an
 //! input-monitoring feature.
 //!
+//! There is exactly **one** settings document. Private sharing does not add a
+//! second one: [`SettingsStore`] is a view over the same file, so a cloud
+//! write preserves the Recording, Camera, Recent Captures and After Capture
+//! sections beside it — and any section a future version adds. That document
+//! stores only validated, **non-secret** values; a credential-bearing key is
+//! refused rather than written, because secrets belong in the platform vault.
+//!
 //! # Naming
 //!
 //! `area.key-name`: a dotted area, hyphenated words. It matches the action slugs
 //! the hotkey commands already use, and it survives being a TOML table, a JSON
 //! object path and a command-line argument without being quoted.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 use crate::{
     after_capture::{AfterCaptureAction, AfterCaptureSettings, AfterCaptureStore, MediaKind},
@@ -35,7 +47,6 @@ use scrozz_record::{
     },
 };
 use scrozz_shell::ScreenshotSound;
-use std::path::PathBuf;
 
 /// Persisted opt-in transform resolved before screenshot consumers run.
 pub const APPLY_SMART_FRAME_AFTER_CAPTURE_KEY: &str = "after-capture.apply-smart-frame";
@@ -103,6 +114,11 @@ pub enum Kind {
     Accelerator,
     /// An RGB or RGBA hexadecimal color.
     Color,
+    /// Free text. Empty is permitted where it means "not configured".
+    Text {
+        /// Whether an empty value is meaningful.
+        allow_empty: bool,
+    },
 }
 
 impl Kind {
@@ -117,6 +133,7 @@ impl Kind {
             Self::Choice(_) => "choice",
             Self::Accelerator => "accelerator",
             Self::Color => "color",
+            Self::Text { .. } => "text",
         }
     }
 }
@@ -237,6 +254,13 @@ impl Setting {
                 }
             }
             Kind::Color => Rgba8::parse(value).map(|_| ()).map_err(CliError::Core),
+            Kind::Text { allow_empty } => {
+                if !allow_empty && value.trim().is_empty() {
+                    Err(CliError::usage(format!("{} cannot be empty", self.key)))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -931,6 +955,99 @@ pub const SETTINGS: &[Setting] = &[
         description: scrozz_core::product_copy::SHORTCUT_ALL_IN_ONE,
     },
     Setting {
+        key: "cloud.provider",
+        kind: Kind::Choice(&["aws", "r2", "b2", "minio"]),
+        default: "aws",
+        description: "S3-compatible provider preset used for private sharing.",
+    },
+    Setting {
+        key: "cloud.bucket",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Bucket name. Empty leaves sharing unconfigured.",
+    },
+    Setting {
+        key: "cloud.region",
+        kind: Kind::Text { allow_empty: false },
+        default: "us-east-1",
+        description: "Signature region. R2 always signs with auto; B2 requires its bucket region.",
+    },
+    Setting {
+        key: "cloud.endpoint",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Optional S3 API endpoint override; required for MinIO.",
+    },
+    Setting {
+        key: "cloud.account-id",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Cloudflare account id used to form the default R2 endpoint.",
+    },
+    Setting {
+        key: "cloud.prefix",
+        kind: Kind::Text { allow_empty: true },
+        default: "captures",
+        description: "Object-key prefix for uploaded captures.",
+    },
+    Setting {
+        key: "cloud.public-base-url",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Custom public origin or path used only for non-expiring links.",
+    },
+    Setting {
+        key: "cloud.url-policy",
+        kind: Kind::Choice(&["private-expiring", "public-base"]),
+        default: "private-expiring",
+        description: "Use provider-enforced expiring links or the configured public base URL.",
+    },
+    Setting {
+        key: "cloud.expiry-seconds",
+        kind: Kind::Int {
+            min: 0,
+            max: 604_800,
+        },
+        default: "86400",
+        description: "Presigned-link lifetime; zero means an already-public bucket or CDN.",
+    },
+    Setting {
+        key: "cloud.naming-template",
+        kind: Kind::Text { allow_empty: false },
+        default: "Screenshot-{timestamp}",
+        description: "Object name template; supports {timestamp}, {card}, and {kind}.",
+    },
+    Setting {
+        key: "cloud.tags",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Comma-separated key=value tags added to each uploaded object.",
+    },
+    Setting {
+        key: "cloud.protection-mode",
+        kind: Kind::Choice(&["none", "vault"]),
+        default: "none",
+        description: "Encrypt shares with the default password kept in the native credential vault.",
+    },
+    Setting {
+        key: "cloud.credential-command",
+        kind: Kind::Text { allow_empty: true },
+        default: "",
+        description: "Optional program whose stdout supplies the secret access key.",
+    },
+    Setting {
+        key: "cloud.viewer-title",
+        kind: Kind::Text { allow_empty: false },
+        default: "Scrozz share",
+        description: "Heading and browser title for encrypted share viewers.",
+    },
+    Setting {
+        key: "cloud.viewer-accent",
+        kind: Kind::Text { allow_empty: false },
+        default: "#7c3aed",
+        description: "Six-digit CSS accent color for encrypted share viewers.",
+    },
+    Setting {
         key: "hotkey.capture-region",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureRegion.default_accelerator_setting(),
@@ -1237,6 +1354,262 @@ fn screenshot_sound_from(selected: &str, custom: &str) -> CliResult<ScreenshotSo
     }
 }
 
+/// Effective settings as one read-only snapshot, plus the edits made to it.
+///
+/// A *view* over the single versioned document [`crate::after_capture`] owns,
+/// not a second file. That is the whole point: private sharing has to write
+/// `cloud.*` keys without disturbing the Recording, Camera, Recent Captures and
+/// After Capture state stored beside them, and re-serialising one authoritative
+/// document is the only way to guarantee that. Unknown keys and unknown root
+/// sections survive untouched because the underlying document preserves them.
+///
+/// Nothing secret is ever held here. [`StoredSettings::set`] refuses a
+/// credential-bearing key outright, and such a key is never read back, so a
+/// stray secret cannot be echoed by `scrozz settings get`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredSettings {
+    effective: BTreeMap<String, String>,
+    user_set: BTreeSet<String>,
+    pending: BTreeMap<String, String>,
+}
+
+impl Default for StoredSettings {
+    fn default() -> Self {
+        Self::from_resolved(&Shortcuts::default(), &AfterCaptureSettings::default())
+    }
+}
+
+impl StoredSettings {
+    /// Resolves every schema key against stored shortcuts and stored values.
+    fn from_resolved(shortcuts: &Shortcuts, persisted: &AfterCaptureSettings) -> Self {
+        let mut effective = BTreeMap::new();
+        let mut user_set = BTreeSet::new();
+        for setting in SETTINGS {
+            if credential_bearing_key(setting.key) {
+                continue;
+            }
+            let (value, _) = resolve(setting, shortcuts, persisted);
+            if user_chose(setting, shortcuts, persisted) {
+                user_set.insert(setting.key.to_owned());
+            }
+            effective.insert(setting.key.to_owned(), value);
+        }
+        Self {
+            effective,
+            user_set,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    /// Effective value, falling back to the schema default.
+    #[must_use]
+    pub fn value(&self, key: &str) -> Option<&str> {
+        self.effective.get(key).map(String::as_str)
+    }
+
+    /// Whether the user, rather than the schema, chose this key's value.
+    #[must_use]
+    pub fn is_user_set(&self, key: &str) -> bool {
+        self.user_set.contains(key)
+    }
+
+    /// Validates and changes one known, non-secret value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a usage error for an unknown key, a value the schema rejects, or
+    /// a credential-bearing key.
+    pub fn set(&mut self, key: &str, value: &str) -> CliResult<()> {
+        let setting = lookup(key)?;
+        if credential_bearing_key(setting.key) {
+            return Err(credential_refusal(setting.key));
+        }
+        setting.validate(value)?;
+        self.effective.insert(key.to_owned(), value.to_owned());
+        self.pending.insert(key.to_owned(), value.to_owned());
+        if value == setting.default {
+            self.user_set.remove(key);
+        } else {
+            self.user_set.insert(key.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Restores one key to its schema default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a usage error for an unknown key.
+    pub fn reset(&mut self, key: &str) -> CliResult<()> {
+        let setting = lookup(key)?;
+        self.set(key, setting.default)
+    }
+
+    /// The edits not yet written back to the document.
+    fn take_pending(&mut self) -> BTreeMap<String, String> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// Whether the user, rather than the schema, chose this key's current value.
+fn user_chose(setting: &Setting, shortcuts: &Shortcuts, persisted: &AfterCaptureSettings) -> bool {
+    match ShortcutAction::from_stored_key(setting.key) {
+        Some(action) => !shortcuts.is_default(action),
+        None => {
+            persisted.value(setting.key).is_some()
+                || persisted
+                    .value_for_key(setting.key)
+                    .is_some_and(|enabled| enabled.to_string() != setting.default)
+        }
+    }
+}
+
+/// Deliberately never echoes the value: a refusal that quotes the secret it
+/// refused is worse than no refusal at all.
+fn credential_refusal(key: &str) -> CliError {
+    CliError::usage(format!(
+        "credential-bearing field {key:?} is forbidden in settings; use the native vault"
+    ))
+}
+
+fn credential_bearing_key(key: &str) -> bool {
+    let key = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    ["accesskey", "secret", "sessiontoken", "password"]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+/// Reads and writes schema values inside the one versioned settings document.
+///
+/// Every write goes through [`AfterCaptureStore`], so it inherits that store's
+/// cross-process lock, atomic replacement, and unknown-field preservation
+/// rather than racing it from a second file.
+#[derive(Debug, Clone)]
+pub struct SettingsStore {
+    inner: AfterCaptureStore,
+}
+
+impl SettingsStore {
+    /// Uses an explicit document path.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: AfterCaptureStore::new(path),
+        }
+    }
+
+    /// Resolves the platform configuration path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when no configuration directory exists.
+    pub fn default_location() -> CliResult<Self> {
+        AfterCaptureStore::default_location()
+            .map(|inner| Self { inner })
+            .map_err(CliError::Core)
+    }
+
+    /// The document this store reads and writes.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    /// Loads the effective settings. An absent document means schema defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the document cannot be read or migrated.
+    pub fn load(&self) -> CliResult<StoredSettings> {
+        let profile = self.inner.inferred_profile();
+        let persisted = self.inner.load(profile).map_err(CliError::Core)?;
+        Ok(StoredSettings::from_resolved(
+            &stored_shortcuts(),
+            &persisted,
+        ))
+    }
+
+    /// Applies `change` and writes back only what it altered.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `change` refuses, or a storage error if the document
+    /// cannot be written.
+    pub fn update(
+        &self,
+        change: impl FnOnce(&mut StoredSettings) -> CliResult<()>,
+    ) -> CliResult<StoredSettings> {
+        let profile = self.inner.inferred_profile();
+        let mut view = self.load()?;
+        change(&mut view)?;
+        let pending = view.take_pending();
+        if pending.is_empty() {
+            return Ok(view);
+        }
+        // Only the deltas are applied, inside the store's own lock, so a
+        // concurrent writer's untouched sections are never clobbered by the
+        // stale snapshot read above.
+        let persisted = self
+            .inner
+            .update(profile, |latest| {
+                for (key, value) in &pending {
+                    if let Some((media, action)) = AfterCaptureSettings::resolve_key(key) {
+                        latest.set(media, action, value == "true");
+                    } else {
+                        latest.set_value(key.clone(), value.clone());
+                    }
+                }
+                Ok(())
+            })
+            .map_err(CliError::Core)?;
+        Ok(StoredSettings::from_resolved(
+            &stored_shortcuts(),
+            &persisted,
+        ))
+    }
+}
+
+/// Every effective setting as JSON.
+#[must_use]
+pub fn all_json_from(settings: &StoredSettings) -> Json {
+    Json::arr(SETTINGS.iter().filter_map(|setting| {
+        let value = settings.value(setting.key)?;
+        let source = if settings.is_user_set(setting.key) {
+            "user"
+        } else {
+            "default"
+        };
+        Some(setting.to_json_valued(value, source))
+    }))
+}
+
+/// Every effective setting as aligned text.
+#[must_use]
+pub fn all_human_from(settings: &StoredSettings) -> String {
+    let width = SETTINGS
+        .iter()
+        .map(|setting| setting.key.len())
+        .max()
+        .unwrap_or(0);
+    SETTINGS
+        .iter()
+        .filter_map(|setting| {
+            let value = settings.value(setting.key)?;
+            let shown = if value.is_empty() {
+                "(unassigned)"
+            } else {
+                value
+            };
+            Some(format!("{:width$}  {}", setting.key, shown))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1450,6 +1823,19 @@ mod tests {
                 .validate(setting.default)
                 .unwrap_or_else(|e| panic!("{} has an invalid default: {e}", setting.key));
         }
+    }
+
+    #[test]
+    fn credential_values_have_no_plaintext_setting() {
+        for forbidden in ["secret", "access-key", "session-token", "password"] {
+            assert!(
+                SETTINGS
+                    .iter()
+                    .all(|setting| !setting.key.contains(forbidden)),
+                "a credential-bearing setting contains {forbidden:?}"
+            );
+        }
+        assert!(lookup("cloud.credential-command").is_ok());
     }
 
     #[test]
@@ -1812,5 +2198,99 @@ mod tests {
             assert!(text.contains(setting.key), "{}", setting.key);
         }
         assert_eq!(text.lines().count(), SETTINGS.len());
+    }
+
+    #[test]
+    fn cloud_settings_round_trip_through_the_one_settings_document() {
+        let root = scratch("cloud-round-trip");
+        let _guard = Scratch(root.clone());
+        let store = SettingsStore::new(root.join("settings.json"));
+
+        store
+            .update(|settings| settings.set("cloud.bucket", "screenshots"))
+            .expect("write a cloud setting");
+
+        let loaded = store.load().expect("read back");
+        assert_eq!(loaded.value("cloud.bucket"), Some("screenshots"));
+        assert!(loaded.is_user_set("cloud.bucket"));
+        let json = all_json_from(&loaded).to_compact_string();
+        assert!(json.contains(r#""source":"user""#), "{json}");
+    }
+
+    #[test]
+    fn a_cloud_write_preserves_every_other_settings_section() {
+        // The whole reason private sharing does not get its own file: writing a
+        // cloud key must leave Recording, Camera, Recent Captures, After
+        // Capture and any not-yet-known section exactly as they were.
+        let root = scratch("cloud-composes");
+        let _guard = Scratch(root.clone());
+        let path = root.join("settings.json");
+        std::fs::create_dir_all(&root).expect("scratch dir");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 7,
+                "future_root": {"kept": true},
+                "values": {
+                    "future.setting": {"shape": [1, 2, 3]},
+                    "record.camera": "true",
+                    "recent-captures-overlay.placement": "right",
+                    "cloud.bucket": "before"
+                },
+                "after_capture": {"screenshot": {"copy-to-clipboard": true}}
+            }"#,
+        )
+        .expect("seed document");
+
+        let store = SettingsStore::new(&path);
+        store
+            .update(|settings| settings.set("cloud.bucket", "after"))
+            .expect("update one cloud key");
+
+        let rendered = std::fs::read_to_string(&path).expect("read document");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value["future_root"]["kept"], true);
+        assert_eq!(value["values"]["future.setting"]["shape"][2], 3);
+        assert_eq!(value["values"]["record.camera"], "true");
+        assert_eq!(
+            value["values"]["recent-captures-overlay.placement"],
+            "right"
+        );
+        assert_eq!(
+            value["after_capture"]["screenshot"]["copy-to-clipboard"],
+            true
+        );
+        assert_eq!(value["values"]["cloud.bucket"], "after");
+    }
+
+    #[test]
+    fn the_schema_never_offers_a_credential_bearing_key() {
+        // Secrets live in the platform vault. If a key like this were ever
+        // added, `settings get` would print it and `settings set` would write
+        // it to a world-readable file.
+        for setting in SETTINGS {
+            assert!(
+                !credential_bearing_key(setting.key),
+                "{} would persist a secret",
+                setting.key
+            );
+        }
+        for key in [
+            "cloud.secret",
+            "access_key_id",
+            "AccessKeyId",
+            "session_token",
+            "session-token",
+            "sharePassword",
+        ] {
+            assert!(credential_bearing_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_credential_bearing_refusal_never_echoes_the_value() {
+        let error = credential_refusal("cloud.secret-access-key");
+        assert!(error.to_string().contains("native vault"), "{error}");
+        assert!(!error.to_string().contains("never-echo-this"), "{error}");
     }
 }

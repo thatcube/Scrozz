@@ -19,6 +19,7 @@ egui.workspace = true
 eframe.workspace = true
 image.workspace = true
 resvg.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dark-light.workspace = true

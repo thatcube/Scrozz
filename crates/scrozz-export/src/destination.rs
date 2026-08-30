@@ -55,9 +55,9 @@ pub struct S3Object<'a> {
 /// Deliberately a trait with no implementation in this crate. Every S3-alike —
 /// AWS, Cloudflare R2, Backblaze B2, MinIO — speaks the same handful of
 /// requests, and a full SDK is a very large dependency to carry for a single
-/// authenticated PUT. Keeping the seam here means the eventual implementation
-/// is a swappable detail, that a test can substitute a fake, and that this crate
-/// stays buildable and testable with no network stack at all.
+/// authenticated PUT. Keeping the seam here means `scrozz-cloud` is a swappable
+/// implementation, a test can substitute a fake, and this crate stays buildable
+/// and testable with no network stack at all.
 pub trait S3Uploader: fmt::Debug + Send + Sync {
     /// Uploads an object and returns the URL it can be fetched from.
     ///
@@ -68,26 +68,6 @@ pub trait S3Uploader: fmt::Debug + Send + Sync {
     /// with visible progress and retry, so a failure here is a queue state, not
     /// a lost capture.
     fn upload(&self, object: &S3Object<'_>) -> Result<String>;
-}
-
-/// The placeholder [`S3Uploader`].
-///
-/// Present so the wiring is real and typechecked before the protocol work is
-/// done. It is never installed by default — [`FileExporter`] with no uploader
-/// returns [`Error::Unsupported`], which is a message a user can act on rather
-/// than a panic.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnimplementedS3Uploader;
-
-impl S3Uploader for UnimplementedS3Uploader {
-    fn upload(&self, _object: &S3Object<'_>) -> Result<String> {
-        todo!(
-            "S3-compatible upload: sign a PUT with AWS Signature Version 4 and send it to \
-             {{endpoint}}/{{bucket}}/{{key}}. Endpoint, region and credentials come from \
-             configuration so that R2, B2 and MinIO work alongside AWS. Deliberately not \
-             implemented with an AWS SDK — see the S3Uploader documentation."
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------

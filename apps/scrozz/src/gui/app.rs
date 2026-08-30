@@ -24,13 +24,14 @@
 //! and [`scrozz_shell::GlobalHotkeys::poll`] are what this uses.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, channel},
     },
     task::{Context, Poll, Waker},
     thread::JoinHandle,
@@ -203,6 +204,11 @@ pub struct Config {
     pub retention_policy: RetentionPolicy,
     /// Current Recent Captures Overlay behavior.
     pub recent_captures_overlay: scrozz_ui::RecentCapturesOverlaySettings,
+    /// Whether construction must avoid every external service.
+    ///
+    /// A sealed run reads no provider settings and opens no credential vault,
+    /// which is what makes headless validation safe to run on a real machine.
+    sealed: bool,
 }
 
 impl Default for Config {
@@ -222,6 +228,7 @@ impl Default for Config {
             after_capture_warning: None,
             retention_policy: RetentionPolicy::default(),
             recent_captures_overlay: scrozz_ui::RecentCapturesOverlaySettings::default(),
+            sealed: false,
         }
     }
 }
@@ -350,6 +357,7 @@ impl Config {
                 max_image_age: scrozz_store::RetentionWindow::Forever,
             },
             recent_captures_overlay: scrozz_ui::RecentCapturesOverlaySettings::default(),
+            sealed: true,
         }
     }
 }
@@ -629,6 +637,12 @@ pub struct App {
     drag_keep_after_accept: HashSet<CardId>,
     /// Cards that retire only after a queued copy/save reports success.
     close_after_output: HashSet<CardId>,
+    /// Cards waiting for a *confirmed* upload before they may be retired.
+    ///
+    /// Separate from `close_after_output` because "Hide a card only after a
+    /// cloud upload is confirmed successful" means exactly that: a copy or a
+    /// save finishing first must not take the card away before the link exists.
+    close_after_upload: HashSet<CardId>,
     /// Whether each live card has another retained artifact and a visible export.
     card_retention: HashMap<CardId, (bool, bool)>,
     /// Durable identities used to re-check source retention at cleanup time.
@@ -712,6 +726,14 @@ pub struct App {
     recorded_history_id: Option<CaptureId>,
     /// A native destination chooser polled without blocking the application event loop.
     pending_save_dialog: Option<PendingSaveDialog>,
+    /// Secret-free private-sharing configuration, as the UI sees it.
+    cloud_settings: scrozz_ui::CloudSettingsModel,
+    /// A pending request to open the Sharing settings viewport.
+    sharing_settings_requested: bool,
+    /// An in-flight provider reachability probe, run off the main thread.
+    connection_test: Option<Receiver<CliResult<()>>>,
+    /// Cards currently on screen, so Upload availability can be refreshed.
+    visible_cards: BTreeSet<CardId>,
 }
 
 /// A capture the annotation editor has been asked to open.
@@ -773,6 +795,7 @@ impl<'a> EditorSnapshot<'a> {
 enum CardOutput {
     Copy,
     Save(Option<PathBuf>),
+    Upload,
 }
 
 struct PendingSaveDialog {
@@ -786,6 +809,7 @@ impl CardOutput {
         match self {
             Self::Copy => "copy",
             Self::Save(_) => "save",
+            Self::Upload => "upload",
         }
     }
 }
@@ -1054,6 +1078,17 @@ impl App {
                 "the saved camera could not be applied to the recording engine: {error}"
             ));
         }
+        let cloud_settings = if config.sealed {
+            crate::cloud::sealed_settings_model()
+        } else {
+            match crate::cloud::settings_model(scrozz_ui::CloudConnectionState::Idle) {
+                Ok(model) => model,
+                Err(error) => {
+                    notes.push(format!("sharing settings are unavailable: {error}"));
+                    crate::cloud::settings_error_model(error.to_string())
+                }
+            }
+        };
 
         let shortcuts = config.shortcuts.clone();
         let unlock_hotkey_registered = hotkeys
@@ -1078,6 +1113,7 @@ impl App {
             modal_drag_input_release_pending: false,
             drag_keep_after_accept: HashSet::new(),
             close_after_output: HashSet::new(),
+            close_after_upload: HashSet::new(),
             card_retention: HashMap::new(),
             card_capture_ids: HashMap::new(),
             pending_retention_close: HashSet::new(),
@@ -1133,6 +1169,10 @@ impl App {
             recorded_media_targets: HashMap::new(),
             recorded_history_id: None,
             pending_save_dialog: None,
+            cloud_settings,
+            sharing_settings_requested: false,
+            connection_test: None,
+            visible_cards: BTreeSet::new(),
         };
         app.refresh_tray_shortcuts();
 
@@ -1201,6 +1241,7 @@ impl App {
         self.sync_camera_settings_window();
         self.drain_pipeline();
         self.drain_save_dialog();
+        self.drain_connection_test();
         self.drain_cards(editor);
         self.drain_drags();
         self.drain_history();
@@ -1624,7 +1665,12 @@ impl App {
                         }
                     }
                     let ready = *ready;
-                    let card = ready.card;
+                    let mut card = ready.card;
+                    // The card is told what Upload can do the moment it is
+                    // built, so a control that cannot work is never offered as
+                    // if it could.
+                    card.upload_available = self.cloud_settings.upload_enabled;
+                    card.upload_unavailable_reason = self.cloud_settings.unavailable_reason.clone();
                     let history_changed = card.capture_id.is_some();
                     let card_id = card.id;
                     let capture_id = card.capture_id.clone();
@@ -1667,6 +1713,7 @@ impl App {
                             ));
                         } else {
                             retained = true;
+                            self.visible_cards.insert(card_id);
                             self.card_retention
                                 .insert(card_id, (retained_elsewhere, exported));
                             if let Some(capture_id) = capture_id {
@@ -1696,7 +1743,9 @@ impl App {
                         self.with_history(|history| history.refresh_from_start(Timestamp::now()));
                     }
                 }
-                Outcome::Restored(card) => {
+                Outcome::Restored(mut card) => {
+                    card.upload_available = self.cloud_settings.upload_enabled;
+                    card.upload_unavailable_reason = self.cloud_settings.unavailable_reason.clone();
                     let summary = card.summary();
                     let card_id = card.id;
                     let capture_id = card.capture_id.clone();
@@ -1704,6 +1753,7 @@ impl App {
                         self.pipeline.post(Job::Release(card_id));
                         self.note(format!("a restored card could not be shown: {err}"));
                     } else {
+                        self.visible_cards.insert(card_id);
                         self.card_retention.insert(card_id, (true, false));
                         if let Some(capture_id) = capture_id {
                             self.card_capture_ids.insert(card_id, capture_id);
@@ -1724,13 +1774,26 @@ impl App {
                         self.handle_capture_permission_failure(kind, origin, Self::screen_access());
                     }
                 }
+                Outcome::Started { card, detail } => {
+                    self.surface.set_status(card, Some(detail.clone()));
+                    self.note(format!("{card} {detail}"));
+                }
                 Outcome::Done { card, detail } => {
+                    self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
                     if let Some(retention) = self.card_retention.get_mut(&card)
                         && detail.starts_with("saved")
                     {
                         retention.0 = true;
                         retention.1 = true;
+                    }
+                    if detail.starts_with("uploaded") {
+                        if let Some(retention) = self.card_retention.get_mut(&card) {
+                            retention.0 = true;
+                        }
+                        if self.close_after_upload.remove(&card) {
+                            self.dismiss_recent_capture(card, "completed its upload");
+                        }
                     }
                     if self.close_after_output.remove(&card) {
                         self.dismiss_recent_capture(card, "completed its action");
@@ -1800,6 +1863,12 @@ impl App {
                     });
                 }
                 Outcome::Refused { card, error } => {
+                    // A failed upload leaves the card exactly where it is: the
+                    // link the user asked for never arrived, so hiding it now
+                    // would throw away the only copy they can still act on.
+                    self.close_after_upload.remove(&card);
+                    self.surface
+                        .set_status(card, Some(format!("Action failed: {error}")));
                     self.note(format!("{card} refused: {error}"));
                 }
                 Outcome::OutputRefused { card, error } => {
@@ -2051,11 +2120,6 @@ impl App {
                         self.close_after_output.insert(card);
                     }
                 }
-                CardEvent::Upload(id) => {
-                    self.note(format!(
-                        "{id} stayed visible because cloud upload is not configured"
-                    ));
-                }
                 CardEvent::AutoClose(id, action) => {
                     if self.close_after_output.contains(&id) {
                         self.note(format!(
@@ -2070,6 +2134,25 @@ impl App {
                     }
                     self.handle_auto_close(id, action, editor);
                 }
+                CardEvent::Upload(id) => {
+                    self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                    if self.cloud_settings.upload_enabled {
+                        self.surface.set_status(id, Some("Uploading...".to_owned()));
+                        if self.post_card_output(id, CardOutput::Upload, editor)
+                            && self.config.recent_captures_overlay.close_after_upload
+                        {
+                            self.close_after_upload.insert(id);
+                        }
+                    } else {
+                        let reason = self
+                            .cloud_settings
+                            .unavailable_reason
+                            .clone()
+                            .unwrap_or_else(|| "sharing is unavailable".to_owned());
+                        self.surface.set_status(id, Some(reason.clone()));
+                        self.note(format!("{id} upload unavailable: {reason}"));
+                    }
+                }
                 CardEvent::Dismiss(id) => {
                     if self.close_after_output.contains(&id) {
                         self.note(format!(
@@ -2077,6 +2160,8 @@ impl App {
                         ));
                         continue;
                     }
+                    self.visible_cards.remove(&id);
+                    self.close_after_upload.remove(&id);
                     self.dismiss_recent_capture(id, "dismissed");
                     self.note(format!("{id} dismissed"));
                 }
@@ -2572,6 +2657,8 @@ impl App {
         if !save_dialog_owns_card {
             self.close_after_output.remove(&card);
         }
+        self.visible_cards.remove(&card);
+        self.close_after_upload.remove(&card);
         self.drag_keep_after_accept.remove(&card);
         self.card_retention.remove(&card);
         self.card_capture_ids.remove(&card);
@@ -2604,9 +2691,11 @@ impl App {
                 CardOutput::Copy => Job::Copy(card),
                 CardOutput::Save(None) => Job::Save(card),
                 CardOutput::Save(Some(path)) => Job::SaveTo { card, path },
+                CardOutput::Upload => Job::Upload(card),
             });
         };
 
+        let generation = editor.generation;
         let rendered = Box::new(editor.render()?);
         Ok(match output {
             CardOutput::Copy => Job::CopyImage { card, rendered },
@@ -2615,6 +2704,11 @@ impl App {
                 card,
                 rendered,
                 path,
+            },
+            CardOutput::Upload => Job::UploadImage {
+                card,
+                generation,
+                rendered,
             },
         })
     }
@@ -4023,6 +4117,157 @@ impl App {
         self.note(detail);
     }
 
+    /// Asks for the Sharing settings window on the next host pass.
+    pub const fn request_sharing_settings(&mut self) {
+        self.sharing_settings_requested = true;
+    }
+
+    /// Takes a pending request to open or focus the Sharing settings window.
+    ///
+    /// Separate from [`Self::take_settings_request`]: the main Settings
+    /// window is the aggregate's own, and Sharing is a viewport beside it.
+    pub fn take_sharing_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.sharing_settings_requested)
+    }
+
+    /// Current secret-free Settings model.
+    #[must_use]
+    pub fn cloud_settings(&self) -> &scrozz_ui::CloudSettingsModel {
+        &self.cloud_settings
+    }
+
+    /// Applies one Settings intent.
+    pub fn apply_cloud_settings(&mut self, event: scrozz_ui::CloudSettingsEvent) {
+        match event {
+            scrozz_ui::CloudSettingsEvent::Save(draft) => {
+                self.invalidate_connection_test();
+                match crate::cloud::save_settings(&draft) {
+                    Ok(()) => {
+                        self.note("sharing settings saved");
+                        self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                    }
+                    Err(error) => {
+                        self.note(format!("sharing settings were not saved: {error}"));
+                        self.cloud_settings.connection =
+                            scrozz_ui::CloudConnectionState::Failed(error.to_string());
+                    }
+                }
+            }
+            scrozz_ui::CloudSettingsEvent::StoreCredentials(credentials) => {
+                self.invalidate_connection_test();
+                let token = (!credentials.session_token.is_empty())
+                    .then_some(credentials.session_token.as_str());
+                let password = (!credentials.share_password.is_empty())
+                    .then_some(credentials.share_password.as_str());
+                match crate::cloud::store_credentials(
+                    &credentials.access_key_id,
+                    &credentials.secret_access_key,
+                    token,
+                    password,
+                ) {
+                    Ok(()) => {
+                        self.note("provider credentials stored in the native vault");
+                        self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                    }
+                    Err(error) => {
+                        self.note(format!("provider credentials were not stored: {error}"));
+                        self.cloud_settings.connection =
+                            scrozz_ui::CloudConnectionState::Failed(error.to_string());
+                    }
+                }
+            }
+            scrozz_ui::CloudSettingsEvent::RemoveCredentials => {
+                self.invalidate_connection_test();
+                match crate::cloud::remove_credentials() {
+                    Ok(_) => {
+                        self.note("provider credentials removed from the native vault");
+                        self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                    }
+                    Err(error) => {
+                        self.note(format!("provider credentials were not removed: {error}"));
+                        self.cloud_settings.connection =
+                            scrozz_ui::CloudConnectionState::Failed(error.to_string());
+                    }
+                }
+            }
+            scrozz_ui::CloudSettingsEvent::TestConnection => {
+                if self.connection_test.is_some() {
+                    return;
+                }
+                let (sender, receiver) = channel();
+                match std::thread::Builder::new()
+                    .name("scrozz-cloud-test".to_owned())
+                    .spawn(move || {
+                        let _ = sender.send(crate::cloud::test_connection());
+                    }) {
+                    Ok(_) => {
+                        self.connection_test = Some(receiver);
+                        self.cloud_settings.connection = scrozz_ui::CloudConnectionState::Testing;
+                    }
+                    Err(error) => {
+                        self.cloud_settings.connection = scrozz_ui::CloudConnectionState::Failed(
+                            format!("could not start the connection test: {error}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn drain_connection_test(&mut self) {
+        let Some(receiver) = &self.connection_test else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(())) => {
+                self.connection_test = None;
+                self.note("cloud connection test passed");
+                self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Passed);
+            }
+
+            Ok(Err(error)) => {
+                self.connection_test = None;
+                self.note(format!("cloud connection test failed: {error}"));
+                self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Failed(
+                    error.to_string(),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.connection_test = None;
+                self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Failed(
+                    "the connection-test worker stopped without an answer".to_owned(),
+                ));
+            }
+        }
+    }
+
+    fn invalidate_connection_test(&mut self) {
+        self.connection_test = None;
+        if matches!(
+            self.cloud_settings.connection,
+            scrozz_ui::CloudConnectionState::Testing
+        ) {
+            self.cloud_settings.connection = scrozz_ui::CloudConnectionState::Idle;
+        }
+    }
+
+    fn refresh_cloud_settings(&mut self, connection: scrozz_ui::CloudConnectionState) {
+        match crate::cloud::settings_model(connection) {
+            Ok(model) => self.cloud_settings = model,
+            Err(error) => {
+                self.cloud_settings = crate::cloud::settings_error_model(error.to_string());
+            }
+        }
+        for id in self.visible_cards.iter().copied() {
+            self.surface.set_upload_availability(
+                id,
+                self.cloud_settings.upload_enabled,
+                self.cloud_settings.unavailable_reason.clone(),
+            );
+        }
+    }
+
     /// How many cards are on screen.
     #[must_use]
     pub fn showing(&self) -> usize {
@@ -4788,7 +5033,9 @@ impl App {
         };
         let id = self.pipeline.allocate();
         let capture_id = self.recorded_history_id.take();
-        let card = Card::from_finalized_media(id, capture_id, &handoff);
+        let mut card = Card::from_finalized_media(id, capture_id, &handoff);
+        card.upload_available = self.cloud_settings.upload_enabled;
+        card.upload_unavailable_reason = self.cloud_settings.unavailable_reason.clone();
         let path = handoff.path.clone();
         self.recorded_media.insert(id, handoff);
         if let Some(target) = target {
@@ -4796,6 +5043,7 @@ impl App {
         }
         match self.surface.present(card) {
             Ok(()) => {
+                self.visible_cards.insert(id);
                 self.card_retention.insert(id, (true, true));
                 self.captures += 1;
                 self.note(format!("recording card shown for {}", path.display()));
@@ -4815,6 +5063,50 @@ impl App {
     #[must_use]
     pub fn recorded_media(&self, card: CardId) -> Option<&FinalizedMediaHandoff> {
         self.recorded_media.get(&card)
+    }
+
+    /// Shares the durable media a recording card is showing.
+    ///
+    /// A recording never entered the capture vault — the card points at a file
+    /// on disk — so it takes its own route to the upload worker, carrying the
+    /// content type and file name the recorder actually produced rather than
+    /// pretending a video is a PNG.
+    fn upload_recorded_media(&mut self, card: CardId) {
+        self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+        if !self.cloud_settings.upload_enabled {
+            let reason = self
+                .cloud_settings
+                .unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "sharing is unavailable".to_owned());
+            self.surface.set_status(card, Some(reason.clone()));
+            self.note(format!("{card} upload unavailable: {reason}"));
+            return;
+        }
+        let Some(handoff) = self.recorded_media.get(&card) else {
+            self.note(format!("{card} has no recording to upload"));
+            return;
+        };
+        let path = handoff.path.clone();
+        let content_type = handoff.content_type.clone();
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("Recording-{}", card.0));
+        let capture = self.card_capture_ids.get(&card).cloned();
+        self.surface
+            .set_status(card, Some("Uploading...".to_owned()));
+        if !self.pipeline.post(Job::UploadRecording {
+            card,
+            capture,
+            path,
+            content_type,
+            file_name,
+        }) {
+            self.note(format!(
+                "{card} could not be queued for upload: the capture worker has gone"
+            ));
+        }
     }
 
     /// Handles a card gesture that belongs to a recording rather than a still.
@@ -4852,6 +5144,10 @@ impl App {
                 self.note(format!(
                     "{card} auto-closed; its recording remains at its saved location"
                 ));
+                true
+            }
+            CardEvent::Upload(_) => {
+                self.upload_recorded_media(card);
                 true
             }
             CardEvent::Copy(_) | CardEvent::Save { .. } | CardEvent::Pin(..) => {
@@ -7669,6 +7965,8 @@ mod tests {
         let root = scratch("card");
         let handoff = durable_handoff(&root);
         let media = handoff.path.clone();
+        app.cloud_settings.upload_enabled = true;
+        app.cloud_settings.unavailable_reason = None;
 
         app.recording.handoff = Some(handoff);
         app.present_recorded_media(None);
@@ -7691,6 +7989,8 @@ mod tests {
             vec![media.to_string_lossy().into_owned()],
             "the card points at the durable file rather than owning a copy"
         );
+        assert!(card.upload_available);
+        assert!(app.visible_cards.contains(&card.id));
         assert!(
             app.finalized_media_handoff().is_none(),
             "the handoff was consumed by the card it produced"
@@ -7710,6 +8010,7 @@ mod tests {
             "dismissing a recording card must never delete its durable media"
         );
         assert!(app.recorded_media.is_empty());
+        assert!(app.visible_cards.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7966,6 +8267,22 @@ mod tests {
     }
 
     #[test]
+    fn changing_settings_invalidates_an_inflight_connection_test() {
+        let (mut app, _) = app();
+        let (_sender, receiver) = channel();
+        app.connection_test = Some(receiver);
+        app.cloud_settings.connection = scrozz_ui::CloudConnectionState::Testing;
+
+        app.invalidate_connection_test();
+
+        assert!(app.connection_test.is_none());
+        assert!(matches!(
+            app.cloud_settings.connection,
+            scrozz_ui::CloudConnectionState::Idle
+        ));
+    }
+
+    #[test]
     fn dismissing_a_card_removes_it_from_the_surface() {
         let (mut app, surface) = app();
         // Placed directly, because a real capture needs a screen.
@@ -7999,13 +8316,13 @@ mod tests {
     }
 
     #[test]
-    fn card_copy_and_save_use_the_live_revision_when_the_editor_owns_the_card() {
+    fn card_copy_save_and_upload_use_the_live_revision_when_the_editor_owns_the_card() {
         let editor = redacted_editor();
         let card = CardId(42);
         let expected = editor.state().revision();
         let snapshot = Some(EditorSnapshot::new(card, 1, &editor));
 
-        for output in [CardOutput::Copy, CardOutput::Save(None)] {
+        for output in [CardOutput::Copy, CardOutput::Save(None), CardOutput::Upload] {
             let job = App::card_output_job(card, output, snapshot).expect("the document renders");
             let rendered = match job {
                 Job::CopyImage {
@@ -8019,7 +8336,19 @@ mod tests {
                     assert_eq!(got, card);
                     rendered
                 }
-                Job::Copy(_) | Job::Save(_) => {
+                Job::UploadImage {
+                    card: got,
+                    generation,
+                    rendered,
+                } => {
+                    assert_eq!(got, card);
+                    assert_eq!(
+                        generation, 1,
+                        "the share must be bound to this editor lifetime"
+                    );
+                    rendered
+                }
+                Job::Copy(_) | Job::Save(_) | Job::Upload(_) => {
                     panic!("an edited card fell back to its original capture")
                 }
                 _ => panic!("the card output was routed to an unrelated job"),
@@ -8137,6 +8466,20 @@ mod tests {
         assert_eq!(
             app.editor_render_pending, None,
             "a missing card queued a render that can only fail"
+        );
+    }
+
+    #[test]
+    fn uploading_is_blocked_when_the_backend_or_provider_is_unavailable() {
+        let (mut app, surface) = app();
+        surface.inject(CardEvent::Upload(CardId(43)));
+        app.tick();
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("card:43 upload unavailable")),
+            "{:?}",
+            app.notes()
         );
     }
 

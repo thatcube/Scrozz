@@ -119,6 +119,20 @@ impl CardSurface for RecentCapturesOverlayCards {
         self.forget(id);
     }
 
+    fn set_status(&mut self, id: CardId, status: Option<String>) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .set_status(scrozz_ui::stack::CardId(theirs), status);
+        }
+    }
+
+    fn set_upload_availability(&mut self, id: CardId, enabled: bool, reason: Option<String>) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .set_upload_availability(scrozz_ui::stack::CardId(theirs), enabled, reason);
+        }
+    }
+
     fn settle_drag(&mut self, id: CardId, accepted: bool) {
         // Deliberately does *not* `forget` the card: a rejected drop leaves it
         // on the pile, and an accepted one is retired by the separate dismiss
@@ -426,7 +440,11 @@ fn request_for_card(card: &Card) -> CaptureRequest {
         None => CaptureRequest::new(name, provenance, card.source_px()),
     }
     .with_source_scale(card.scale)
-    .with_media(capture_media(card.media));
+    .with_media(capture_media(card.media))
+    .with_upload_availability(
+        card.upload_available,
+        card.upload_unavailable_reason.clone(),
+    );
     request.source_px = card.source_px();
     if let Some(capture) = &card.capture_id {
         request = request.with_pin_id(capture.0.clone());

@@ -42,6 +42,7 @@
 mod after_capture;
 mod build_info;
 mod cli;
+mod cloud;
 mod color_swatches;
 mod commands;
 mod exit;
@@ -62,7 +63,13 @@ mod test_env;
 use std::{io::Write, process::ExitCode};
 
 use clap::Parser;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{
+    EnvFilter, Layer,
+    filter::{FilterExt, filter_fn},
+    fmt,
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::{
     cli::{Cli, Command},
@@ -273,9 +280,9 @@ fn report_stream_failure(err: &std::io::Error) -> ExitCode {
 /// **Logs go to stderr, always.** stdout carries the result — a JSON document or
 /// a PNG — and a log line in the middle of either is a corrupt result.
 ///
-/// **`RUST_LOG` wins.** `-v` raises the floor for people who do not want to think
-/// about filter syntax; anyone who set `RUST_LOG` deliberately gets exactly what
-/// they asked for.
+/// **`RUST_LOG` wins except at the secret boundary.** `-v` raises the floor for
+/// people who do not want to think about filter syntax. Dependency targets that
+/// can dump signed HTTP request bytes remain disabled even under `RUST_LOG=trace`.
 fn init_tracing(verbose: u8, quiet: bool) {
     let default = match (quiet, verbose) {
         (true, _) => "error",
@@ -287,17 +294,23 @@ fn init_tracing(verbose: u8, quiet: bool) {
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("scrozz={default},warn")));
+    let filter = filter_fn(|metadata| log_target_is_safe(metadata.target())).and(filter);
 
     // `try_init` rather than `init`: this is also reachable from the test
     // binary, where a second call must not abort the process.
-    let _ = fmt()
-        .with_env_filter(filter)
+    // The CLI is often invoked from a compositor keybinding, where output
+    // lands in a session log read long afterwards and out of order.
+    let layer = fmt::layer()
         .with_writer(std::io::stderr)
-        // The CLI is often invoked from a compositor keybinding, where output
-        // lands in a session log read long afterwards and out of order.
         .with_target(true)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .try_init();
+        .with_filter(filter);
+    let _ = tracing_subscriber::registry().with(layer).try_init();
+}
+
+fn log_target_is_safe(target: &str) -> bool {
+    let root = target.split("::").next().unwrap_or(target);
+    root != "ureq" && root != "ureq_proto"
 }
 
 #[cfg(test)]
@@ -356,5 +369,12 @@ mod tests {
     fn initialising_tracing_twice_is_harmless() {
         init_tracing(0, false);
         init_tracing(3, false);
+    }
+
+    #[test]
+    fn dependency_wire_logs_are_never_enabled() {
+        assert!(!log_target_is_safe("ureq::run"));
+        assert!(!log_target_is_safe("ureq_proto::util"));
+        assert!(log_target_is_safe("scrozz::cloud"));
     }
 }

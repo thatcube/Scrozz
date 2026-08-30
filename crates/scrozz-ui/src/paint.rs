@@ -499,6 +499,10 @@ pub fn icon_button(
 }
 
 /// A flat neutral icon button used over capture thumbnails.
+///
+/// `state` carries `enabled` so a control the app cannot honour — Upload with no
+/// provider configured — is disabled in every sense: reported to assistive
+/// technology (D13), unresponsive to the pointer, and dimmed.
 #[allow(clippy::too_many_arguments)]
 pub fn card_icon_button(
     ui: &mut Ui,
@@ -507,17 +511,23 @@ pub fn card_icon_button(
     id: Id,
     icon: Icon,
     label: &str,
+    state: ControlState,
     reveal: Reveal,
 ) -> Response {
-    let state = ControlState::new();
     let response = ui.interact(rect, id, sense_for(state));
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    response.widget_info(|| {
+        WidgetInfo::selected(WidgetType::Button, state.enabled, state.selected, label)
+    });
 
     let pointer = pointer_state(surface, &response, state, reveal);
     let scale = card_control_scale(pointer);
     let rect = scaled_control_rect(rect.translate(reveal.offset), pointer);
     let painter = ui.painter();
-    let opacity = reveal.opacity;
+    let opacity = if state.enabled {
+        reveal.opacity
+    } else {
+        reveal.opacity * 0.4
+    };
     paint_card_control_frame(painter, rect, Radius::BUTTON, pointer, opacity);
     surface.icons.draw(
         painter,

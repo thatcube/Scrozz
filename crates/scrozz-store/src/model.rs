@@ -20,7 +20,7 @@ use scrozz_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::CaptureId;
+use crate::{CaptureId, sharing::CaptureSharing};
 
 /// A point in time, as milliseconds since the Unix epoch.
 ///
@@ -637,6 +637,8 @@ pub struct CaptureRecord {
     pub ocr_text: Option<String>,
     /// How many annotations the document holds.
     pub annotation_count: usize,
+    /// Optional sharing metadata.
+    pub sharing: Option<CaptureSharing>,
 }
 
 /// A page of results.

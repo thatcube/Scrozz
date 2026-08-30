@@ -142,6 +142,7 @@ fn every_subcommand_has_working_help() {
         vec!["history", "delete", "--help"],
         vec!["history", "pin", "--help"],
         vec!["ocr", "--help"],
+        vec!["share", "--help"],
         vec!["settings", "--help"],
         vec!["settings", "get", "--help"],
         vec!["settings", "set", "--help"],
@@ -153,6 +154,178 @@ fn every_subcommand_has_working_help() {
         assert_eq!(code(&out), 0, "{args:?} should print help and exit 0");
         assert!(!out.stdout.is_empty(), "{args:?} printed no help");
     }
+}
+
+#[cfg(not(feature = "cloud"))]
+#[test]
+fn default_binary_explains_that_cloud_networking_is_optional() {
+    let path = std::env::temp_dir().join(format!(
+        "scrozz-cloud-feature-smoke-{}.png",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"feature boundary only").unwrap();
+    let out = scrozz(["share", path.to_str().unwrap()]);
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(code(&out), 5);
+    let text = stderr(&out);
+    assert!(text.contains("--features cloud"), "{text}");
+    assert!(!text.to_ascii_lowercase().contains("secret access key"));
+}
+
+#[test]
+fn json_share_missing_file_fails_before_feature_config_credentials_or_network() {
+    let missing = std::env::temp_dir().join(format!(
+        "scrozz-definitely-missing-{}-credential-sentinel.png",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&missing);
+    let out = Command::new(env!("CARGO_BIN_EXE_scrozz"))
+        .args(["--json", "--no-ipc", "share", missing.to_str().unwrap()])
+        .env("SCROZZ_S3_ACCESS_KEY_ID", "access-id-must-not-appear")
+        .env("SCROZZ_S3_SECRET_ACCESS_KEY", "secret-key-must-not-appear")
+        .env("SCROZZ_S3_ENDPOINT", "https://network-must-not-run.invalid")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("the binary should run");
+    assert_eq!(code(&out), 2);
+    assert!(out.stderr.is_empty(), "JSON runtime errors use stdout");
+    let text = stdout(&out);
+    assert!(text.contains(r#""ok":false"#), "{text}");
+    assert!(text.contains(r#""kind":"usage""#), "{text}");
+    for forbidden in [
+        "Unsupported",
+        "--features cloud",
+        "access-id-must-not-appear",
+        "secret-key-must-not-appear",
+        "network-must-not-run.invalid",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden:?} leaked in {text}");
+    }
+}
+
+#[test]
+fn settings_set_persists_non_secret_values_and_reports_their_source() {
+    let root = std::env::temp_dir().join(format!(
+        "scrozz-cli-settings-persistence-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let path = root.join("settings.json");
+    let set = Command::new(env!("CARGO_BIN_EXE_scrozz"))
+        .args([
+            "--json",
+            "--no-ipc",
+            "settings",
+            "set",
+            "cloud.bucket",
+            "screenshots",
+        ])
+        .env("SCROZZ_SETTINGS_FILE", &path)
+        .output()
+        .unwrap();
+    assert_eq!(code(&set), 0, "{}", stderr(&set));
+    let get = Command::new(env!("CARGO_BIN_EXE_scrozz"))
+        .args(["--json", "--no-ipc", "settings", "get", "cloud.bucket"])
+        .env("SCROZZ_SETTINGS_FILE", &path)
+        .output()
+        .unwrap();
+    assert_eq!(code(&get), 0, "{}", stderr(&get));
+    let text = stdout(&get);
+    assert!(text.contains(r#""value":"screenshots""#), "{text}");
+    assert!(text.contains(r#""source":"user""#), "{text}");
+    let stored = std::fs::read_to_string(&path).unwrap();
+    for forbidden in ["secret_access_key", "session_token", "\"password\""] {
+        assert!(!stored.contains(forbidden), "{stored}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "cloud")]
+#[test]
+fn share_puts_to_loopback_s3_and_emits_stable_json_without_logging_secrets() {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        process::Stdio,
+        time::Duration,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            request.extend_from_slice(&chunk[..count]);
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= headers_end + 4 + length {
+                break;
+            }
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        request
+    });
+
+    let file = std::env::temp_dir().join(format!(
+        "scrozz-cli-share-{}-capture.png",
+        std::process::id()
+    ));
+    std::fs::write(&file, b"\x89PNG\r\n\x1a\nloopback-image").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_scrozz"))
+        .arg("--json")
+        .arg("share")
+        .arg(&file)
+        .arg("--expires")
+        .arg("1h")
+        .arg("--secret-key-stdin")
+        .env_remove("RUST_LOG")
+        .env_remove("SCROZZ_S3_CREDENTIAL_COMMAND")
+        .env_remove("SCROZZ_S3_CREDENTIAL_ARGS")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env("SCROZZ_S3_PROVIDER", "minio")
+        .env("SCROZZ_S3_ENDPOINT", format!("http://{address}"))
+        .env("SCROZZ_S3_BUCKET", "fake")
+        .env("SCROZZ_S3_EXPIRES", "invalid-environment-value")
+        .env("SCROZZ_S3_ACCESS_KEY_ID", "loopback-access")
+        .env("SCROZZ_S3_SECRET_ACCESS_KEY", "loopback-secret")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    let request = String::from_utf8_lossy(&server.join().unwrap()).into_owned();
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty(), "{}", stderr(&output));
+    let json = stdout(&output);
+    assert!(json.contains(r#""command":"share""#), "{json}");
+    assert!(json.contains(r#""provider":"minio""#), "{json}");
+    assert!(json.contains(r#""seconds":3600"#), "{json}");
+    assert!(json.contains("X-Amz-Signature"), "{json}");
+    assert!(request.starts_with("PUT /fake/captures/"));
+    assert!(request.to_ascii_lowercase().contains("authorization:"));
+    assert!(!request.contains("loopback-secret"));
+    assert!(!json.contains("loopback-secret"));
 }
 
 // ---------------------------------------------------------------------------

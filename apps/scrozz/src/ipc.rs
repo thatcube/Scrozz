@@ -171,9 +171,11 @@ pub fn policy(command: &Command) -> Forwarding {
         // Pure reads and pure functions. `list` asks the compositor, not Scrozz;
         // `hotkey generate-config` is string formatting; `gui` is the thing that
         // would be forwarded to.
-        Command::Settings(_) | Command::List(_) | Command::Hotkey(_) | Command::Gui => {
-            Forwarding::Never
-        }
+        Command::Settings(_)
+        | Command::List(_)
+        | Command::Hotkey(_)
+        | Command::Share(_)
+        | Command::Gui => Forwarding::Never,
     }
 }
 

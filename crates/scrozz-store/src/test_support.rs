@@ -28,6 +28,10 @@ use crate::{
     CaptureId,
     model::{FrameHeader, MediaKind, Timestamp},
     record::StoredRecord,
+    sharing::{
+        CaptureSharing, RemoteObjectId, RemoteObjectStatus, ShareProvider, ShareTag, ShareUrl,
+        SharedMediaKind,
+    },
 };
 
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -208,6 +212,30 @@ pub fn sample_record(app: &str, created_at: i64) -> StoredRecord {
         &scrozz_annotate::DocumentData::default(),
     )
     .expect("sample record must build")
+}
+
+/// Representative sharing metadata for integration tests.
+///
+/// # Panics
+///
+/// Panics if the metadata cannot be built, which would be a bug in this helper.
+#[must_use]
+pub fn sample_sharing(seed: u8) -> CaptureSharing {
+    CaptureSharing::new(
+        ShareUrl::new(format!(
+            "https://example.invalid/shares/{seed}.png?sig=test"
+        ))
+        .expect("url"),
+        ShareProvider::R2,
+        RemoteObjectId::new(format!("captures/{seed}.png")).expect("object id"),
+        SharedMediaKind::Image,
+    )
+    .expiring_at(Timestamp(1_800_000_000_000 + i64::from(seed)))
+    .with_remote_status(RemoteObjectStatus::Available)
+    .tagged(vec![
+        ShareTag::new("project", "scrozz").expect("tag"),
+        ShareTag::new("seed", seed.to_string()).expect("tag"),
+    ])
 }
 
 /// The identifier a capture inserted at `unix_millis` would sort as.

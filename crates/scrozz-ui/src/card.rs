@@ -36,7 +36,7 @@ use scrozz_core::Provenance;
 
 use crate::icons::Icon;
 use crate::motion::fade;
-use crate::paint::{self, Reveal, Surface};
+use crate::paint::{self, ControlState, Reveal, Surface};
 use crate::recording_controls::format_duration;
 use crate::stack::{CardFrame, CardId, MAX_LEAN};
 use crate::theme::{Radius, Space, corner};
@@ -236,6 +236,12 @@ pub struct CardContent<'a> {
     pub media: CardMedia,
     /// The uploaded thumbnail, if it has been uploaded yet.
     pub texture: Option<egui::TextureId>,
+    /// Whether Upload accepts input for this capture.
+    pub upload_enabled: bool,
+    /// Accessible explanation for a disabled Upload control.
+    pub upload_unavailable_reason: Option<&'a str>,
+    /// Latest action status, shown in the caption.
+    pub status: Option<&'a str>,
 }
 
 impl<'a> CardContent<'a> {
@@ -248,6 +254,9 @@ impl<'a> CardContent<'a> {
             provenance,
             media: CardMedia::Image,
             texture: None,
+            upload_enabled: true,
+            upload_unavailable_reason: None,
+            status: None,
         }
     }
 
@@ -269,6 +278,12 @@ impl<'a> CardContent<'a> {
     #[must_use]
     pub fn dimensions(&self) -> String {
         format!("{} × {}", self.source_px.0, self.source_px.1)
+    }
+
+    /// Right-hand caption text.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        self.status.map_or_else(|| self.dimensions(), str::to_owned)
     }
 }
 
@@ -446,15 +461,7 @@ pub fn draw_card(
     draw_media_marks(ui, content, capture, alpha);
 
     let reveal = frame.reveal.clamp(0.0, 1.0) * flat;
-    let action = draw_chrome(
-        ui,
-        surface,
-        frame,
-        chrome,
-        content.media,
-        rect,
-        alpha * reveal,
-    );
+    let action = draw_chrome(ui, surface, frame, chrome, content, rect, alpha * reveal);
 
     CardResponse {
         body,
@@ -611,13 +618,15 @@ fn draw_chrome(
     surface: &Surface<'_>,
     frame: &CardFrame,
     chrome: CardChrome,
-    media: CardMedia,
+    content: &CardContent<'_>,
     container: Rect,
     opacity: f32,
 ) -> Option<CardAction> {
     if opacity <= 0.004 {
         return None;
     }
+
+    let media = content.media;
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let scrim = (HOVER_SCRIM * opacity).round().clamp(0.0, 255.0) as u8;
@@ -652,6 +661,7 @@ fn draw_chrome(
                 control_id(frame.id, action),
                 action.icon(),
                 action.label(),
+                ControlState::new(),
                 lift,
             );
             if response.clicked() {
@@ -697,15 +707,29 @@ fn draw_chrome(
             continue;
         };
         let r = Rect::from_min_size(origin, size);
-        let resp = paint::card_icon_button(
+        // A control that is drawn and then always fails is worse than one that
+        // was never offered — but Upload keeps its slot so the reason can be
+        // read on hover instead of the button silently vanishing.
+        let state = if action == CardAction::Upload && !content.upload_enabled {
+            ControlState::disabled()
+        } else {
+            ControlState::new()
+        };
+        let mut resp = paint::card_icon_button(
             ui,
             surface,
             r,
             control_id(frame.id, action),
             action.icon(),
             action.label(),
+            state,
             settle,
         );
+        if action == CardAction::Upload
+            && let Some(reason) = content.upload_unavailable_reason
+        {
+            resp = resp.on_disabled_hover_text(reason);
+        }
         if resp.clicked() {
             pressed = Some(action);
         }

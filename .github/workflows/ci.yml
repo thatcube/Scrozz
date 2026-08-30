@@ -174,6 +174,10 @@ jobs:
             echo "::error title=Clippy on ${{ matrix.name }}::Warnings are errors here. Reproduce with 'tools/dev.sh lint'. If a lint is genuinely wrong, silence it with a targeted #[allow] and a comment saying why."
             exit 1
           fi
+          if ! cargo clippy --workspace --all-targets --all-features -- -D warnings; then
+            echo "::error title=All-feature Clippy on ${{ matrix.name }}::The distributed cloud build must be warning-free too."
+            exit 1
+          fi
 
       # This is the build step as well as the test step: `cargo test` compiles
       # the libraries, the binaries and the test harnesses for real, with real
@@ -182,6 +186,14 @@ jobs:
         run: |
           if ! cargo test --workspace; then
             echo "::error title=Tests failed on ${{ matrix.name }}::If this passes on the other two platforms, the cause is platform-specific — that is precisely what this job exists to find."
+            exit 1
+          fi
+          if ! cargo test -p scrozz-cloud --no-default-features; then
+            echo "::error title=No-network cloud tests failed::The auditable default boundary regressed."
+            exit 1
+          fi
+          if ! cargo test --workspace --all-features; then
+            echo "::error title=All-feature tests failed on ${{ matrix.name }}::The distributed cloud/native-vault build failed."
             exit 1
           fi
 

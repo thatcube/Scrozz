@@ -509,9 +509,15 @@ capture.** A synced folder needs a manual trip to get a link. That single gap is
 the entire justification for S3-compatible upload, and it is what CleanShot Cloud
 actually sells.
 
-Deliberately excluded: link expiry, password-protected links, and view analytics
-all need a server or a viewer page — T3 at best, possibly never. Team management
-is a permanent non-goal.
+Link expiry is implemented without a Scrozz server: a private object is shared
+through a provider-enforced SigV4 URL (at most seven days). AWS and MinIO use a
+PUT tag that matches a generated lifecycle rule for eventual deletion; R2 and B2
+do not accept S3 object tags, so they use a reserved per-duration object prefix
+and a matching prefix lifecycle rule instead. Password sharing is client-side
+AES-256-GCM encryption plus a self-contained WebCrypto viewer; the bucket never
+receives plaintext, and Scrozz never calls it a server-enforced password gate.
+Custom domains are a public-base URL override. View analytics and team
+management remain permanent non-goals.
 
 **Sequencing.** In the plan and designed for from the start so the storage
 abstraction is never retrofitted; built after the core capture → annotate → drag

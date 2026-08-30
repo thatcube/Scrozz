@@ -7,9 +7,9 @@
 
 use rusqlite::Connection;
 use scrozz_store::{
-    History as _, NewCapture, SqliteStore, Store as _, Timestamp,
+    History as _, NewCapture, SqliteStore, Store as _, StoreLayout, Timestamp,
     schema::{MIGRATIONS, Migration, latest_version, migrate, schema_version},
-    test_support::{sample_document, scratch_dir},
+    test_support::{sample_document, sample_record, scratch_dir},
 };
 
 #[test]
@@ -129,7 +129,11 @@ fn a_recording_schema_six_database_gains_the_pin_cache_without_losing_rows() {
     drop(conn);
 
     let store = SqliteStore::open(dir.path()).expect("schema six migrates");
-    assert_eq!(store.schema_version().expect("version"), 7);
+    assert_eq!(
+        store.schema_version().expect("version"),
+        latest_version(MIGRATIONS),
+        "an old file climbs every remaining rung, not just the next one"
+    );
     assert!(store.record(&id).expect("read").is_some());
     let conn = Connection::open(&index).expect("inspect migrated index");
     let pins: i64 = conn
@@ -162,6 +166,52 @@ fn a_database_from_a_newer_build_is_refused_rather_than_mangled() {
         message.contains("newer") || message.contains("future"),
         "the error should explain the version mismatch, got {error}"
     );
+}
+
+#[test]
+fn a_v1_database_and_record_load_after_migration() {
+    let dir = scratch_dir("v1-load");
+    let layout = StoreLayout::new(dir.path());
+    layout.ensure_dirs().expect("dirs");
+    let mut record = sample_record("Safari", 1_700_000_000_000);
+    record.window_title = Some("legacy record".into());
+    let id = scrozz_store::CaptureId(record.id.clone());
+    layout.write_record(&record).expect("record");
+
+    let index = layout.index_path();
+    let mut conn = Connection::open(&index).expect("open");
+    migrate(&mut conn, &MIGRATIONS[..1]).expect("v1 schema");
+    conn.execute(
+        "INSERT INTO captures (
+             id, created_at, stored_at, pinned, app_name, window_title, provenance,
+             target_json, frame_json, image_hash, image_bytes, image_evicted_at, ocr_text,
+             annotation_count, search_fold, app_fold, title_fold, ocr_fold
+         ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, NULL, 0, NULL, NULL, 0, ?9, ?10, ?11, NULL)",
+        rusqlite::params![
+            id.0,
+            record.created_at,
+            record.stored_at,
+            record.app_name,
+            record.window_title,
+            record.provenance.as_token(),
+            serde_json::to_string(&record.target).expect("target"),
+            serde_json::to_string(&record.frame).expect("frame"),
+            record.search_text(),
+            record.app_name.as_ref().map(|t| t.to_lowercase()),
+            record.window_title.as_ref().map(|t| t.to_lowercase()),
+        ],
+    )
+    .expect("insert v1 row");
+    drop(conn);
+
+    let store = SqliteStore::open(dir.path()).expect("migrate and open");
+    assert_eq!(
+        store.schema_version().expect("version"),
+        latest_version(MIGRATIONS)
+    );
+    let loaded = store.record(&id).expect("read").expect("present");
+    assert_eq!(loaded.window_title.as_deref(), Some("legacy record"));
+    assert!(loaded.sharing.is_none(), "v1 rows had no share metadata");
 }
 
 #[test]
@@ -204,7 +254,13 @@ fn the_tables_the_store_depends_on_actually_exist_after_migration() {
     let mut conn = Connection::open_in_memory().expect("memory database");
     migrate(&mut conn, MIGRATIONS).expect("migrate");
 
-    for table in ["captures", "blobs", "capture_pins", "store_meta"] {
+    for table in [
+        "captures",
+        "blobs",
+        "capture_pins",
+        "capture_shares",
+        "store_meta",
+    ] {
         let found: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",

@@ -23,6 +23,7 @@
 //! `--json` because raw image bytes and a JSON document cannot share one stream.
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     str::FromStr,
     time::{Duration, Instant},
@@ -116,6 +117,9 @@ pub enum Command {
     /// Capture Text (OCR) from a capture or image file.
     Ocr(OcrArgs),
 
+    /// Upload an image to storage you control and print a shareable link.
+    Share(ShareArgs),
+
     /// Read and write settings.
     Settings(SettingsArgs),
 
@@ -152,6 +156,7 @@ impl Command {
                 HistoryCommand::UnlockPins => "history.unlock-pins".into(),
             },
             Self::Ocr(_) => "ocr".into(),
+            Self::Share(_) => "share".into(),
             Self::Settings(args) => match args.command {
                 SettingsCommand::Get { .. } => "settings.get".into(),
                 SettingsCommand::Set { .. } => "settings.set".into(),
@@ -1302,6 +1307,234 @@ fn checked_delay(seconds: f64) -> CliResult<Duration> {
 }
 
 // ---------------------------------------------------------------------------
+// share
+// ---------------------------------------------------------------------------
+
+/// An S3-compatible provider preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CloudProvider {
+    /// Amazon S3.
+    Aws,
+    /// Cloudflare R2.
+    R2,
+    /// Backblaze B2.
+    B2,
+    /// A user-operated MinIO endpoint.
+    Minio,
+}
+
+/// A validated presigned-link lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareExpiry {
+    seconds: u32,
+}
+
+impl ShareExpiry {
+    /// Whole seconds, no longer than SigV4's seven-day maximum.
+    #[must_use]
+    pub const fn seconds(self) -> u32 {
+        self.seconds
+    }
+}
+
+impl FromStr for ShareExpiry {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let text = raw.trim().to_ascii_lowercase();
+        let (number, multiplier) = match text.chars().last() {
+            Some('s') => (&text[..text.len() - 1], 1u32),
+            Some('m') => (&text[..text.len() - 1], 60),
+            Some('h') => (&text[..text.len() - 1], 3600),
+            Some('d') => (&text[..text.len() - 1], 86_400),
+            _ => (text.as_str(), 1),
+        };
+        let amount: u32 = number.parse().map_err(|_| {
+            format!("invalid expiry {raw:?}; use seconds or a suffix such as 30m, 24h or 7d")
+        })?;
+        let seconds = amount
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("expiry {raw:?} is too large"))?;
+        if seconds == 0 || seconds > 604_800 {
+            return Err(format!(
+                "share expiry must be between 1 second and 7 days, got {seconds} seconds"
+            ));
+        }
+        Ok(Self { seconds })
+    }
+}
+
+/// One `KEY=VALUE` object tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareTag {
+    /// Key.
+    pub key: String,
+    /// Value.
+    pub value: String,
+}
+
+impl FromStr for ShareTag {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (key, value) = raw
+            .split_once('=')
+            .ok_or_else(|| format!("tag {raw:?} must be written as KEY=VALUE"))?;
+        if key.is_empty() {
+            return Err("a tag key cannot be empty".to_owned());
+        }
+        Ok(Self {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        })
+    }
+}
+
+/// Arguments to `scrozz share`.
+///
+/// No secret has a value-taking argument. Environment credentials are checked
+/// first, a configured command may print a secret second, and
+/// `--secret-key-stdin` is the explicit fallback. Passwords likewise come only
+/// from stdin.
+#[derive(Clone, Args)]
+pub struct ShareArgs {
+    /// Image file to upload.
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Provider preset. Defaults to `SCROZZ_S3_PROVIDER`, then AWS.
+    #[arg(long, value_enum)]
+    pub provider: Option<CloudProvider>,
+
+    /// Bucket name. Defaults to `SCROZZ_S3_BUCKET`.
+    #[arg(long)]
+    pub bucket: Option<String>,
+
+    /// SigV4 region. Required for B2; AWS defaults to us-east-1.
+    #[arg(long)]
+    pub region: Option<String>,
+
+    /// Complete S3 API endpoint override.
+    #[arg(long)]
+    pub endpoint: Option<String>,
+
+    /// Cloudflare account id used to form the R2 endpoint.
+    #[arg(long)]
+    pub account_id: Option<String>,
+
+    /// Object-key prefix.
+    #[arg(long)]
+    pub prefix: Option<String>,
+
+    /// Full object key after the configured prefix. Defaults to the file name.
+    #[arg(long)]
+    pub key: Option<String>,
+
+    /// Public custom origin/path for a non-expiring share.
+    #[arg(long, requires = "no_expiry")]
+    pub public_base_url: Option<String>,
+
+    /// Provider-enforced presigned-link lifetime, up to seven days.
+    #[arg(long, value_name = "DURATION", conflicts_with = "no_expiry")]
+    pub expires: Option<ShareExpiry>,
+
+    /// Return a public/custom-domain URL instead of a presigned private URL.
+    ///
+    /// This does not make a bucket public. The bucket or CDN must already allow
+    /// GET requests.
+    #[arg(long, conflicts_with = "expires")]
+    pub no_expiry: bool,
+
+    /// Encrypt with AES-256-GCM using a password read from stdin and upload a
+    /// self-contained WebCrypto viewer.
+    #[arg(long, conflicts_with = "secret_key_stdin")]
+    pub password_stdin: bool,
+
+    /// Read the explicit secret access key from stdin.
+    ///
+    /// The non-secret access-key id still comes from
+    /// `SCROZZ_S3_ACCESS_KEY_ID` or `AWS_ACCESS_KEY_ID`.
+    #[arg(long, conflicts_with = "password_stdin")]
+    pub secret_key_stdin: bool,
+
+    /// Program whose stdout is the secret access key. It is executed directly,
+    /// never through a shell.
+    #[arg(long, value_name = "PROGRAM")]
+    pub credential_command: Option<PathBuf>,
+
+    /// One argument for `--credential-command`. Repeat as needed.
+    #[arg(
+        long = "credential-arg",
+        value_name = "ARG",
+        requires = "credential_command",
+        allow_hyphen_values = true
+    )]
+    pub credential_args: Vec<OsString>,
+
+    /// S3 object tag, as `KEY=VALUE`. Repeatable.
+    #[arg(long = "tag", value_name = "KEY=VALUE")]
+    pub tags: Vec<ShareTag>,
+
+    /// Heading for an encrypted viewer.
+    #[arg(long, requires = "password_stdin")]
+    pub title: Option<String>,
+
+    /// Six-digit CSS accent color for an encrypted viewer.
+    #[arg(long, value_name = "#RRGGBB", requires = "password_stdin")]
+    pub accent: Option<String>,
+}
+
+impl std::fmt::Debug for ShareArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareArgs")
+            .field("file", &self.file)
+            .field("provider", &self.provider)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("account_id", &self.account_id)
+            .field("prefix", &self.prefix)
+            .field("key", &self.key)
+            .field("public_base_url", &self.public_base_url)
+            .field("expires", &self.expires)
+            .field("no_expiry", &self.no_expiry)
+            .field("password_stdin", &self.password_stdin)
+            .field("secret_key_stdin", &self.secret_key_stdin)
+            .field("credential_command", &self.credential_command)
+            .field("credential_args", &"[REDACTED]")
+            .field("tags", &self.tags)
+            .field("title", &self.title)
+            .field("accent", &self.accent)
+            .finish()
+    }
+}
+
+impl ShareArgs {
+    /// Validates rules that are clearer after parsing.
+    pub fn validate(&self) -> CliResult<()> {
+        if self
+            .key
+            .as_deref()
+            .is_some_and(|key| key.trim().is_empty() || key.starts_with('/'))
+        {
+            return Err(CliError::usage(
+                "--key must be nonempty and must not begin with `/`",
+            ));
+        }
+        if self.accent.as_deref().is_some_and(|accent| {
+            accent.len() != 7
+                || !accent.starts_with('#')
+                || !accent[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(CliError::usage(
+                "--accent must be a six-digit CSS color such as #7c3aed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // record
 // ---------------------------------------------------------------------------
 
@@ -2089,6 +2322,62 @@ mod tests {
             parse(&["scrozz", "gui"]).command,
             Some(Command::Gui)
         ));
+    }
+
+    #[test]
+    fn share_parses_provider_expiry_tags_and_stdin_only_secrets() {
+        let Some(Command::Share(args)) = parse(&[
+            "scrozz",
+            "share",
+            "capture.png",
+            "--provider",
+            "r2",
+            "--expires",
+            "90m",
+            "--tag",
+            "project=demo",
+            "--secret-key-stdin",
+        ])
+        .command
+        else {
+            panic!("expected share")
+        };
+        assert_eq!(args.provider, Some(CloudProvider::R2));
+        assert_eq!(args.expires.unwrap().seconds(), 5400);
+        assert_eq!(args.tags[0].key, "project");
+        assert!(args.secret_key_stdin);
+    }
+
+    #[test]
+    fn share_password_and_explicit_secret_cannot_compete_for_stdin() {
+        reject(&[
+            "scrozz",
+            "share",
+            "capture.png",
+            "--password-stdin",
+            "--secret-key-stdin",
+        ]);
+        reject(&["scrozz", "share", "capture.png", "--expires", "8d"]);
+    }
+
+    #[test]
+    fn share_debug_redacts_credential_command_arguments() {
+        let Some(Command::Share(args)) = parse(&[
+            "scrozz",
+            "share",
+            "capture.png",
+            "--credential-command",
+            "secret-tool",
+            "--credential-arg",
+            "private-item-reference",
+        ])
+        .command
+        else {
+            panic!("expected share")
+        };
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("private-item-reference"));
+        assert!(rendered.contains("[REDACTED]"));
     }
 
     #[test]
@@ -3442,6 +3731,7 @@ mod tests {
             (vec!["scrozz", "history", "delete", "a"], "history.delete"),
             (vec!["scrozz", "history", "pin", "a"], "history.pin"),
             (vec!["scrozz", "ocr", "a"], "ocr"),
+            (vec!["scrozz", "share", "a.png"], "share"),
             (vec!["scrozz", "settings", "get"], "settings.get"),
             (vec!["scrozz", "settings", "set", "a", "b"], "settings.set"),
             (
@@ -3468,6 +3758,7 @@ mod tests {
             vec!["scrozz", "--help"],
             vec!["scrozz", "--version"],
             vec!["scrozz", "capture", "--help"],
+            vec!["scrozz", "share", "--help"],
             vec!["scrozz", "history", "get", "--help"],
             vec!["scrozz", "hotkey", "generate-config", "--help"],
         ] {
@@ -3481,5 +3772,61 @@ mod tests {
                 err.kind()
             );
         }
+    }
+
+    #[test]
+    fn share_has_no_argument_that_can_carry_a_secret() {
+        let command = Cli::command();
+        let share = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "share")
+            .unwrap();
+        let names = share
+            .get_arguments()
+            .map(|argument| argument.get_id().as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"secret_key"));
+        assert!(!names.contains(&"password"));
+        assert!(names.contains(&"secret_key_stdin"));
+        assert!(names.contains(&"password_stdin"));
+    }
+
+    #[test]
+    fn share_branding_and_custom_domains_require_their_matching_modes() {
+        for argv in [
+            vec!["scrozz", "share", "a.png", "--title", "Demo"],
+            vec!["scrozz", "share", "a.png", "--accent", "#112233"],
+            vec![
+                "scrozz",
+                "share",
+                "a.png",
+                "--public-base-url",
+                "https://cdn.example",
+            ],
+        ] {
+            assert_eq!(
+                reject(&argv).kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+
+        parse(&[
+            "scrozz",
+            "share",
+            "a.png",
+            "--password-stdin",
+            "--title",
+            "Demo",
+            "--accent",
+            "#112233",
+        ]);
+        parse(&[
+            "scrozz",
+            "share",
+            "a.png",
+            "--no-expiry",
+            "--public-base-url",
+            "https://cdn.example",
+        ]);
     }
 }

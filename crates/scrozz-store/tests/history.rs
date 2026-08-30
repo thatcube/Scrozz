@@ -3,9 +3,11 @@
 use scrozz_annotate::{Annotation, Style};
 use scrozz_core::{DisplayId, LogicalPoint, LogicalRect, LogicalSize, Opacity, PinScale, PinState};
 use scrozz_store::{
-    DocumentState, History as _, ImageState, MediaKind, NewCapture, Page, SearchQuery, SqliteStore,
-    Store as _, Timestamp,
-    test_support::{ScratchDir, richly_annotated_document, sample_document, scratch_dir},
+    CaptureSharing, DocumentState, History as _, ImageState, MediaKind, NewCapture, Page,
+    RemoteDeletionState, RemoteObjectStatus, SearchQuery, SqliteStore, Store as _, Timestamp,
+    test_support::{
+        ScratchDir, richly_annotated_document, sample_document, sample_sharing, scratch_dir,
+    },
 };
 
 fn store(label: &str) -> (ScratchDir, SqliteStore) {
@@ -1039,4 +1041,65 @@ fn sidecar_recovery_preserves_recording_metadata() {
     let video = record.video.expect("metadata survives recovery");
     assert_eq!(video.duration_secs, 6.75);
     assert_eq!(video.engine, "AVFoundation");
+}
+
+// ─── Private sharing metadata ───────────────────────────────────────────────
+
+#[test]
+fn sharing_metadata_round_trips_through_the_store() {
+    let (_dir, mut store) = store("sharing-round-trip");
+    let document = sample_document(8, 8, 10, 1);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+    let sharing = sample_sharing(10);
+
+    store
+        .set_share_metadata(&id, Some(sharing.clone()))
+        .expect("set sharing");
+
+    let record = store.record(&id).expect("read").expect("present");
+    assert_eq!(record.sharing, Some(sharing.clone()));
+    assert_eq!(store.share_metadata(&id).expect("read"), Some(sharing));
+}
+
+#[test]
+fn sharing_status_and_deletion_transitions_are_durable() {
+    let (dir, mut store) = store("sharing-transitions");
+    let document = sample_document(8, 8, 11, 1);
+    let id = store.insert(NewCapture::new(&document)).expect("insert");
+
+    store
+        .set_share_metadata(
+            &id,
+            Some(
+                CaptureSharing::new(
+                    scrozz_store::ShareUrl::new("https://example.invalid/shares/11.png?sig=test")
+                        .expect("url"),
+                    scrozz_store::ShareProvider::Aws,
+                    scrozz_store::RemoteObjectId::new("captures/11.png").expect("object"),
+                    scrozz_store::SharedMediaKind::Image,
+                )
+                .with_remote_status(RemoteObjectStatus::Pending),
+            ),
+        )
+        .expect("set sharing");
+    store
+        .set_share_remote_status(&id, RemoteObjectStatus::Available)
+        .expect("available");
+    store
+        .set_share_deletion_state(&id, RemoteDeletionState::Requested)
+        .expect("requested");
+    store
+        .set_share_deletion_state(&id, RemoteDeletionState::Deleted)
+        .expect("deleted");
+
+    drop(store);
+    let store = SqliteStore::open(dir.path()).expect("reopen");
+    let sharing = store
+        .record(&id)
+        .expect("read")
+        .expect("present")
+        .sharing
+        .expect("sharing");
+    assert_eq!(sharing.remote_status, RemoteObjectStatus::Available);
+    assert_eq!(sharing.deletion, RemoteDeletionState::Deleted);
 }

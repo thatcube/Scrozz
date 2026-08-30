@@ -13,7 +13,7 @@ use scrozz_core::{ColorSpace, Error, Frame, PixelFormat};
 use scrozz_export::{
     Clipboard, ClipboardPlatform, ClipboardReport, Destination, Encoder, ExportOutcome,
     FileExporter, FrameEncoder, ImageFormat, NamePolicy, NameTemplate, NamingContext, S3Object,
-    S3Uploader, Timestamp, UnimplementedS3Uploader,
+    S3Uploader, Timestamp,
 };
 
 // ---------------------------------------------------------------------------
@@ -452,8 +452,6 @@ fn a_clipboard_failure_is_reported_rather_than_swallowed() {
 
 #[test]
 fn without_a_bucket_configured_s3_is_unsupported_and_says_what_to_do_instead() {
-    // Never a panic on the default path: `UnimplementedS3Uploader` is only
-    // reached if somebody installs it deliberately.
     let destination = Destination::S3 {
         bucket: "shots".into(),
         prefix: "2025/".into(),
@@ -544,20 +542,6 @@ fn an_upload_failure_surfaces_so_the_queue_can_retry() {
         .export_bytes(&png_bytes(), &destination, &context())
         .unwrap_err();
     assert!(matches!(err, Error::Storage(_)), "got {err:?}");
-}
-
-#[test]
-#[should_panic(expected = "Signature Version 4")]
-fn the_stub_uploader_is_explicitly_unfinished() {
-    // Documents the deliberate stub: the interface is defined and wired, the
-    // protocol work is not done, and nothing reaches this unless it is
-    // installed on purpose.
-    let _ = UnimplementedS3Uploader.upload(&S3Object {
-        bucket: "b",
-        key: "k",
-        bytes: &[],
-        content_type: "image/png",
-    });
 }
 
 // ---------------------------------------------------------------------------

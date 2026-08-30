@@ -1,0 +1,38 @@
+[package]
+name = "scrozz-cloud"
+description = "Private, bring-your-own S3-compatible capture sharing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+network = ["dep:ureq"]
+native-vault = ["dep:keyring"]
+
+[dependencies]
+scrozz-core.workspace = true
+scrozz-export.workspace = true
+aes-gcm.workspace = true
+getrandom.workspace = true
+httpdate.workspace = true
+ureq = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, optional = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, optional = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, optional = true, features = [
+    "crypto-rust",
+    "sync-secret-service",
+    "vendored",
+] }
+
+[lints]
+workspace = true

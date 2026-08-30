@@ -25,6 +25,7 @@ scrozz-stitch = { path = "crates/scrozz-stitch" }
 scrozz-ocr = { path = "crates/scrozz-ocr" }
 scrozz-store = { path = "crates/scrozz-store" }
 scrozz-export = { path = "crates/scrozz-export" }
+scrozz-cloud = { path = "crates/scrozz-cloud" }
 scrozz-shell = { path = "crates/scrozz-shell" }
 scrozz-ui = { path = "crates/scrozz-ui" }
 
@@ -77,6 +78,12 @@ global-hotkey = "0.8"
 tray-icon = "0.24"
 dark-light = { version = "3", default-features = false }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+httpdate = "1"
+keyring = { version = "3.6.3", default-features = false }
+zeroize = "1"
+aes-gcm = "0.11"
+getrandom = "0.3"
+ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
 
 # --- macOS ---
 objc2 = "0.6"

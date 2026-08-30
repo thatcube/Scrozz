@@ -144,10 +144,14 @@ if [[ -n "$PREBUILT" ]]; then
   echo "==> using prebuilt binary $PREBUILT"
   SOURCE_BIN="$PREBUILT"
 else
+  # `--features cloud` is what makes a distributed bundle able to share: the
+  # feature is off by default so a plain `cargo build` links neither a TLS
+  # stack nor a platform credential vault, and every shipped artefact turns it
+  # on. See `apps/scrozz/Cargo.toml`.
   echo "==> building release binary (Scrozz $APP_VERSION)"
   SCROZZ_VERSION="$APP_VERSION" \
     SCROZZ_BUILD_NUMBER="$BUILD_NUMBER" \
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo build -p scrozz --release --features cloud
   SOURCE_BIN="$TARGET_DIR/release/scrozz"
 fi
 

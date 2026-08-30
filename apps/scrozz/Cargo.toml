@@ -8,14 +8,22 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "scrozz"
+path = "src/main.rs"
+
 [features]
 default = ["rav1e-fallback"]
 linux-recording = ["scrozz-record/linux-native"]
 rav1e-fallback = ["scrozz-record/rav1e-fallback"]
-
-[[bin]]
-name = "scrozz"
-path = "src/main.rs"
+# Private sharing is opt-in: it is the only feature that links a TLS stack and
+# a platform credential vault, so a build that never uploads never pays for
+# either. Distributed builds turn it on — see `tools/make-app-bundle.sh`.
+cloud = [
+    "dep:scrozz-cloud",
+    "scrozz-cloud/native-vault",
+    "scrozz-cloud/network",
+]
 
 [dependencies]
 scrozz-core.workspace = true
@@ -26,6 +34,7 @@ scrozz-stitch.workspace = true
 scrozz-ocr.workspace = true
 scrozz-store.workspace = true
 scrozz-export.workspace = true
+scrozz-cloud = { workspace = true, optional = true }
 scrozz-shell.workspace = true
 scrozz-ui.workspace = true
 # The app opens the overlay window, so it names eframe directly. scrozz-ui

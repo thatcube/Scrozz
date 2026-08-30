@@ -94,6 +94,12 @@ pub struct SettingsEdits {
     pub recording: Vec<RecordingSettingsAction>,
     /// Complete Recent Captures Overlay configuration after an accepted edit.
     pub recent_captures_overlay: Option<RecentCapturesOverlaySettings>,
+    /// The user asked to configure private sharing.
+    ///
+    /// Sharing has a viewport of its own rather than a pane here, because it
+    /// holds transient credential fields that must be zeroized the moment that
+    /// window closes — a lifetime the Settings window does not have.
+    pub open_sharing: bool,
 }
 
 impl SettingsEdits {
@@ -104,6 +110,7 @@ impl SettingsEdits {
             && self.after_capture.is_empty()
             && self.recording.is_empty()
             && self.recent_captures_overlay.is_none()
+            && !self.open_sharing
     }
 }
 
@@ -831,7 +838,8 @@ fn draw_body(
             ui.set_width(ui.available_width());
             match pane {
                 Pane::AfterCapture => {
-                    edits.after_capture = draw_after_capture(ui, theme, after_capture);
+                    edits.after_capture =
+                        draw_after_capture(ui, theme, after_capture, &mut edits.open_sharing);
                 }
                 Pane::Recording => {
                     edits.recording = draw_recording(ui, theme, recording_pane);
@@ -1396,6 +1404,7 @@ fn draw_after_capture(
     ui: &mut egui::Ui,
     theme: &Theme,
     rows: &[AfterCaptureRow],
+    open_sharing: &mut bool,
 ) -> Vec<AfterCaptureEdit> {
     let palette = theme.palette;
     let mut edits = Vec::new();
@@ -1423,6 +1432,29 @@ fn draw_after_capture(
             } else {
                 draw_after_capture_cards(ui, theme, rows, &mut edits);
             }
+            // The one row above that depends on a *remote* service gets its
+            // configuration where the user is already reading about it, rather
+            // than somewhere they would have to be told about.
+            ui.add_space(Space::LG);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Private sharing")
+                        .font(theme.font(Text::Label))
+                        .color(palette.text),
+                );
+                if ui.button("Configure Sharing…").clicked() {
+                    *open_sharing = true;
+                }
+            });
+            ui.add_space(Space::XS);
+            ui.label(
+                RichText::new(
+                    "Upload uses your own S3-compatible bucket. Credentials live in the \
+                     platform keychain, never in the settings file.",
+                )
+                .font(theme.font(Text::Caption))
+                .color(palette.text_muted),
+            );
         });
     edits
 }
@@ -1898,7 +1930,7 @@ impl crate::harness::Scene for AfterCaptureSettingsScene {
                 ui.add_space(Space::LG);
                 ui.separator();
                 ui.add_space(Space::LG);
-                let _ = draw_after_capture(ui, &theme, &preview_after_capture_rows());
+                let _ = draw_after_capture(ui, &theme, &preview_after_capture_rows(), &mut false);
             });
     }
 }
@@ -1906,8 +1938,7 @@ impl crate::harness::Scene for AfterCaptureSettingsScene {
 fn preview_after_capture_rows() -> Vec<AfterCaptureRow> {
     const COPY_RECORDING_UNAVAILABLE: &str = "Copying a recording needs a platform file-reference clipboard flavour, which is not implemented in this build.";
     const SAVE_RECORDING_UNAVAILABLE: &str = "A recording is already written to its destination when it finalizes, so a second automatic export is not implemented in this build.";
-    const UPLOAD_UNAVAILABLE: &str =
-        "No cloud upload provider is implemented or configured in this build.";
+    const UPLOAD_UNAVAILABLE: &str = "Uploading here would hold the shutter open on a remote host. Press Upload on the card instead: it runs on its own worker and copies the link when it lands.";
     const PIN_UNAVAILABLE: &str = "Pin to Screen is not implemented in this build.";
     let available = |enabled| AfterCaptureCell {
         enabled,
