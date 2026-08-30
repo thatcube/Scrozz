@@ -190,7 +190,7 @@ flawless. Capso's unclean radii come from doing post-processing that should not
 happen.
 
 **Therefore, for Scrozz:** window captures are sacred. Take what the OS gives and
-never crop, round, border, re-shadow, or paint over those pixels. Smart Frame may
+never crop, round, border, re-shadow, or paint over those pixels. Scene may
 place the byte-stable captured rectangle on a larger presentation canvas, because
 that changes the canvas rather than the window. Where a platform does *not* give correct corners and alpha
 (Windows, Linux), reconstructing them is a **fidelity gap to be closed**, held to

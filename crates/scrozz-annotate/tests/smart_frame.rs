@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 use scrozz_annotate::{
-    AnalysisCancellation, Background, Beautification, InsetDecision, MAX_ANALYSIS_SAMPLES,
-    SmartFramePreset, SmartFramePresetSettings, analyze_smart_frame, contrast_ratio,
+    AnalysisCancellation, AutomaticBackground, Background, Beautification, GeneratedStyle,
+    InsetDecision, MAX_ANALYSIS_SAMPLES, PresetBackground, SmartFramePreset,
+    SmartFramePresetSettings, analyze_scene_with_style, analyze_smart_frame, contrast_ratio,
 };
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
 
@@ -51,17 +52,14 @@ fn analysis_is_byte_deterministic() {
 }
 
 #[test]
-fn transparent_outer_margin_is_trimmed_in_source_space() {
+fn transparent_outer_margin_remains_part_of_the_source_composition() {
     let mut frame = rgba_frame(100, 80, [0, 0, 0, 0], ColorSpace::DisplayP3);
     paint_rect(&mut frame, 10, 8, 90, 72, [220, 80, 40, 255]);
 
     let result =
         analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
     let inset = result.beautification.inset;
-    assert_eq!(
-        (inset.left, inset.top, inset.right, inset.bottom),
-        (10.0, 8.0, 10.0, 8.0)
-    );
+    assert!(inset.is_zero());
     assert_eq!(
         result
             .beautification
@@ -69,7 +67,7 @@ fn transparent_outer_margin_is_trimmed_in_source_space() {
             .as_ref()
             .unwrap()
             .inset_decision,
-        InsetDecision::TransparentMargin
+        InsetDecision::NoExcessMargin
     );
 }
 
@@ -130,6 +128,41 @@ fn automatic_background_has_resolved_contrast_and_space_metadata() {
     assert!(contrast_ratio(background.start, background.edge_reference) >= 3.0);
     assert!(contrast_ratio(background.end, background.edge_reference) >= 3.0);
     assert!(background.minimum_contrast_x100 >= 300);
+    assert_ne!(background.seed, 0);
+    assert_eq!(background.resolved_palette().len(), 4);
+}
+
+#[test]
+fn generated_styles_are_reproducible_and_visibly_distinct() {
+    let mut frame = rgba_frame(180, 120, [24, 31, 52, 255], ColorSpace::Srgb);
+    paint_rect(&mut frame, 90, 20, 170, 100, [228, 76, 126, 255]);
+    let cancellation = AnalysisCancellation::default();
+    let mut resolved = Vec::new();
+
+    for style in [
+        GeneratedStyle::Balanced,
+        GeneratedStyle::Soft,
+        GeneratedStyle::Vibrant,
+        GeneratedStyle::Neutral,
+    ] {
+        let first =
+            analyze_scene_with_style(&frame, Provenance::Region, style, &cancellation).unwrap();
+        let second =
+            analyze_scene_with_style(&frame, Provenance::Region, style, &cancellation).unwrap();
+        assert_eq!(first, second);
+        let Background::Automatic(background) = first.beautification.background else {
+            panic!("generated background");
+        };
+        assert_eq!(background.style, style);
+        resolved.push((background.template, background.resolved_palette()));
+    }
+
+    resolved.dedup();
+    assert_eq!(
+        resolved.len(),
+        4,
+        "each named direction must visibly change its deterministic treatment"
+    );
 }
 
 #[test]
@@ -190,6 +223,21 @@ fn window_analysis_only_adds_an_outer_presentation_canvas() {
 }
 
 #[test]
+fn stitched_scene_uses_modest_vertical_and_useful_horizontal_space() {
+    let frame = rgba_frame(300, 900, [80, 100, 140, 255], ColorSpace::Srgb);
+    let result = analyze_smart_frame(
+        &frame,
+        Provenance::Stitched,
+        &AnalysisCancellation::default(),
+    )
+    .unwrap();
+    let padding = result.beautification.resolved_padding();
+    assert_eq!(padding.left, padding.right);
+    assert_eq!(padding.top, padding.bottom);
+    assert!(padding.left > padding.top);
+}
+
+#[test]
 fn cancellation_is_an_outcome_not_a_partial_result() {
     let frame = rgba_frame(640, 480, [20, 30, 40, 255], ColorSpace::Srgb);
     let cancellation = AnalysisCancellation::default();
@@ -197,6 +245,28 @@ fn cancellation_is_an_outcome_not_a_partial_result() {
     let error = analyze_smart_frame(&frame, Provenance::Region, &cancellation)
         .expect_err("cancelled analysis");
     assert!(error.is_cancellation());
+}
+
+#[test]
+fn scene_api_refuses_legacy_source_inset() {
+    let mut document = scrozz_annotate::Document::new(scrozz_core::Capture {
+        frame: rgba_frame(100, 80, [20, 30, 40, 255], ColorSpace::Srgb),
+        provenance: Provenance::Region,
+        target: scrozz_core::CaptureTarget::Region(scrozz_core::LogicalRect::new(
+            scrozz_core::LogicalPoint::new(0.0, 0.0),
+            scrozz_core::LogicalSize::new(100.0, 80.0),
+        )),
+    });
+    let scene = Beautification {
+        inset: scrozz_annotate::SourceInsets::uniform(4.0),
+        ..Beautification::default()
+    };
+
+    assert!(document.set_scene(Some(scene.clone())).is_err());
+    assert!(
+        document.set_beautification(Some(scene)).is_ok(),
+        "legacy Smart Frame documents remain readable during migration"
+    );
 }
 
 #[test]
@@ -232,6 +302,56 @@ fn preset_round_trip_preserves_unknown_fields_but_never_pixels() {
         scrozz_annotate::BackgroundImage::new(1, 1, vec![0, 0, 0, 255], ColorSpace::Srgb).unwrap();
     beauty.background = Background::Image(image);
     assert!(SmartFramePresetSettings::from_beautification(&beauty).is_err());
+}
+
+#[test]
+fn fixed_generated_background_round_trips_through_a_preset() {
+    let mut generated =
+        AutomaticBackground::fallback(ColorSpace::DisplayP3).restyled(GeneratedStyle::Vibrant);
+    generated.seed = 8_675_309;
+    let mut beauty = Beautification {
+        background: Background::Automatic(generated.clone()),
+        ..Beautification::default()
+    };
+    beauty.automatic.background = false;
+
+    let settings = SmartFramePresetSettings::from_beautification(&beauty).unwrap();
+    assert!(matches!(
+        settings.background,
+        PresetBackground::ResolvedGenerated(_)
+    ));
+    assert_eq!(
+        settings.to_beautification().background,
+        Background::Automatic(generated)
+    );
+}
+
+#[test]
+fn legacy_presets_default_only_explicit_automatic_backgrounds_to_automatic() {
+    let fixed = SmartFramePresetSettings::from_beautification(&Beautification {
+        padding: 48.0,
+        background: Background::Solid(scrozz_annotate::Color::rgb(20, 40, 80)),
+        ..Beautification::default()
+    })
+    .unwrap();
+    let mut fixed_json = serde_json::to_value(fixed).unwrap();
+    fixed_json.as_object_mut().unwrap().remove("automatic");
+    let fixed: SmartFramePresetSettings = serde_json::from_value(fixed_json).unwrap();
+    assert!(!fixed.automatic.any());
+
+    let mut automatic_json = serde_json::to_value(SmartFramePresetSettings {
+        background: PresetBackground::Automatic,
+        ..SmartFramePresetSettings::default()
+    })
+    .unwrap();
+    automatic_json.as_object_mut().unwrap().remove("automatic");
+    let automatic: SmartFramePresetSettings = serde_json::from_value(automatic_json).unwrap();
+    assert!(automatic.automatic.background);
+    assert!(!automatic.automatic.padding);
+    assert!(!automatic.automatic.placement);
+    assert!(!automatic.automatic.corners);
+    assert!(!automatic.automatic.shadow);
+    assert!(!automatic.automatic.output_size);
 }
 
 #[test]
@@ -331,7 +451,7 @@ fn detailed_photo_like_edges_disable_automatic_inset() {
     assert!(result.beautification.inset.is_zero());
     assert_eq!(
         result.beautification.smart_frame.unwrap().inset_decision,
-        InsetDecision::LowConfidence
+        InsetDecision::NoExcessMargin
     );
 }
 

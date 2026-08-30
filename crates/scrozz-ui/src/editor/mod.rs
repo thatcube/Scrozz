@@ -42,7 +42,8 @@ pub use paint::{CanvasView, Preview, to_color_image};
 pub use scene::EditorScene;
 pub use state::{
     CROP_SNAP_TOLERANCE, Caret, Command, CropAspect, EditorState, Handle, Intent, MAX_ZOOM,
-    MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE, NUDGE_COARSE, SmartFrameDraft, TextEdit, Tool, ZOOM_STEP,
+    MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE, NUDGE_COARSE, SceneDraft, SmartFrameDraft, TextEdit, Tool,
+    ZOOM_STEP,
 };
 pub use toolbar::{PALETTE, STROKE_MAX, STROKE_MIN};
 
@@ -107,7 +108,7 @@ pub struct EditorUi {
     arrow_popover: toolbar::ArrowPopover,
     /// A decision reached while painting, returned at the end of the frame.
     pending: Option<Intent>,
-    /// Whether the Smart Frame side panel is shown.
+    /// Whether the Scene side panel is shown for this editor session.
     show_smart_frame: bool,
 }
 
@@ -267,10 +268,21 @@ impl EditorUi {
         self.show_smart_frame = visible;
     }
 
+    /// Enables or disables the session-local Scene panel.
+    pub fn set_scene_visible(&mut self, visible: bool) {
+        self.set_smart_frame_visible(visible);
+    }
+
     /// Whether the Smart Frame side panel is visible.
     #[must_use]
     pub const fn smart_frame_visible(&self) -> bool {
         self.show_smart_frame
+    }
+
+    /// Whether the Scene panel is visible in this editor session.
+    #[must_use]
+    pub const fn scene_visible(&self) -> bool {
+        self.smart_frame_visible()
     }
 
     /// Draws one frame and reports what the host should do.
@@ -310,7 +322,7 @@ impl EditorUi {
                     self.show_smart_frame = false;
                 } else {
                     self.show_smart_frame = true;
-                    self.pending = Some(self.state.begin_smart_frame());
+                    self.state.edit_existing_scene();
                 }
             } else {
                 self.pending = Some(action);
@@ -319,7 +331,7 @@ impl EditorUi {
         // Smart Frame right panel.
         if let Some(panel_rect) = sf_panel
             && let Some(sf_intent) =
-                toolbar::draw_smart_frame_panel(ui, &surface, &mut self.state, panel_rect)
+                toolbar::draw_scene_panel(ui, &surface, &mut self.state, panel_rect)
         {
             self.pending = Some(sf_intent);
         }
@@ -368,7 +380,7 @@ pub fn editor_layout(full: egui::Rect) -> (egui::Rect, egui::Rect) {
     (bar, canvas)
 }
 
-/// Width of the Smart Frame side panel in points.
+/// Width of the compact Scene side panel in points.
 const SMART_FRAME_PANEL_W: f32 = 320.0;
 
 /// Layout with an optional Smart Frame right panel.

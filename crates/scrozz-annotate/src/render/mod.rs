@@ -24,7 +24,7 @@ const BYTES_PER_PIXEL: u64 = 4;
 
 /// Renders a document to pixels.
 pub trait Renderer {
-    /// Composites annotations and framing over the source.
+    /// Composites annotations and Scene over the source.
     ///
     /// # Errors
     ///
@@ -72,7 +72,7 @@ impl SkiaRenderer {
                 .is_some_and(|beautification| !beautification.preserves_subject_pixels())
         {
             return Err(Error::InvalidRequest(
-                "window Smart Frame may add only an outer canvas; native pixels must remain untouched (decision D9)"
+                "window Scene may add only an outer canvas; native pixels must remain untouched (decision D9)"
                     .to_owned(),
             ));
         }
@@ -150,7 +150,7 @@ impl SkiaRenderer {
             || document.beautification().is_some_and(|beautification| {
                 matches!(
                     &beautification.background,
-                    crate::Background::Image(image)
+                    crate::Background::Image(image) | crate::Background::Desktop(image)
                         if image.color_space() == ColorSpace::Unknown
                 )
             }) {
@@ -251,7 +251,9 @@ fn preflight_render(
 }
 
 fn retained_background_bytes(beautification: &Beautification) -> Result<u64> {
-    let crate::Background::Image(image) = &beautification.background else {
+    let (crate::Background::Image(image) | crate::Background::Desktop(image)) =
+        &beautification.background
+    else {
         return Ok(0);
     };
     u64::from(image.width())

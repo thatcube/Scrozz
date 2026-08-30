@@ -6,7 +6,9 @@ use common::{
     capture_with, document, flat, near, pixel, pixels, rect, region_capture, window_capture,
 };
 use scrozz_annotate::{
-    Annotation, Background, Beautification, Color, Document, Renderer, SkiaRenderer, Style,
+    Annotation, AspectPreset, AutomaticBackground, Background, Beautification, Color, Document,
+    ExactOutputSize, GeneratedStyle, Renderer, ResolvedFocus, SkiaRenderer, SmartFrameMetadata,
+    Style,
 };
 use scrozz_core::{Frame, LogicalPoint, PixelFormat, Provenance, ScaleFactor};
 
@@ -287,11 +289,11 @@ fn subject_styling_is_refused_by_the_renderer_for_window_captures() {
     };
 
     // Build it against a permitted capture, then verify the safe replacement
-    // API refuses to create the invalid state the renderer also guards.
+    // API refuses to apply synthetic corners to native window pixels.
     let mut doc = Document::from_data(region_capture(60, 60), data).unwrap();
     let err = doc
         .replace_source(window_capture(60, 60))
-        .expect_err("a window capture must never be re-framed");
+        .expect_err("a window capture must retain its native silhouette");
     assert!(format!("{err}").to_lowercase().contains("window"), "{err}");
 }
 
@@ -329,6 +331,156 @@ fn beautification_pads_the_canvas() {
 
     assert!(near(pixel(&out, 2, 2), [0, 0, 255, 255], 2), "background");
     assert!(near(pixel(&out, 45, 40), [200, 30, 30, 255], 2), "content");
+}
+
+#[test]
+fn undersized_exact_output_grows_canvas_without_shrinking_source() {
+    let mut doc = Document::new(capture_with(
+        flat(100, 60, [220, 40, 60, 255]),
+        Provenance::Region,
+    ));
+    doc.set_scene(Some(Beautification {
+        padding: 10.0,
+        output_size: Some(ExactOutputSize {
+            width: 20,
+            height: 20,
+        }),
+        background: Background::Solid(Color::rgb(20, 40, 180)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (120, 120));
+    assert!(near(pixel(&out, 10, 30), [220, 40, 60, 255], 1));
+    assert!(near(pixel(&out, 109, 89), [220, 40, 60, 255], 1));
+    assert!(near(pixel(&out, 9, 30), [20, 40, 180, 255], 1));
+}
+
+#[test]
+fn exact_output_supersedes_a_stale_aspect_preset() {
+    let mut doc = Document::new(capture_with(
+        flat(100, 50, [220, 40, 60, 255]),
+        Provenance::Region,
+    ));
+    doc.set_scene(Some(Beautification {
+        padding: 10.0,
+        aspect: AspectPreset::Story,
+        output_size: Some(ExactOutputSize {
+            width: 192,
+            height: 108,
+        }),
+        background: Background::Solid(Color::rgb(20, 40, 180)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+
+    assert_eq!((out.width(), out.height()), (192, 108));
+}
+
+#[test]
+fn low_confidence_automatic_placement_is_exactly_centered() {
+    let mut doc = Document::new(capture_with(
+        flat(40, 20, [220, 40, 60, 255]),
+        Provenance::Region,
+    ));
+    doc.set_scene(Some(Beautification {
+        padding: 20.0,
+        auto_balance: true,
+        smart_frame: Some(SmartFrameMetadata {
+            focus: ResolvedFocus {
+                x: 10_000,
+                y: 0,
+                confidence: 54,
+            },
+            ..SmartFrameMetadata::default()
+        }),
+        background: Background::Solid(Color::rgb(20, 40, 180)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert!(near(pixel(&out, 20, 20), [220, 40, 60, 255], 1));
+    assert!(near(pixel(&out, 19, 20), [20, 40, 180, 255], 1));
+    assert!(near(pixel(&out, 60, 20), [20, 40, 180, 255], 1));
+}
+
+#[test]
+fn generated_scene_styles_render_deterministically_and_differ() {
+    let renderer = SkiaRenderer::new();
+    let mut outputs = Vec::new();
+    for style in [
+        GeneratedStyle::Balanced,
+        GeneratedStyle::Soft,
+        GeneratedStyle::Vibrant,
+        GeneratedStyle::Neutral,
+    ] {
+        let mut doc = document(80, 50);
+        doc.set_scene(Some(Beautification {
+            padding: 20.0,
+            background: Background::Automatic(
+                AutomaticBackground::fallback(scrozz_core::ColorSpace::Srgb).restyled(style),
+            ),
+            ..Beautification::default()
+        }))
+        .unwrap();
+        let first = renderer.render(&doc).unwrap();
+        let second = renderer.render(&doc).unwrap();
+        assert_eq!(first.data, second.data);
+        outputs.push(first.data);
+    }
+    outputs.dedup();
+    assert_eq!(outputs.len(), 4);
+}
+
+#[test]
+fn native_window_pixels_are_copied_without_a_second_shadow() {
+    let mut doc = Document::new(window_capture(32, 24));
+    doc.set_scene(Some(Beautification {
+        padding: 12.0,
+        shadow: 0.0,
+        background: Background::Solid(Color::rgb(10, 20, 30)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+    let source = doc.source().frame.data.clone();
+    let source_stride = doc.source().frame.stride;
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    for y in 0..24usize {
+        let source_row = &source[y * source_stride..y * source_stride + 32 * 4];
+        let start = (y + 12) * out.stride + 12 * 4;
+        assert_eq!(&out.data[start..start + 32 * 4], source_row);
+    }
+}
+
+#[test]
+fn undersized_native_window_output_grows_around_the_untouched_source() {
+    let mut doc = Document::new(window_capture(32, 24));
+    doc.set_scene(Some(Beautification {
+        padding: 12.0,
+        output_size: Some(ExactOutputSize {
+            width: 20,
+            height: 20,
+        }),
+        background: Background::Solid(Color::rgb(10, 20, 30)),
+        ..Beautification::default()
+    }))
+    .expect("exact output dimensions are grow-only minimums");
+    let source = doc.source().frame.data.clone();
+    let source_stride = doc.source().frame.stride;
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+
+    assert_eq!((out.width(), out.height()), (56, 56));
+    for y in 0..24usize {
+        let source_row = &source[y * source_stride..y * source_stride + 32 * 4];
+        let start = (y + 16) * out.stride + 12 * 4;
+        assert_eq!(&out.data[start..start + 32 * 4], source_row);
+    }
 }
 
 #[test]

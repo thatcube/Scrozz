@@ -9,8 +9,9 @@ use common::{
     capture_with, checkerboard, document, every_annotation, rect, region_capture, window_capture,
 };
 use scrozz_annotate::{
-    Annotation, ArrowStyle, Background, Beautification, Color, Document, DocumentData, RedactStyle,
-    Renderer, SkiaRenderer, Style,
+    Annotation, ArrowStyle, AutomaticBackground, Background, Beautification, CanvasInsets, Color,
+    Document, DocumentData, GeneratedStyle, GeneratedTemplate, RedactStyle, Renderer, SkiaRenderer,
+    Style,
 };
 use scrozz_core::{LogicalPoint, Provenance};
 
@@ -305,6 +306,34 @@ fn round_trip_preserves_beautification() {
 }
 
 #[test]
+fn scene_round_trip_preserves_reproducible_automatic_state() {
+    let mut scene = Beautification {
+        padding: 64.0,
+        canvas_padding: Some(CanvasInsets {
+            left: 80.0,
+            top: 36.0,
+            right: 72.0,
+            bottom: 40.0,
+        }),
+        background: Background::Automatic(
+            AutomaticBackground::fallback(scrozz_core::ColorSpace::Srgb)
+                .restyled(GeneratedStyle::Vibrant),
+        ),
+        ..Beautification::default()
+    };
+    scene.automatic.padding = false;
+    scene.automatic.shadow = false;
+    let mut doc = document(200, 120);
+    doc.set_scene(Some(scene.clone())).unwrap();
+
+    let json = serde_json::to_string(&doc.data()).unwrap();
+    let data: DocumentData = serde_json::from_str(&json).unwrap();
+    let restored = Document::from_data(region_capture(200, 120), data).unwrap();
+
+    assert_eq!(restored.scene(), Some(&scene));
+}
+
+#[test]
 fn an_empty_document_round_trips() {
     let doc = document(10, 10);
     let json = serde_json::to_string(&doc.data()).unwrap();
@@ -323,6 +352,24 @@ fn a_sidecar_from_the_future_is_refused_rather_than_misread() {
     // Silently accepting a newer sidecar would drop whatever fields this build
     // does not know about, then write the loss back on the next save.
     assert!(Document::from_data(region_capture(50, 50), data).is_err());
+}
+
+#[test]
+fn legacy_automatic_background_decodes_as_its_original_two_stop_gradient() {
+    let mut value =
+        serde_json::to_value(AutomaticBackground::fallback(scrozz_core::ColorSpace::Srgb)).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("style");
+    object.remove("template");
+    object.remove("seed");
+    object.remove("palette");
+    let legacy: AutomaticBackground = serde_json::from_value(value).unwrap();
+
+    assert_eq!(legacy.template, GeneratedTemplate::SmoothGradient);
+    assert_eq!(
+        legacy.resolved_palette(),
+        [legacy.start, legacy.end, legacy.start, legacy.end]
+    );
 }
 
 #[test]

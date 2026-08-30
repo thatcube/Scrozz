@@ -856,6 +856,12 @@ fn beautification_json(beautification: &Beautification) -> Json {
                 Background::Image(image) => {
                     format!("image:{}x{}", image.width(), image.height())
                 }
+                Background::Desktop(image) => {
+                    format!("desktop:{}x{}", image.width(), image.height())
+                }
+                Background::BlurredSource { blur_radius, .. } => {
+                    format!("blurred-source:{blur_radius}")
+                }
             }),
         ),
     ])

@@ -22,8 +22,9 @@
 //! exactly one step.
 
 use scrozz_annotate::{
-    AnalysisCancellation, Background, DocumentData, SensitiveRegionReview, SmartFrameAnalysis,
-    SmartFramePreset, SmartFramePresetSettings, SourceInsets, provisional_smart_frame,
+    AnalysisCancellation, Background, BackgroundImage, DocumentData, GeneratedStyle,
+    SensitiveRegionReview, SmartFrameAnalysis, SmartFramePreset, SmartFramePresetSettings,
+    SourceInsets, smart_frame::provisional_with_style,
 };
 use scrozz_annotate::{
     Annotation, AnnotationId, AnnotationKind, ArrowStyle, Beautification, Color, Document, History,
@@ -665,7 +666,12 @@ pub struct SmartFrameDraft {
     /// Whether a returning analysis should replace all settings or only the
     /// automatic-background portion.
     analysis_scope: AnalysisScope,
+    /// Generated art direction retained while capture analysis resolves.
+    generated_style: GeneratedStyle,
 }
+
+/// Canonical editor name for the legacy-compatible Smart Frame draft payload.
+pub type SceneDraft = SmartFrameDraft;
 
 /// What a returning analysis result should replace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -673,7 +679,9 @@ enum AnalysisScope {
     /// Replace the entire beautification with the analysis result.
     All,
     /// Replace only the background and metadata, keeping manual edits.
-    AutomaticOnly,
+    BackgroundOnly,
+    /// Resolve every property the current Scene or preset leaves Automatic.
+    AutomaticProperties,
 }
 
 /// The editor's whole mutable state.
@@ -737,8 +745,6 @@ pub struct EditorState {
     preset_name: String,
     /// Reviewed sensitive-region suggestions, if delivered.
     sensitive_review: Option<SensitiveRegionReview>,
-    /// Whether the advanced Smart Frame inspector panel is expanded.
-    pub(super) advanced_open: bool,
 }
 
 impl EditorState {
@@ -775,7 +781,6 @@ impl EditorState {
             selected_preset: None,
             preset_name: String::new(),
             sensitive_review: None,
-            advanced_open: false,
         }
     }
 
@@ -2683,6 +2688,12 @@ impl EditorState {
         self.smart_frame.is_some()
     }
 
+    /// Whether an editable Scene draft is currently open.
+    #[must_use]
+    pub fn has_scene_draft(&self) -> bool {
+        self.has_smart_frame_draft()
+    }
+
     /// Whether the draft's analysis is still pending.
     #[must_use]
     pub fn smart_frame_analysis_pending(&self) -> bool {
@@ -2756,18 +2767,33 @@ impl EditorState {
     ///
     /// Opening/analysis preview does not dirty the document or spend a revision.
     pub fn begin_smart_frame(&mut self) -> Intent {
-        let before = self.document.beautification().cloned();
+        self.begin_scene_with_style(GeneratedStyle::Balanced)
+    }
+
+    /// Starts the immutable built-in Automatic Scene.
+    pub fn begin_scene(&mut self) -> Intent {
+        self.begin_smart_frame()
+    }
+
+    /// Starts Automatic Scene using a deterministic generated style direction.
+    pub fn begin_scene_with_style(&mut self, style: GeneratedStyle) -> Intent {
+        let before = self.smart_frame.as_ref().map_or_else(
+            || self.document.beautification().cloned(),
+            |draft| draft.before.clone(),
+        );
+        self.cancel_analysis();
         let generation = self.next_analysis_generation;
         self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
         let cancellation = AnalysisCancellation::default();
-        let provisional = provisional_smart_frame(
+        let provisional = provisional_with_style(
             self.document.logical_size(),
             self.document.source().frame.scale.get(),
             self.document.source().provenance,
             self.document.source().frame.color_space,
+            style,
         );
         self.document
-            .set_beautification(Some(provisional))
+            .set_scene(Some(provisional))
             .expect("the provisional recipe is provenance-safe");
         self.smart_frame = Some(SmartFrameDraft {
             before,
@@ -2777,9 +2803,9 @@ impl EditorState {
             edited_after_request: false,
             inset_explanation: "Analysing this revision...".to_owned(),
             analysis_scope: AnalysisScope::All,
+            generated_style: style,
         });
         self.touch();
-        self.advanced_open = false;
         let mut data = self.document.data();
         data.beautification = None;
         Intent::AnalyzeSmartFrame {
@@ -2799,13 +2825,16 @@ impl EditorState {
             |d| d.before.clone(),
         );
         self.cancel_analysis();
+        config.inset = SourceInsets::default();
         if !self.document.may_style_subject() {
-            config.inset = SourceInsets::default();
             config.corner_radius = 0.0;
             config.shadow = 0.0;
             config.border_width = 0.0;
+            config.automatic.corners = false;
+            config.automatic.shadow = false;
         }
-        match self.document.set_beautification(Some(config)) {
+        let style = generated_style(&config);
+        match self.document.set_scene(Some(config)) {
             Ok(()) => {
                 self.smart_frame = Some(SmartFrameDraft {
                     before,
@@ -2815,6 +2844,7 @@ impl EditorState {
                     edited_after_request: true,
                     inset_explanation: "Preset values are editable until Apply".to_owned(),
                     analysis_scope: AnalysisScope::All,
+                    generated_style: style,
                 });
                 self.touch();
             }
@@ -2822,21 +2852,46 @@ impl EditorState {
         }
     }
 
+    /// Opens an already-applied Scene without changing any stored value.
+    pub fn edit_existing_scene(&mut self) {
+        if self.smart_frame.is_some() {
+            return;
+        }
+        let Some(scene) = self.document.beautification().cloned() else {
+            return;
+        };
+        self.smart_frame = Some(SmartFrameDraft {
+            before: Some(scene.clone()),
+            analysis_revision: 0,
+            cancellation: AnalysisCancellation::default(),
+            analysis_pending: false,
+            edited_after_request: false,
+            inset_explanation: "Existing Scene values are unchanged".to_owned(),
+            analysis_scope: AnalysisScope::All,
+            generated_style: generated_style(&scene),
+        });
+    }
+
     /// Restarts analysis (e.g. after "Refresh automatic choices").
     pub fn restart_analysis(&mut self) -> Option<Intent> {
         let before = self.smart_frame.as_ref()?.before.clone();
+        let style = self
+            .document
+            .beautification()
+            .map_or(GeneratedStyle::Balanced, generated_style);
         self.cancel_analysis();
         let generation = self.next_analysis_generation;
         self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
         let cancellation = AnalysisCancellation::default();
-        let provisional = provisional_smart_frame(
+        let provisional = provisional_with_style(
             self.document.logical_size(),
             self.document.source().frame.scale.get(),
             self.document.source().provenance,
             self.document.source().frame.color_space,
+            style,
         );
         self.document
-            .set_beautification(Some(provisional))
+            .set_scene(Some(provisional))
             .expect("the provisional recipe is provenance-safe");
         self.smart_frame = Some(SmartFrameDraft {
             before,
@@ -2846,6 +2901,7 @@ impl EditorState {
             edited_after_request: false,
             inset_explanation: "Analysing this revision...".to_owned(),
             analysis_scope: AnalysisScope::All,
+            generated_style: style,
         });
         self.touch();
         let mut data = self.document.data();
@@ -2877,17 +2933,29 @@ impl EditorState {
         match result {
             Ok(analysis) => {
                 draft.inset_explanation = analysis.inset_explanation;
+                let restyle = |mut scene: Beautification| {
+                    if let Background::Automatic(background) = scene.background {
+                        scene.background =
+                            Background::Automatic(background.restyled(draft.generated_style));
+                    }
+                    scene
+                };
                 let beautification = match draft.analysis_scope {
-                    AnalysisScope::All => analysis.beautification,
-                    AnalysisScope::AutomaticOnly => {
+                    AnalysisScope::All => restyle(analysis.beautification),
+                    AnalysisScope::BackgroundOnly => {
                         let mut current =
                             self.document.beautification().cloned().unwrap_or_default();
-                        current.background = analysis.beautification.background;
-                        current.smart_frame = analysis.beautification.smart_frame;
+                        let analyzed = restyle(analysis.beautification);
+                        current.background = analyzed.background;
+                        current.smart_frame = analyzed.smart_frame;
                         current
                     }
+                    AnalysisScope::AutomaticProperties => {
+                        let current = self.document.beautification().cloned().unwrap_or_default();
+                        merge_automatic_scene(current, restyle(analysis.beautification))
+                    }
                 };
-                match self.document.set_beautification(Some(beautification)) {
+                match self.document.set_scene(Some(beautification)) {
                     Ok(()) => self.touch(),
                     Err(error) => tracing::warn!(%error, "analysis result rejected"),
                 }
@@ -2904,6 +2972,29 @@ impl EditorState {
     /// Requests an automatic-background-only analysis (used when the user
     /// switches to Automatic background in the inspector).
     pub fn request_automatic_background_analysis(&mut self) -> Option<Intent> {
+        self.request_scene_analysis(
+            AnalysisScope::BackgroundOnly,
+            "Resolving a capture-aware background...",
+        )
+    }
+
+    /// Resolves every property the current Scene or preset leaves Automatic.
+    pub fn request_scene_automatic_analysis(&mut self) -> Option<Intent> {
+        self.request_scene_analysis(
+            AnalysisScope::AutomaticProperties,
+            "Resolving automatic Scene properties...",
+        )
+    }
+
+    fn request_scene_analysis(
+        &mut self,
+        scope: AnalysisScope,
+        explanation: &'static str,
+    ) -> Option<Intent> {
+        let style = self
+            .document
+            .beautification()
+            .map_or(GeneratedStyle::Balanced, generated_style);
         let draft = self.smart_frame.as_mut()?;
         draft.cancellation.cancel();
         let generation = self.next_analysis_generation;
@@ -2913,8 +3004,9 @@ impl EditorState {
         draft.cancellation = cancellation.clone();
         draft.analysis_pending = true;
         draft.edited_after_request = false;
-        draft.analysis_scope = AnalysisScope::AutomaticOnly;
-        draft.inset_explanation = "Resolving a capture-aware background...".to_owned();
+        draft.analysis_scope = scope;
+        draft.generated_style = style;
+        draft.inset_explanation = explanation.to_owned();
         let mut data = self.document.data();
         data.beautification = None;
         Some(Intent::AnalyzeSmartFrame {
@@ -2949,6 +3041,11 @@ impl EditorState {
         }
     }
 
+    /// Commits the current Scene draft as one undoable editor revision.
+    pub fn apply_scene(&mut self) {
+        self.apply_smart_frame();
+    }
+
     /// Cancels the Smart Frame draft, restoring the exact pre-draft document.
     pub fn cancel_smart_frame(&mut self) {
         let Some(draft) = self.smart_frame.take() else {
@@ -2958,6 +3055,11 @@ impl EditorState {
         if self.document.set_beautification(draft.before).is_ok() {
             self.touch();
         }
+    }
+
+    /// Cancels Scene editing and restores the exact pre-draft document.
+    pub fn cancel_scene(&mut self) {
+        self.cancel_smart_frame();
     }
 
     /// Reverts all framing (undoable: pushes onto framing undo stack).
@@ -3064,12 +3166,40 @@ impl EditorState {
     /// edited. Returns an intent if an automatic background re-analysis is
     /// needed.
     pub fn apply_beautification_edit(&mut self, config: Beautification) -> Option<Intent> {
+        self.apply_scene_edit(config)
+    }
+
+    /// Applies one Scene inspector edit and fixes every changed automatic property.
+    pub fn apply_scene_edit(&mut self, mut config: Beautification) -> Option<Intent> {
+        config.inset = SourceInsets::default();
+        if let Some(current) = self.document.scene() {
+            if current.background != config.background {
+                config.automatic.background = matches!(config.background, Background::Automatic(_));
+            }
+            if current.padding != config.padding || current.canvas_padding != config.canvas_padding
+            {
+                config.automatic.padding = false;
+            }
+            if current.alignment != config.alignment || current.auto_balance != config.auto_balance
+            {
+                config.automatic.placement = false;
+            }
+            if current.corner_radius != config.corner_radius {
+                config.automatic.corners = false;
+            }
+            if current.shadow != config.shadow {
+                config.automatic.shadow = false;
+            }
+            if current.output_size != config.output_size {
+                config.automatic.output_size = false;
+            }
+        }
         let automatic_switched = self
             .document
             .beautification()
             .is_some_and(|b| !matches!(b.background, Background::Automatic(_)))
             && matches!(config.background, Background::Automatic(_));
-        match self.document.set_beautification(Some(config)) {
+        match self.document.set_scene(Some(config)) {
             Ok(()) => {
                 self.mark_draft_edited();
                 if automatic_switched {
@@ -3080,6 +3210,96 @@ impl EditorState {
         }
         None
     }
+
+    /// Changes only the generated background direction and re-resolves its palette.
+    pub fn set_generated_scene_style(&mut self, style: GeneratedStyle) -> Option<Intent> {
+        if self.smart_frame.is_none() {
+            return Some(self.begin_scene_with_style(style));
+        }
+        let mut scene = self.document.scene().cloned().unwrap_or_default();
+        let generated = match scene.background {
+            Background::Automatic(background) => background.restyled(style),
+            _ => scrozz_annotate::AutomaticBackground::fallback(
+                self.document.source().frame.color_space,
+            )
+            .restyled(style),
+        };
+        scene.inset = SourceInsets::default();
+        scene.background = Background::Automatic(generated);
+        scene.automatic.background = true;
+        if let Err(error) = self.document.set_scene(Some(scene)) {
+            tracing::warn!(%error, "generated Scene style rejected");
+            return None;
+        }
+        self.mark_draft_edited();
+        self.request_automatic_background_analysis()
+    }
+
+    /// Restores the immutable built-in Automatic Scene and re-runs analysis.
+    pub fn reset_scene_to_auto(&mut self) -> Option<Intent> {
+        if self.smart_frame.is_none() {
+            return Some(self.begin_scene_with_style(GeneratedStyle::Balanced));
+        }
+        self.restart_analysis()
+    }
+
+    /// Keeps the Scene canvas but makes its fill transparent.
+    pub fn clear_scene_canvas(&mut self) {
+        let mut scene = self.document.scene().cloned().unwrap_or_default();
+        scene.background = Background::Transparent;
+        scene.automatic.background = false;
+        self.begin_with(scene);
+    }
+
+    /// Supplies host-selected image pixels to the Scene background seam.
+    pub fn set_scene_background_image(&mut self, image: BackgroundImage, desktop: bool) {
+        let mut scene = self.document.scene().cloned().unwrap_or_default();
+        scene.background = if desktop {
+            Background::Desktop(image)
+        } else {
+            Background::Image(image)
+        };
+        scene.automatic.background = false;
+        self.begin_with(scene);
+    }
+
+    /// Removes Scene entirely, returning to the untouched source composition.
+    pub fn remove_scene(&mut self) {
+        self.revert_framing();
+    }
+}
+
+fn generated_style(scene: &Beautification) -> GeneratedStyle {
+    match &scene.background {
+        Background::Automatic(background) => background.style,
+        _ => GeneratedStyle::Balanced,
+    }
+}
+
+fn merge_automatic_scene(mut current: Beautification, analyzed: Beautification) -> Beautification {
+    let automatic = current.automatic;
+    if automatic.background {
+        current.background = analyzed.background;
+    }
+    if automatic.padding {
+        current.padding = analyzed.padding;
+        current.canvas_padding = analyzed.canvas_padding;
+    }
+    if automatic.placement {
+        current.alignment = analyzed.alignment;
+        current.auto_balance = analyzed.auto_balance;
+    }
+    if automatic.corners {
+        current.corner_radius = analyzed.corner_radius;
+    }
+    if automatic.shadow {
+        current.shadow = analyzed.shadow;
+    }
+    if automatic.output_size {
+        current.output_size = analyzed.output_size;
+    }
+    current.smart_frame = analyzed.smart_frame;
+    current
 }
 
 /// The nearest `char` boundary at or before `at`, never past the end.
