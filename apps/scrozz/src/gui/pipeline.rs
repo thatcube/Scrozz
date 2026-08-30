@@ -2274,11 +2274,14 @@ impl Worker {
             } => {
                 let mut beautification = settings.to_beautification();
                 if resolve_background {
-                    // Only the background and the inset it implies come from the
-                    // capture; every other value stays exactly as saved.
+                    // The background is the *only* thing `Automatic` defers to
+                    // the capture. Carrying the analysis metadata across too
+                    // would smuggle in its focus point, and with auto balance on
+                    // that silently repositions the subject — so a preset would
+                    // frame differently depending on what it was pointed at.
+                    // Placement stays the preset's own.
                     let analysis = Self::analyze_scene(document)?;
                     beautification.background = analysis.beautification.background;
-                    beautification.smart_frame = analysis.beautification.smart_frame;
                 }
                 Self::constrain_to_provenance(&mut beautification, document.source().provenance);
                 beautification
@@ -4478,6 +4481,78 @@ mod tests {
             beautification.background,
             scrozz_annotate::Background::Automatic(_)
         ));
+    }
+
+    #[test]
+    fn an_automatic_background_does_not_move_where_the_preset_puts_the_subject() {
+        // Resolving `Automatic` runs analysis, and analysis knows where the
+        // capture's visual centre is. With auto balance on, letting that focus
+        // ride along would place the subject somewhere the preset never asked
+        // for — the same preset framing two captures differently. Only the
+        // colour crosses over.
+        let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-focus");
+        let policy = preset_policy(
+            "balanced",
+            SmartFramePresetSettings {
+                padding: 48.0,
+                background: PresetBackground::Automatic,
+                auto_balance: true,
+                ..SmartFramePresetSettings::default()
+            },
+        );
+        // Heavily lopsided pixels: everything bright is crammed into the left
+        // sixth, so an analysed focus sits far from centre and any leak shows up
+        // as a different placement.
+        let mut source = sample_display_capture(96, 60, 1);
+        let (width, height) = (source.frame.width(), source.frame.height());
+        let stride = source.frame.stride;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let offset = y * stride + x * 4;
+                let value = if x < width as usize / 6 { 0xff } else { 0x08 };
+                source.frame.data[offset] = value;
+                source.frame.data[offset + 1] = value;
+                source.frame.data[offset + 2] = value;
+                source.frame.data[offset + 3] = 0xff;
+            }
+        }
+
+        let ready = worker
+            .finish_capture(CaptureKind::Region, CardId(31), source, &policy)
+            .unwrap();
+
+        let capture = ready.card.capture_id.expect("history identity");
+        let stored = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .document(&capture)
+            .unwrap()
+            .and_then(scrozz_store::DocumentState::complete)
+            .expect("complete derived document");
+        let beautification = stored.beautification().expect("the preset was applied");
+        assert!(matches!(
+            beautification.background,
+            scrozz_annotate::Background::Automatic(_)
+        ));
+        assert!(
+            beautification.smart_frame.is_none(),
+            "analysis metadata must not ride along with the resolved background"
+        );
+
+        // Everything except the background is the preset's own, byte for byte.
+        let mut expected = SmartFramePresetSettings {
+            padding: 48.0,
+            background: PresetBackground::Automatic,
+            auto_balance: true,
+            ..SmartFramePresetSettings::default()
+        }
+        .to_beautification();
+        expected.background = beautification.background.clone();
+        assert_eq!(
+            *beautification, expected,
+            "only the background may come from the capture"
+        );
     }
 
     #[test]
