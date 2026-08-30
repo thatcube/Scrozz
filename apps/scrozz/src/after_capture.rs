@@ -727,11 +727,24 @@ pub enum InstallProfile {
 }
 
 impl InstallProfile {
-    fn defaults(self) -> AfterCaptureSettings {
-        match self {
+    /// What an install of this shape starts from when no document can be read.
+    ///
+    /// The single seam for that decision, so a caller cannot get half of it.
+    /// [`AfterCaptureSettings::legacy`] deliberately leaves Scenes unset — it is
+    /// also the parse seed, and seeding `scenes.default` there would hide the
+    /// retired flag the migration reads — so an existing install has to be
+    /// folded forward here. Without it the absent key takes the new schema
+    /// default of `auto` and starts framing captures that were never framed.
+    #[must_use]
+    pub fn defaults(self) -> AfterCaptureSettings {
+        let mut settings = match self {
             Self::Fresh => AfterCaptureSettings::fresh(),
             Self::Existing => AfterCaptureSettings::legacy(),
+        };
+        if self == Self::Existing {
+            crate::settings::migrate_scenes(&mut settings);
         }
+        settings
     }
 }
 
@@ -811,13 +824,9 @@ impl AfterCaptureStore {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut settings = profile.defaults();
-                if profile == InstallProfile::Existing {
-                    // A config directory with no settings document is still an
-                    // existing install, and its Scenes default is the retired
-                    // flag's default rather than the new one.
-                    crate::settings::migrate_scenes(&mut settings);
-                }
+                // A config directory with no settings document is still an
+                // existing install, and `defaults` folds Scenes forward for it.
+                let settings = profile.defaults();
                 self.save_unlocked(&settings)?;
                 return Ok(settings);
             }
@@ -1254,6 +1263,62 @@ mod tests {
         );
         assert!(!rewritten.contains("quick-access"), "{rewritten}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn profile_defaults_are_the_only_place_an_install_shape_is_decided() {
+        // Every path that cannot read a document — a first run, a config
+        // directory with no file, and the GUI's fallback when the file is
+        // unreadable — has to agree. An existing install that is handed the raw
+        // legacy seed takes the new `auto` default and starts framing captures
+        // that were never framed.
+        let fresh = InstallProfile::Fresh.defaults();
+        assert_eq!(
+            crate::settings::scene_default(&fresh).unwrap(),
+            "auto",
+            "a new install opts in"
+        );
+
+        let existing = InstallProfile::Existing.defaults();
+        assert_eq!(
+            crate::settings::scene_default(&existing).unwrap(),
+            "none",
+            "an existing install keeps the retired flag's default"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_document_falls_back_to_what_a_first_run_would_have_written() {
+        // The GUI keeps running on `profile.defaults()` when the file cannot be
+        // parsed, and deliberately does not overwrite it. That fallback must be
+        // the same document the store would have created itself, or a corrupt
+        // file quietly changes behaviour that a missing file does not.
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-after-capture-unreadable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let store = AfterCaptureStore::new(path.clone());
+
+        let created = store.load(InstallProfile::Existing).unwrap();
+        assert_eq!(
+            crate::settings::scene_default(&created).unwrap(),
+            crate::settings::scene_default(&InstallProfile::Existing.defaults()).unwrap()
+        );
+
+        // Now make it unreadable and confirm the fallback still matches, and
+        // that reading it left the bytes alone.
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        assert!(store.load(InstallProfile::Existing).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{ this is not json",
+            "an unreadable document must not be rewritten with a guess"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

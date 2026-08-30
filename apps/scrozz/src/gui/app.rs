@@ -88,8 +88,8 @@ use scrozz_ui::{ScrollHudAction, ScrollHudState, ScrollHudStatus};
 
 use crate::{
     after_capture::{
-        ActionEffect, AfterCaptureAction, AfterCaptureSettings, AfterCaptureStore, InstallProfile,
-        MediaKind, current_availability,
+        ActionEffect, AfterCaptureAction, AfterCaptureSettings, AfterCaptureStore, MediaKind,
+        current_availability,
     },
     cli::{Cli, InteractiveMode, SettingsCommand},
     commands::{ScrollingTarget, wayland_portal_picker_target},
@@ -268,10 +268,12 @@ impl Config {
                     config.after_capture_warning = Some(format!(
                         "After Capture settings could not be loaded; preserving the inferred profile defaults for this session: {error}"
                     ));
-                    config.after_capture = match profile {
-                        InstallProfile::Fresh => AfterCaptureSettings::fresh(),
-                        InstallProfile::Existing => AfterCaptureSettings::legacy(),
-                    };
+                    // The same defaults a first run would have written, Scenes
+                    // included: an existing install whose document cannot be
+                    // read must still not start framing captures. Nothing is
+                    // saved here — the unreadable file is left exactly as found
+                    // rather than overwritten with a guess.
+                    config.after_capture = profile.defaults();
                 }
             }
         }
@@ -6699,6 +6701,7 @@ pub fn menu_actions() -> Vec<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::after_capture::InstallProfile;
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
     use scrozz_core::{
