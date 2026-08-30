@@ -981,7 +981,17 @@ pub fn dropdown<R>(
     menu: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
     let ink = Ink::new(theme);
-    egui::ComboBox::from_id_salt(id_salt)
+    // The trigger is a stock button, so egui fakes a primary click on it for a
+    // focused Space or Return without checking modifiers — and the popup opens
+    // straight off that click, inside the widget, before anything here can
+    // object. Note what it was before, and put it back afterwards if a chord is
+    // what moved it.
+    let trigger = dropdown_trigger_id(ui, &id_salt);
+    let chord_holds_the_trigger =
+        chord_pressed(ui) && ui.ctx().memory(egui::Memory::focused) == Some(trigger);
+    let was_open = egui::ComboBox::is_open(ui.ctx(), trigger);
+
+    let opened = egui::ComboBox::from_id_salt(id_salt)
         .width(width)
         .height(280.0)
         .selected_text(
@@ -993,8 +1003,40 @@ pub fn dropdown<R>(
             ui.spacing_mut().item_spacing.y = 1.0;
             ui.style_mut().visuals.widgets.hovered.bg_fill = ink.control_hover;
             menu(ui)
-        })
-        .inner
+        });
+
+    if chord_holds_the_trigger
+        && !opened.response.clicked_by(egui::PointerButton::Primary)
+        && !accessibility_activated(ui, &opened.response)
+    {
+        restore_dropdown(ui.ctx(), trigger, was_open);
+    }
+    opened.inner
+}
+
+/// The id of a [`dropdown`]'s trigger button.
+///
+/// Derived exactly as `ComboBox` derives it: the salt is hashed into an
+/// `IdSalt` first, so hashing the raw value here would name a different widget
+/// and every guard below would silently watch nothing. The tests hold the two
+/// together by asserting a bare Return still opens the real popup.
+fn dropdown_trigger_id(ui: &egui::Ui, id_salt: impl std::hash::Hash + std::fmt::Debug) -> egui::Id {
+    ui.make_persistent_id(egui::IdSalt::new(id_salt))
+}
+
+/// Puts a dropdown back the way it was before a chord toggled it.
+fn restore_dropdown(ctx: &egui::Context, trigger: egui::Id, was_open: bool) {
+    if egui::ComboBox::is_open(ctx, trigger) == was_open {
+        return;
+    }
+    // `ComboBox::widget_to_popup_id`, which is private. `ComboBox::is_open`
+    // above reads through it, so the two agree or neither works.
+    let popup = trigger.with("popup");
+    if was_open {
+        egui::Popup::open_id(ctx, popup);
+    } else {
+        egui::Popup::close_id(ctx, popup);
+    }
 }
 
 /// One row inside a [`dropdown`].
@@ -1010,6 +1052,7 @@ pub fn menu_item(ui: &mut egui::Ui, theme: &Theme, selected: bool, label: &str) 
     let width = ui.available_width().max(galley.size().x + Space::MD * 2.0);
     let (rect, mut response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click());
     // A chord typed while a row holds focus must not choose that row.
+    activated(ui, &mut response);
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
     });
@@ -1350,6 +1393,79 @@ mod tests {
                 .into_iter()
                 .map(move |key| (key, modifiers))
         })
+    }
+
+    #[test]
+    fn a_modified_chord_does_not_open_the_dropdown() {
+        // The trigger is a stock egui button, so it took the synthetic click
+        // egui hands any focused widget on Space or Return and opened the menu
+        // — leaving a popup over the dialog every time a chord was typed.
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let trigger = run(&ctx, egui::RawInput::default(), |ui| {
+            let id = dropdown_trigger_id(ui, "scene-default");
+            dropdown(ui, &theme, "scene-default", "Auto", 160.0, |ui| {
+                ui.label("Auto");
+            });
+            id
+        });
+        ctx.memory_mut(|memory| memory.request_focus(trigger));
+
+        for (key, modifiers) in chords() {
+            run(&ctx, key_press(key, modifiers), |ui| {
+                dropdown(ui, &theme, "scene-default", "Auto", 160.0, |ui| {
+                    ui.label("Auto");
+                });
+            });
+            assert!(
+                !egui::ComboBox::is_open(&ctx, trigger),
+                "{key:?} with {modifiers:?} opened the dropdown"
+            );
+            ctx.memory_mut(|memory| memory.request_focus(trigger));
+        }
+
+        // A bare key still opens it, so the guard did not disable the keyboard.
+        run(
+            &ctx,
+            key_press(egui::Key::Enter, egui::Modifiers::NONE),
+            |ui| {
+                dropdown(ui, &theme, "scene-default", "Auto", 160.0, |ui| {
+                    ui.label("Auto");
+                });
+            },
+        );
+        assert!(
+            egui::ComboBox::is_open(&ctx, trigger),
+            "Return must still open the dropdown it has focus on"
+        );
+    }
+
+    #[test]
+    fn a_modified_chord_does_not_choose_a_row_in_the_dropdown() {
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let id = run(&ctx, egui::RawInput::default(), |ui| {
+            menu_item(ui, &theme, false, "Auto").id
+        });
+        ctx.memory_mut(|memory| memory.request_focus(id));
+
+        for (key, modifiers) in chords() {
+            let chosen = run(&ctx, key_press(key, modifiers), |ui| {
+                menu_item(ui, &theme, false, "Auto").clicked()
+            });
+            assert!(
+                !chosen,
+                "{key:?} with {modifiers:?} changed the selection under the chord"
+            );
+            ctx.memory_mut(|memory| memory.request_focus(id));
+        }
+
+        let chosen = run(
+            &ctx,
+            key_press(egui::Key::Space, egui::Modifiers::NONE),
+            |ui| menu_item(ui, &theme, false, "Auto").clicked(),
+        );
+        assert!(chosen, "Space must still choose the focused row");
     }
 
     #[test]
