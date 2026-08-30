@@ -13,7 +13,8 @@ use scrozz_core::{
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
 use scrozz_ui::editor::{
-    EditorUi, Intent, PALETTE, Tool, editor_layout, fit, rect_to_screen, toolbar::COLOR_CONTROL_ID,
+    Command, EditorUi, Intent, PALETTE, TextEdit, Tool, editor_layout, fit, rect_to_screen,
+    toolbar::COLOR_CONTROL_ID,
 };
 use scrozz_ui::{Space, Theme, theme};
 
@@ -496,6 +497,56 @@ fn crop_canvas_uses_default_inside_and_resize_cursors_only_on_edges() {
         vec![Event::PointerMoved(crop.left_top())],
     );
     assert_eq!(corner.platform_output.cursor_icon, CursorIcon::ResizeNwSe);
+}
+
+#[test]
+fn transformed_text_caret_has_a_visible_segment_and_valid_ime_bounds() {
+    let mut editor = editor();
+    editor.state_mut().set_tool(Tool::Text);
+    editor
+        .state_mut()
+        .pointer_pressed(LogicalPoint::new(20.0, 20.0));
+    editor.state_mut().pointer_released();
+    editor
+        .state_mut()
+        .text_edit(&TextEdit::Insert("note".to_owned()));
+    editor.state_mut().command(Command::Escape).unwrap();
+
+    editor.state_mut().set_tool(Tool::Crop);
+    editor
+        .state_mut()
+        .command(Command::RotateCropRight)
+        .unwrap();
+    editor.state_mut().command(Command::ApplyCrop).unwrap();
+
+    let text = editor.document().annotations()[0].bounds();
+    let inside = LogicalPoint::new(
+        text.origin.x + text.size.width / 2.0,
+        text.origin.y + text.size.height / 2.0,
+    );
+    editor.state_mut().pointer_pressed(inside);
+    editor.state_mut().pointer_released();
+    assert!(editor.state().editing_text().is_some());
+
+    let mut driver = Driver::new(false, 1.0);
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    let ime = output
+        .platform_output
+        .ime
+        .expect("editing transformed text should publish IME geometry");
+    for rect in [ime.rect, ime.cursor_rect] {
+        assert!(rect.width() > 0.0);
+        assert!(rect.height() > 0.0);
+        assert!(
+            [rect.min.x, rect.min.y, rect.max.x, rect.max.y]
+                .into_iter()
+                .all(f32::is_finite)
+        );
+    }
+    assert!(
+        ime.cursor_rect.width() > ime.cursor_rect.height(),
+        "a 90-degree rotation should turn the caret into a horizontal segment"
+    );
 }
 
 #[test]

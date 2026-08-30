@@ -26,7 +26,7 @@
 
 use scrozz_core::Result;
 
-use crate::document::{Document, DocumentData};
+use crate::document::{Beautification, Document, DocumentData};
 
 /// How many undo steps are kept before the oldest is dropped.
 ///
@@ -518,6 +518,25 @@ impl History {
     #[must_use]
     pub const fn current_mark(&self) -> Mark {
         self.present.mark
+    }
+
+    /// Keeps independently-managed framing identical across every snapshot.
+    ///
+    /// The editor gives Smart Frame its own undo lane. Annotation and crop
+    /// history must therefore treat beautification as ambient state rather than
+    /// restoring whatever framing happened to exist when each snapshot was
+    /// recorded.
+    pub fn synchronize_beautification(&mut self, beautification: Option<&Beautification>) {
+        let synchronize = |step: &mut Step| {
+            step.data.beautification = beautification.cloned();
+        };
+        self.past.iter_mut().for_each(synchronize);
+        synchronize(&mut self.present);
+        self.future.iter_mut().for_each(synchronize);
+        if let Some(open) = self.open.as_mut() {
+            synchronize(&mut open.present);
+            open.future.iter_mut().for_each(synchronize);
+        }
     }
 
     /// Forgets every step, keeping the document's current state as the origin.

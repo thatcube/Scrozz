@@ -1506,6 +1506,24 @@ impl Document {
         resolve_crop(self.logical_bounds(), area)
     }
 
+    /// Physical size of the source-trimming portion of `area`.
+    ///
+    /// Quantizes absolute edges exactly as the renderer does, rather than
+    /// rounding width and height independently. Outward Scene expansion is not
+    /// included.
+    pub fn source_crop_pixel_size(&self, area: Option<LogicalRect>) -> Result<(u32, u32)> {
+        let bounds = self.logical_bounds();
+        let content = self.resolve_crop(area)?.source_crop.unwrap_or(bounds);
+        let frame = &self.source.frame;
+        let (left, top, right, bottom) = quantized_crop_edges(
+            bounds,
+            content,
+            frame.scale,
+            (frame.width(), frame.height()),
+        );
+        Ok((right - left, bottom - top))
+    }
+
     /// Adds an annotation on top of everything else.
     ///
     /// Counter markers are numbered by the document, so the `index` on a
@@ -1899,6 +1917,44 @@ fn resolve_crop(bounds: LogicalRect, area: Option<LogicalRect>) -> Result<CropRe
             bottom: (geom::max_y(&area) - geom::max_y(&bounds)).max(0.0),
         },
     })
+}
+
+/// Renderer-compatible absolute-edge quantization.
+///
+/// Returns `(left, top, right, bottom)` in physical pixels, with at least one
+/// pixel on each axis.
+pub(crate) fn quantized_crop_edges(
+    bounds: LogicalRect,
+    content: LogicalRect,
+    scale: ScaleFactor,
+    canvas: (u32, u32),
+) -> (u32, u32, u32, u32) {
+    let quantize = |start: f64, end: f64, origin: f64, limit: u32| {
+        let mut start = ((start - origin) * scale.get())
+            .round()
+            .clamp(0.0, f64::from(limit)) as u32;
+        let mut end = ((end - origin) * scale.get())
+            .round()
+            .clamp(0.0, f64::from(limit)) as u32;
+        if end <= start {
+            start = start.min(limit.saturating_sub(1));
+            end = (start + 1).min(limit);
+        }
+        (start, end)
+    };
+    let (left, right) = quantize(
+        content.origin.x,
+        geom::max_x(&content),
+        bounds.origin.x,
+        canvas.0,
+    );
+    let (top, bottom) = quantize(
+        content.origin.y,
+        geom::max_y(&content),
+        bounds.origin.y,
+        canvas.1,
+    );
+    (left, top, right, bottom)
 }
 
 fn normalize_redaction_styles(objects: &mut [AnnotationObject]) {

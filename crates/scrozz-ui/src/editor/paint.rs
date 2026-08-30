@@ -396,7 +396,7 @@ fn draw_caret(
         view.image,
         view.content,
     );
-    let caret = Rect::from_min_max(top, bottom);
+    let caret = Rect::from_two_pos(top, bottom).expand(0.75);
 
     // Blink on the same cadence as the rest of the system, and keep the frame
     // loop alive so it actually blinks while the pointer is still.
@@ -407,11 +407,7 @@ fn draw_caret(
             ((blink - phase) * 1000.0).max(16.0) as u64,
         ));
     if phase < blink / 2.0 {
-        painter.rect_filled(
-            Rect::from_min_max(caret.min, caret.max + egui::vec2(1.5, 0.0)),
-            corner(0.0),
-            palette.accent,
-        );
+        painter.line_segment([top, bottom], Stroke::new(1.5, palette.accent));
     }
 
     ui.ctx().output_mut(|out| {

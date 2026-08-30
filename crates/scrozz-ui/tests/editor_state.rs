@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use egui::CursorIcon;
 use scrozz_annotate::{
-    AnalysisCancellation, Annotation, AnnotationKind, ArrowStyle, Color, Document,
-    ImageOrientation, RedactStyle, Style,
+    AnalysisCancellation, Annotation, AnnotationKind, ArrowStyle, Beautification,
+    BeautificationPreset, Color, Document, ImageOrientation, RedactStyle, Renderer, SkiaRenderer,
+    Style,
 };
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
@@ -1191,6 +1192,38 @@ fn crop_handle_drag_preserves_the_selected_aspect_ratio() {
 }
 
 #[test]
+fn crossed_crop_handles_keep_following_the_pointer_past_the_fixed_edge() {
+    let mut state = state();
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    state.set_crop_snap_edges(false);
+    let crop = state.pending_crop().unwrap();
+    let left = Handle::Left.position(&crop);
+    state.pointer_pressed(left);
+
+    state.pointer_dragged(at(300.0, left.y), false);
+    let crossed = state.pending_crop().unwrap();
+    assert_eq!(crossed.origin.x, 260.0);
+    assert_eq!(crossed.size.width, 40.0);
+
+    state.pointer_dragged(at(320.0, left.y), false);
+    let continued = state.pending_crop().unwrap();
+    assert_eq!(continued.origin.x, 260.0);
+    assert_eq!(continued.size.width, 60.0);
+    state.pointer_released();
+
+    let mut corner_state = EditorState::new(Document::new(capture()));
+    draft_crop(&mut corner_state, 40.0, 30.0, 260.0, 210.0);
+    corner_state.set_crop_snap_edges(false);
+    let crop = corner_state.pending_crop().unwrap();
+    let top_left = Handle::TopLeft.position(&crop);
+    corner_state.pointer_pressed(top_left);
+    corner_state.pointer_dragged(at(300.0, 250.0), false);
+    let crossed = corner_state.pending_crop().unwrap();
+    assert_eq!(crossed.origin, at(260.0, 210.0));
+    assert_eq!(crossed.size, LogicalSize::new(40.0, 40.0));
+}
+
+#[test]
 fn malformed_crop_dimensions_are_sanitised_and_bounded() {
     let mut state = state();
     state.set_tool(Tool::Crop);
@@ -1290,6 +1323,35 @@ fn structural_snap_has_zoom_independent_entry_release_hysteresis_and_modifier_by
 }
 
 #[test]
+fn aspect_projection_keeps_the_structurally_snapped_edge_and_guide_aligned() {
+    let mut capture = capture();
+    for y in 0..capture.frame.height() as usize {
+        for x in 0..capture.frame.width() as usize {
+            let value = if x < 400 { 32 } else { 224 };
+            let offset = y * capture.frame.stride + x * 4;
+            capture.frame.data[offset..offset + 4].copy_from_slice(&[value, value, value, 255]);
+        }
+    }
+    let index =
+        StructuralBoundaryIndex::analyze(&capture.frame, &AnalysisCancellation::default()).unwrap();
+    let mut state = EditorState::new(Document::new(capture));
+    state.set_tool(Tool::Crop);
+    state.set_crop_aspect(CropAspect::Square);
+    state.set_crop_width(100.0);
+    state.set_crop_boundaries(Arc::new(index));
+    let crop = state.pending_crop().unwrap();
+    let top_right = Handle::TopRight.position(&crop);
+    state.pointer_pressed(top_right);
+
+    state.pointer_dragged_with_snap(at(204.0, 20.0), false, false);
+
+    let snapped = state.pending_crop().unwrap();
+    assert_eq!(snapped.origin.x + snapped.size.width, 200.0);
+    assert_eq!(snapped.size, LogicalSize::new(50.0, 50.0));
+    assert_eq!(state.active_crop_snap_segments().len(), 1);
+}
+
+#[test]
 fn crop_rotation_and_flip_are_transactional_and_share_one_undo_step() {
     let mut state = state();
     draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
@@ -1359,6 +1421,68 @@ fn crop_cancel_is_a_no_op_apply_is_one_step_and_revert_is_undoable() {
     assert_eq!(state.document().crop(), None);
     state.command(Command::Undo).expect("undo revert");
     assert_eq!(state.document().crop(), Some(applied));
+}
+
+#[test]
+fn crop_history_is_orthogonal_to_applied_smart_frame_history() {
+    let mut state = state();
+    let framing = Beautification::preset(BeautificationPreset::Social);
+    state.begin_with(framing.clone());
+    state.apply_smart_frame();
+    assert_eq!(state.document().beautification(), Some(&framing));
+    assert!(state.can_undo_framing());
+    assert_eq!(state.undo_depth(), 0);
+
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(100.0);
+    state.set_crop_height(80.0);
+    let crop = state.pending_crop().unwrap();
+    let center = LogicalPoint::new(
+        crop.origin.x + crop.size.width / 2.0,
+        crop.origin.y + crop.size.height / 2.0,
+    );
+    drag(&mut state, center, at(center.x + 20.0, center.y + 15.0));
+    state.command(Command::CancelCrop).unwrap();
+    assert_eq!(state.undo_depth(), 0);
+    assert!(state.can_undo_framing());
+    assert_eq!(state.document().beautification(), Some(&framing));
+
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(100.0);
+    state.set_crop_height(80.0);
+    state.command(Command::ApplyCrop).unwrap();
+    assert_eq!(state.undo_depth(), 1);
+    state.command(Command::Undo).unwrap();
+    assert_eq!(state.document().crop(), None);
+    assert_eq!(state.document().beautification(), Some(&framing));
+    assert!(state.can_undo_framing());
+
+    state.undo_framing();
+    assert_eq!(state.document().beautification(), None);
+}
+
+#[test]
+fn crop_pixel_readout_uses_renderer_edge_quantization_then_orientation() {
+    let mut state = state();
+    state.set_tool(Tool::Crop);
+    state.set_crop_snap_edges(false);
+    let full = state.pending_crop().unwrap();
+    drag(&mut state, Handle::TopLeft.position(&full), at(0.3, 0.2));
+    let crop = state.pending_crop().unwrap();
+    drag(
+        &mut state,
+        Handle::BottomRight.position(&crop),
+        at(100.7, 80.8),
+    );
+    state.command(Command::RotateCropRight).unwrap();
+
+    let (crop_pixels, source_pixels) = state.crop_pixel_sizes().unwrap();
+    assert_eq!(crop_pixels, (162, 200));
+    assert_eq!(source_pixels, (600, 800));
+
+    state.command(Command::ApplyCrop).unwrap();
+    let rendered = SkiaRenderer::new().render(state.document()).unwrap();
+    assert_eq!((rendered.width(), rendered.height()), crop_pixels);
 }
 
 #[test]
