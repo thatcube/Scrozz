@@ -1229,7 +1229,10 @@ impl ClientOverlayController {
                     let _ = restored.send(());
                     self.phase = ControllerPhase::Cards;
                 } else {
-                    configure_viewport(ctx, native, self.cards, false);
+                    // The long-running host owns the card root after selection.
+                    // Queuing card geometry or passthrough here can be delivered
+                    // after its hidden first-card barrier and restore the stale
+                    // selector viewport over the newly revealed card.
                     native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                     native.set_visible(false);
                     ctx.request_repaint();
@@ -3344,6 +3347,53 @@ mod tests {
         controller.logic(&ctx, &native);
         worker.join().expect("fixed capture worker");
         assert!(matches!(&controller.phase, ControllerPhase::Cards));
+    }
+
+    #[test]
+    fn capture_completion_returns_card_root_authority_without_stale_viewport_commands() {
+        let (selector, mut controller) = region_test_pair(Completion::RestoreCards);
+        controller.phase = ControllerPhase::AwaitingCapture { id: 7 };
+        let (restored_tx, _restored_rx) = channel();
+        selector
+            .events
+            .send(BridgeEvent::CaptureFinished {
+                id: 7,
+                restored: restored_tx,
+            })
+            .expect("controller receiver");
+        let ctx = egui::Context::default();
+        let (native, behavior_log) = crate::gui::panel::BehaviorController::recording();
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            controller.logic(&ctx, &native);
+        });
+        output.textures_delta.clear();
+
+        assert!(matches!(
+            &controller.phase,
+            ControllerPhase::RestoringCards { .. }
+        ));
+        assert_eq!(
+            behavior_log.borrow().last(),
+            Some(&scrozz_shell::OverlayBehavior::hidden_surface())
+        );
+        assert_eq!(native.recorded_visibility().last(), Some(&false));
+        let commands = output
+            .viewport_output
+            .into_values()
+            .flat_map(|viewport| viewport.commands)
+            .collect::<Vec<_>>();
+        assert!(
+            commands.iter().all(|command| !matches!(
+                command,
+                egui::ViewportCommand::OuterPosition(_)
+                    | egui::ViewportCommand::InnerSize(_)
+                    | egui::ViewportCommand::MousePassthrough(_)
+                    | egui::ViewportCommand::Visible(_)
+            )),
+            "selector restoration must not queue commands that can override the card host: \
+             {commands:?}"
+        );
     }
 
     #[test]

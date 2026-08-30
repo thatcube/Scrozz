@@ -1084,7 +1084,8 @@ impl Driver {
                 if geometry != self.base_geometry || scale != self.display_scale {
                     self.base_geometry = geometry;
                     self.display_scale = scale;
-                    self.selection.set_cards_geometry(geometry);
+                    let cards = self.desired_card_target().geometry;
+                    self.selection.set_cards_geometry(cards);
                 }
             }
 
@@ -1110,7 +1111,8 @@ impl Driver {
             if geometry != self.base_geometry || scale != self.display_scale {
                 self.base_geometry = geometry;
                 self.display_scale = scale;
-                self.selection.set_cards_geometry(geometry);
+                let cards = self.desired_card_target().geometry;
+                self.selection.set_cards_geometry(cards);
             }
             self.overlay.refresh_pin_topology();
         }
