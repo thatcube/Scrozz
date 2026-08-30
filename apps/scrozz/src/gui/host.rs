@@ -41,7 +41,7 @@ use scrozz_ui::{
 use crate::{
     fault::{CliError, CliResult},
     gui::{
-        app::{App, Config, EditorSnapshot, KeyboardOwner, PendingDrag, Tick},
+        app::{App, Config, EditorSnapshot, EditorSnapshots, KeyboardOwner, PendingDrag, Tick},
         card::{CardSurface, Recording},
         panel::BehaviorController,
         pipeline::{DragGeometry, DragSubject},
@@ -545,12 +545,11 @@ impl Host for Windowed {
                     ocr_onboarding_memory,
                     permission: scrozz_ui::permission::PermissionWindow::default(),
                     permission_resume_armed: false,
-                    editor: scrozz_ui::editor::EditorWindow::new(),
+                    editors: std::collections::HashMap::new(),
                     video_editor: VideoEditorWindow::default(),
                     video_editor_actions: Arc::new(Mutex::new(Vec::new())),
                     camera_settings_actions: Arc::new(Mutex::new(Vec::new())),
                     camera_settings_was_open: false,
-                    editing: None,
                     color_picker: scrozz_shell::SystemColorPicker::default(),
                     color_picker_generation: None,
                     color_swatch_store,
@@ -754,6 +753,10 @@ struct Editing {
     card: crate::gui::card::CardId,
     generation: u64,
     editor: scrozz_ui::editor::EditorUi,
+    /// This capture's own annotation viewport. Each open editor owns a
+    /// distinct, stable [`egui::ViewportId`] keyed off the card's identity,
+    /// so two cards edited at once never collide on the same window.
+    window: scrozz_ui::editor::EditorWindow,
 }
 
 struct Driver {
@@ -772,9 +775,14 @@ struct Driver {
     ocr_onboarding_memory: crate::gui::onboarding::OcrOnboardingMemory,
     permission: scrozz_ui::permission::PermissionWindow,
     permission_resume_armed: bool,
-    editor: scrozz_ui::editor::EditorWindow,
-    /// The editor's document, and the card it came from.
-    editing: Option<Editing>,
+    /// Every capture currently being annotated, keyed by its card.
+    ///
+    /// Multiple cards may each have one editor open simultaneously; the map
+    /// itself is what makes a second open of the same card impossible to
+    /// duplicate — a card already present here is looked up by `app.rs`
+    /// (via [`Self::editor_snapshots`]) before it ever decides to start a
+    /// new one, routing the request to raise the existing window instead.
+    editors: std::collections::HashMap<crate::gui::card::CardId, Editing>,
     /// The ordinary opaque recording-editor window.
     video_editor: VideoEditorWindow,
     /// Actions emitted by the deferred video viewport and drained by the next
@@ -873,29 +881,48 @@ impl Driver {
         }
     }
 
-    /// Draws the annotation editor's window while one is open.
+    /// Every editor open this frame, as a snapshot slice `App` can look up
+    /// by card without knowing how many editors exist or how they are
+    /// stored. Rebuilt fresh each time it is needed: cheap, and it can never
+    /// go stale the way a cached view of the map could.
+    ///
+    /// A free function borrowing only the map, not `self`, so a caller can
+    /// hold the returned snapshots alive across a sibling call that needs
+    /// `&mut self.app` at the same time.
+    fn editor_snapshots(
+        editors: &std::collections::HashMap<crate::gui::card::CardId, Editing>,
+    ) -> Vec<EditorSnapshot<'_>> {
+        editors
+            .values()
+            .map(|editing| EditorSnapshot::new(editing.card, editing.generation, &editing.editor))
+            .collect()
+    }
+
+    /// Draws every open annotation editor window.
     ///
     /// Copy and save go back through the worker rather than being written
     /// here: encoding a full-resolution PNG on the UI thread would stall the
     /// overlay, and the card's own copy already takes that route.
     ///
-    /// The document lives on until the *window* closes, not until the editor
-    /// says it is done, so reopening after an accidental Escape is impossible
-    /// to distinguish from never having closed. Nothing is written back to the
-    /// card: per D14 a capture's own pixels are never replaced by an annotated
-    /// version unless the user explicitly saves one.
+    /// Nothing is written back to a card's own pixels until Done commits it:
+    /// per D14 a capture is never replaced by an annotated version unless the
+    /// user explicitly finishes editing it. Cancel, a clean native close, and
+    /// Escape on a clean document all discard without touching the card; a
+    /// dirty native close or Escape is instead held behind the window's own
+    /// confirm-discard prompt, so a session is never lost silently.
     ///
-    /// Closing a dirty editor queues its scene graph before the card cache is
-    /// released. The worker channel preserves that order, so a history-backed
-    /// capture reopens with its editable annotations rather than a flattened
-    /// approximation.
+    /// A Done that commits a dirty document queues its scene graph before
+    /// the card's editor-only cache is released. The worker channel
+    /// preserves that order, so a history-backed capture reopens with its
+    /// editable annotations rather than a flattened approximation.
     fn show_editor(&mut self, ctx: &egui::Context) {
-        use scrozz_ui::editor::Intent;
+        use scrozz_ui::editor::{EditorWindowExit, Intent};
 
-        // Tied to the viewport's lifetime rather than to `editing`, so the keys
-        // come back even if the document is torn down by some other path.
+        // Tied to whether any editor viewport is open rather than to a
+        // single slot, so the keys come back the moment the last one closes,
+        // no matter which card it was.
         self.app
-            .set_keyboard_owner(KeyboardOwner::Editor, self.editor.is_open());
+            .set_keyboard_owner(KeyboardOwner::Editor, !self.editors.is_empty());
 
         let picker_event = match self.color_picker.poll() {
             Ok(event) => event,
@@ -904,133 +931,179 @@ impl Driver {
                 None
             }
         };
-
-        let Some(editing) = self.editing.as_mut() else {
-            return;
-        };
-        let card = editing.card;
-        let generation = editing.generation;
-        let editor = &mut editing.editor;
+        // The system colour picker is one modeless native panel shared by
+        // whichever editor generation currently owns it; every other open
+        // editor ignores an event addressed to a generation that is not its
+        // own.
         if let Some(event) = picker_event {
+            let owner = self.color_picker_generation.and_then(|generation| {
+                self.editors
+                    .values_mut()
+                    .find(|editing| editing.generation == generation)
+            });
             match event {
-                scrozz_shell::ColorPickerEvent::Changed([r, g, b, a])
-                    if self.color_picker_generation == Some(generation) =>
-                {
-                    editor.apply_external_color(scrozz_annotate::Color::rgba(r, g, b, a));
+                scrozz_shell::ColorPickerEvent::Changed([r, g, b, a]) => {
+                    if let Some(editing) = owner {
+                        editing
+                            .editor
+                            .apply_external_color(scrozz_annotate::Color::rgba(r, g, b, a));
+                    }
                 }
                 scrozz_shell::ColorPickerEvent::Closed {
                     color: [r, g, b, a],
                     changed,
                 } => {
-                    if self.color_picker_generation == Some(generation) {
+                    if let Some(editing) = owner {
                         if changed {
-                            editor.apply_external_color(scrozz_annotate::Color::rgba(r, g, b, a));
+                            editing
+                                .editor
+                                .apply_external_color(scrozz_annotate::Color::rgba(r, g, b, a));
                         }
-                        editor.remember_custom_color(scrozz_annotate::Color::rgba(r, g, b, a));
-                        self.editor.request_foreground();
+                        editing
+                            .editor
+                            .remember_custom_color(scrozz_annotate::Color::rgba(r, g, b, a));
+                        editing.window.request_foreground();
                     }
                     self.color_picker_generation = None;
                 }
-                scrozz_shell::ColorPickerEvent::Changed(_) => {}
             }
         }
-        let mut intent = Intent::None;
-        self.editor.show(ctx, |ui| {
-            let got = editor.update(ui);
-            if got != Intent::None {
-                intent = got;
-            }
-        });
 
-        match intent {
-            Intent::None => {}
-            Intent::ToggleSmartFrame => {}
-            Intent::Close => self.editor.close(),
-            Intent::Copy | Intent::Save => match editor.render() {
-                Ok(rendered) => {
-                    if intent == Intent::Copy {
-                        self.app.copy_rendered(card, rendered);
-                    } else {
-                        self.app.save_rendered(card, rendered);
-                    }
+        let cards: Vec<crate::gui::card::CardId> = self.editors.keys().copied().collect();
+        let mut to_remove = Vec::new();
+        for card in cards {
+            let Some(editing) = self.editors.get_mut(&card) else {
+                continue;
+            };
+            let generation = editing.generation;
+            let editor = &mut editing.editor;
+            let window = &mut editing.window;
+            let dirty = editor.state().is_dirty();
+
+            let mut intent = Intent::None;
+            let mut exit = window.show(ctx, dirty, |ui| {
+                let got = editor.update(ui);
+                if got != Intent::None {
+                    intent = got;
                 }
-                Err(error) => tracing::warn!(%error, "the annotated image could not be rendered"),
-            },
-            Intent::CustomColor => {
-                let color = editor.state().stroke_color();
-                match self.color_picker.open([color.r, color.g, color.b, color.a]) {
-                    Ok(true) => {
-                        self.color_picker_generation = Some(generation);
-                        editor.native_color_picker_started();
+            });
+
+            match intent {
+                Intent::None | Intent::ToggleSmartFrame => {}
+                // Shares the window's own no-silent-loss guarantee with the
+                // native close button: a clean document closes immediately,
+                // a dirty one is held open behind the confirm-discard
+                // prompt. Only applies if nothing else already decided this
+                // window's fate this frame (chrome Done/Cancel wins).
+                Intent::Close if exit == EditorWindowExit::None => {
+                    exit = window.request_close(editor.state().is_dirty());
+                }
+                Intent::Close => {}
+                Intent::Copy | Intent::Save => match editor.render() {
+                    Ok(rendered) => {
+                        if intent == Intent::Copy {
+                            self.app.copy_rendered(card, rendered);
+                        } else {
+                            self.app.save_rendered(card, rendered);
+                        }
                     }
-                    Ok(false) => editor.open_custom_color_fallback(),
                     Err(error) => {
-                        tracing::warn!(%error, "the system colour picker could not open");
-                        editor.open_custom_color_fallback();
+                        tracing::warn!(%error, "the annotated image could not be rendered");
+                    }
+                },
+                Intent::CustomColor => {
+                    let color = editor.state().stroke_color();
+                    match self.color_picker.open([color.r, color.g, color.b, color.a]) {
+                        Ok(true) => {
+                            self.color_picker_generation = Some(generation);
+                            editor.native_color_picker_started();
+                        }
+                        Ok(false) => editor.open_custom_color_fallback(),
+                        Err(error) => {
+                            tracing::warn!(%error, "the system colour picker could not open");
+                            editor.open_custom_color_fallback();
+                        }
                     }
                 }
-            }
-            Intent::AnalyzeSmartFrame {
-                revision,
-                data,
-                cancellation,
-            } => self
-                .app
-                .analyze_smart_frame(card, generation, revision, *data, cancellation),
-            Intent::UpsertPreset(preset) => match self.app.upsert_smart_frame_preset(*preset) {
-                Ok(presets) => editor.state_mut().set_custom_presets(presets),
-                Err(error) => {
-                    editor
-                        .state_mut()
-                        .set_custom_presets(self.app.smart_frame_presets().to_vec());
-                    tracing::warn!(%error, "Smart Frame preset could not be saved");
-                }
-            },
-            Intent::DeletePreset(preset_id) => {
-                match self.app.delete_smart_frame_preset(&preset_id) {
+                Intent::AnalyzeSmartFrame {
+                    revision,
+                    data,
+                    cancellation,
+                } => self
+                    .app
+                    .analyze_smart_frame(card, generation, revision, *data, cancellation),
+                Intent::UpsertPreset(preset) => match self.app.upsert_smart_frame_preset(*preset) {
                     Ok(presets) => editor.state_mut().set_custom_presets(presets),
                     Err(error) => {
                         editor
                             .state_mut()
                             .set_custom_presets(self.app.smart_frame_presets().to_vec());
-                        tracing::warn!(%error, "Smart Frame preset could not be deleted");
+                        tracing::warn!(%error, "Smart Frame preset could not be saved");
+                    }
+                },
+                Intent::DeletePreset(preset_id) => {
+                    match self.app.delete_smart_frame_preset(&preset_id) {
+                        Ok(presets) => editor.state_mut().set_custom_presets(presets),
+                        Err(error) => {
+                            editor
+                                .state_mut()
+                                .set_custom_presets(self.app.smart_frame_presets().to_vec());
+                            tracing::warn!(%error, "Smart Frame preset could not be deleted");
+                        }
                     }
                 }
+                Intent::RequestSensitiveReview { revision, data } => {
+                    let _ = data;
+                    editor.deliver_sensitive_review(scrozz_annotate::SensitiveRegionReview {
+                        revision,
+                        ..Default::default()
+                    });
+                }
             }
-            Intent::RequestSensitiveReview { revision, data } => {
-                let _ = data;
-                editor.deliver_sensitive_review(scrozz_annotate::SensitiveRegionReview {
-                    revision,
-                    ..Default::default()
-                });
+
+            self.app
+                .prepare_editor(EditorSnapshot::new(card, generation, editor));
+            if let Some(colors) = editor.take_custom_swatches_change() {
+                if let Some(store) = &self.color_swatch_store
+                    && let Err(error) = store.save(&colors)
+                {
+                    tracing::warn!(%error, "custom colours could not be saved");
+                }
+                self.custom_swatches = colors;
             }
+
+            if matches!(exit, EditorWindowExit::Done | EditorWindowExit::Cancel) {
+                // The card keeps its pre-edit thumbnail for the whole
+                // session; only an explicit Done ever replaces it, and only
+                // when the document actually changed.
+                if exit == EditorWindowExit::Done && editor.state().is_dirty() {
+                    match editor.render() {
+                        Ok(rendered) => self.app.refresh_card_thumbnail(card, rendered.frame()),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "the annotated image could not be rendered for the card thumbnail"
+                        ),
+                    }
+                    self.app
+                        .persist_editor(EditorSnapshot::new(card, generation, editor));
+                }
+                self.app
+                    .editor_closed(EditorSnapshot::new(card, generation, editor));
+                if self.color_picker_generation == Some(generation) {
+                    if let Err(error) = self.color_picker.close() {
+                        tracing::warn!(%error, "the system colour picker could not close");
+                    }
+                    self.color_picker_generation = None;
+                }
+                to_remove.push(card);
+            }
+        }
+        for card in to_remove {
+            self.editors.remove(&card);
         }
 
-        self.app
-            .prepare_editor(EditorSnapshot::new(card, generation, editor));
-        if let Some(colors) = editor.take_custom_swatches_change() {
-            if let Some(store) = &self.color_swatch_store
-                && let Err(error) = store.save(&colors)
-            {
-                tracing::warn!(%error, "custom colours could not be saved");
-            }
-            self.custom_swatches = colors;
-        }
         if self.color_picker.is_open() {
             ctx.request_repaint_after(IDLE);
-        }
-        if !self.editor.is_open() {
-            if let Err(error) = self.color_picker.close() {
-                tracing::warn!(%error, "the system colour picker could not close");
-            }
-            self.color_picker_generation = None;
-            if editor.state().is_dirty() {
-                self.app
-                    .persist_editor(EditorSnapshot::new(card, generation, editor));
-            }
-            self.app
-                .editor_closed(EditorSnapshot::new(card, generation, editor));
-            self.editing = None;
         }
     }
 
@@ -1284,7 +1357,7 @@ impl Driver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_visible();
         let auxiliary_open = self.settings.is_open()
-            || self.editor.is_open()
+            || !self.editors.is_empty()
             || self.app.video_editor_is_open()
             || self.video_editor.is_open()
             || self.camera_settings_was_open
@@ -1399,11 +1472,10 @@ impl Driver {
         // revision this lookup asks for. The overlay draw and native call
         // remain adjacent: once the card arms, nothing slow is allowed
         // between that event and the platform taking the held pointer.
-        let editor = self
-            .editing
-            .as_ref()
-            .map(|editing| EditorSnapshot::new(editing.card, editing.generation, &editing.editor));
-        let started = self.app.pump_drag_starts_with_editor(editor);
+        let snapshots = Self::editor_snapshots(&self.editors);
+        let started = self
+            .app
+            .pump_drag_starts_with_editor(EditorSnapshots::new(&snapshots));
         if started > 0 {
             tracing::debug!(started, "drag: began within the gesture frame");
         }
@@ -2048,11 +2120,8 @@ impl eframe::App for Driver {
         let display_refresh_requested =
             self.native_display_parameters_changed() || disconnected_display_check_due;
 
-        let editor = self
-            .editing
-            .as_ref()
-            .map(|editing| EditorSnapshot::new(editing.card, editing.generation, &editing.editor));
-        let tick = self.app.tick_with_editor(editor);
+        let snapshots = Self::editor_snapshots(&self.editors);
+        let tick = self.app.tick_with_editor(EditorSnapshots::new(&snapshots));
         if self.app.has_pending_save_dialog() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -2064,36 +2133,50 @@ impl eframe::App for Driver {
             #[cfg(target_os = "macos")]
             self.record_lifecycle("settings-requested");
         }
-        if self.editing.is_none()
-            && let Some(request) = self.app.take_editor_request()
-        {
-            if let Err(error) = self.color_picker.close() {
-                tracing::warn!(%error, "the system colour picker could not close");
-            }
-            self.color_picker_generation = None;
+        // Drains every decode that finished this tick, not just one: a card
+        // already open here was never queued as a `Job::Open` in the first
+        // place (see `CardEvent::Open`'s per-card dedup in `app.rs`), so
+        // every request that does arrive is for a distinct, not-yet-open
+        // card and none can duplicate an existing editor.
+        while let Some(request) = self.app.take_editor_request() {
             let title = format!("{}", request.card);
             let mut editor = scrozz_ui::editor::EditorUi::new(request.document);
             editor.set_custom_swatches(self.custom_swatches.clone());
             editor
                 .state_mut()
                 .set_custom_presets(request.smart_frame_presets);
-            self.editing = Some(Editing {
-                card: request.card,
-                generation: request.generation,
-                editor,
-            });
-            let _ = self.editor.open(title);
+            let mut window = scrozz_ui::editor::EditorWindow::new(request.card.0);
+            let _ = window.open(title);
+            self.editors.insert(
+                request.card,
+                Editing {
+                    card: request.card,
+                    generation: request.generation,
+                    editor,
+                    window,
+                },
+            );
+        }
+        // A card whose editor is already open (Edit from any menu, or a
+        // whole-card activation) is routed here instead of a new decode, so
+        // the existing window is raised rather than silently ignored or
+        // duplicated.
+        while let Some(card) = self.app.take_focus_editor_request() {
+            if let Some(editing) = self.editors.get_mut(&card) {
+                editing.window.request_foreground();
+            }
         }
         while let Some(result) = self.app.take_smart_frame_result() {
-            let Some(editing) = self.editing.as_mut() else {
+            let Some(editing) = self.editors.get_mut(&result.card) else {
                 continue;
             };
-            if editing.card == result.card && editing.generation == result.generation {
+            if editing.generation == result.generation {
                 editing
                     .editor
                     .deliver_analysis(result.revision, result.result);
             }
         }
+
         self.sync_root_visibility(ctx, display_refresh_requested);
         if !self.stopped
             && let Tick::Stop(reason) = tick
@@ -2751,6 +2834,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn focus_editor_requests_are_drained_alongside_the_ordinary_tick() {
+        // A duplicate-open (whole-card click, Enter/Space, or Edit from any
+        // menu on an already-open card) must raise the existing window on
+        // the same cadence as the rest of the app's event draining. Draining
+        // it from `ui` instead would race a request queued this frame
+        // against a window that hasn't been created until the next `logic`
+        // pass runs `take_editor_request`.
+        assert_eq!(
+            driver_pass("take_focus_editor_request"),
+            "logic",
+            "focus-existing-editor requests must be serviced in the logic pass, \
+             like the rest of the app's event queues"
+        );
+    }
+
+    #[test]
+    fn editor_close_requests_always_route_through_the_dirty_close_prompt() {
+        // `show_editor` is this window's only path from a chrome/keyboard
+        // close request to an actual close. It must always go through
+        // `EditorWindow::request_close`, which is what decides — based on
+        // whether the document is dirty — between closing immediately and
+        // holding the window open behind a discard-confirmation prompt. A
+        // bare, unconditional close here would silently drop unsaved edits.
+        let source = include_str!("host.rs");
+        let editor = source
+            .split("fn show_editor")
+            .nth(1)
+            .and_then(|body| body.split_once("fn announce_panel"))
+            .map(|(body, _)| body)
+            .expect("editor host");
+
+        let close_arm = editor
+            .find("Intent::Close if exit == EditorWindowExit::None")
+            .expect("a dirty-aware close arm guards Intent::Close");
+        let request_close = editor
+            .find("window.request_close(")
+            .expect("close requests are routed through request_close");
+        assert!(
+            request_close > close_arm,
+            "request_close must be called from inside the Intent::Close arm"
+        );
+
+        // No sibling arm may resolve `Intent::Close` by closing the window
+        // outright: the fallthrough arm right after must be a no-op (a
+        // chrome Done/Cancel already decided this window's fate this frame).
+        let after_first_arm = &editor[request_close + "window.request_close(".len()..];
+        let fallthrough = after_first_arm
+            .find("Intent::Close => {}")
+            .expect("the remaining Intent::Close arm must be a no-op");
+        let second_request_close = after_first_arm.find("window.request_close(");
+        assert!(
+            second_request_close.is_none() || second_request_close.unwrap() > fallthrough,
+            "Intent::Close must have exactly one dirty-aware close path"
+        );
+    }
+
     fn display(id: &str, x: f64, scale: f64) -> Display {
         let bounds = LogicalRect::new(
             LogicalPoint::new(x, 0.0),
@@ -3127,7 +3267,7 @@ mod tests {
             .expect("root visibility synchronizer");
 
         assert!(visibility.contains("self.settings.is_open()"));
-        assert!(visibility.contains("self.editor.is_open()"));
+        assert!(visibility.contains("!self.editors.is_empty()"));
         assert!(visibility.contains("self.app.video_editor_is_open()"));
         assert!(visibility.contains("self.video_editor.is_open()"));
         assert!(visibility.contains("self.app.permission_prompt().is_some()"));

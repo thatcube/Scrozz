@@ -728,6 +728,69 @@ pub fn card_pill_button(
     response
 }
 
+/// The always-visible morphing "Editing"/"Continue" pill shown on a card
+/// whose editor is open.
+///
+/// Every other control here is part of the hover-revealed chrome: it fades in
+/// with `reveal` and is inert while faded (D19, [`Reveal::is_live`]). This one
+/// is deliberately not — it is drawn at `alpha`, the card's own visibility,
+/// on every frame regardless of pointer hover, so an editing card is never
+/// ambiguous about its own state and never reads as merely disabled (D13).
+///
+/// Its label morphs with hover or keyboard focus (`Editing` at rest,
+/// `Continue` on either), but its accessible name is one fixed string naming
+/// both facts at once, so assistive technology is never made to re-announce
+/// the control as the pointer happens to cross it.
+pub fn editing_pill(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    rect: Rect,
+    id: Id,
+    alpha: f32,
+) -> Response {
+    let state = ControlState::new();
+    let response = ui.interact(rect, id, sense_for(state));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Continue editing"));
+
+    // Always fully live, independent of the card's own (possibly zero) hover
+    // reveal: this pill's entire purpose is to stay legible and interactive
+    // whether or not the pointer is anywhere near the card.
+    let pointer = pointer_state(surface, &response, state, Reveal::SHOWN);
+    let continuing = pointer.hovered || pointer.focused;
+    let label = if continuing { "Continue" } else { "Editing" };
+
+    let scale = card_control_scale(pointer);
+    let drawn = scaled_control_rect(rect, pointer);
+    let radius = Radius::pill(drawn.height());
+    let painter = ui.painter();
+    paint_card_control_frame(painter, drawn, radius, pointer, alpha);
+
+    let foreground = fade(card_control_foreground(), alpha);
+    let mut font = surface.font(Text::Button);
+    font.size *= scale;
+    let galley = painter.layout_no_wrap(label.to_owned(), font, foreground);
+    let icon_width = 15.0 * scale;
+    let gap = (Space::SM - 2.0) * scale;
+    let total = icon_width + gap + galley.size().x;
+    let x = drawn.center().x - total / 2.0;
+    surface.icons.draw(
+        painter,
+        Icon::Pencil,
+        pos2(x + icon_width / 2.0, drawn.center().y),
+        icon_width,
+        foreground,
+    );
+    painter.galley(
+        pos2(
+            x + icon_width + gap,
+            drawn.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        foreground,
+    );
+    response
+}
+
 fn card_control_scale(pointer: Pointer) -> f32 {
     if pointer.pressed {
         0.98
@@ -1347,5 +1410,133 @@ mod tests {
         assert_eq!(pressed.center(), rect.center());
         assert_eq!(card_control_scale(hovered_pointer), 1.03);
         assert_eq!(card_control_scale(pressed_pointer), 0.98);
+    }
+
+    #[test]
+    fn the_editing_pill_senses_click_so_enter_and_space_can_activate_it() {
+        // egui treats Enter/Space on a focused widget as a click only when
+        // the widget's `Sense` includes `senses_click()` (see
+        // `Context::interact`, which gates `FAKE_PRIMARY_CLICKED` on exactly
+        // that). Asserting this here pins the mechanism the "Enter/Space
+        // activation" accessibility requirement depends on, independent of
+        // whichever surface (whole card, this pill, an Edit menu action)
+        // ends up wiring the keypress to it.
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let icons = IconStore::new(&ctx);
+        let theme = Theme::default();
+        let surface = Surface::new(&theme, &icons, Motion::at_ms(0));
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 30.0));
+        let id = Id::new("editing-pill-senses-click");
+
+        // `set_fonts` only takes effect on the pass *after* it runs; throw
+        // away a warm-up pass before the one whose response we assert on.
+        let mut warmup = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = editing_pill(ui, &surface, rect, id, 1.0);
+        });
+        warmup.textures_delta.clear();
+
+        let mut response_sense_is_click = false;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response = editing_pill(ui, &surface, rect, id, 1.0);
+            response_sense_is_click = response.sense.senses_click();
+        });
+        output.textures_delta.clear();
+
+        assert!(
+            response_sense_is_click,
+            "the pill must sense clicks (not just hover) or a focused Enter/Space press can never activate it"
+        );
+    }
+
+    #[test]
+    fn the_editing_pill_is_activated_by_enter_when_it_already_has_keyboard_focus() {
+        // Drives the pill through the exact input egui uses to turn a
+        // focused Enter/Space press into `Response::clicked()` (see
+        // `Context::interact`: `memory.has_focus(id) && (key_pressed(Space)
+        // || key_pressed(Enter))`). A user who has Tabbed onto the card and
+        // presses Enter must reach the editor, not merely see focus.
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let icons = IconStore::new(&ctx);
+        let theme = Theme::default();
+        let surface = Surface::new(&theme, &icons, Motion::at_ms(0));
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(100.0, 30.0));
+        let id = Id::new("editing-pill-enter-activates");
+
+        // A prior frame's Tab navigation already left this pill focused.
+        ctx.memory_mut(|memory| memory.request_focus(id));
+
+        // `set_fonts` only takes effect on the pass *after* it runs; throw
+        // away a warm-up pass before the one whose response we assert on.
+        let mut warmup = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = editing_pill(ui, &surface, rect, id, 1.0);
+        });
+        warmup.textures_delta.clear();
+
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+
+        let mut has_focus = false;
+        let mut clicked = false;
+        let mut output = ctx.run_ui(input, |ui| {
+            let response = editing_pill(ui, &surface, rect, id, 1.0);
+            has_focus = response.has_focus();
+            clicked = response.clicked();
+        });
+        output.textures_delta.clear();
+
+        assert!(
+            has_focus,
+            "the pill should still hold the keyboard focus it was given"
+        );
+        assert!(
+            clicked,
+            "Enter while focused must activate the pill exactly like a click"
+        );
+    }
+
+    #[test]
+    fn the_editing_pills_accessible_name_is_fixed_before_the_hover_dependent_label_is_chosen() {
+        // The visible word morphs with hover/focus ("Editing" vs
+        // "Continue"), but assistive technology must be told both facts at
+        // once via one fixed string, set by `response.widget_info(..)`
+        // *before* `continuing`/`label` are computed in `editing_pill`. This
+        // doesn't re-run egui's accessibility pipeline (that requires the
+        // `accesskit` feature plus a live frame using it, which this crate's
+        // test harness does not drive); it instead pins the source-level
+        // invariant directly: the call that registers the accessible name is
+        // unconditional and textually precedes the point where hover/focus
+        // decide what word gets painted, so no code path can make the
+        // accessible name depend on transient pointer/focus state.
+        let source = include_str!("paint.rs");
+        let body_start = source
+            .find("pub fn editing_pill(")
+            .expect("editing_pill must exist");
+        let body = &source[body_start..];
+        let fn_end = body
+            .find("\nfn card_control_scale")
+            .expect("editing_pill must be followed by card_control_scale");
+        let body = &body[..fn_end];
+
+        let widget_info_at = body
+            .find(r#"WidgetInfo::labeled(WidgetType::Button, true, "Continue editing")"#)
+            .expect("the pill must register a fixed accessible label");
+        let continuing_at = body
+            .find("let continuing = pointer.hovered || pointer.focused;")
+            .expect("the pill must still compute a hover/focus-dependent visible label");
+
+        assert!(
+            widget_info_at < continuing_at,
+            "the accessible name must be registered before hover/focus state chooses the visible word, so it never depends on that state"
+        );
     }
 }

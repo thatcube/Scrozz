@@ -647,7 +647,19 @@ pub struct App {
     pending_admissions: VecDeque<Admission>,
     selector: Arc<dyn CaptureSelector>,
     file_launcher: FileLauncher,
-    active_editor_card: Option<CardId>,
+    /// Every card with an editor open as of the most recent tick.
+    active_editor_cards: HashSet<CardId>,
+    /// Cards with a decode in flight for [`Job::Open`], not yet a live editor.
+    ///
+    /// Closes the gap between the click that starts opening a card and the
+    /// first tick where [`Self::active_editor_cards`] can see it, so a rapid
+    /// second click (or a second trigger from another menu) during that
+    /// window still raises the one editor being opened instead of decoding
+    /// the same card twice.
+    opening_cards: HashSet<CardId>,
+    /// Cards whose already-open (or opening) editor should be raised, because
+    /// something asked to edit a card that is already being edited.
+    focus_editor_requests: VecDeque<CardId>,
     drag: DragHost,
     /// A native modal drag can consume mouse-up and modifier-release events.
     /// The window host clears that stale egui input before another interaction.
@@ -711,10 +723,10 @@ pub struct App {
     smart_frame_results: VecDeque<SmartFrameResult>,
     /// Captures retained only because their editor is open, not by the overlay.
     editor_only_cards: HashSet<CardId>,
-    /// The one editor revision currently being prepared on the worker.
-    editor_render_pending: Option<(CardId, u64, u64)>,
+    /// At most one full-resolution render per card is in flight at a time.
+    editor_render_pending: HashMap<CardId, (u64, u64)>,
     /// A failed version is not retried until the document or editor changes.
-    editor_render_failed: Option<(CardId, u64, u64)>,
+    editor_render_failed: HashMap<CardId, (u64, u64)>,
     next_editor_generation: u64,
     notes: Vec<String>,
     exit_reason: Option<ExitReason>,
@@ -838,6 +850,41 @@ impl<'a> EditorSnapshot<'a> {
 
     fn render(self) -> CliResult<RevisionedFrame> {
         self.editor.render().map_err(CliError::Core)
+    }
+}
+
+/// Every editor open this frame, so several captures can each have one open
+/// simultaneously without any card's Copy/Save/Upload/drag/overflow handling
+/// having to know how many others exist.
+///
+/// A thin, `Copy` view over a slice rather than an owned collection: it is
+/// rebuilt every frame from whatever the host is holding open, and every
+/// consumer below only ever needs to look one card up at a time.
+#[derive(Clone, Copy, Default)]
+pub struct EditorSnapshots<'a>(&'a [EditorSnapshot<'a>]);
+
+impl<'a> EditorSnapshots<'a> {
+    /// No editors are open.
+    pub const EMPTY: Self = Self(&[]);
+
+    /// Wraps one snapshot per currently open editor.
+    #[must_use]
+    pub const fn new(snapshots: &'a [EditorSnapshot<'a>]) -> Self {
+        Self(snapshots)
+    }
+
+    /// The live editor for `card`, if one is open.
+    #[must_use]
+    pub fn for_card(self, card: CardId) -> Option<EditorSnapshot<'a>> {
+        self.0
+            .iter()
+            .copied()
+            .find(|snapshot| snapshot.card == card)
+    }
+
+    /// Every card with an editor open this frame.
+    fn cards(self) -> impl Iterator<Item = CardId> + 'a {
+        self.0.iter().map(|snapshot| snapshot.card)
     }
 }
 
@@ -1265,7 +1312,9 @@ impl App {
             pending_admissions: VecDeque::new(),
             selector,
             file_launcher: default_file_launcher(),
-            active_editor_card: None,
+            active_editor_cards: HashSet::new(),
+            opening_cards: HashSet::new(),
+            focus_editor_requests: VecDeque::new(),
             drag: DragHost::new(),
             modal_drag_input_release_pending: false,
             drag_keep_after_accept: HashSet::new(),
@@ -1298,8 +1347,8 @@ impl App {
             editor_requests: VecDeque::new(),
             smart_frame_results: VecDeque::new(),
             editor_only_cards: HashSet::new(),
-            editor_render_pending: None,
-            editor_render_failed: None,
+            editor_render_pending: HashMap::new(),
+            editor_render_failed: HashMap::new(),
             next_editor_generation: 1,
             notes,
             exit_reason: None,
@@ -1375,18 +1424,20 @@ impl App {
     /// waiting in the worker queue, so an explicit Discard remains authoritative
     /// at the final frame boundary.
     pub fn tick(&mut self) -> Tick {
-        self.tick_with_editor(None)
+        self.tick_with_editor(EditorSnapshots::EMPTY)
     }
 
-    /// Services every source once with the current editor document available to
-    /// card output actions.
+    /// Services every source once with the current editor documents available
+    /// to card output actions.
     ///
     /// A card being edited must never fall back to its original cached pixels:
-    /// that would let Copy or Save bypass destructive redactions. The snapshot
-    /// is borrowed only for this pass and rendered into an immutable,
-    /// revision-tagged frame before it is sent to the worker.
-    pub fn tick_with_editor(&mut self, editor: Option<EditorSnapshot<'_>>) -> Tick {
-        self.active_editor_card = editor.map(|snapshot| snapshot.card);
+    /// that would let Copy or Save bypass destructive redactions. Each
+    /// snapshot is borrowed only for this pass and rendered into an
+    /// immutable, revision-tagged frame before it is sent to the worker.
+    pub fn tick_with_editor(&mut self, editors: EditorSnapshots<'_>) -> Tick {
+        self.active_editor_cards = editors.cards().collect();
+        self.opening_cards
+            .retain(|card| !self.active_editor_cards.contains(card));
         if self.expired() {
             self.note("the run deadline passed");
             return self.stop(ExitReason::Deadline);
@@ -1408,7 +1459,7 @@ impl App {
         self.drain_pipeline();
         self.drain_save_dialog();
         self.drain_connection_test();
-        self.drain_cards(editor);
+        self.drain_cards(editors);
         // After the HUD's own events: an abort raised this frame must beat the
         // finished capture that was held back for exactly one pass.
         self.drain_scrolling_start();
@@ -1954,12 +2005,12 @@ impl App {
                     generation,
                     revision,
                 } => {
-                    let version = (card, generation, revision);
-                    if self.editor_render_pending == Some(version) {
-                        self.editor_render_pending = None;
+                    let version = (generation, revision);
+                    if self.editor_render_pending.get(&card) == Some(&version) {
+                        self.editor_render_pending.remove(&card);
                     }
-                    if self.editor_render_failed == Some(version) {
-                        self.editor_render_failed = None;
+                    if self.editor_render_failed.get(&card) == Some(&version) {
+                        self.editor_render_failed.remove(&card);
                     }
                 }
                 Outcome::PreparationFailed {
@@ -1968,11 +2019,11 @@ impl App {
                     revision,
                     error,
                 } => {
-                    let version = (card, generation, revision);
-                    if self.editor_render_pending == Some(version) {
-                        self.editor_render_pending = None;
+                    let version = (generation, revision);
+                    if self.editor_render_pending.get(&card) == Some(&version) {
+                        self.editor_render_pending.remove(&card);
                     }
-                    self.editor_render_failed = Some(version);
+                    self.editor_render_failed.insert(card, version);
                     self.note(format!(
                         "{card} editor {generation} revision {revision} could not be prepared for \
                          drag: {error}"
@@ -1992,6 +2043,9 @@ impl App {
                     });
                 }
                 Outcome::Refused { card, error } => {
+                    if self.opening_cards.remove(&card) {
+                        self.surface.set_editing(card, false);
+                    }
                     self.surface
                         .set_status(card, Some(format!("Action failed: {error}")));
                     self.note(format!("{card} refused: {error}"));
@@ -2207,7 +2261,7 @@ impl App {
         }
     }
 
-    fn drain_cards(&mut self, editor: Option<EditorSnapshot<'_>>) {
+    fn drain_cards(&mut self, editors: EditorSnapshots<'_>) {
         let mut pending = Vec::new();
         while let Some(event) = self.surface.poll() {
             pending.push(event);
@@ -2223,7 +2277,7 @@ impl App {
                         self.note(format!("{id} already has an action in progress"));
                         continue;
                     }
-                    if self.post_card_output(id, CardOutput::Copy, editor) {
+                    if self.post_card_output(id, CardOutput::Copy, editors) {
                         self.close_after_output.insert(id);
                     }
                 }
@@ -2240,17 +2294,15 @@ impl App {
                             .card_retention
                             .get(&card)
                             .is_some_and(|(_, exported)| *exported)
-                        && editor
-                            .and_then(|snapshot| snapshot.for_card(card))
-                            .is_none()
+                        && editors.for_card(card).is_none()
                     {
                         self.dismiss_recent_capture(card, "used its existing export");
                         self.note(format!("{card} was already saved to Export Location"));
                         continue;
                     }
                     if choose_destination {
-                        self.begin_save_dialog(card, editor);
-                    } else if self.post_card_output(card, CardOutput::Save(None), editor) {
+                        self.begin_save_dialog(card, editors);
+                    } else if self.post_card_output(card, CardOutput::Save(None), editors) {
                         self.close_after_output.insert(card);
                     }
                 }
@@ -2261,18 +2313,18 @@ impl App {
                         ));
                         continue;
                     }
-                    if editor.and_then(|snapshot| snapshot.for_card(id)).is_some() {
+                    if editors.for_card(id).is_some() {
                         self.deferred_auto_close.insert(id, action);
                         self.note(format!("{id} stayed visible while its editor is open"));
                         continue;
                     }
-                    self.handle_auto_close(id, action, editor);
+                    self.handle_auto_close(id, action, editors);
                 }
                 CardEvent::Upload(id) => {
                     self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
                     if self.cloud_settings.upload_enabled {
                         self.surface.set_status(id, Some("Uploading...".to_owned()));
-                        if self.post_card_output(id, CardOutput::Upload, editor)
+                        if self.post_card_output(id, CardOutput::Upload, editors)
                             && self.config.recent_captures_overlay.close_after_upload
                         {
                             self.close_after_upload.insert(id);
@@ -2303,25 +2355,36 @@ impl App {
                     // Releasing an editor's source would strand the window on
                     // pixels it can no longer re-read, so capacity retirement
                     // waits and resumes against the revision the editor ends on.
-                    if editor.and_then(|snapshot| snapshot.for_card(id)).is_some() {
+                    if editors.for_card(id).is_some() {
                         self.deferred_overflow.insert(id);
                         self.note(format!(
                             "{id} overflow cleanup was deferred while its editor is open"
                         ));
                     } else {
-                        self.handle_overflow(id, editor);
+                        self.handle_overflow(id, editors);
                     }
                 }
                 CardEvent::Open(id) => {
-                    // Decoding happens on the worker, so the click that opens
-                    // the editor never inflates a 6K PNG on the UI thread.
-                    self.pipeline.post(Job::Open(id));
+                    if editors.for_card(id).is_some() || self.opening_cards.contains(&id) {
+                        // Already open, or already being decoded for one:
+                        // raise the one editor instead of starting a second.
+                        self.focus_editor_requests.push_back(id);
+                    } else {
+                        // Decoding happens on the worker, so the click that
+                        // opens the editor never inflates a 6K PNG on the UI
+                        // thread. The card's timer pauses optimistically here,
+                        // before the decode even finishes, so a slow decode
+                        // can never let the card auto-close out from under it.
+                        self.opening_cards.insert(id);
+                        self.surface.set_editing(id, true);
+                        self.pipeline.post(Job::Open(id));
+                    }
                 }
                 CardEvent::Drag { card, at } => {
                     if at.keep_after_accept {
                         self.drag_keep_after_accept.insert(card);
                     }
-                    self.begin_drag(card, at, editor);
+                    self.begin_drag(card, at, editors);
                 }
                 // Collapsing into the dock is the capture stack's own animation
                 // and belongs to the surface that raised the event once there
@@ -2330,8 +2393,7 @@ impl App {
                     self.note(format!("{id}: {event:?} is not routed yet"));
                 }
                 CardEvent::Pin(id, capture, state) => {
-                    let editor = if let Some(editor) = editor.and_then(|editor| editor.for_card(id))
-                    {
+                    let editor = if let Some(editor) = editors.for_card(id) {
                         let rendered = match editor.render() {
                             Ok(rendered) => rendered,
                             Err(error) => {
@@ -2568,7 +2630,7 @@ impl App {
     /// writes what the user last saw rather than the original capture. An
     /// existing export is only reused when nothing is editing the card, because
     /// a stale file must not stand in for unsaved edits.
-    fn handle_overflow(&mut self, id: CardId, editor: Option<EditorSnapshot<'_>>) {
+    fn handle_overflow(&mut self, id: CardId, editors: EditorSnapshots<'_>) {
         // An in-flight Save As or output already owns this card's outcome.
         // Retiring it here would invalidate that work, so overflow only records
         // that the card is no longer reachable and lets the outcome decide.
@@ -2579,8 +2641,8 @@ impl App {
             ));
             return;
         }
-        if let Some(editor) = editor.and_then(|snapshot| snapshot.for_card(id)) {
-            match Self::card_output_job(id, CardOutput::Save(None), Some(editor)) {
+        if editors.for_card(id).is_some() {
+            match Self::card_output_job(id, CardOutput::Save(None), editors) {
                 Ok(recovery) => {
                     if self.pipeline.post(recovery) {
                         self.close_after_output.insert(id);
@@ -2612,7 +2674,7 @@ impl App {
             self.dismiss_recent_capture(id, "overflowed with a durable export");
         } else if retained {
             if let Some(capture) = self.card_capture_ids.get(&id).cloned() {
-                match Self::card_output_job(id, CardOutput::Save(None), editor) {
+                match Self::card_output_job(id, CardOutput::Save(None), editors) {
                     Ok(recovery) => {
                         self.pending_overflow_recovery.insert(id, recovery);
                         if self.pending_retention_overflow.insert(id)
@@ -2641,7 +2703,7 @@ impl App {
             } else {
                 self.dismiss_recent_capture(id, "overflowed with retained history");
             }
-        } else if self.post_card_output(id, CardOutput::Save(None), editor) {
+        } else if self.post_card_output(id, CardOutput::Save(None), editors) {
             self.close_after_output.insert(id);
             self.overflow_recovery_in_flight.insert(id);
             self.note(format!(
@@ -2676,10 +2738,10 @@ impl App {
             return;
         }
         self.overflow_recovery_in_flight.remove(&card);
-        if self.active_editor_card == Some(card) {
+        if self.active_editor_cards.contains(&card) {
             self.deferred_overflow.insert(card);
         } else {
-            self.handle_overflow(card, None);
+            self.handle_overflow(card, EditorSnapshots::EMPTY);
         }
     }
 
@@ -2692,7 +2754,7 @@ impl App {
         &mut self,
         id: CardId,
         action: RecentCapturesAutoCloseAction,
-        editor: Option<EditorSnapshot<'_>>,
+        editors: EditorSnapshots<'_>,
     ) {
         let (retained, exported) = self.card_retention.get(&id).copied().unwrap_or_default();
         match action {
@@ -2718,14 +2780,14 @@ impl App {
                 "{id} stayed visible because it is the only retained artifact"
             )),
             RecentCapturesAutoCloseAction::SaveThenHide
-                if exported && editor.and_then(|snapshot| snapshot.for_card(id)).is_none() =>
+                if exported && editors.for_card(id).is_none() =>
             {
                 self.dismiss_recent_capture(id, "auto-closed after its existing save");
             }
             RecentCapturesAutoCloseAction::SaveThenHide => {
                 if self.close_after_output.contains(&id) {
                     self.note(format!("{id} already has an action in progress"));
-                } else if self.post_card_output(id, CardOutput::Save(None), editor) {
+                } else if self.post_card_output(id, CardOutput::Save(None), editors) {
                     self.close_after_output.insert(id);
                 }
             }
@@ -2736,10 +2798,10 @@ impl App {
         &mut self,
         card: CardId,
         output: CardOutput,
-        editor: Option<EditorSnapshot<'_>>,
+        editors: EditorSnapshots<'_>,
     ) -> bool {
         let label = output.label();
-        let job = match Self::card_output_job(card, output, editor) {
+        let job = match Self::card_output_job(card, output, editors) {
             Ok(job) => job,
             Err(error) => {
                 self.note(format!(
@@ -2760,15 +2822,15 @@ impl App {
         true
     }
 
-    fn begin_save_dialog(&mut self, card: CardId, editor: Option<EditorSnapshot<'_>>) {
+    fn begin_save_dialog(&mut self, card: CardId, editors: EditorSnapshots<'_>) {
         if self.pending_save_dialog.is_some() || self.close_after_output.contains(&card) {
             self.note(format!(
                 "{card} stayed visible because another Save As dialog is already open"
             ));
             return;
         }
-        let rendered = match editor
-            .and_then(|editor| editor.for_card(card))
+        let rendered = match editors
+            .for_card(card)
             .map(EditorSnapshot::render)
             .transpose()
         {
@@ -2835,7 +2897,7 @@ impl App {
     }
 
     fn dismiss_recent_capture(&mut self, card: CardId, reason: &str) {
-        let editor_owns_card = self.active_editor_card == Some(card);
+        let editor_owns_card = self.active_editor_cards.contains(&card);
         let save_dialog_owns_card = self
             .pending_save_dialog
             .as_ref()
@@ -2870,9 +2932,9 @@ impl App {
     fn card_output_job(
         card: CardId,
         output: CardOutput,
-        editor: Option<EditorSnapshot<'_>>,
+        editors: EditorSnapshots<'_>,
     ) -> CliResult<Job> {
-        let Some(editor) = editor.and_then(|editor| editor.for_card(card)) else {
+        let Some(editor) = editors.for_card(card) else {
             return Ok(match output {
                 CardOutput::Copy => Job::Copy(card),
                 CardOutput::Save(None) => Job::Save(card),
@@ -2913,7 +2975,7 @@ impl App {
     /// Returns how many drags were started, which is what the ordering test
     /// asserts on.
     pub fn pump_drag_starts(&mut self) -> usize {
-        self.pump_drag_starts_with_editor(None)
+        self.pump_drag_starts_with_editor(EditorSnapshots::EMPTY)
     }
 
     /// Starts native drags with the current editor document available.
@@ -2922,7 +2984,7 @@ impl App {
     /// that exact revision. A failed render refuses the drag; it never falls
     /// back to the vault's original pixels and risk exposing data under a
     /// destructive redaction.
-    pub fn pump_drag_starts_with_editor(&mut self, editor: Option<EditorSnapshot<'_>>) -> usize {
+    pub fn pump_drag_starts_with_editor(&mut self, editors: EditorSnapshots<'_>) -> usize {
         let armed = self.surface.poll_drag_starts();
         let mut started = 0;
         for event in armed {
@@ -2933,7 +2995,7 @@ impl App {
                 if self.recorded_media.contains_key(&card) {
                     self.begin_recorded_drag(card, at);
                 } else {
-                    self.begin_drag(card, at, editor);
+                    self.begin_drag(card, at, editors);
                 }
                 started += 1;
             }
@@ -2947,14 +3009,14 @@ impl App {
     /// for why that is the only moment this can work. The card stays where it
     /// is; [`Self::drain_drags`] removes it if and only if something accepts
     /// the drop.
-    fn begin_drag(&mut self, card: CardId, at: DragSpot, editor: Option<EditorSnapshot<'_>>) {
+    fn begin_drag(&mut self, card: CardId, at: DragSpot, editors: EditorSnapshots<'_>) {
         if !self.drag.is_attached()
             && let Some(surface) = self.surface.native_surface()
         {
             self.drag.attach(surface);
         }
 
-        let bytes = match self.drag_bytes(card, editor) {
+        let bytes = match self.drag_bytes(card, editors) {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.drag_keep_after_accept.remove(&card);
@@ -2982,12 +3044,8 @@ impl App {
         }
     }
 
-    fn drag_bytes(
-        &self,
-        card: CardId,
-        editor: Option<EditorSnapshot<'_>>,
-    ) -> CliResult<CaptureBytes> {
-        if let Some(editor) = editor.and_then(|editor| editor.for_card(card)) {
+    fn drag_bytes(&self, card: CardId, editors: EditorSnapshots<'_>) -> CliResult<CaptureBytes> {
+        if let Some(editor) = editors.for_card(card) {
             let revision = editor.editor.state().revision();
             return self
                 .pipeline
@@ -3273,6 +3331,8 @@ impl App {
         if open_editor {
             if self.pipeline.post(Job::Open(card_id)) {
                 retained = true;
+                self.opening_cards.insert(card_id);
+                self.surface.set_editing(card_id, true);
                 if !show_overlay {
                     self.editor_only_cards.insert(card_id);
                 }
@@ -4411,6 +4471,12 @@ impl App {
         self.editor_requests.pop_front()
     }
 
+    /// Takes a pending request to raise a card's already-open (or opening)
+    /// editor instead of starting a second one for the same card.
+    pub fn take_focus_editor_request(&mut self) -> Option<CardId> {
+        self.focus_editor_requests.pop_front()
+    }
+
     /// Takes one completed Smart Frame analysis for delivery by the viewport host.
     pub fn take_smart_frame_result(&mut self) -> Option<SmartFrameResult> {
         self.smart_frame_results.pop_front()
@@ -4498,34 +4564,39 @@ impl App {
     /// its live bytes back in the same pass.
     pub fn editor_closed(&mut self, editor: EditorSnapshot<'_>) {
         let card = editor.card;
+        let editors = EditorSnapshots::new(std::slice::from_ref(&editor));
         if let Some(action) = self.deferred_auto_close.remove(&card) {
-            self.handle_auto_close(card, action, Some(editor));
+            self.handle_auto_close(card, action, editors);
         }
         if self.deferred_overflow.remove(&card) {
-            self.handle_overflow(card, Some(editor));
+            self.handle_overflow(card, editors);
         }
         if self.editor_only_cards.remove(&card) {
             self.pipeline.post(Job::Release(card));
         }
+        self.opening_cards.remove(&card);
+        self.surface.set_editing(card, false);
     }
 
     /// Asks the worker to prepare the latest settled editor revision for drag.
     ///
-    /// At most one full-resolution render is in flight, so a continuous drawing
-    /// gesture cannot fill the worker queue with obsolete documents. Once that
-    /// render returns, the next frame submits the newest revision if the editor
-    /// moved on. Drag refuses while the exact revision is unavailable.
+    /// At most one full-resolution render per card is in flight, so a
+    /// continuous drawing gesture cannot fill the worker queue with obsolete
+    /// documents, and one card's drag preparation never blocks another's.
+    /// Once that render returns, the next frame submits the newest revision
+    /// if the editor moved on. Drag refuses while the exact revision is
+    /// unavailable.
     pub fn prepare_editor(&mut self, editor: EditorSnapshot<'_>) {
         let revision = editor.editor.state().revision();
-        let version = (editor.card, editor.generation, revision);
+        let version = (editor.generation, revision);
         let captures = self.pipeline.captures();
         if editor.editor.state().is_dragging()
             || captures.get(editor.card).is_none()
             || captures
                 .get_revision(editor.card, editor.generation, revision)
                 .is_some()
-            || self.editor_render_pending.is_some()
-            || self.editor_render_failed == Some(version)
+            || self.editor_render_pending.contains_key(&editor.card)
+            || self.editor_render_failed.get(&editor.card) == Some(&version)
         {
             return;
         }
@@ -4537,7 +4608,7 @@ impl App {
             data: Box::new(editor.editor.document().data()),
         };
         if self.pipeline.post(job) {
-            self.editor_render_pending = Some(version);
+            self.editor_render_pending.insert(editor.card, version);
         } else {
             self.note(format!(
                 "{} editor {} revision {revision} could not be queued for drag preparation: \
@@ -4582,6 +4653,18 @@ impl App {
             card,
             rendered: Box::new(rendered),
         });
+    }
+
+    /// Replaces a card's visible thumbnail with a freshly rendered document.
+    ///
+    /// The card keeps its pre-edit thumbnail for the entire editing session —
+    /// this is only ever called once, when the editor commits (Done) a dirty
+    /// document. Per D14 a capture's own pixels are never replaced by an
+    /// annotated version unless the user explicitly saves one; Done is that
+    /// explicit action, distinct from a plain window close or Cancel, neither
+    /// of which reaches this method.
+    pub fn refresh_card_thumbnail(&mut self, card: CardId, frame: &scrozz_core::Frame) {
+        self.surface.refresh_card_image(card, frame);
     }
 
     fn with_history<R>(&self, f: impl FnOnce(&mut HistoryViewModel) -> R) -> R {
@@ -4862,7 +4945,7 @@ impl App {
         self.settle_recording_before_shutdown();
         self.recording.discard_interactions();
         self.input_wake_monitor = None;
-        self.drain_cards(None);
+        self.drain_cards(EditorSnapshots::EMPTY);
         self.hotkeys.unregister_all();
         if let Some(tray) = self.tray.take() {
             tray.close();
@@ -7120,7 +7203,9 @@ mod tests {
             choose_destination: false,
         });
 
-        app.tick_with_editor(Some(EditorSnapshot::new(card, 1, &editor)));
+        app.tick_with_editor(EditorSnapshots::new(std::slice::from_ref(
+            &EditorSnapshot::new(card, 1, &editor),
+        )));
 
         assert!(
             !surface.trace().contains(&SurfaceCall::Dismiss(card)),
@@ -7143,7 +7228,9 @@ mod tests {
             RecentCapturesAutoCloseAction::SaveThenHide,
         ));
 
-        app.drain_cards(Some(EditorSnapshot::new(card, 1, &editor)));
+        app.drain_cards(EditorSnapshots::new(std::slice::from_ref(
+            &EditorSnapshot::new(card, 1, &editor),
+        )));
 
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
         assert!(
@@ -7170,6 +7257,225 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_open_marks_the_card_opening_and_pauses_its_timer() {
+        let (mut app, surface) = app();
+        let card = CardId(70);
+        surface.inject(CardEvent::Open(card));
+
+        app.drain_cards(EditorSnapshots::EMPTY);
+
+        assert!(
+            app.opening_cards.contains(&card),
+            "a fresh open must be tracked until the decode produces a live editor"
+        );
+        assert!(
+            surface.trace().contains(&SurfaceCall::SetEditing {
+                id: card,
+                editing: true
+            }),
+            "the timer must pause optimistically before the decode even finishes"
+        );
+        assert_eq!(
+            app.take_focus_editor_request(),
+            None,
+            "a fresh open is not a duplicate and must not raise anything"
+        );
+    }
+
+    #[test]
+    fn a_second_open_while_the_first_is_still_decoding_focuses_instead_of_reopening() {
+        let (mut app, surface) = app();
+        let card = CardId(71);
+        surface.inject(CardEvent::Open(card));
+        app.drain_cards(EditorSnapshots::EMPTY);
+        assert!(app.opening_cards.contains(&card));
+        assert_eq!(app.take_focus_editor_request(), None);
+
+        // The decode for `card` has not produced an editor yet (still no
+        // snapshot), but something clicks the card again -- or a menu's Edit
+        // action fires -- before it lands.
+        surface.inject(CardEvent::Open(card));
+        app.drain_cards(EditorSnapshots::EMPTY);
+
+        assert_eq!(
+            app.take_focus_editor_request(),
+            Some(card),
+            "a duplicate open mid-decode must raise the one editor being opened, not start a second"
+        );
+        assert_eq!(
+            surface
+                .trace()
+                .iter()
+                .filter(|call| **call
+                    == SurfaceCall::SetEditing {
+                        id: card,
+                        editing: true
+                    })
+                .count(),
+            1,
+            "the timer must only be paused once for the one decode in flight"
+        );
+    }
+
+    #[test]
+    fn opening_an_already_open_card_focuses_the_existing_editor_without_a_second_decode() {
+        let (mut app, surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(72);
+        let snapshot = EditorSnapshot::new(card, 1, &editor);
+        let editors = EditorSnapshots::new(std::slice::from_ref(&snapshot));
+
+        // The card's editor is already open and live this frame (its decode
+        // finished on an earlier tick); the click that opens it again -- the
+        // whole-card click, Enter/Space, or an Edit menu action -- must raise
+        // it, never queue a second decode.
+        surface.inject(CardEvent::Open(card));
+        app.drain_cards(editors);
+
+        assert_eq!(
+            app.take_focus_editor_request(),
+            Some(card),
+            "opening an already-open card must raise its existing editor"
+        );
+        assert!(
+            !app.opening_cards.contains(&card),
+            "an already-open card was never queued for decode and must not become so now"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::SetEditing {
+                id: card,
+                editing: true
+            }),
+            "the timer is already paused for an open editor; opening it again must not re-pause it"
+        );
+    }
+
+    #[test]
+    fn two_cards_opening_at_once_are_tracked_and_focused_independently() {
+        let (mut app, surface) = app();
+        let a = CardId(73);
+        let b = CardId(74);
+        surface.inject(CardEvent::Open(a));
+        surface.inject(CardEvent::Open(b));
+
+        app.drain_cards(EditorSnapshots::EMPTY);
+
+        assert!(app.opening_cards.contains(&a));
+        assert!(app.opening_cards.contains(&b));
+        assert_eq!(app.take_focus_editor_request(), None);
+
+        // `a`'s decode has since finished (it now has a live editor); `b`'s
+        // has not. A duplicate open arrives for each in the same pass. Using
+        // `drain_cards` directly (rather than a full `tick_with_editor`) keeps
+        // this test isolated to card-dedup routing: a full tick would also
+        // drain the pipeline and try to service the `Job::Open` jobs posted
+        // above, which is a different concern with its own coverage.
+        let editor = redacted_editor();
+        let snapshot_a = EditorSnapshot::new(a, 1, &editor);
+        let editors = EditorSnapshots::new(std::slice::from_ref(&snapshot_a));
+        surface.inject(CardEvent::Open(a));
+        surface.inject(CardEvent::Open(b));
+
+        app.drain_cards(editors);
+
+        assert!(
+            app.opening_cards.contains(&b),
+            "`b` is still mid-decode and must remain tracked"
+        );
+        // Both duplicates must be queued to focus, each exactly once, and
+        // neither card's routing may bleed into the other's.
+        let mut focused = Vec::new();
+        while let Some(card) = app.take_focus_editor_request() {
+            focused.push(card);
+        }
+        assert_eq!(focused, vec![a, b]);
+    }
+
+    #[test]
+    fn a_decode_in_flight_stops_being_tracked_once_its_editor_goes_live() {
+        let (mut app, _surface) = app();
+        let a = CardId(200);
+        let b = CardId(201);
+        // Simulate the state a real tick would reach after two opens were
+        // posted for decode: both tracked as in-flight, no editor yet.
+        app.opening_cards.insert(a);
+        app.opening_cards.insert(b);
+
+        // `a`'s decode has landed and produced a live editor this tick;
+        // `b`'s has not.
+        let editor = redacted_editor();
+        let snapshot_a = EditorSnapshot::new(a, 1, &editor);
+        let editors = EditorSnapshots::new(std::slice::from_ref(&snapshot_a));
+
+        app.tick_with_editor(editors);
+
+        assert!(
+            !app.opening_cards.contains(&a),
+            "a card with a live editor this tick must fall out of the decode-in-flight set"
+        );
+        assert!(
+            app.opening_cards.contains(&b),
+            "a card with no editor yet must remain tracked as still decoding"
+        );
+    }
+
+    #[test]
+    fn closing_one_cards_editor_leaves_a_second_open_editor_untouched() {
+        let (mut app, surface) = app();
+        let editor_a = redacted_editor();
+        let editor_b = redacted_editor();
+        let a = CardId(75);
+        let b = CardId(76);
+        app.card_retention.insert(a, (true, true));
+        app.card_retention.insert(b, (true, true));
+        surface.inject(CardEvent::AutoClose(a, RecentCapturesAutoCloseAction::Hide));
+        surface.inject(CardEvent::AutoClose(b, RecentCapturesAutoCloseAction::Hide));
+
+        let snapshot_a = EditorSnapshot::new(a, 1, &editor_a);
+        let snapshot_b = EditorSnapshot::new(b, 1, &editor_b);
+        let both = [snapshot_a, snapshot_b];
+        app.drain_cards(EditorSnapshots::new(&both));
+
+        assert_eq!(
+            app.deferred_auto_close.get(&a),
+            Some(&RecentCapturesAutoCloseAction::Hide)
+        );
+        assert_eq!(
+            app.deferred_auto_close.get(&b),
+            Some(&RecentCapturesAutoCloseAction::Hide)
+        );
+
+        // Closing `a`'s editor must resolve only `a`'s deferred state, resume
+        // only `a`'s timer, and leave `b` -- still open -- completely alone.
+        app.editor_closed(EditorSnapshot::new(a, 1, &editor_a));
+
+        assert!(!app.deferred_auto_close.contains_key(&a));
+        assert!(
+            app.deferred_auto_close.contains_key(&b),
+            "closing one card's editor must not resolve a still-open card's deferred auto-close"
+        );
+        assert!(surface.trace().contains(&SurfaceCall::Dismiss(a)));
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(b)),
+            "`b` is still being edited and must not be dismissed by `a`'s close"
+        );
+        assert!(
+            surface.trace().contains(&SurfaceCall::SetEditing {
+                id: a,
+                editing: false
+            }),
+            "closing `a`'s editor must resume `a`'s timer"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::SetEditing {
+                id: b,
+                editing: false
+            }),
+            "`b`'s editor is still open; its timer must stay paused"
+        );
+    }
+
+    #[test]
     fn a_deferred_hide_retires_the_card_once_its_editor_closes() {
         let (mut app, surface) = app();
         let editor = redacted_editor();
@@ -7180,7 +7486,9 @@ mod tests {
             RecentCapturesAutoCloseAction::Hide,
         ));
 
-        app.drain_cards(Some(EditorSnapshot::new(card, 1, &editor)));
+        app.drain_cards(EditorSnapshots::new(std::slice::from_ref(
+            &EditorSnapshot::new(card, 1, &editor),
+        )));
 
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
         assert_eq!(
@@ -7208,7 +7516,9 @@ mod tests {
             .insert(card, CaptureId("editor-overflow".into()));
         surface.inject(CardEvent::Overflow(card));
 
-        app.tick_with_editor(Some(EditorSnapshot::new(card, 1, &editor)));
+        app.tick_with_editor(EditorSnapshots::new(std::slice::from_ref(
+            &EditorSnapshot::new(card, 1, &editor),
+        )));
 
         assert!(app.deferred_overflow.contains(&card));
         assert!(
@@ -7239,7 +7549,9 @@ mod tests {
         app.card_retention.insert(card, (false, true));
         surface.inject(CardEvent::Overflow(card));
 
-        app.tick_with_editor(Some(EditorSnapshot::new(card, 1, &editor)));
+        app.tick_with_editor(EditorSnapshots::new(std::slice::from_ref(
+            &EditorSnapshot::new(card, 1, &editor),
+        )));
 
         assert!(app.deferred_overflow.contains(&card));
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
@@ -7268,7 +7580,9 @@ mod tests {
         });
         surface.inject(CardEvent::Overflow(card));
 
-        app.drain_cards(Some(EditorSnapshot::new(card, 1, &editor)));
+        app.drain_cards(EditorSnapshots::new(std::slice::from_ref(
+            &EditorSnapshot::new(card, 1, &editor),
+        )));
         app.editor_closed(EditorSnapshot::new(card, 1, &editor));
 
         assert!(!app.deferred_overflow.contains(&card));
@@ -7305,7 +7619,7 @@ mod tests {
         app.card_retention.insert(card, (true, false));
         app.close_after_upload.insert(card);
 
-        app.handle_overflow(card, None);
+        app.handle_overflow(card, EditorSnapshots::EMPTY);
 
         assert!(app.overflow_recovery_in_flight.contains(&card));
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
@@ -7322,7 +7636,7 @@ mod tests {
         let card = CardId(58);
         app.card_retention.insert(card, (true, false));
         app.close_after_upload.insert(card);
-        app.handle_overflow(card, None);
+        app.handle_overflow(card, EditorSnapshots::EMPTY);
 
         app.fail_upload(card);
 
@@ -7344,7 +7658,7 @@ mod tests {
         });
         surface.inject(CardEvent::Overflow(card));
 
-        app.drain_cards(None);
+        app.drain_cards(EditorSnapshots::EMPTY);
         assert!(app.overflow_recovery_in_flight.contains(&card));
         app.drain_save_dialog();
 
@@ -7403,7 +7717,7 @@ mod tests {
             });
             surface.inject(event.clone());
 
-            app.drain_cards(None);
+            app.drain_cards(EditorSnapshots::EMPTY);
 
             assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
             assert!(app.card_retention.contains_key(&card));
@@ -9171,7 +9485,8 @@ mod tests {
         let editor = redacted_editor();
         let card = CardId(42);
         let expected = editor.state().revision();
-        let snapshot = Some(EditorSnapshot::new(card, 1, &editor));
+        let editor_snapshot = EditorSnapshot::new(card, 1, &editor);
+        let snapshot = EditorSnapshots::new(std::slice::from_ref(&editor_snapshot));
 
         for output in [CardOutput::Copy, CardOutput::Save(None), CardOutput::Upload] {
             let job = App::card_output_job(card, output, snapshot).expect("the document renders");
@@ -9234,10 +9549,11 @@ mod tests {
         let generation = 7;
         let snapshot = EditorSnapshot::new(card, generation, &editor);
 
-        let stale = match app.drag_bytes(card, Some(snapshot)) {
-            Ok(_) => panic!("the original bytes stood in for an edited revision"),
-            Err(error) => error,
-        };
+        let stale =
+            match app.drag_bytes(card, EditorSnapshots::new(std::slice::from_ref(&snapshot))) {
+                Ok(_) => panic!("the original bytes stood in for an edited revision"),
+                Err(error) => error,
+            };
         assert!(
             stale.to_string().contains("still being prepared"),
             "the safe refusal should explain itself: {stale}"
@@ -9257,7 +9573,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let bytes = app
-            .drag_bytes(card, Some(snapshot))
+            .drag_bytes(card, EditorSnapshots::new(std::slice::from_ref(&snapshot)))
             .expect("the prepared edited revision is ready");
         let decoded = scrozz_export::decode(&bytes.full).expect("the drag payload is a PNG");
 
@@ -9281,7 +9597,8 @@ mod tests {
 
         let reopened = EditorSnapshot::new(card, generation + 1, &editor);
         assert!(
-            app.drag_bytes(card, Some(reopened)).is_err(),
+            app.drag_bytes(card, EditorSnapshots::new(std::slice::from_ref(&reopened)))
+                .is_err(),
             "a new editor lifetime reused an old lifetime's matching revision"
         );
     }
@@ -9296,13 +9613,13 @@ mod tests {
             .captures()
             .store_test_capture(card, editor.document().source())
             .expect("the original capture encodes");
-        let version = (card, generation, editor.state().revision());
-        app.editor_render_failed = Some(version);
+        let version = (generation, editor.state().revision());
+        app.editor_render_failed.insert(card, version);
 
         app.prepare_editor(EditorSnapshot::new(card, generation, &editor));
 
-        assert_eq!(
-            app.editor_render_pending, None,
+        assert!(
+            !app.editor_render_pending.contains_key(&card),
             "an unchanged terminal failure was queued again"
         );
     }
@@ -9314,8 +9631,8 @@ mod tests {
 
         app.prepare_editor(EditorSnapshot::new(CardId(404), 1, &editor));
 
-        assert_eq!(
-            app.editor_render_pending, None,
+        assert!(
+            !app.editor_render_pending.contains_key(&CardId(404)),
             "a missing card queued a render that can only fail"
         );
     }

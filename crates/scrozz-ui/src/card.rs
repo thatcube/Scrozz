@@ -234,6 +234,12 @@ pub struct CardContent<'a> {
     pub provenance: Provenance,
     /// Whether this card is a still or a recording.
     pub media: CardMedia,
+    /// Whether this card's editor is currently open.
+    ///
+    /// While `true` the card freezes its pre-edit thumbnail, replaces its
+    /// edit corner with an always-visible morphing pill (D13), and blocks
+    /// Close as the one action that is not proven revision-safe.
+    pub editing: bool,
     /// The uploaded thumbnail, if it has been uploaded yet.
     pub texture: Option<egui::TextureId>,
     /// Whether Upload accepts input for this capture.
@@ -253,6 +259,7 @@ impl<'a> CardContent<'a> {
             source_px,
             provenance,
             media: CardMedia::Image,
+            editing: false,
             texture: None,
             upload_enabled: true,
             upload_unavailable_reason: None,
@@ -299,6 +306,12 @@ pub enum CardAction {
     Annotate,
     /// Open the video editor for a recording.
     Edit,
+    /// Focus (never duplicate) the editor already open for this card.
+    ///
+    /// The only action a card offers while its editor is open: the whole
+    /// card, its morphing pill, and its edit corner all resolve to this one
+    /// outcome rather than each risking a second editor for the same capture.
+    Continue,
     /// Upload and produce a link.
     Upload,
     /// Pin the card so the stack will not retire it.
@@ -316,6 +329,7 @@ impl CardAction {
             Self::Save => "save",
             Self::Annotate => "annotate",
             Self::Edit => "edit",
+            Self::Continue => "continue",
             Self::Upload => "upload",
             Self::Pin => "pin",
             Self::Close => "close",
@@ -330,6 +344,7 @@ impl CardAction {
             Self::Save => "Save",
             Self::Annotate => "Annotate",
             Self::Edit => "Edit",
+            Self::Continue => "Continue",
             Self::Upload => "Upload",
             Self::Pin => "Pin",
             Self::Close => "Close",
@@ -342,7 +357,7 @@ impl CardAction {
         match self {
             Self::Copy => Icon::Copy,
             Self::Save => Icon::DeviceFloppy,
-            Self::Annotate => Icon::Pencil,
+            Self::Annotate | Self::Continue => Icon::Pencil,
             Self::Edit => Icon::Video,
             Self::Upload => Icon::CloudUpload,
             Self::Pin => Icon::Pin,
@@ -461,7 +476,21 @@ pub fn draw_card(
     draw_media_marks(ui, content, capture, alpha);
 
     let reveal = frame.reveal.clamp(0.0, 1.0) * flat;
-    let action = draw_chrome(ui, surface, frame, chrome, content, rect, alpha * reveal);
+    let mut action = draw_chrome(ui, surface, frame, chrome, content, rect, alpha * reveal);
+
+    if content.editing {
+        // Always visible — bypassing the hover-reveal fade entirely — so an
+        // editing card is never ambiguous about its own state and never
+        // reads as merely disabled (D13). Drawn after the reveal chrome so
+        // it sits on top of the hover scrim rather than under it.
+        if let Some(pill_action) = draw_editing_pill(ui, surface, frame, rect, alpha) {
+            action = Some(pill_action);
+        } else if action.is_none() && body.clicked() {
+            // Whole-card click focuses the open editor; there is nothing
+            // else a card offers while it is being edited.
+            action = Some(CardAction::Continue);
+        }
+    }
 
     CardResponse {
         body,
@@ -695,7 +724,7 @@ fn draw_chrome(
     // Smaller matching controls occupy the corners. Close follows native window
     // convention: left on macOS, right on Windows and Linux.
     let size = vec2(ICON_BTN, ICON_BTN);
-    let corners = corner_actions(media);
+    let corners = corner_actions(media, content.editing);
     let origins = [
         inner.left_top(),
         pos2(inner.right() - ICON_BTN, inner.top()),
@@ -709,8 +738,15 @@ fn draw_chrome(
         let r = Rect::from_min_size(origin, size);
         // A control that is drawn and then always fails is worse than one that
         // was never offered — but Upload keeps its slot so the reason can be
-        // read on hover instead of the button silently vanishing.
-        let state = if action == CardAction::Upload && !content.upload_enabled {
+        // read on hover instead of the button silently vanishing. Close is
+        // the one corner action that is not proven revision-safe while a
+        // card's editor is open, so it is the one that gets blocked rather
+        // than deferred: dismissing a card whose thumbnail is deliberately
+        // frozen would either silently lose the pending edit or orphan the
+        // editor with no card left to raise it from.
+        let state = if (action == CardAction::Upload && !content.upload_enabled)
+            || (action == CardAction::Close && content.editing)
+        {
             ControlState::disabled()
         } else {
             ControlState::new()
@@ -729,6 +765,10 @@ fn draw_chrome(
             && let Some(reason) = content.upload_unavailable_reason
         {
             resp = resp.on_disabled_hover_text(reason);
+        } else if action == CardAction::Close && content.editing {
+            resp = resp.on_disabled_hover_text(
+                "Finish editing (Done or Cancel) before closing this card.",
+            );
         }
         if resp.clicked() {
             pressed = Some(action);
@@ -736,6 +776,49 @@ fn draw_chrome(
     }
 
     pressed
+}
+
+/// The always-visible morphing pill shown in place of the edit corner while
+/// a card's editor is open.
+///
+/// Unlike every other control here, this one does not fade with hover:
+/// `alpha` is the card's own visibility, never multiplied by `reveal`. An
+/// editing card must be legible about its own state at rest, not only when
+/// the pointer happens to be over it, and must never read as merely
+/// disabled — so this is drawn at full strength the instant the card itself
+/// is (D13).
+///
+/// Its label morphs `Editing` (rest) → `Continue` (hover or keyboard focus),
+/// but its accessible name is one stable string that names both facts at
+/// once, so assistive technology never re-announces the control as the
+/// pointer happens to cross it.
+fn draw_editing_pill(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    frame: &CardFrame,
+    container: Rect,
+    alpha: f32,
+) -> Option<CardAction> {
+    if alpha <= 0.004 {
+        return None;
+    }
+    let inner = container.shrink(CHROME_INSET);
+    let width = 116.0_f32.min(inner.width());
+    if width <= 0.0 || inner.height() < PILL_H {
+        return None;
+    }
+    let rect = Rect::from_min_size(
+        pos2(inner.left(), inner.bottom() - PILL_H),
+        vec2(width, PILL_H),
+    );
+    let response = paint::editing_pill(
+        ui,
+        surface,
+        rect,
+        control_id(frame.id, CardAction::Continue),
+        alpha,
+    );
+    response.clicked().then_some(CardAction::Continue)
 }
 
 /// The four corner slots, in origin order: top-left, top-right, bottom-left,
@@ -746,11 +829,18 @@ fn draw_chrome(
 ///
 /// * **Bottom-left** is the edit affordance. A still gets **Annotate**, a
 ///   recording gets **Edit**; [`CardMedia::edit_action`] is the one place that
-///   decision is made.
+///   decision is made. It is dropped entirely while `editing` is `true`: the
+///   always-visible pill ([`draw_editing_pill`]) is the one control a card
+///   offers for "focus my editor" once that editor exists, so there is never
+///   a moment with two controls claiming the same job.
 /// * **Pin** is empty for a recording. Pin to Screen holds a still image in a
 ///   floating window and has nothing to show for a video, which is exactly what
 ///   the After Capture matrix already says about `record.pin-to-screen`.
-fn corner_actions_for(close_on_left: bool, media: CardMedia) -> [Option<CardAction>; 4] {
+fn corner_actions_for(
+    close_on_left: bool,
+    media: CardMedia,
+    editing: bool,
+) -> [Option<CardAction>; 4] {
     let pin = (!media.is_video()).then_some(CardAction::Pin);
     let close = Some(CardAction::Close);
     let top = if close_on_left {
@@ -761,13 +851,13 @@ fn corner_actions_for(close_on_left: bool, media: CardMedia) -> [Option<CardActi
     [
         top[0],
         top[1],
-        Some(media.edit_action()),
+        (!editing).then_some(media.edit_action()),
         Some(CardAction::Upload),
     ]
 }
 
-fn corner_actions(media: CardMedia) -> [Option<CardAction>; 4] {
-    corner_actions_for(cfg!(target_os = "macos"), media)
+fn corner_actions(media: CardMedia, editing: bool) -> [Option<CardAction>; 4] {
+    corner_actions_for(cfg!(target_os = "macos"), media, editing)
 }
 
 fn primary_pill_rects(inner: Rect) -> Option<[Rect; 2]> {
@@ -991,7 +1081,7 @@ mod tests {
     #[test]
     fn close_follows_mac_and_windows_corner_conventions() {
         assert_eq!(
-            corner_actions_for(true, CardMedia::Image),
+            corner_actions_for(true, CardMedia::Image, false),
             [
                 Some(CardAction::Close),
                 Some(CardAction::Pin),
@@ -1000,7 +1090,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            corner_actions_for(false, CardMedia::Image),
+            corner_actions_for(false, CardMedia::Image, false),
             [
                 Some(CardAction::Pin),
                 Some(CardAction::Close),
@@ -1014,7 +1104,7 @@ mod tests {
     fn a_recording_card_offers_edit_and_never_offers_pin() {
         let video = CardMedia::video(Duration::from_secs(9), false);
         for close_on_left in [true, false] {
-            let corners = corner_actions_for(close_on_left, video);
+            let corners = corner_actions_for(close_on_left, video, false);
             assert!(
                 !corners.contains(&Some(CardAction::Pin)),
                 "Pin to Screen holds a still image and would always fail here"
@@ -1026,6 +1116,38 @@ mod tests {
             );
             assert!(!corners.contains(&Some(CardAction::Annotate)));
             assert_eq!(corners[2], Some(CardAction::Edit), "bottom-left slot");
+        }
+    }
+
+    #[test]
+    fn editing_suppresses_only_the_redundant_edit_corner() {
+        // The bottom-left "open the editor" corner button disappears once an
+        // editor already exists for this capture -- the always-visible pill
+        // is the one control that offers that job now, and a card must never
+        // show two controls claiming it at once. Every other corner
+        // (Close/Pin/Upload) is untouched: Close is merely disabled later at
+        // draw time, not removed from the slot map, and Pin/Upload stay
+        // fully live because they are already revision-safe.
+        for media in [
+            CardMedia::Image,
+            CardMedia::video(Duration::from_secs(4), false),
+        ] {
+            for close_on_left in [true, false] {
+                let idle = corner_actions_for(close_on_left, media, false);
+                let editing = corner_actions_for(close_on_left, media, true);
+                assert_eq!(editing[2], None, "edit corner is suppressed while editing");
+                assert_eq!(idle[0], editing[0], "top-left corner is unaffected");
+                assert_eq!(idle[1], editing[1], "top-right corner is unaffected");
+                assert_eq!(
+                    idle[3], editing[3],
+                    "upload stays offered while editing: it is revision-safe"
+                );
+                assert!(
+                    idle.contains(&Some(CardAction::Close))
+                        && editing.contains(&Some(CardAction::Close)),
+                    "Close stays present in the slot map; it is disabled at draw time, not removed"
+                );
+            }
         }
     }
 
