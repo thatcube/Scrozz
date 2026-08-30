@@ -20,7 +20,8 @@ use crate::theme::{Elevation, Radius, Space, Text, corner};
 use super::paint::CanvasView;
 use super::state::{Command, CropAspect, EditorState, Intent, Tool};
 use scrozz_annotate::{
-    AspectPreset, Background, Beautification, BeautificationPreset, SourceInsets, Watermark,
+    Alignment, AspectPreset, Background, Beautification, BeautificationPreset, BuiltInBackground,
+    ExactOutputSize, GeneratedStyle,
 };
 
 /// The height of one row of controls, in points.
@@ -559,7 +560,7 @@ pub fn draw(
         (Icon::ArrowBackUp, "Undo", Action::Undo),
         (
             Icon::LayoutGrid,
-            "Smart Frame",
+            "Scene",
             Action::Intent(Box::new(Intent::ToggleSmartFrame)),
         ),
     ] {
@@ -1683,13 +1684,13 @@ fn row_bottom(cy: f32) -> f32 {
     cy + ROW / 2.0 - Space::XS
 }
 
-// ── Smart Frame toolbar integration ──────────────────────────────
+// ── Scene toolbar integration ────────────────────────────────────
 
-/// Draws the Smart Frame controls in the given `panel` rectangle.
+/// Draws the Scene controls in the given `panel` rectangle.
 ///
 /// Returns an [`Intent`] if the user triggered something the host must act on
 /// (analysis request, preset save/delete, etc.).
-pub fn draw_smart_frame_panel(
+pub fn draw_scene_panel(
     ui: &mut Ui,
     surface: &Surface<'_>,
     state: &mut EditorState,
@@ -1708,16 +1709,15 @@ pub fn draw_smart_frame_panel(
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel));
     let child_ui = &mut child;
     ScrollArea::vertical()
-        .id_salt("smart-frame-panel")
+        .id_salt("scene-panel")
         .show(child_ui, |ui| {
             ui.set_min_width(panel.width() - Space::MD * 2.0);
             ui.add_space(Space::SM);
 
             if !state.has_smart_frame_draft() {
-                // Show intro + one-click button.
                 smart_frame_intro(ui, palette);
                 ui.add_space(Space::SM);
-                let label = "Apply Smart Frame";
+                let label = "Apply Automatic Scene";
                 let btn = ui.add_sized(
                     [ui.available_width(), 44.0],
                     egui::Button::new(
@@ -1732,45 +1732,26 @@ pub fn draw_smart_frame_panel(
                 if btn.clicked() {
                     intent = Some(state.begin_smart_frame());
                 }
-                // Starting-point presets.
                 ui.add_space(Space::SM);
                 starting_points(ui, state, palette, &mut intent);
             } else {
-                // Draft header.
                 draft_header(ui, state, palette, &mut intent);
                 ui.add_space(Space::SM);
 
-                // Starting-point presets.
+                section_label(ui, "CURATED BACKGROUNDS", palette);
                 starting_points(ui, state, palette, &mut intent);
                 ui.add_space(Space::SM);
 
-                // Preset library.
+                section_label(ui, "GENERATED FOR THIS CAPTURE", palette);
+                generated_suggestions(ui, state, palette, &mut intent);
+
+                advanced_controls(ui, state, palette, &mut intent);
                 preset_library(ui, state, palette, &mut intent);
 
-                // Advanced inspector toggle.
-                ui.add_space(Space::SM);
-                let toggle_label = if state.advanced_open {
-                    "▾ Advanced"
-                } else {
-                    "▸ Advanced"
-                };
-                if ui.button(toggle_label).clicked() {
-                    state.advanced_open = !state.advanced_open;
-                }
-
-                if state.advanced_open {
-                    advanced_controls(ui, state, palette, &mut intent);
-                }
-
-                // Sensitive-region review.
-                ui.add_space(Space::SM);
-                sensitive_suggestions(ui, state, palette);
-
-                // Framing undo/redo.
-                ui.add_space(Space::SM);
+                section_rule(ui, palette);
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(state.can_undo_framing(), egui::Button::new("Undo framing"))
+                        .add_enabled(state.can_undo_framing(), egui::Button::new("Undo Scene"))
                         .clicked()
                     {
                         state.undo_framing();
@@ -1789,6 +1770,16 @@ pub fn draw_smart_frame_panel(
     intent
 }
 
+/// Legacy name retained for hosts and harnesses compiled against Smart Frame.
+pub fn draw_smart_frame_panel(
+    ui: &mut Ui,
+    surface: &Surface<'_>,
+    state: &mut EditorState,
+    panel: Rect,
+) -> Option<Intent> {
+    draw_scene_panel(ui, surface, state, panel)
+}
+
 fn smart_frame_intro(ui: &mut Ui, palette: &crate::theme::Palette) {
     Frame::new()
         .fill(palette.card_fill)
@@ -1797,14 +1788,14 @@ fn smart_frame_intro(ui: &mut Ui, palette: &crate::theme::Palette) {
         .stroke(Stroke::new(1.0, palette.hairline))
         .show(ui, |ui| {
             ui.label(
-                egui::RichText::new("SMART FRAME")
+                egui::RichText::new("SCENE")
                     .font(egui::FontId::monospace(10.0))
                     .color(palette.accent)
                     .strong(),
             );
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("Balanced framing in one action")
+                egui::RichText::new("Present the capture without changing it")
                     .size(17.0)
                     .color(palette.text)
                     .strong(),
@@ -1812,8 +1803,8 @@ fn smart_frame_intro(ui: &mut Ui, palette: &crate::theme::Palette) {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "Adapts spacing, finish, and a capture-aware background. \
-                     Auto Balance starts on.",
+                    "Scene adds a reversible canvas around untouched capture pixels. \
+                     Export flattens a copy; Remove Scene restores the source.",
                 )
                 .small()
                 .color(palette.text_muted),
@@ -1840,7 +1831,7 @@ fn draft_header(
         .stroke(Stroke::new(1.0, palette.accent.gamma_multiply(0.55)))
         .show(ui, |ui| {
             ui.label(
-                egui::RichText::new("SMART FRAME DRAFT")
+                egui::RichText::new("SCENE")
                     .font(egui::FontId::monospace(10.0))
                     .color(palette.accent)
                     .strong(),
@@ -1848,9 +1839,9 @@ fn draft_header(
             ui.add_space(5.0);
             ui.label(
                 egui::RichText::new(if analysis_pending {
-                    "Balancing this revision..."
+                    "Resolving automatic choices..."
                 } else {
-                    "Ready to refine"
+                    "Editable and reversible"
                 })
                 .color(palette.text)
                 .strong(),
@@ -1861,8 +1852,8 @@ fn draft_header(
                     .color(palette.text_muted),
             );
             if !analysis_pending
-                && ui.small_button("Refresh automatic choices").clicked()
-                && let Some(i) = state.restart_analysis()
+                && ui.small_button("Reset to Automatic").clicked()
+                && let Some(i) = state.reset_scene_to_auto()
             {
                 *intent = Some(i);
             }
@@ -1871,7 +1862,7 @@ fn draft_header(
                 let apply = ui.add_sized(
                     [112.0, 34.0],
                     egui::Button::new(
-                        egui::RichText::new("Apply")
+                        egui::RichText::new("Done")
                             .strong()
                             .color(palette.on_accent),
                     )
@@ -1879,13 +1870,13 @@ fn draft_header(
                     .corner_radius(egui::CornerRadius::same(8)),
                 );
                 if apply.clicked() {
-                    state.apply_smart_frame();
+                    state.apply_scene();
                 }
                 if ui
                     .add_sized([92.0, 34.0], egui::Button::new("Cancel"))
                     .clicked()
                 {
-                    state.cancel_smart_frame();
+                    state.cancel_scene();
                 }
             });
         });
@@ -1900,24 +1891,61 @@ fn starting_points(
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.horizontal_wrapped(|ui| {
-            for (label, preset) in [
-                ("Clean", BeautificationPreset::Clean),
-                ("Social", BeautificationPreset::Social),
-                ("Story", BeautificationPreset::Story),
-                ("Editorial", BeautificationPreset::Editorial),
+            for (label, background) in [
+                ("Mist", BuiltInBackground::Mist),
+                ("Iris", BuiltInBackground::Iris),
+                ("Midnight", BuiltInBackground::Midnight),
+                ("Sunrise", BuiltInBackground::Sunrise),
+                ("Lagoon", BuiltInBackground::Lagoon),
+                ("Sand", BuiltInBackground::Sand),
             ] {
-                let candidate = Beautification::preset(preset);
-                let selected = state.document().beautification() == Some(&candidate);
+                let selected = matches!(
+                    state.document().scene(),
+                    Some(scene) if scene.background == Background::BuiltIn(background)
+                );
                 let response = pill_button(ui, label, selected, palette);
                 if response.clicked() {
-                    state.begin_with(candidate.clone());
-                    let automatic = matches!(
-                        state.document().beautification(),
-                        Some(b) if matches!(b.background, Background::Automatic(_))
-                    );
-                    if automatic && let Some(i) = state.request_automatic_background_analysis() {
+                    let mut scene = state
+                        .document()
+                        .scene()
+                        .cloned()
+                        .unwrap_or_else(|| Beautification::preset(BeautificationPreset::Clean));
+                    scene.background = Background::BuiltIn(background);
+                    scene.automatic.background = false;
+                    let has_automatic_properties = scene.automatic.any();
+                    state.begin_with(scene);
+                    if has_automatic_properties
+                        && let Some(i) = state.request_scene_automatic_analysis()
+                    {
                         *intent = Some(i);
                     }
+                }
+            }
+        });
+    });
+}
+
+fn generated_suggestions(
+    ui: &mut Ui,
+    state: &mut EditorState,
+    palette: &crate::theme::Palette,
+    intent: &mut Option<Intent>,
+) {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.horizontal_wrapped(|ui| {
+            for (label, style) in [
+                ("Balanced", GeneratedStyle::Balanced),
+                ("Soft", GeneratedStyle::Soft),
+                ("Vibrant", GeneratedStyle::Vibrant),
+                ("Neutral", GeneratedStyle::Neutral),
+            ] {
+                let selected = matches!(
+                    state.document().scene().map(|scene| &scene.background),
+                    Some(Background::Automatic(background)) if background.style == style
+                );
+                if pill_button(ui, label, selected, palette).clicked() {
+                    *intent = state.set_generated_scene_style(style);
                 }
             }
         });
@@ -1962,12 +1990,9 @@ fn preset_library(
                     if ui.selectable_label(is_selected, &preset.name).clicked() {
                         state.set_selected_preset(Some(preset.id.clone()));
                         state.set_preset_name(preset.name.clone());
-                        let automatic = matches!(
-                            preset.settings.background,
-                            scrozz_annotate::PresetBackground::Automatic
-                        );
                         state.begin_with(preset.settings.to_beautification());
-                        if automatic && let Some(i) = state.request_automatic_background_analysis()
+                        if preset.settings.automatic.any()
+                            && let Some(i) = state.request_scene_automatic_analysis()
                         {
                             *intent = Some(i);
                         }
@@ -1992,9 +2017,9 @@ fn preset_library(
         .and_then(|id| presets.iter().find(|p| p.id == id))
         .is_some_and(|p| p.name == state.preset_name().trim());
     let save_label = if updates_selected {
-        "Update preset"
+        "Update Scene preset"
     } else {
-        "Save new preset"
+        "Save Scene as Preset"
     };
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -2049,113 +2074,231 @@ fn advanced_controls(
 
     section_rule(ui, palette);
     section_label(ui, "CANVAS", palette);
-    ui.add(egui::Slider::new(&mut config.padding, 0.0..=220.0).text("Padding"));
-    let mut uniform_inset = config
-        .inset
-        .left
-        .max(config.inset.top)
-        .max(config.inset.right)
-        .max(config.inset.bottom);
+    let mut padding = config.padding;
+    property_status(
+        ui,
+        "Padding",
+        config.automatic.padding,
+        format!("{padding:.0} pt"),
+        palette,
+    );
     if ui
-        .add(egui::Slider::new(&mut uniform_inset, 0.0..=160.0).text("Inset"))
+        .add(egui::Slider::new(&mut padding, 0.0..=220.0).show_value(false))
         .changed()
     {
-        config.inset = SourceInsets::uniform(uniform_inset);
+        config.set_uniform_padding(padding);
     }
-    if let Some(metadata) = &config.smart_frame {
-        ui.label(
-            egui::RichText::new(metadata.inset_decision.explanation())
-                .small()
-                .color(palette.text_muted),
-        );
+
+    ui.add_space(6.0);
+    property_status(
+        ui,
+        "Placement",
+        config.automatic.placement,
+        if config.auto_balance {
+            "Subtle optical balance"
+        } else {
+            alignment_name(config.alignment)
+        },
+        palette,
+    );
+    ui.checkbox(&mut config.auto_balance, "Automatic balance");
+    if !config.auto_balance {
+        alignment_row(ui, &mut config.alignment);
     }
+
     ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("Aspect ratio")
+            .color(palette.text)
+            .strong(),
+    );
     aspect_row(ui, &mut config.aspect);
     if config.aspect != AspectPreset::Original {
         config.output_size = None;
     }
 
-    ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new("Alignment")
-                    .color(palette.text)
-                    .strong(),
+    ui.add_space(8.0);
+    let mut exact = config.output_size.is_some();
+    ui.checkbox(&mut exact, "Minimum output size");
+    if exact {
+        let default = config.output_size.unwrap_or_else(|| {
+            let scale = state.document().source().frame.scale.get();
+            let size = config.output_size(state.document().content_size());
+            ExactOutputSize {
+                width: (size.width * scale).round().max(1.0) as u32,
+                height: (size.height * scale).round().max(1.0) as u32,
+            }
+        });
+        let mut width = default.width;
+        let mut height = default.height;
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut width)
+                    .range(1..=16_384)
+                    .prefix("W "),
             );
-            ui.label(
-                egui::RichText::new(if config.auto_balance {
-                    "Auto Balance positions the subject"
-                } else {
-                    "Choose an anchor in the extra canvas"
-                })
-                .small()
-                .color(palette.text_muted),
+            ui.add(
+                egui::DragValue::new(&mut height)
+                    .range(1..=16_384)
+                    .prefix("H "),
             );
         });
-    });
-    ui.add_space(10.0);
-    ui.checkbox(&mut config.auto_balance, "Auto Balance")
-        .on_hover_text(
-            "Uses the stored visual focus for stable placement and retains a safe edge inset.",
-        );
+        config.output_size = Some(ExactOutputSize { width, height });
+    } else {
+        config.output_size = None;
+    }
 
     section_rule(ui, palette);
-    section_label(ui, "SUBJECT", palette);
+    section_label(ui, "APPEARANCE", palette);
     ui.add_enabled_ui(state.document().may_style_subject(), |ui| {
-        ui.add(egui::Slider::new(&mut config.corner_radius, 0.0..=80.0).text("Corners"));
-        ui.add(egui::Slider::new(&mut config.shadow, 0.0..=80.0).text("Shadow"));
-        ui.add(egui::Slider::new(&mut config.border_width, 0.0..=12.0).text("Border"));
+        property_status(
+            ui,
+            "Corners",
+            config.automatic.corners,
+            format!("{:.0} pt", config.corner_radius),
+            palette,
+        );
+        ui.add(egui::Slider::new(&mut config.corner_radius, 0.0..=80.0).show_value(false));
+        property_status(
+            ui,
+            "Shadow",
+            config.automatic.shadow,
+            format!("{:.0} pt", config.shadow),
+            palette,
+        );
+        ui.add(egui::Slider::new(&mut config.shadow, 0.0..=80.0).show_value(false));
     });
     if !state.document().may_style_subject() {
         d9_outer_canvas_note(ui, palette);
-        config.inset = SourceInsets::default();
         config.corner_radius = 0.0;
         config.shadow = 0.0;
         config.border_width = 0.0;
     }
 
-    section_rule(ui, palette);
-    section_label(ui, "WATERMARK", palette);
-    let mut watermark_enabled = config.watermark.is_some();
-    if ui
-        .checkbox(&mut watermark_enabled, "Show watermark")
-        .changed()
-    {
-        config.watermark = watermark_enabled.then(Watermark::default);
-    }
-    if let Some(watermark) = &mut config.watermark {
-        ui.add(
-            egui::TextEdit::singleline(&mut watermark.text)
-                .hint_text("Your text")
-                .desired_width(ui.available_width()),
-        );
-        ui.add(egui::Slider::new(&mut watermark.font_size, 8.0..=36.0).text("Text size"));
-    }
-
     if config != before
-        && let Some(i) = state.apply_beautification_edit(config)
+        && let Some(i) = state.apply_scene_edit(config)
     {
         *intent = Some(i);
     }
+
+    section_rule(ui, palette);
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Reset to Automatic").clicked()
+            && let Some(next) = state.reset_scene_to_auto()
+        {
+            *intent = Some(next);
+        }
+        if ui
+            .button("Clear canvas")
+            .on_hover_text("Keep Scene spacing and controls, but use a transparent canvas.")
+            .clicked()
+        {
+            state.clear_scene_canvas();
+        }
+        if ui
+            .button("Remove Scene")
+            .on_hover_text("Return exactly to the source without Scene.")
+            .clicked()
+        {
+            state.remove_scene();
+        }
+    });
+}
+
+fn property_status(
+    ui: &mut Ui,
+    label: &str,
+    automatic: bool,
+    resolved: impl std::fmt::Display,
+    palette: &crate::theme::Palette,
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(palette.text).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(if automatic {
+                    format!("Automatic · {resolved}")
+                } else {
+                    resolved.to_string()
+                })
+                .small()
+                .color(if automatic {
+                    palette.accent
+                } else {
+                    palette.text_muted
+                }),
+            );
+        });
+    });
+}
+
+fn alignment_name(alignment: Alignment) -> &'static str {
+    match alignment {
+        Alignment::TopLeft => "Top left",
+        Alignment::Top => "Top",
+        Alignment::TopRight => "Top right",
+        Alignment::Left => "Left",
+        Alignment::Center => "Center",
+        Alignment::Right => "Right",
+        Alignment::BottomLeft => "Bottom left",
+        Alignment::Bottom => "Bottom",
+        Alignment::BottomRight => "Bottom right",
+    }
+}
+
+fn alignment_row(ui: &mut Ui, alignment: &mut Alignment) {
+    egui::ComboBox::from_id_salt("scene-alignment")
+        .selected_text(alignment_name(*alignment))
+        .width(ui.available_width())
+        .show_ui(ui, |ui| {
+            for candidate in [
+                Alignment::TopLeft,
+                Alignment::Top,
+                Alignment::TopRight,
+                Alignment::Left,
+                Alignment::Center,
+                Alignment::Right,
+                Alignment::BottomLeft,
+                Alignment::Bottom,
+                Alignment::BottomRight,
+            ] {
+                ui.selectable_value(alignment, candidate, alignment_name(candidate));
+            }
+        });
 }
 
 fn background_selector(ui: &mut Ui, config: &mut Beautification, palette: &crate::theme::Palette) {
     let choices = [
         ("Automatic", 0u8),
-        ("Transparent", 1),
-        ("Solid colour", 2),
+        ("Blurred source", 1),
+        ("Color", 2),
         ("Gradient", 3),
+        ("Clear", 4),
     ];
     let current = match &config.background {
         Background::Automatic(_) => 0,
-        Background::Transparent => 1,
+        Background::BlurredSource { .. } => 1,
         Background::Solid(_) => 2,
         Background::Gradient { .. } => 3,
-        _ => 0,
+        Background::Transparent => 4,
+        Background::Desktop(_) | Background::Image(_) | Background::BuiltIn(_) => 5,
     };
-    egui::ComboBox::from_id_salt("smart-frame-background")
-        .selected_text(choices[current as usize].0)
+    let current_label = match &config.background {
+        Background::Desktop(_) => "Desktop",
+        Background::Image(_) => "Image",
+        Background::BuiltIn(background) => match background {
+            BuiltInBackground::Mist => "Mist",
+            BuiltInBackground::Iris => "Iris",
+            BuiltInBackground::Midnight => "Midnight",
+            BuiltInBackground::Sunrise => "Sunrise",
+            BuiltInBackground::Lagoon => "Lagoon",
+            BuiltInBackground::Sand => "Sand",
+        },
+        _ => choices[current as usize].0,
+    };
+    egui::ComboBox::from_id_salt("scene-background")
+        .selected_text(current_label)
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
             for &(label, idx) in &choices {
                 if ui.selectable_label(current == idx, label).clicked() {
@@ -2163,17 +2306,26 @@ fn background_selector(ui: &mut Ui, config: &mut Beautification, palette: &crate
                         0 => Background::Automatic(scrozz_annotate::AutomaticBackground::fallback(
                             scrozz_core::ColorSpace::Unknown,
                         )),
-                        1 => Background::Transparent,
+                        1 => Background::BlurredSource {
+                            blur_radius: 28,
+                            tint: Color::rgba(20, 24, 32, 72),
+                        },
                         2 => Background::Solid(scrozz_annotate::Color::WHITE),
                         3 => Background::Gradient {
                             start: scrozz_annotate::Color::WHITE,
                             end: scrozz_annotate::Color::rgb(0x00, 0x00, 0x00),
                         },
+                        4 => Background::Transparent,
                         _ => unreachable!(),
                     };
                 }
             }
         });
+    ui.label(
+        egui::RichText::new("Desktop and Image appear here after the host supplies pixels.")
+            .small()
+            .color(palette.text_muted),
+    );
 }
 
 fn aspect_row(ui: &mut Ui, aspect: &mut AspectPreset) {
@@ -2183,7 +2335,7 @@ fn aspect_row(ui: &mut Ui, aspect: &mut AspectPreset) {
         ("1:1", AspectPreset::Square),
         ("9:16", AspectPreset::Story),
     ];
-    egui::ComboBox::from_id_salt("smart-frame-aspect")
+    egui::ComboBox::from_id_salt("scene-aspect")
         .selected_text(
             choices
                 .iter()
@@ -2235,7 +2387,7 @@ fn d9_outer_canvas_note(ui: &mut Ui, palette: &crate::theme::Palette) {
         .stroke(Stroke::new(1.0, danger.gamma_multiply(0.7)))
         .show(ui, |ui| {
             ui.label(
-                egui::RichText::new("NATIVE WINDOW PRESERVED")
+                egui::RichText::new("NATIVE APPEARANCE")
                     .font(egui::FontId::monospace(10.0))
                     .color(danger)
                     .strong(),
@@ -2249,9 +2401,9 @@ fn d9_outer_canvas_note(ui: &mut Ui, palette: &crate::theme::Palette) {
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(
-                    "Inset, corners, shadow, and border stay disabled so the captured \
-                     window remains byte-stable. Background, padding, placement, and \
-                     output size remain available.",
+                    "The captured silhouette, corners, and shadow stay byte-stable. \
+                     Scene can change only background, padding, placement, ratio, and \
+                     output size.",
                 )
                 .color(palette.text_muted),
             );

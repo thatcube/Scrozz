@@ -127,12 +127,18 @@ fn crop_clamps_to_the_capture_rather_than_inventing_margin() {
 #[test]
 fn a_crop_covering_everything_is_no_crop() {
     let mut doc = coded();
+    let revision = doc.revision();
     doc.set_crop(Some(rect(-10.0, -10.0, 500.0, 500.0)))
         .unwrap();
     assert_eq!(
         doc.crop(),
         None,
         "a crop the user cannot see must not be a crop they cannot clear"
+    );
+    assert_eq!(
+        doc.revision(),
+        revision,
+        "normalizing to the existing full-frame view is not a content change"
     );
 }
 

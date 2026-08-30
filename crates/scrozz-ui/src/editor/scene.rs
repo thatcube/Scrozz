@@ -125,7 +125,19 @@ fn prime(fixture: &Fixture, editor: &mut EditorUi) {
                 .finish_smart_frame_analysis(revision, result);
         }
         if fixture.scenario == crate::harness::Scenario::SmartFrameExpanded {
-            editor.state_mut().advanced_open = true;
+            let mut scene = editor
+                .state()
+                .document()
+                .scene()
+                .cloned()
+                .expect("automatic Scene");
+            scene.set_uniform_padding(92.0);
+            scene.auto_balance = false;
+            scene.alignment = scrozz_annotate::Alignment::Top;
+            scene.aspect = scrozz_annotate::AspectPreset::Square;
+            scene.background =
+                scrozz_annotate::Background::BuiltIn(scrozz_annotate::BuiltInBackground::Iris);
+            let _ = editor.state_mut().apply_scene_edit(scene);
         }
         return;
     }

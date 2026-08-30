@@ -1,14 +1,15 @@
 //! Smart Frame behavior contracts ported from the reviewed monolithic editor.
 
 use scrozz_annotate::{
-    Background, Beautification, BeautificationPreset, Document, SmartFrameAnalysis,
-    SmartFramePreset, SmartFramePresetSettings,
+    AspectPreset, Background, Beautification, BeautificationPreset, CanvasInsets, Color, Document,
+    GeneratedStyle, SceneAutomatic, SmartFrameAnalysis, SmartFramePreset, SmartFramePresetSettings,
+    SourceInsets, SubjectAppearance,
 };
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
-use scrozz_ui::editor::{EditorState, Intent};
+use scrozz_ui::editor::{Command, EditorState, EditorUi, Handle, Intent, Tool};
 
 fn document(provenance: Provenance) -> Document {
     let size = LogicalSize::new(480.0, 300.0);
@@ -27,6 +28,12 @@ fn document(provenance: Provenance) -> Document {
         provenance,
         target: CaptureTarget::Region(LogicalRect::new(LogicalPoint::new(0.0, 0.0), size)),
     })
+}
+
+fn drag(state: &mut EditorState, from: LogicalPoint, to: LogicalPoint) {
+    state.pointer_pressed(from);
+    state.pointer_dragged(to, false);
+    state.pointer_released();
 }
 
 #[test]
@@ -64,6 +71,199 @@ fn smart_frame_starts_as_an_immediate_default_on_draft() {
 
     state.cancel_smart_frame();
     assert_eq!(state.document().data(), before);
+}
+
+#[test]
+fn opening_scene_panel_is_neutral_and_session_local() {
+    let doc = document(Provenance::Region);
+    let before = doc.data();
+    let mut editor = EditorUi::new(doc);
+
+    editor.set_scene_visible(true);
+
+    assert!(editor.scene_visible());
+    assert!(!editor.state().has_scene_draft());
+    assert_eq!(editor.document().data(), before);
+}
+
+#[test]
+fn opening_an_existing_legacy_scene_preserves_it_until_an_explicit_edit() {
+    let mut doc = document(Provenance::Region);
+    let legacy = Beautification {
+        inset: SourceInsets::uniform(8.0),
+        padding: 24.0,
+        background: Background::Solid(Color::rgb(24, 32, 48)),
+        ..Beautification::default()
+    };
+    doc.set_beautification(Some(legacy.clone())).unwrap();
+    let before = doc.data();
+    let mut state = EditorState::new(doc);
+
+    state.edit_existing_scene();
+
+    assert!(state.has_scene_draft());
+    assert_eq!(state.document().beautification(), Some(&legacy));
+    state.cancel_scene();
+    assert_eq!(state.document().data(), before);
+}
+
+#[test]
+fn editing_a_resolved_value_fixes_only_that_automatic_property() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let _ = state.begin_scene();
+    let mut scene = state.document().scene().cloned().unwrap();
+    assert!(scene.automatic.padding);
+    assert!(scene.automatic.background);
+    scene.padding = 73.0;
+
+    assert!(state.apply_scene_edit(scene).is_none());
+    let edited = state.document().scene().unwrap();
+    assert!(!edited.automatic.padding);
+    assert!(edited.automatic.background);
+    assert!(edited.automatic.corners);
+}
+
+#[test]
+fn clear_canvas_and_remove_scene_are_distinct_reversible_actions() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let source = state.document().source().frame.data.clone();
+    state.begin_with(Beautification::preset(BeautificationPreset::Social));
+
+    state.clear_scene_canvas();
+    assert!(matches!(
+        state.document().scene().map(|scene| &scene.background),
+        Some(Background::Transparent)
+    ));
+
+    state.remove_scene();
+    assert!(state.document().scene().is_none());
+    assert_eq!(state.document().source().frame.data, source);
+}
+
+#[test]
+fn generated_direction_survives_analysis_delivery() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame { revision, .. } =
+        state.begin_scene_with_style(GeneratedStyle::Vibrant)
+    else {
+        panic!("expected analysis intent");
+    };
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification {
+                background: Background::Automatic(Default::default()),
+                ..Beautification::default()
+            },
+            inset_explanation: "complete source preserved".to_owned(),
+        }),
+    );
+    let Background::Automatic(background) = &state.document().scene().unwrap().background else {
+        panic!("automatic background");
+    };
+    assert_eq!(background.style, GeneratedStyle::Vibrant);
+}
+
+#[test]
+fn generated_direction_preserves_scene_edits_and_cancel_baseline() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let before = state.document().data();
+    state.begin_with(Beautification {
+        padding: 61.0,
+        canvas_padding: Some(CanvasInsets {
+            top: 13.0,
+            right: 21.0,
+            bottom: 34.0,
+            left: 55.0,
+        }),
+        aspect: AspectPreset::Square,
+        background: Background::Solid(Color::rgb(24, 32, 48)),
+        ..Beautification::default()
+    });
+
+    let intent = state
+        .set_generated_scene_style(GeneratedStyle::Soft)
+        .expect("generated background needs analysis");
+
+    assert!(matches!(intent, Intent::AnalyzeSmartFrame { .. }));
+    let scene = state.document().scene().unwrap();
+    assert_eq!(scene.padding, 61.0);
+    assert_eq!(
+        scene.canvas_padding,
+        Some(CanvasInsets {
+            top: 13.0,
+            right: 21.0,
+            bottom: 34.0,
+            left: 55.0,
+        })
+    );
+    assert_eq!(scene.aspect, AspectPreset::Square);
+    state.cancel_scene();
+    assert_eq!(state.document().data(), before);
+}
+
+#[test]
+fn mixed_preset_resolves_only_automatic_properties() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let fixed_background = Background::Solid(Color::rgb(24, 32, 48));
+    state.begin_with(Beautification {
+        padding: 11.0,
+        canvas_padding: Some(CanvasInsets::uniform(11.0)),
+        corner_radius: 7.0,
+        shadow: 3.0,
+        background: fixed_background.clone(),
+        aspect: AspectPreset::Square,
+        automatic: SceneAutomatic {
+            padding: true,
+            placement: true,
+            ..SceneAutomatic::default()
+        },
+        ..Beautification::default()
+    });
+    let Intent::AnalyzeSmartFrame { revision, .. } = state
+        .request_scene_automatic_analysis()
+        .expect("mixed preset has automatic properties")
+    else {
+        panic!("expected analysis intent");
+    };
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification {
+                padding: 42.0,
+                canvas_padding: Some(CanvasInsets {
+                    top: 18.0,
+                    right: 42.0,
+                    bottom: 18.0,
+                    left: 42.0,
+                }),
+                corner_radius: 99.0,
+                shadow: 99.0,
+                background: Background::Solid(Color::rgb(200, 20, 20)),
+                auto_balance: true,
+                ..Beautification::default()
+            },
+            inset_explanation: "automatic values resolved".to_owned(),
+        }),
+    );
+
+    let scene = state.document().scene().unwrap();
+    assert_eq!(scene.background, fixed_background);
+    assert_eq!(scene.padding, 42.0);
+    assert_eq!(
+        scene.canvas_padding,
+        Some(CanvasInsets {
+            top: 18.0,
+            right: 42.0,
+            bottom: 18.0,
+            left: 42.0,
+        })
+    );
+    assert!(scene.auto_balance);
+    assert_eq!(scene.corner_radius, 7.0);
+    assert_eq!(scene.shadow, 3.0);
+    assert_eq!(scene.aspect, AspectPreset::Square);
 }
 
 #[test]
@@ -132,6 +332,119 @@ fn stale_analysis_never_replaces_newer_draft() {
 }
 
 #[test]
+fn annotation_history_and_scene_history_remain_independent() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let scene = Beautification::preset(BeautificationPreset::Social);
+    state.begin_with(scene.clone());
+    state.apply_scene();
+
+    state.set_tool(Tool::Rectangle);
+    drag(
+        &mut state,
+        LogicalPoint::new(20.0, 20.0),
+        LogicalPoint::new(120.0, 90.0),
+    );
+    assert_eq!(state.document().len(), 1);
+
+    state.command(Command::Undo).unwrap();
+    assert!(state.document().is_empty());
+    assert_eq!(state.document().scene(), Some(&scene));
+
+    state.command(Command::Redo).unwrap();
+    assert_eq!(state.document().len(), 1);
+    assert_eq!(state.document().scene(), Some(&scene));
+
+    state.undo_framing();
+    assert_eq!(state.document().len(), 1);
+    assert!(state.document().scene().is_none());
+
+    state.redo_framing();
+    assert_eq!(state.document().len(), 1);
+    assert_eq!(state.document().scene(), Some(&scene));
+}
+
+#[test]
+fn annotation_mutation_invalidates_in_flight_scene_analysis() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame { revision, .. } = state.begin_scene() else {
+        panic!("expected analysis intent");
+    };
+    state.set_tool(Tool::Rectangle);
+    drag(
+        &mut state,
+        LogicalPoint::new(20.0, 20.0),
+        LogicalPoint::new(120.0, 90.0),
+    );
+    let expected = state.document().scene().cloned();
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification::preset(BeautificationPreset::Story),
+            inset_explanation: "stale annotation snapshot".to_owned(),
+        }),
+    );
+
+    assert_eq!(state.document().scene(), expected.as_ref());
+    assert!(!state.smart_frame_analysis_pending());
+}
+
+#[test]
+fn crop_mutation_invalidates_in_flight_scene_analysis() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame { revision, .. } = state.begin_scene() else {
+        panic!("expected analysis intent");
+    };
+    state.set_tool(Tool::Crop);
+    let full = state.pending_crop().expect("crop session");
+    drag(
+        &mut state,
+        Handle::TopLeft.position(&full),
+        LogicalPoint::new(40.0, 30.0),
+    );
+    state.command(Command::ApplyCrop).unwrap();
+    let expected = state.document().scene().cloned();
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification::preset(BeautificationPreset::Story),
+            inset_explanation: "stale crop snapshot".to_owned(),
+        }),
+    );
+
+    assert!(state.document().crop().is_some());
+    assert_eq!(state.document().scene(), expected.as_ref());
+    assert!(!state.smart_frame_analysis_pending());
+}
+
+#[test]
+fn unchanged_crop_keeps_in_flight_scene_analysis_valid() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame { revision, .. } = state.begin_scene() else {
+        panic!("expected analysis intent");
+    };
+    state.set_tool(Tool::Crop);
+    state.command(Command::ApplyCrop).unwrap();
+    assert!(
+        state.smart_frame_analysis_pending(),
+        "applying the initial full-frame crop must not invalidate analysis"
+    );
+    let analyzed = Beautification::preset(BeautificationPreset::Story);
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: analyzed.clone(),
+            inset_explanation: "current full-frame snapshot".to_owned(),
+        }),
+    );
+
+    assert_eq!(state.document().scene(), Some(&analyzed));
+    assert!(!state.smart_frame_analysis_pending());
+}
+
+#[test]
 fn manual_preset_choice_cancels_in_flight_analysis() {
     let mut state = EditorState::new(document(Provenance::Region));
     let Intent::AnalyzeSmartFrame {
@@ -168,6 +481,10 @@ fn d9_window_preserves_subject_controls() {
     assert!(beauty.preserves_subject_pixels());
     assert!(state.document().may_beautify());
     assert!(!state.document().may_style_subject());
+    assert_eq!(
+        state.document().subject_appearance(),
+        SubjectAppearance::Native
+    );
 }
 
 #[test]

@@ -412,11 +412,47 @@ pub enum Background {
     Automatic(AutomaticBackground),
     /// A custom image, cropped to cover the canvas.
     Image(BackgroundImage),
+    /// A desktop image, retained separately from an ordinary imported image.
+    Desktop(BackgroundImage),
+    /// A locally generated, softened copy of the current capture.
+    BlurredSource {
+        /// Blur radius in output pixels before scale is applied.
+        blur_radius: u16,
+        /// Colour mixed over the blurred pixels for legibility.
+        tint: Color,
+    },
+}
+
+/// The four intentionally bounded generated-background directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedStyle {
+    /// Capture-aware colour with restrained contrast.
+    #[default]
+    Balanced,
+    /// Low-saturation, low-contrast treatment.
+    Soft,
+    /// Stronger colour separation without random effects.
+    Vibrant,
+    /// Desaturated studio treatment.
+    Neutral,
+}
+
+/// Art-directed renderer used for a capture-derived background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedTemplate {
+    /// One reliable, smooth directional field.
+    SmoothGradient,
+    /// Layered translucent fields that read as a soft mesh.
+    #[default]
+    SoftMesh,
+    /// A restrained studio field with a central tonal lift.
+    TonalStudio,
 }
 
 /// Resolved automatic background inputs and output colours.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AutomaticBackground {
     /// Algorithm that chose these colours.
     pub algorithm_version: u16,
@@ -430,9 +466,78 @@ pub struct AutomaticBackground {
     pub source_color_space: ColorSpace,
     /// Lowest contrast ratio between either stop and `edge_reference`, ×100.
     pub minimum_contrast_x100: u16,
+    /// User-selected generated direction.
+    pub style: GeneratedStyle,
+    /// Art-directed template selected for that direction.
+    pub template: GeneratedTemplate,
+    /// Stable seed controlling template placement, never unconstrained randomness.
+    pub seed: u64,
+    /// Resolved capture-derived palette used by the canonical renderer.
+    pub palette: Vec<Color>,
     /// Unknown fields survive read-modify-write cycles.
     #[serde(flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct AutomaticBackgroundWire {
+    algorithm_version: u16,
+    start: Color,
+    end: Color,
+    edge_reference: Color,
+    source_color_space: ColorSpace,
+    minimum_contrast_x100: u16,
+    style: GeneratedStyle,
+    template: Option<GeneratedTemplate>,
+    seed: Option<u64>,
+    palette: Option<Vec<Color>>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for AutomaticBackgroundWire {
+    fn default() -> Self {
+        let fallback = AutomaticBackground::default();
+        Self {
+            algorithm_version: fallback.algorithm_version,
+            start: fallback.start,
+            end: fallback.end,
+            edge_reference: fallback.edge_reference,
+            source_color_space: fallback.source_color_space,
+            minimum_contrast_x100: fallback.minimum_contrast_x100,
+            style: fallback.style,
+            template: None,
+            seed: None,
+            palette: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AutomaticBackground {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AutomaticBackgroundWire::deserialize(deserializer)?;
+        let palette = wire
+            .palette
+            .unwrap_or_else(|| vec![wire.start, wire.end, wire.start, wire.end]);
+        Ok(Self {
+            algorithm_version: wire.algorithm_version,
+            start: wire.start,
+            end: wire.end,
+            edge_reference: wire.edge_reference,
+            source_color_space: wire.source_color_space,
+            minimum_contrast_x100: wire.minimum_contrast_x100,
+            style: wire.style,
+            template: wire.template.unwrap_or(GeneratedTemplate::SmoothGradient),
+            seed: wire.seed.unwrap_or_default(),
+            palette,
+            extensions: wire.extensions,
+        })
+    }
 }
 
 impl Default for AutomaticBackground {
@@ -452,6 +557,15 @@ impl AutomaticBackground {
             edge_reference: Color::rgb(128, 128, 128),
             source_color_space,
             minimum_contrast_x100: 300,
+            style: GeneratedStyle::Balanced,
+            template: GeneratedTemplate::SoftMesh,
+            seed: 0x5343_524f_5a5a,
+            palette: vec![
+                Color::rgb(34, 40, 55),
+                Color::rgb(62, 74, 103),
+                Color::rgb(102, 83, 146),
+                Color::rgb(42, 88, 110),
+            ],
             extensions: BTreeMap::new(),
         }
     }
@@ -461,6 +575,75 @@ impl AutomaticBackground {
     pub fn average_luminance(&self) -> f32 {
         (self.start.luminance() + self.end.luminance()) / 2.0
     }
+
+    /// Four resolved colours, with backward-compatible derivation for old data.
+    #[must_use]
+    pub fn resolved_palette(&self) -> [Color; 4] {
+        [
+            self.palette.first().copied().unwrap_or(self.start),
+            self.palette.get(1).copied().unwrap_or(self.end),
+            self.palette.get(2).copied().unwrap_or(self.start),
+            self.palette.get(3).copied().unwrap_or(self.end),
+        ]
+    }
+
+    /// Applies one of the four deterministic art directions to this resolved palette.
+    #[must_use]
+    pub fn restyled(mut self, style: GeneratedStyle) -> Self {
+        self.style = style;
+        self.template = match style {
+            GeneratedStyle::Balanced | GeneratedStyle::Vibrant => GeneratedTemplate::SoftMesh,
+            GeneratedStyle::Soft => GeneratedTemplate::SmoothGradient,
+            GeneratedStyle::Neutral => GeneratedTemplate::TonalStudio,
+        };
+        let base = [
+            self.start,
+            self.end,
+            mix_scene_color(self.start, self.edge_reference, 46),
+            mix_scene_color(self.end, self.edge_reference, 34),
+        ];
+        let neutral = Color::rgb(112, 116, 124);
+        self.palette = base
+            .into_iter()
+            .map(|color| match style {
+                GeneratedStyle::Balanced => color,
+                GeneratedStyle::Soft => mix_scene_color(color, Color::WHITE, 34),
+                GeneratedStyle::Vibrant => scene_saturate(color),
+                GeneratedStyle::Neutral => mix_scene_color(color, neutral, 72),
+            })
+            .collect();
+        self
+    }
+}
+
+fn mix_scene_color(left: Color, right: Color, right_weight: u16) -> Color {
+    let right_weight = right_weight.min(255);
+    let left_weight = 255 - right_weight;
+    let channel = |left: u8, right: u8| {
+        ((u16::from(left) * left_weight + u16::from(right) * right_weight + 127) / 255) as u8
+    };
+    Color::rgba(
+        channel(left.r, right.r),
+        channel(left.g, right.g),
+        channel(left.b, right.b),
+        channel(left.a, right.a),
+    )
+}
+
+fn scene_saturate(color: Color) -> Color {
+    let maximum = color.r.max(color.g).max(color.b);
+    let minimum = color.r.min(color.g).min(color.b);
+    let midpoint = ((u16::from(maximum) + u16::from(minimum)) / 2) as u8;
+    let channel = |value: u8| {
+        let delta = i16::from(value) - i16::from(midpoint);
+        (i16::from(midpoint) + delta * 3 / 2).clamp(0, 255) as u8
+    };
+    Color::rgba(
+        channel(color.r),
+        channel(color.g),
+        channel(color.b),
+        color.a,
+    )
 }
 
 /// Non-destructive inset in source logical coordinates.
@@ -490,6 +673,56 @@ impl SourceInsets {
     }
 
     /// Whether no source pixels are excluded.
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        [self.left, self.top, self.right, self.bottom]
+            .into_iter()
+            .all(|value| value <= 0.0)
+    }
+}
+
+/// Per-edge space between the subject and the Scene canvas.
+///
+/// `Beautification::padding` remains the portable uniform value. This optional
+/// resolved form lets scrolling captures and future outward crop expansion share
+/// the same canvas/background system without inventing a second fill model.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CanvasInsets {
+    /// Left canvas inset.
+    pub left: f64,
+    /// Top canvas inset.
+    pub top: f64,
+    /// Right canvas inset.
+    pub right: f64,
+    /// Bottom canvas inset.
+    pub bottom: f64,
+}
+
+impl CanvasInsets {
+    /// Equal spacing on every edge.
+    #[must_use]
+    pub const fn uniform(value: f64) -> Self {
+        Self {
+            left: value,
+            top: value,
+            right: value,
+            bottom: value,
+        }
+    }
+
+    /// Different horizontal and vertical spacing.
+    #[must_use]
+    pub const fn symmetric(horizontal: f64, vertical: f64) -> Self {
+        Self {
+            left: horizontal,
+            top: vertical,
+            right: horizontal,
+            bottom: vertical,
+        }
+    }
+
+    /// Whether this adds no canvas space.
     #[must_use]
     pub fn is_zero(self) -> bool {
         [self.left, self.top, self.right, self.bottom]
@@ -641,6 +874,89 @@ pub enum BeautificationPreset {
     Editorial,
 }
 
+/// One Scene property whose resolved value may remain automatic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SceneProperty {
+    /// Capture-derived or curated background.
+    Background,
+    /// Canvas padding.
+    Padding,
+    /// Optical placement.
+    Placement,
+    /// Subject corner treatment.
+    Corners,
+    /// Subject shadow treatment.
+    Shadow,
+    /// Output pixel size. Aspect ratio is intentionally never automatic.
+    OutputSize,
+}
+
+/// Per-property automation retained in editable Scene state and presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SceneAutomatic {
+    /// Resolve the background from capture colours.
+    pub background: bool,
+    /// Resolve proportional canvas padding.
+    pub padding: bool,
+    /// Resolve subtle confidence-gated optical placement.
+    pub placement: bool,
+    /// Resolve subject corners when the capture is not a native window.
+    pub corners: bool,
+    /// Resolve subject shadow when the capture is not a native window.
+    pub shadow: bool,
+    /// Resolve output size from subject and padding.
+    pub output_size: bool,
+}
+
+impl SceneAutomatic {
+    /// All automatic properties that can apply to an ordinary capture.
+    #[must_use]
+    pub const fn ordinary() -> Self {
+        Self {
+            background: true,
+            padding: true,
+            placement: true,
+            corners: true,
+            shadow: true,
+            output_size: true,
+        }
+    }
+
+    /// Automatic properties available while preserving native window appearance.
+    #[must_use]
+    pub const fn native_window() -> Self {
+        Self {
+            corners: false,
+            shadow: false,
+            ..Self::ordinary()
+        }
+    }
+
+    /// Marks one resolved value as fixed after the user edits it.
+    pub fn disable(&mut self, property: SceneProperty) {
+        match property {
+            SceneProperty::Background => self.background = false,
+            SceneProperty::Padding => self.padding = false,
+            SceneProperty::Placement => self.placement = false,
+            SceneProperty::Corners => self.corners = false,
+            SceneProperty::Shadow => self.shadow = false,
+            SceneProperty::OutputSize => self.output_size = false,
+        }
+    }
+
+    /// Whether any value will resolve again when used as a preset.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.background
+            || self.padding
+            || self.placement
+            || self.corners
+            || self.shadow
+            || self.output_size
+    }
+}
+
 /// Padding, background and framing applied around a capture.
 ///
 /// Per decision D9 a window capture may use only the outer-canvas fields. The OS
@@ -652,6 +968,8 @@ pub enum BeautificationPreset {
 pub struct Beautification {
     /// Padding around the image, in logical points.
     pub padding: f64,
+    /// Optional per-edge canvas padding, for asymmetric expansion.
+    pub canvas_padding: Option<CanvasInsets>,
     /// Non-destructive source-space trim.
     pub inset: SourceInsets,
     /// Corner radius applied to the image.
@@ -676,6 +994,8 @@ pub struct Beautification {
     pub watermark: Option<Watermark>,
     /// Resolved Smart Frame analysis for stable rendering across upgrades.
     pub smart_frame: Option<SmartFrameMetadata>,
+    /// Properties that should resolve from each capture when this is a preset.
+    pub automatic: SceneAutomatic,
     /// Unknown fields survive read-modify-write cycles.
     #[serde(flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
@@ -685,6 +1005,7 @@ impl Default for Beautification {
     fn default() -> Self {
         Self {
             padding: 0.0,
+            canvas_padding: None,
             inset: SourceInsets::uniform(0.0),
             corner_radius: 0.0,
             shadow: 0.0,
@@ -697,6 +1018,7 @@ impl Default for Beautification {
             border_color: Color::TRANSPARENT,
             watermark: None,
             smart_frame: None,
+            automatic: SceneAutomatic::ordinary(),
             extensions: BTreeMap::new(),
         }
     }
@@ -714,6 +1036,7 @@ impl Beautification {
     pub fn padded(padding: f64, background: Background) -> Self {
         Self {
             padding,
+            canvas_padding: None,
             inset: SourceInsets::uniform(0.0),
             corner_radius: 0.0,
             shadow: 0.0,
@@ -726,6 +1049,7 @@ impl Beautification {
             border_color: Color::TRANSPARENT,
             watermark: None,
             smart_frame: None,
+            automatic: SceneAutomatic::ordinary(),
             extensions: BTreeMap::new(),
         }
     }
@@ -736,6 +1060,7 @@ impl Beautification {
         match preset {
             BeautificationPreset::Clean => Self {
                 padding: 40.0,
+                canvas_padding: None,
                 inset: SourceInsets::uniform(0.0),
                 corner_radius: 16.0,
                 shadow: 18.0,
@@ -748,10 +1073,12 @@ impl Beautification {
                 border_color: Color::rgba(255, 255, 255, 90),
                 watermark: None,
                 smart_frame: None,
+                automatic: SceneAutomatic::ordinary(),
                 extensions: BTreeMap::new(),
             },
             BeautificationPreset::Social => Self {
                 padding: 64.0,
+                canvas_padding: None,
                 inset: SourceInsets::uniform(0.0),
                 corner_radius: 20.0,
                 shadow: 24.0,
@@ -764,10 +1091,12 @@ impl Beautification {
                 border_color: Color::rgba(255, 255, 255, 110),
                 watermark: None,
                 smart_frame: None,
+                automatic: SceneAutomatic::ordinary(),
                 extensions: BTreeMap::new(),
             },
             BeautificationPreset::Story => Self {
                 padding: 72.0,
+                canvas_padding: None,
                 inset: SourceInsets::uniform(0.0),
                 corner_radius: 24.0,
                 shadow: 28.0,
@@ -780,10 +1109,12 @@ impl Beautification {
                 border_color: Color::rgba(255, 255, 255, 90),
                 watermark: None,
                 smart_frame: None,
+                automatic: SceneAutomatic::ordinary(),
                 extensions: BTreeMap::new(),
             },
             BeautificationPreset::Editorial => Self {
                 padding: 56.0,
+                canvas_padding: None,
                 inset: SourceInsets::uniform(0.0),
                 corner_radius: 10.0,
                 shadow: 14.0,
@@ -796,6 +1127,7 @@ impl Beautification {
                 border_color: Color::rgba(65, 53, 43, 65),
                 watermark: None,
                 smart_frame: None,
+                automatic: SceneAutomatic::ordinary(),
                 extensions: BTreeMap::new(),
             },
         }
@@ -814,7 +1146,7 @@ impl Beautification {
     /// Whether this would visibly change the image at all.
     #[must_use]
     pub fn is_noop(&self) -> bool {
-        self.padding <= 0.0
+        self.resolved_padding().is_zero()
             && self.corner_radius <= 0.0
             && self.shadow <= 0.0
             && self.background == Background::Transparent
@@ -844,6 +1176,22 @@ impl Beautification {
             ("corner radius", self.corner_radius),
             ("shadow", self.shadow),
             ("border width", self.border_width),
+            (
+                "left canvas padding",
+                self.canvas_padding.unwrap_or_default().left,
+            ),
+            (
+                "top canvas padding",
+                self.canvas_padding.unwrap_or_default().top,
+            ),
+            (
+                "right canvas padding",
+                self.canvas_padding.unwrap_or_default().right,
+            ),
+            (
+                "bottom canvas padding",
+                self.canvas_padding.unwrap_or_default().bottom,
+            ),
         ] {
             if !value.is_finite() || !(0.0..=Self::MAX_MEASUREMENT).contains(&value) {
                 return Err(Error::InvalidRequest(format!(
@@ -852,7 +1200,7 @@ impl Beautification {
                 )));
             }
         }
-        if let Background::Image(image) = &self.background {
+        if let Background::Image(image) | Background::Desktop(image) = &self.background {
             image.validate()?;
         }
         if let Some(size) = self.output_size {
@@ -908,8 +1256,9 @@ impl Beautification {
     pub fn output_size(&self, content: LogicalSize) -> LogicalSize {
         let content_width = (content.width - self.inset.left - self.inset.right).max(1.0);
         let content_height = (content.height - self.inset.top - self.inset.bottom).max(1.0);
-        let base_width = content_width + self.padding * 2.0;
-        let base_height = content_height + self.padding * 2.0;
+        let padding = self.resolved_padding();
+        let base_width = content_width + padding.left + padding.right;
+        let base_height = content_height + padding.top + padding.bottom;
         let Some(ratio) = self.aspect.ratio() else {
             return LogicalSize::new(base_width, base_height);
         };
@@ -919,6 +1268,65 @@ impl Beautification {
             LogicalSize::new(base_width, base_width / ratio)
         }
     }
+
+    /// Logical Scene size with an exact-output request resolved at `source_scale`.
+    ///
+    /// Exact dimensions are minimums. When they cannot contain the untouched
+    /// source plus canvas spacing, the canvas grows at the requested ratio.
+    #[must_use]
+    pub fn output_size_at_scale(&self, content: LogicalSize, source_scale: f64) -> LogicalSize {
+        let Some(exact) = self.output_size else {
+            return self.output_size(content);
+        };
+        let content_width = (content.width - self.inset.left - self.inset.right).max(1.0);
+        let content_height = (content.height - self.inset.top - self.inset.bottom).max(1.0);
+        let padding = self.resolved_padding();
+        let minimum = LogicalSize::new(
+            content_width + padding.left + padding.right,
+            content_height + padding.top + padding.bottom,
+        );
+        let ratio = exact.ratio();
+        let requested_width = f64::from(exact.width) / source_scale;
+        let requested_height = f64::from(exact.height) / source_scale;
+        let width = requested_width
+            .max(requested_height * ratio)
+            .max(minimum.width)
+            .max(minimum.height * ratio);
+        LogicalSize::new(width, width / ratio)
+    }
+
+    /// Resolved per-edge canvas spacing.
+    #[must_use]
+    pub fn resolved_padding(&self) -> CanvasInsets {
+        self.canvas_padding
+            .unwrap_or_else(|| CanvasInsets::uniform(self.padding))
+    }
+
+    /// Changes uniform padding and clears an old asymmetric override.
+    pub fn set_uniform_padding(&mut self, padding: f64) {
+        self.padding = padding;
+        self.canvas_padding = None;
+    }
+
+    /// Converts one automatic resolved value into a fixed value.
+    pub fn fix(&mut self, property: SceneProperty) {
+        self.automatic.disable(property);
+    }
+}
+
+/// Canonical product name for nondestructive presentation state.
+pub type Scene = Beautification;
+
+/// Canonical product name for the built-in Scene starting points.
+pub type ScenePreset = BeautificationPreset;
+
+/// Whether Scene may style the subject or must preserve native appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubjectAppearance {
+    /// Corners and shadow are editable because the capture is an ordinary raster.
+    Editable,
+    /// The capture already contains the platform's true silhouette and shadow.
+    Native,
 }
 
 /// The editable part of a document: everything except the pixels.
@@ -1131,15 +1539,8 @@ impl Document {
         self.beautification.as_ref().map_or_else(
             || self.content_size(),
             |beautification| {
-                beautification.output_size.map_or_else(
-                    || beautification.output_size(self.content_size()),
-                    |size| {
-                        LogicalSize::new(
-                            f64::from(size.width) / self.source.frame.scale.get(),
-                            f64::from(size.height) / self.source.frame.scale.get(),
-                        )
-                    },
-                )
+                beautification
+                    .output_size_at_scale(self.content_size(), self.source.frame.scale.get())
             },
         )
     }
@@ -1209,8 +1610,11 @@ impl Document {
     /// zero-pixel image, and silently ignoring the request would leave the
     /// editor showing a selection the document does not have.
     pub fn set_crop(&mut self, area: Option<LogicalRect>) -> Result<()> {
-        self.crop = normalize_crop(self.logical_bounds(), area)?;
-        self.touch();
+        let crop = normalize_crop(self.logical_bounds(), area)?;
+        if self.crop != crop {
+            self.crop = crop;
+            self.touch();
+        }
         Ok(())
     }
 
@@ -1406,6 +1810,22 @@ impl Document {
         !self.source.provenance.forbids_compositing()
     }
 
+    /// Subject appearance contract exposed to the Scene inspector.
+    #[must_use]
+    pub fn subject_appearance(&self) -> SubjectAppearance {
+        if self.may_style_subject() {
+            SubjectAppearance::Editable
+        } else {
+            SubjectAppearance::Native
+        }
+    }
+
+    /// Editable Scene state currently wrapped around the untouched source.
+    #[must_use]
+    pub fn scene(&self) -> Option<&Scene> {
+        self.beautification()
+    }
+
     /// The framing currently applied, if any.
     #[must_use]
     pub fn beautification(&self) -> Option<&Beautification> {
@@ -1430,6 +1850,22 @@ impl Document {
         Ok(())
     }
 
+    /// Applies or removes the nondestructive Scene around the source pixels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] when a Scene would alter native window
+    /// pixels or exceed render bounds.
+    pub fn set_scene(&mut self, scene: Option<Scene>) -> Result<()> {
+        if scene.as_ref().is_some_and(|scene| !scene.inset.is_zero()) {
+            return Err(Error::InvalidRequest(
+                "Scene preserves the complete source composition; source inset is a legacy Smart Frame setting"
+                    .to_owned(),
+            ));
+        }
+        self.set_beautification(scene)
+    }
+
     fn validate_provenance(beautification: &Beautification, source: &Capture) -> Result<()> {
         if source.provenance.forbids_compositing() && !beautification.preserves_subject_pixels() {
             return Err(Error::InvalidRequest(
@@ -1437,28 +1873,6 @@ impl Document {
                  are disabled to preserve native pixels (decision D9)"
                     .to_owned(),
             ));
-        }
-        if source.provenance.forbids_compositing()
-            && let Some(size) = beautification.output_size
-        {
-            let padding = (beautification.padding * source.frame.scale.get()).ceil() as u32;
-            let minimum_width = source
-                .frame
-                .width()
-                .saturating_add(padding.saturating_mul(2));
-            let minimum_height = source
-                .frame
-                .height()
-                .saturating_add(padding.saturating_mul(2));
-            if size.width < minimum_width || size.height < minimum_height {
-                return Err(Error::InvalidRequest(format!(
-                    "exact output {}x{} is too small for the native {}x{} window plus padding",
-                    size.width,
-                    size.height,
-                    source.frame.width(),
-                    source.frame.height()
-                )));
-            }
         }
         Ok(())
     }

@@ -18,12 +18,12 @@ use scrozz_export::{RgbaImage, convert_to_srgb, to_straight_rgba8};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Alignment, AspectPreset, AutomaticBackground, Background, Beautification, Color,
-    ExactOutputSize, SourceInsets, Watermark,
+    Alignment, AspectPreset, AutomaticBackground, Background, Beautification, CanvasInsets, Color,
+    ExactOutputSize, GeneratedStyle, GeneratedTemplate, SceneAutomatic, SourceInsets, Watermark,
 };
 
 /// Version of the analysis whose resolved inputs are persisted in documents.
-pub const SMART_FRAME_ALGORITHM_VERSION: u16 = 1;
+pub const SMART_FRAME_ALGORITHM_VERSION: u16 = 2;
 /// Current schema for user-created presets.
 pub const SMART_FRAME_PRESET_VERSION: u32 = 1;
 /// Maximum number of sampled pixels used for salience and palette analysis.
@@ -198,6 +198,9 @@ pub struct SmartFrameAnalysis {
     pub inset_explanation: String,
 }
 
+/// Canonical Scene name for revision-bound automatic analysis.
+pub type SceneAnalysis = SmartFrameAnalysis;
+
 /// Immediate, analysis-free Smart Frame draft used while background work runs.
 #[must_use]
 pub fn provisional(
@@ -205,6 +208,24 @@ pub fn provisional(
     source_scale: f64,
     provenance: Provenance,
     color_space: ColorSpace,
+) -> Beautification {
+    provisional_with_style(
+        source,
+        source_scale,
+        provenance,
+        color_space,
+        GeneratedStyle::Balanced,
+    )
+}
+
+/// Immediate Scene draft for one of the four generated style directions.
+#[must_use]
+pub fn provisional_with_style(
+    source: LogicalSize,
+    source_scale: f64,
+    provenance: Provenance,
+    color_space: ColorSpace,
+    style: GeneratedStyle,
 ) -> Beautification {
     let logical_min = source.width.min(source.height).round().clamp(1.0, 16_384.0) as u32;
     let padding = quantize_even((logical_min * 8 / 100).clamp(24, 96));
@@ -217,10 +238,11 @@ pub fn provisional(
     };
     Beautification {
         padding: f64::from(padding),
+        canvas_padding: stitched_padding(provenance, f64::from(padding)),
         inset: SourceInsets::default(),
         corner_radius,
         shadow,
-        background: Background::Automatic(AutomaticBackground::fallback(color_space)),
+        background: Background::Automatic(fallback_background(color_space, style)),
         alignment: Alignment::Center,
         auto_balance: true,
         aspect: AspectPreset::Original,
@@ -239,6 +261,11 @@ pub fn provisional(
             },
             ..SmartFrameMetadata::default()
         }),
+        automatic: if provenance == Provenance::Window {
+            SceneAutomatic::native_window()
+        } else {
+            SceneAutomatic::ordinary()
+        },
         extensions: BTreeMap::new(),
     }
 }
@@ -280,11 +307,15 @@ pub struct SensitiveRegionReview {
 ///
 /// Capture pixels never enter preset storage. `Automatic` asks each new capture
 /// to resolve its own palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PresetBackground {
     /// Resolve a fresh palette from the capture.
     Automatic,
+    /// Resolve a fresh palette using a selected generated direction.
+    Generated(GeneratedStyle),
+    /// Reuse a fixed, fully resolved generated field without re-analysis.
+    ResolvedGenerated(AutomaticBackground),
     /// No background.
     Transparent,
     /// A flat colour.
@@ -298,14 +329,22 @@ pub enum PresetBackground {
     },
     /// A procedural Scrozz background.
     BuiltIn(crate::BuiltInBackground),
+    /// A deterministic softened copy of each capture.
+    BlurredSource {
+        /// Blur radius.
+        blur_radius: u16,
+        /// Tonal overlay.
+        tint: Color,
+    },
 }
 
 /// Pixel-free settings stored in a reusable preset.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SmartFramePresetSettings {
     /// Padding in logical points.
     pub padding: f64,
+    /// Optional asymmetric canvas spacing.
+    pub canvas_padding: Option<CanvasInsets>,
     /// Source-space inset.
     pub inset: SourceInsets,
     /// Capture corner radius.
@@ -328,10 +367,92 @@ pub struct SmartFramePresetSettings {
     pub border_color: Color,
     /// Optional, off-by-default watermark.
     pub watermark: Option<Watermark>,
+    /// Automatic and fixed values may be mixed per property.
+    pub automatic: SceneAutomatic,
     /// Unknown settings survive migrations.
     #[serde(flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct SmartFramePresetSettingsWire {
+    padding: f64,
+    canvas_padding: Option<CanvasInsets>,
+    inset: SourceInsets,
+    corner_radius: f64,
+    shadow: f64,
+    background: PresetBackground,
+    alignment: Alignment,
+    auto_balance: bool,
+    aspect: AspectPreset,
+    output_size: Option<ExactOutputSize>,
+    border_width: f64,
+    border_color: Color,
+    watermark: Option<Watermark>,
+    automatic: Option<SceneAutomatic>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for SmartFramePresetSettingsWire {
+    fn default() -> Self {
+        let defaults = SmartFramePresetSettings::default();
+        Self {
+            padding: defaults.padding,
+            canvas_padding: defaults.canvas_padding,
+            inset: defaults.inset,
+            corner_radius: defaults.corner_radius,
+            shadow: defaults.shadow,
+            background: defaults.background,
+            alignment: defaults.alignment,
+            auto_balance: defaults.auto_balance,
+            aspect: defaults.aspect,
+            output_size: defaults.output_size,
+            border_width: defaults.border_width,
+            border_color: defaults.border_color,
+            watermark: defaults.watermark,
+            automatic: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SmartFramePresetSettings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = SmartFramePresetSettingsWire::deserialize(deserializer)?;
+        let automatic = wire.automatic.unwrap_or(SceneAutomatic {
+            background: matches!(
+                &wire.background,
+                PresetBackground::Automatic | PresetBackground::Generated(_)
+            ),
+            ..SceneAutomatic::default()
+        });
+        Ok(Self {
+            padding: wire.padding,
+            canvas_padding: wire.canvas_padding,
+            inset: wire.inset,
+            corner_radius: wire.corner_radius,
+            shadow: wire.shadow,
+            background: wire.background,
+            alignment: wire.alignment,
+            auto_balance: wire.auto_balance,
+            aspect: wire.aspect,
+            output_size: wire.output_size,
+            border_width: wire.border_width,
+            border_color: wire.border_color,
+            watermark: wire.watermark,
+            automatic,
+            extensions: wire.extensions,
+        })
+    }
+}
+
+/// Canonical Scene name for portable user-preset settings.
+pub type ScenePresetSettings = SmartFramePresetSettings;
 
 impl Default for SmartFramePresetSettings {
     fn default() -> Self {
@@ -343,13 +464,25 @@ impl Default for SmartFramePresetSettings {
 impl SmartFramePresetSettings {
     /// Builds a reusable preset, refusing embedded custom-image pixels.
     pub fn from_beautification(value: &Beautification) -> Result<Self> {
-        let background = match value.background {
-            Background::Automatic(_) => PresetBackground::Automatic,
+        let background = match &value.background {
+            Background::Automatic(generated) if value.automatic.background => {
+                PresetBackground::Generated(generated.style)
+            }
+            Background::Automatic(generated) => {
+                PresetBackground::ResolvedGenerated(generated.clone())
+            }
             Background::Transparent => PresetBackground::Transparent,
-            Background::Solid(color) => PresetBackground::Solid(color),
-            Background::Gradient { start, end } => PresetBackground::Gradient { start, end },
-            Background::BuiltIn(background) => PresetBackground::BuiltIn(background),
-            Background::Image(_) => {
+            Background::Solid(color) => PresetBackground::Solid(*color),
+            Background::Gradient { start, end } => PresetBackground::Gradient {
+                start: *start,
+                end: *end,
+            },
+            Background::BuiltIn(background) => PresetBackground::BuiltIn(*background),
+            Background::BlurredSource { blur_radius, tint } => PresetBackground::BlurredSource {
+                blur_radius: *blur_radius,
+                tint: *tint,
+            },
+            Background::Image(_) | Background::Desktop(_) => {
                 return Err(Error::InvalidRequest(
                     "custom background pixels cannot be stored in a Smart Frame preset".into(),
                 ));
@@ -357,6 +490,7 @@ impl SmartFramePresetSettings {
         };
         Ok(Self {
             padding: value.padding,
+            canvas_padding: value.canvas_padding,
             inset: value.inset,
             corner_radius: value.corner_radius,
             shadow: value.shadow,
@@ -368,6 +502,7 @@ impl SmartFramePresetSettings {
             border_width: value.border_width,
             border_color: value.border_color,
             watermark: value.watermark.clone(),
+            automatic: value.automatic,
             extensions: value.extensions.clone(),
         })
     }
@@ -375,17 +510,31 @@ impl SmartFramePresetSettings {
     /// Applies this preset without carrying capture-specific analysis forward.
     #[must_use]
     pub fn to_beautification(&self) -> Beautification {
-        let background = match self.background {
+        let background = match &self.background {
             PresetBackground::Automatic => {
                 Background::Automatic(AutomaticBackground::fallback(ColorSpace::Unknown))
             }
+            PresetBackground::Generated(style) => {
+                Background::Automatic(fallback_background(ColorSpace::Unknown, *style))
+            }
+            PresetBackground::ResolvedGenerated(generated) => {
+                Background::Automatic(generated.clone())
+            }
             PresetBackground::Transparent => Background::Transparent,
-            PresetBackground::Solid(color) => Background::Solid(color),
-            PresetBackground::Gradient { start, end } => Background::Gradient { start, end },
-            PresetBackground::BuiltIn(background) => Background::BuiltIn(background),
+            PresetBackground::Solid(color) => Background::Solid(*color),
+            PresetBackground::Gradient { start, end } => Background::Gradient {
+                start: *start,
+                end: *end,
+            },
+            PresetBackground::BuiltIn(background) => Background::BuiltIn(*background),
+            PresetBackground::BlurredSource { blur_radius, tint } => Background::BlurredSource {
+                blur_radius: *blur_radius,
+                tint: *tint,
+            },
         };
         Beautification {
             padding: self.padding,
+            canvas_padding: self.canvas_padding,
             inset: self.inset,
             corner_radius: self.corner_radius,
             shadow: self.shadow,
@@ -398,6 +547,7 @@ impl SmartFramePresetSettings {
             border_color: self.border_color,
             watermark: self.watermark.clone(),
             smart_frame: None,
+            automatic: self.automatic,
             extensions: self.extensions.clone(),
         }
     }
@@ -419,6 +569,9 @@ pub struct SmartFramePreset {
     #[serde(flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
+
+/// Canonical Scene name for a user-authored reusable preset.
+pub type SceneUserPreset = SmartFramePreset;
 
 impl Default for SmartFramePreset {
     fn default() -> Self {
@@ -487,6 +640,16 @@ pub fn analyze(
     provenance: Provenance,
     cancellation: &AnalysisCancellation,
 ) -> Result<SmartFrameAnalysis> {
+    analyze_with_style(frame, provenance, GeneratedStyle::Balanced, cancellation)
+}
+
+/// Analyses one immutable revision using a selected generated style direction.
+pub fn analyze_with_style(
+    frame: &Frame,
+    provenance: Provenance,
+    style: GeneratedStyle,
+    cancellation: &AnalysisCancellation,
+) -> Result<SmartFrameAnalysis> {
     cancellation.check()?;
     let pixel_count = u64::from(frame.width())
         .checked_mul(u64::from(frame.height()))
@@ -526,12 +689,16 @@ pub fn analyze(
             confidence: 100,
         }
     } else {
-        detect_inset(&image, frame.scale.get(), edge, cancellation)?
+        InsetAnalysis {
+            inset: SourceInsets::default(),
+            decision: InsetDecision::NoExcessMargin,
+            confidence: 100,
+        }
     };
     let focus = visual_focus(&image, inset.inset, frame.scale.get(), edge, cancellation)?;
     let stats = sampled_stats(&image, edge, cancellation)?;
     let content_class = classify(&stats);
-    let background = automatic_background(edge, original_space);
+    let background = automatic_background(edge, original_space, style, stable_seed(&image));
     let logical_min = (f64::from(frame.width().min(frame.height())) / frame.scale.get())
         .round()
         .clamp(1.0, 16_384.0) as u32;
@@ -567,6 +734,7 @@ pub fn analyze(
     };
     let beautification = Beautification {
         padding: f64::from(padding),
+        canvas_padding: stitched_padding(provenance, f64::from(padding)),
         inset: inset.inset,
         corner_radius,
         shadow,
@@ -579,12 +747,21 @@ pub fn analyze(
         border_color,
         watermark: None,
         smart_frame: Some(metadata),
+        automatic: if provenance == Provenance::Window {
+            SceneAutomatic::native_window()
+        } else {
+            SceneAutomatic::ordinary()
+        },
         extensions: BTreeMap::new(),
     };
     beautification.validate()?;
     Ok(SmartFrameAnalysis {
         beautification,
-        inset_explanation: inset.decision.explanation().to_owned(),
+        inset_explanation: if provenance == Provenance::Window {
+            inset.decision.explanation().to_owned()
+        } else {
+            "Complete source composition preserved".to_owned()
+        },
     })
 }
 
@@ -936,9 +1113,16 @@ fn classify(stats: &SampledStats) -> ContentClass {
     }
 }
 
-fn automatic_background(edge: EdgeReference, source_space: ColorSpace) -> AutomaticBackground {
+fn automatic_background(
+    edge: EdgeReference,
+    source_space: ColorSpace,
+    style: GeneratedStyle,
+    seed: u64,
+) -> AutomaticBackground {
     if edge.transparent || source_space == ColorSpace::Unknown {
-        return AutomaticBackground::fallback(source_space);
+        let mut fallback = fallback_background(source_space, style);
+        fallback.seed = seed;
+        return fallback;
     }
     let edge_color = Color::rgb(edge.color.r, edge.color.g, edge.color.b);
     let light_field = edge_color.luminance() < 0.34;
@@ -962,10 +1146,26 @@ fn automatic_background(edge: EdgeReference, source_space: ColorSpace) -> Automa
         255_u8.saturating_sub(edge_color.g),
         255_u8.saturating_sub(edge_color.b),
     );
-    let mut start = mix_color(anchor_start, complement, 32);
-    let mut end = mix_color(anchor_end, complement, 24);
+    let (start_mix, end_mix) = match style {
+        GeneratedStyle::Balanced => (32, 24),
+        GeneratedStyle::Soft => (16, 12),
+        GeneratedStyle::Vibrant => (54, 46),
+        GeneratedStyle::Neutral => (8, 8),
+    };
+    let neutral = Color::rgb(128, 128, 128);
+    let mut start = mix_color(anchor_start, complement, start_mix);
+    let mut end = mix_color(anchor_end, complement, end_mix);
+    if style == GeneratedStyle::Soft {
+        start = mix_color(start, edge_color, 42);
+        end = mix_color(end, edge_color, 42);
+    } else if style == GeneratedStyle::Neutral {
+        start = mix_color(start, neutral, 96);
+        end = mix_color(end, neutral, 96);
+    }
     start = enforce_contrast(start, edge_color);
     end = enforce_contrast(end, edge_color);
+    let accent = enforce_contrast(mix_color(start, complement, 68), edge_color);
+    let support = enforce_contrast(mix_color(end, neutral, 36), edge_color);
     let minimum = contrast_ratio(start, edge_color).min(contrast_ratio(end, edge_color));
     AutomaticBackground {
         algorithm_version: SMART_FRAME_ALGORITHM_VERSION,
@@ -974,8 +1174,71 @@ fn automatic_background(edge: EdgeReference, source_space: ColorSpace) -> Automa
         edge_reference: edge_color,
         source_color_space: source_space,
         minimum_contrast_x100: (minimum * 100.0).round().clamp(0.0, 2_100.0) as u16,
+        style,
+        template: template_for(style),
+        seed,
+        palette: vec![start, end, accent, support],
         extensions: BTreeMap::new(),
     }
+}
+
+fn fallback_background(source_space: ColorSpace, style: GeneratedStyle) -> AutomaticBackground {
+    let mut background = AutomaticBackground::fallback(source_space);
+    background.style = style;
+    background.template = template_for(style);
+    let neutral = Color::rgb(95, 99, 108);
+    background.palette = match style {
+        GeneratedStyle::Balanced => background.palette,
+        GeneratedStyle::Soft => background
+            .palette
+            .into_iter()
+            .map(|color| mix_color(color, neutral, 46))
+            .collect(),
+        GeneratedStyle::Vibrant => vec![
+            Color::rgb(40, 48, 84),
+            Color::rgb(87, 49, 132),
+            Color::rgb(25, 112, 128),
+            Color::rgb(151, 61, 116),
+        ],
+        GeneratedStyle::Neutral => vec![
+            Color::rgb(54, 58, 66),
+            Color::rgb(91, 96, 105),
+            Color::rgb(70, 74, 82),
+            Color::rgb(112, 116, 124),
+        ],
+    };
+    let palette = background.resolved_palette();
+    background.start = palette[0];
+    background.end = palette[1];
+    background
+}
+
+const fn template_for(style: GeneratedStyle) -> GeneratedTemplate {
+    match style {
+        GeneratedStyle::Balanced | GeneratedStyle::Vibrant => GeneratedTemplate::SoftMesh,
+        GeneratedStyle::Soft => GeneratedTemplate::SmoothGradient,
+        GeneratedStyle::Neutral => GeneratedTemplate::TonalStudio,
+    }
+}
+
+fn stable_seed(image: &RgbaImage) -> u64 {
+    let step_x = sample_step(image.width);
+    let step_y = sample_step(image.height);
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for y in (0..image.height).step_by(step_y as usize) {
+        for x in (0..image.width).step_by(step_x as usize) {
+            for byte in image.pixel(x, y).unwrap_or([0; 4]) {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    hash ^ u64::from(image.width).rotate_left(17) ^ u64::from(image.height).rotate_left(41)
+}
+
+fn stitched_padding(provenance: Provenance, padding: f64) -> Option<CanvasInsets> {
+    (provenance == Provenance::Stitched)
+        .then(|| CanvasInsets::symmetric(padding, (padding * 0.55).round()))
 }
 
 fn enforce_contrast(mut candidate: Color, edge: Color) -> Color {

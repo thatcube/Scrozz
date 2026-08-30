@@ -26,7 +26,7 @@
 
 use scrozz_core::Result;
 
-use crate::document::{Document, DocumentData};
+use crate::document::{Beautification, Document, DocumentData};
 
 /// How many undo steps are kept before the oldest is dropped.
 ///
@@ -124,6 +124,30 @@ impl History {
     #[must_use]
     pub fn new(document: &Document) -> Self {
         Self::with_limit(document, DEFAULT_LIMIT)
+    }
+
+    /// Replaces Scene state in every retained snapshot without adding an undo step.
+    ///
+    /// Scene has its own undo stack in the editor. Keeping this field aligned
+    /// across annotation snapshots prevents an annotation undo from also
+    /// travelling through Scene history.
+    pub fn synchronize_beautification(&mut self, beautification: Option<&Beautification>) {
+        let synchronize = |step: &mut Step| {
+            step.data.beautification = beautification.cloned();
+        };
+        for step in &mut self.past {
+            synchronize(step);
+        }
+        synchronize(&mut self.present);
+        for step in &mut self.future {
+            synchronize(step);
+        }
+        if let Some(open) = &mut self.open {
+            synchronize(&mut open.present);
+            for step in &mut open.future {
+                synchronize(step);
+            }
+        }
     }
 
     /// Starts a history that keeps at most `limit` undo steps.

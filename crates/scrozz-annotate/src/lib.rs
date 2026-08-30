@@ -75,16 +75,19 @@ pub mod style;
 pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject, RedactStyle};
 pub use document::{
     Alignment, AnnotationMut, AspectPreset, AutomaticBackground, Background, BackgroundImage,
-    Beautification, BeautificationPreset, BuiltInBackground, Document, DocumentData,
-    ExactOutputSize, SourceInsets, Watermark,
+    Beautification, BeautificationPreset, BuiltInBackground, CanvasInsets, Document, DocumentData,
+    ExactOutputSize, GeneratedStyle, GeneratedTemplate, Scene, SceneAutomatic, ScenePreset,
+    SceneProperty, SourceInsets, SubjectAppearance, Watermark,
 };
 pub use history::History;
 pub use render::{Renderer, SkiaRenderer};
 pub use smart_frame::{
     AnalysisCancellation, ContentClass, InsetDecision, MAX_ANALYSIS_SAMPLES, PresetBackground,
-    ResolvedFocus, SensitiveRegionReview, SensitiveRegionSuggestion, SmartFrameAnalysis,
-    SmartFrameMetadata, SmartFramePreset, SmartFramePresetSettings, analyze as analyze_smart_frame,
-    contrast_ratio, provisional as provisional_smart_frame,
+    ResolvedFocus, SceneAnalysis, ScenePresetSettings, SceneUserPreset, SensitiveRegionReview,
+    SensitiveRegionSuggestion, SmartFrameAnalysis, SmartFrameMetadata, SmartFramePreset,
+    SmartFramePresetSettings, analyze as analyze_scene, analyze as analyze_smart_frame,
+    analyze_with_style as analyze_scene_with_style, contrast_ratio,
+    provisional as provisional_scene, provisional as provisional_smart_frame,
 };
 pub use style::{
     ArrowStyle, Color, REDACT_INTENSITY_DEFAULT, REDACT_INTENSITY_MAX, REDACT_INTENSITY_MIN, Style,
