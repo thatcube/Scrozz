@@ -6,8 +6,8 @@
 //! unsafe `Send` wrapper. Only the resulting thread-safe `CGImage` crosses into
 //! Scrozz's worker.
 
+use std::cell::RefCell;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -136,26 +136,16 @@ struct InboxState {
 #[derive(Default)]
 struct PickerInbox {
     state: Mutex<InboxState>,
-    /// Whether a window selected in this session keeps its shadow.
-    ///
-    /// Apple's picker answers on its own callback long after the caller
-    /// returned, so the preference cannot be passed down the stack. It is
-    /// latched here when the picker is presented, which is also the moment the
-    /// ordinary capture path reads it — a change made while the picker is up
-    /// applies to the next capture, not the one in flight.
-    include_window_shadow: AtomicBool,
 }
 
 impl PickerInbox {
-    fn begin(&self, include_window_shadow: bool) -> Result<u64> {
+    fn begin(&self) -> Result<u64> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.awaiting {
             return Err(Error::InvalidRequest(
                 "Apple's content picker is already waiting for a selection".to_owned(),
             ));
         }
-        self.include_window_shadow
-            .store(include_window_shadow, Ordering::Relaxed);
         state.session = state.session.wrapping_add(1);
         state.awaiting = true;
         state.capturing = false;
@@ -165,20 +155,35 @@ impl PickerInbox {
         Ok(state.session)
     }
 
-    fn claim_selection(&self) -> Option<u64> {
+    /// Starts capturing for `generation`, or refuses if it is not the live one.
+    ///
+    /// A selection that belongs to a presentation which has already timed out
+    /// must not start a capture, and must certainly not do so under the
+    /// preference and mode of whatever presentation replaced it.
+    fn claim_selection(&self, generation: u64) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if !state.awaiting || state.capturing || state.event.is_some() {
-            return None;
+        if generation != state.session
+            || !state.awaiting
+            || state.capturing
+            || state.event.is_some()
+        {
+            return false;
         }
         state.capturing = true;
         state.presented_since = None;
         state.capturing_since = Some(Instant::now());
-        Some(state.session)
+        true
     }
 
-    fn deliver(&self, session: u64, event: ApplePickerEvent) {
+    /// Records `event` against the presentation it came from.
+    ///
+    /// Everything Apple tells us arrives on its own schedule, so an answer to a
+    /// presentation that has already been abandoned can still turn up — after
+    /// its timeout, and after the user has opened another picker. Quoting the
+    /// generation it belongs to is what makes that answer refusable.
+    fn deliver(&self, generation: u64, event: ApplePickerEvent) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if session != state.session || !state.awaiting || state.event.is_some() {
+        if generation != state.session || !state.awaiting || state.event.is_some() {
             return;
         }
         state.awaiting = false;
@@ -186,15 +191,6 @@ impl PickerInbox {
         state.presented_since = None;
         state.capturing_since = None;
         state.event = Some(event);
-    }
-
-    fn deliver_current(&self, event: ApplePickerEvent) {
-        let session = self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .session;
-        self.deliver(session, event);
     }
 
     fn take(&self) -> Option<ApplePickerEvent> {
@@ -232,6 +228,19 @@ impl PickerInbox {
 
 struct PickerObserverIvars {
     inbox: Arc<PickerInbox>,
+    /// The presentation this observer was made for, fixed for its lifetime.
+    ///
+    /// Apple hands us no token identifying which presentation a callback
+    /// answers, so the identity has to come from our side: one observer per
+    /// presentation, carrying the generation it was born with. Everything it
+    /// reports is reported against that, never against whatever happens to be
+    /// live when the callback finally arrives.
+    generation: u64,
+    /// The shadow preference in force when this presentation opened.
+    ///
+    /// Immutable for the same reason: a selection must be captured under the
+    /// preference the user had when they opened *this* picker.
+    include_window_shadow: bool,
 }
 
 define_class!(
@@ -248,9 +257,10 @@ define_class!(
             _picker: &SCContentSharingPicker,
             _stream: Option<&SCStream>,
         ) {
-            self.ivars()
+            let ivars = self.ivars();
+            ivars
                 .inbox
-                .deliver_current(ApplePickerEvent::Cancelled);
+                .deliver(ivars.generation, ApplePickerEvent::Cancelled);
         }
 
         #[unsafe(method(contentSharingPicker:didUpdateWithFilter:forStream:))]
@@ -265,33 +275,44 @@ define_class!(
 
         #[unsafe(method(contentSharingPickerStartDidFailWithError:))]
         unsafe fn content_sharing_picker_start_did_fail(&self, error: &NSError) {
-            self.ivars()
-                .inbox
-                .deliver_current(ApplePickerEvent::Failed(Error::Platform(format!(
+            let ivars = self.ivars();
+            ivars.inbox.deliver(
+                ivars.generation,
+                ApplePickerEvent::Failed(Error::Platform(format!(
                     "Apple's content picker could not start: {} (code {})",
                     error.localizedDescription(),
                     error.code()
-                ))));
+                ))),
+            );
         }
     }
 );
 
 impl PickerObserver {
-    fn new(inbox: Arc<PickerInbox>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(PickerObserverIvars { inbox });
+    fn new(
+        inbox: Arc<PickerInbox>,
+        generation: u64,
+        include_window_shadow: bool,
+    ) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(PickerObserverIvars {
+            inbox,
+            generation,
+            include_window_shadow,
+        });
         // SAFETY: standard two-phase NSObject initialisation after the Rust
         // ivars have been installed.
         unsafe { msg_send![super(this), init] }
     }
 
     fn start_capture(&self, filter: &SCContentFilter) {
-        let inbox = &self.ivars().inbox;
-        let Some(session) = inbox.claim_selection() else {
+        let ivars = self.ivars();
+        let inbox = &ivars.inbox;
+        let session = ivars.generation;
+        if !inbox.claim_selection(session) {
             return;
-        };
-        let include_window_shadow = inbox.include_window_shadow.load(Ordering::Relaxed);
+        }
         let (configuration, scale, target, provenance) =
-            match prepare_capture(filter, include_window_shadow) {
+            match prepare_capture(filter, ivars.include_window_shadow) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     inbox.deliver(session, ApplePickerEvent::Failed(error));
@@ -320,7 +341,13 @@ impl PickerObserver {
 /// Main-thread handle to Apple's picker singleton.
 pub struct AppleContentPicker {
     picker: Retained<SCContentSharingPicker>,
-    observer: Retained<PickerObserver>,
+    /// The observer for the presentation currently on screen, if any.
+    ///
+    /// One presentation, one observer, and none registered in between: a
+    /// callback that Apple emits for an abandoned presentation has nothing
+    /// listening for it, and if it does still land it quotes the generation it
+    /// was born with rather than the live one.
+    observer: RefCell<Option<Retained<PickerObserver>>>,
     inbox: Arc<PickerInbox>,
 }
 
@@ -370,7 +397,7 @@ impl AppleContentPicker {
         }
     }
 
-    /// Attaches one observer to the process-wide picker.
+    /// Takes the main-thread handle to the process-wide picker.
     ///
     /// # Errors
     ///
@@ -401,19 +428,34 @@ impl AppleContentPicker {
 
         // The class probes above make these typed weak-linked lookups safe.
         let picker = unsafe { SCContentSharingPicker::sharedPicker() };
-        let inbox = Arc::new(PickerInbox::default());
-        let observer = PickerObserver::new(Arc::clone(&inbox));
-        let protocol: &ProtocolObject<dyn SCContentSharingPickerObserver> =
-            ProtocolObject::from_ref(&*observer);
-        // SAFETY: `observer` conforms to the generated protocol and is retained
-        // by this handle for at least as long as it remains registered.
-        unsafe { picker.addObserver(protocol) };
 
         Ok(Self {
             picker,
-            observer,
-            inbox,
+            observer: RefCell::new(None),
+            inbox: Arc::new(PickerInbox::default()),
         })
+    }
+
+    /// Registers the observer for one presentation, retiring the previous one.
+    fn observe(&self, generation: u64, include_window_shadow: bool) {
+        let observer =
+            PickerObserver::new(Arc::clone(&self.inbox), generation, include_window_shadow);
+        let protocol: &ProtocolObject<dyn SCContentSharingPickerObserver> =
+            ProtocolObject::from_ref(&*observer);
+        // SAFETY: `observer` conforms to the generated protocol and is retained
+        // by this handle for as long as it remains registered.
+        unsafe { self.picker.addObserver(protocol) };
+        if let Some(retired) = self.observer.replace(Some(observer)) {
+            Self::stop_observing(&self.picker, &retired);
+        }
+    }
+
+    /// Unregisters `observer` so an abandoned presentation stops being heard.
+    fn stop_observing(picker: &SCContentSharingPicker, observer: &PickerObserver) {
+        let protocol: &ProtocolObject<dyn SCContentSharingPickerObserver> =
+            ProtocolObject::from_ref(observer);
+        // SAFETY: the same live observer registered in `observe`.
+        unsafe { picker.removeObserver(protocol) };
     }
 
     /// Presents one least-privilege picker.
@@ -426,7 +468,8 @@ impl AppleContentPicker {
     ///
     /// Returns an error if another picker is already in flight.
     pub fn present(&self, mode: ApplePickerMode, include_window_shadow: bool) -> Result<()> {
-        let _session = self.inbox.begin(include_window_shadow)?;
+        let generation = self.inbox.begin()?;
+        self.observe(generation, include_window_shadow);
 
         // SAFETY: both classes were probed in `new`. The configuration is new,
         // confined to this call, and copied by `setDefaultConfiguration:`.
@@ -460,6 +503,12 @@ impl AppleContentPicker {
             // picker active would let Control Center initiate unrelated future
             // selections outside Scrozz's explicit action.
             unsafe { self.picker.setActive(false) };
+            // This presentation is finished, including when it finished by
+            // timing out. Anything Apple says about it afterwards is no longer
+            // addressed to anyone.
+            if let Some(retired) = self.observer.take() {
+                Self::stop_observing(&self.picker, &retired);
+            }
         }
         event
     }
@@ -467,12 +516,10 @@ impl AppleContentPicker {
 
 impl Drop for AppleContentPicker {
     fn drop(&mut self) {
-        let protocol: &ProtocolObject<dyn SCContentSharingPickerObserver> =
-            ProtocolObject::from_ref(&*self.observer);
-        // SAFETY: the same live observer registered in `new`.
-        unsafe {
-            self.picker.setActive(false);
-            self.picker.removeObserver(protocol);
+        // SAFETY: a plain property update on the singleton.
+        unsafe { self.picker.setActive(false) };
+        if let Some(retired) = self.observer.take() {
+            Self::stop_observing(&self.picker, &retired);
         }
     }
 }
@@ -594,29 +641,14 @@ mod tests {
     }
 
     #[test]
-    fn each_presentation_latches_the_preference_it_was_given() {
-        // Apple answers on its own callback, so the value read when the
-        // selection lands has to be the one in force when the picker opened.
-        let inbox = PickerInbox::default();
-
-        inbox.begin(false).unwrap();
-        assert!(!inbox.include_window_shadow.load(Ordering::Relaxed));
-        inbox.deliver_current(ApplePickerEvent::Cancelled);
-        assert!(matches!(inbox.take(), Some(ApplePickerEvent::Cancelled)));
-
-        inbox.begin(true).unwrap();
-        assert!(inbox.include_window_shadow.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn a_late_capture_cannot_satisfy_a_new_picker_session() {
         let inbox = PickerInbox::default();
-        let first = inbox.begin(true).unwrap();
-        assert_eq!(inbox.claim_selection(), Some(first));
+        let first = inbox.begin().unwrap();
+        assert!(inbox.claim_selection(first));
         inbox.state.lock().unwrap().capturing_since = Some(Instant::now() - PICKER_CAPTURE_TIMEOUT);
         assert!(matches!(inbox.take(), Some(ApplePickerEvent::Failed(_))));
 
-        let second = inbox.begin(true).unwrap();
+        let second = inbox.begin().unwrap();
         assert_ne!(first, second);
         inbox.deliver(
             first,
@@ -626,5 +658,99 @@ mod tests {
 
         inbox.deliver(second, ApplePickerEvent::Cancelled);
         assert!(matches!(inbox.take(), Some(ApplePickerEvent::Cancelled)));
+    }
+
+    /// Abandons the presentation `generation` by timing it out, as `take` does
+    /// once the picker has been up longer than a person would leave it.
+    fn abandon(inbox: &PickerInbox, generation: u64) {
+        inbox.state.lock().unwrap().presented_since = Some(Instant::now() - PICKER_PRESENT_TIMEOUT);
+        assert!(matches!(inbox.take(), Some(ApplePickerEvent::Failed(_))));
+        assert_ne!(
+            generation,
+            inbox.state.lock().unwrap().session,
+            "an abandoned presentation must not keep its generation"
+        );
+    }
+
+    #[test]
+    fn a_selection_made_in_an_abandoned_picker_never_starts_a_capture() {
+        // The dangerous version of this is not a lost screenshot: it is the old
+        // picker's selection being captured under the new presentation's mode
+        // and shadow preference, both of which the user chose for something
+        // else.
+        let inbox = PickerInbox::default();
+        let abandoned = inbox.begin().unwrap();
+        abandon(&inbox, abandoned);
+
+        let live = inbox.begin().unwrap();
+        assert!(
+            !inbox.claim_selection(abandoned),
+            "a selection from the abandoned picker claimed the live one"
+        );
+        assert!(
+            !inbox.state.lock().unwrap().capturing,
+            "the live presentation was pushed into capturing by a stale selection"
+        );
+        assert!(inbox.claim_selection(live));
+    }
+
+    #[test]
+    fn a_cancellation_from_an_abandoned_picker_does_not_close_the_live_one() {
+        let inbox = PickerInbox::default();
+        let abandoned = inbox.begin().unwrap();
+        abandon(&inbox, abandoned);
+
+        let live = inbox.begin().unwrap();
+        inbox.deliver(abandoned, ApplePickerEvent::Cancelled);
+        assert!(
+            inbox.take().is_none(),
+            "the stale cancellation cancelled the picker the user had just opened"
+        );
+
+        inbox.deliver(live, ApplePickerEvent::Cancelled);
+        assert!(matches!(inbox.take(), Some(ApplePickerEvent::Cancelled)));
+    }
+
+    #[test]
+    fn a_start_failure_from_an_abandoned_picker_does_not_fail_the_live_one() {
+        let inbox = PickerInbox::default();
+        let abandoned = inbox.begin().unwrap();
+        abandon(&inbox, abandoned);
+
+        let live = inbox.begin().unwrap();
+        inbox.deliver(
+            abandoned,
+            ApplePickerEvent::Failed(Error::Platform("late start failure".to_owned())),
+        );
+        assert!(
+            inbox.take().is_none(),
+            "the stale failure was reported against the live picker"
+        );
+        assert!(
+            inbox.state.lock().unwrap().awaiting,
+            "the live presentation stopped waiting for its own answer"
+        );
+        let _ = live;
+    }
+
+    #[test]
+    fn each_presentation_carries_the_preference_it_was_opened_with() {
+        // The preference used to live in one shared cell that every callback
+        // read at delivery time, so a late selection captured under whatever
+        // the *next* presentation had asked for.
+        let inbox = Arc::new(PickerInbox::default());
+        let first = PickerObserverIvars {
+            inbox: Arc::clone(&inbox),
+            generation: 1,
+            include_window_shadow: false,
+        };
+        let second = PickerObserverIvars {
+            inbox,
+            generation: 2,
+            include_window_shadow: true,
+        };
+        assert!(!first.include_window_shadow);
+        assert!(second.include_window_shadow);
+        assert_ne!(first.generation, second.generation);
     }
 }
