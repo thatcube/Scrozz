@@ -1517,17 +1517,7 @@ impl App {
                     preset.name = name;
                     latest.upsert_smart_frame_preset(preset)?;
                 }
-                None => {
-                    latest.delete_smart_frame_preset(&id)?;
-                    if latest.value(crate::settings::SCENES_DEFAULT_KEY) == Some(token.as_str()) {
-                        latest.set_value(crate::settings::SCENES_DEFAULT_KEY, "auto");
-                    }
-                    for (_, key) in crate::settings::SCENE_CAPTURE_KEYS {
-                        if latest.value(key) == Some(token.as_str()) {
-                            latest.set_value(*key, "default");
-                        }
-                    }
-                }
+                None => crate::settings::forget_scene_preset(latest, &id)?,
             }
             Ok(())
         });
@@ -3995,7 +3985,11 @@ impl App {
             PickerMode::Display => scrozz_capture::ApplePickerMode::Display,
             PickerMode::WindowOrDisplay => scrozz_capture::ApplePickerMode::WindowOrDisplay,
         };
-        match picker.present(native_mode) {
+        // The picker answers on its own callback, so the shadow preference is
+        // latched now rather than read when the selection arrives.
+        let include_window_shadow =
+            crate::settings::window_shadow(&self.config.after_capture).unwrap_or(true);
+        match picker.present(native_mode, include_window_shadow) {
             Ok(()) => {
                 self.apple_picker = Some(picker);
             }
@@ -4656,6 +4650,10 @@ impl App {
     }
 
     /// Removes one custom Smart Frame preset and updates the live policy snapshot.
+    ///
+    /// Shares [`crate::settings::forget_scene_preset`] with the Settings-side
+    /// delete so a preset can never be removed while Scene assignments still
+    /// name it, whichever list the user deleted it from.
     pub fn delete_smart_frame_preset(
         &mut self,
         preset_id: &str,
@@ -4667,7 +4665,7 @@ impl App {
         })?;
         let updated = store
             .update(store.inferred_profile(), |settings| {
-                settings.delete_smart_frame_preset(preset_id)
+                crate::settings::forget_scene_preset(settings, preset_id)
             })
             .map_err(CliError::Core)?;
         let presets = updated.smart_frame_presets().to_vec();
@@ -7784,6 +7782,74 @@ mod tests {
         assert_eq!(
             crate::settings::scene_for_capture(&restarted, "window").unwrap(),
             Some("auto".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleting_a_preset_from_the_editor_takes_its_assignments_with_it() {
+        // The editor's preset list and the Scenes pane delete the same preset.
+        // If only one of them re-points the assignments, the rows that named it
+        // keep reading as configured while resolving to nothing at all.
+        use scrozz_ui::settings::{SceneAssignment, SceneCapture, SceneChoice, ScenesEvent};
+
+        let root =
+            std::env::temp_dir().join(format!("scrozz-app-preset-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let mut config = Config::sealed();
+        config.after_capture = AfterCaptureSettings::fresh();
+        store.save(&config.after_capture).unwrap();
+        config.after_capture_store = Some(store.clone());
+        let mut app = App::new(
+            config,
+            Box::new(Recording::new()),
+            Arc::new(UnsupportedSelector::headless()),
+            false,
+        )
+        .expect("sealed app");
+
+        let preset = SmartFramePreset::new(
+            "notes",
+            "Notes",
+            scrozz_annotate::SmartFramePresetSettings::default(),
+        )
+        .unwrap();
+        app.upsert_smart_frame_preset(preset).unwrap();
+        app.handle_scenes_event(ScenesEvent::SetDefault(SceneChoice::Preset(
+            "notes".to_owned(),
+        )));
+        app.handle_scenes_event(ScenesEvent::SetAssignment(
+            SceneCapture::Window,
+            SceneAssignment::Explicit(SceneChoice::Preset("notes".to_owned())),
+        ));
+        assert_eq!(
+            crate::settings::scene_for_capture(&app.config.after_capture, "window").unwrap(),
+            Some("preset:notes".to_owned())
+        );
+
+        // The editor-side entry point, not the Scenes pane's.
+        app.delete_smart_frame_preset("notes").unwrap();
+
+        assert_eq!(
+            crate::settings::scene_default(&app.config.after_capture).unwrap(),
+            "auto",
+            "the default must not name a preset that is gone"
+        );
+        assert_eq!(
+            crate::settings::scene_for_capture(&app.config.after_capture, "window").unwrap(),
+            Some("auto".to_owned()),
+            "an explicit row falls back to the default it was overriding"
+        );
+        drop(app);
+
+        let restarted = store.load(InstallProfile::Fresh).unwrap();
+        for (_, key) in crate::settings::SCENE_CAPTURE_KEYS {
+            assert_ne!(restarted.value(key), Some("preset:notes"));
+        }
+        assert_ne!(
+            restarted.value(crate::settings::SCENES_DEFAULT_KEY),
+            Some("preset:notes")
         );
         let _ = std::fs::remove_dir_all(root);
     }

@@ -1378,6 +1378,39 @@ pub fn migrate_scenes(persisted: &mut AfterCaptureSettings) -> bool {
     true
 }
 
+/// Deletes a Scene preset and every assignment that named it.
+///
+/// The one place a preset may be removed. A preset can be deleted from Settings
+/// or from the editor's preset list, and both leave the same wreckage if they
+/// only touch the preset store: `scenes.default` and the per-capture rows keep
+/// pointing at an id that no longer resolves, so the row still reads as
+/// configured while applying nothing. Deleting and re-pointing together — inside
+/// one store update — means no reader ever observes a dangling reference.
+///
+/// The default falls back to `auto` and per-capture rows to `default`, matching
+/// what the pane offers when nothing has been chosen.
+///
+/// # Errors
+///
+/// Returns whatever [`AfterCaptureSettings::delete_smart_frame_preset`] returns,
+/// leaving assignments untouched if the delete itself was refused.
+pub fn forget_scene_preset(
+    persisted: &mut AfterCaptureSettings,
+    id: &str,
+) -> scrozz_core::Result<()> {
+    persisted.delete_smart_frame_preset(id)?;
+    let token = format!("preset:{id}");
+    if persisted.value(SCENES_DEFAULT_KEY) == Some(token.as_str()) {
+        persisted.set_value(SCENES_DEFAULT_KEY, "auto");
+    }
+    for (_, key) in SCENE_CAPTURE_KEYS {
+        if persisted.value(key) == Some(token.as_str()) {
+            persisted.set_value(*key, "default");
+        }
+    }
+    Ok(())
+}
+
 /// Every Scene assignment in force, as raw tokens the UI layer parses.
 ///
 /// Returned as `(slug, token)` pairs rather than a typed enum so this module
