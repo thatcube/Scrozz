@@ -668,30 +668,28 @@ pub struct App {
     drag_keep_after_accept: HashSet<CardId>,
     /// Cards that retire only after a queued copy/save reports success.
     close_after_output: HashSet<CardId>,
-    /// Cards waiting for a *confirmed* upload before they may be retired.
+    /// Each card's *current* outstanding upload request, if any (round 8,
+    /// Findings #2-#4).
     ///
-    /// Separate from `close_after_output` because "Hide a card only after a
-    /// cloud upload is confirmed successful" means exactly that: a copy or a
-    /// save finishing first must not take the card away before the link exists.
-    close_after_upload: HashSet<CardId>,
-    /// The action id of the *current* outstanding upload request for each
-    /// card (round 7, Finding #2).
-    ///
-    /// A card can have a second Upload dispatched before the first one's
-    /// outcome has been drained -- `close_after_upload` and
-    /// `overflow_recovery_in_flight` are flat, non-identified sentinels, so
-    /// without this map the first (now-superseded) request's eventual
-    /// completion or refusal would incorrectly clear bookkeeping that now
-    /// belongs to the request that replaced it, potentially dismissing the
-    /// card or retiring overflow recovery while the newer upload is still
-    /// legitimately in flight. `Outcome::UploadDone`/`Outcome::UploadRefused`
-    /// carry the action id they answer for; a completion whose action no
-    /// longer matches the map's entry for its card is a stale answer to a
-    /// superseded request and is ignored rather than acted on. Assigning a
-    /// fresh action id always overwrites any previous entry, so the newest
-    /// dispatch is unconditionally the one whose completion is trusted.
-    upload_action: HashMap<CardId, u64>,
-    /// Source of the action ids stored in `upload_action`. Monotonically
+    /// Replaces the previous parallel `close_after_upload: HashSet<CardId>` /
+    /// `upload_action: HashMap<CardId, u64>` pair: an upload's identity and
+    /// its close-after-completion policy now travel together as one unit
+    /// that is wholesale replaced on every dispatch, rather than two
+    /// independently updated collections that could drift apart. That
+    /// drift was real: `upload_action` alone recognized *which* answer was
+    /// current, but a stale answer's own revision-staleness handling still
+    /// unconditionally cleared the flat `close_after_upload` flag before
+    /// that check ever ran, silently discarding the close policy a second,
+    /// still-in-flight dispatch actually owned; and a superseding dispatch
+    /// whose policy read `false` never removed the flat flag a `true`
+    /// policy had left behind, so it inherited a stale one. Recorded-media
+    /// uploads ([`Self::upload_recorded_media`]) now insert here too --
+    /// membership is the sole test for whether an
+    /// `Outcome::UploadDone`/`Outcome::UploadRefused` answers this card's
+    /// current request, so a missing entry is exactly as stale as a
+    /// mismatched action id, never trusted by default.
+    pending_upload: HashMap<CardId, PendingUploadAction>,
+    /// Source of the action ids stored in `pending_upload`. Monotonically
     /// increasing and never reused within a process's lifetime in practice,
     /// mirroring `next_editor_generation`.
     next_upload_action: u64,
@@ -1023,6 +1021,25 @@ pub enum EditorCloseOutcome {
     /// A required job refused; the host must reopen the editor instead of
     /// finalizing, so nothing discards the dirty document.
     Failed(String),
+}
+
+/// One card's current outstanding upload request (round 8, Findings #2-#4).
+///
+/// `Outcome::UploadDone`/`Outcome::UploadRefused` carry the action id they
+/// answer for; an outcome is only ever this card's *current* answer when
+/// [`App::pending_upload`]'s entry for that card exists and its `action`
+/// matches exactly -- a missing entry is exactly as stale as a mismatched
+/// one, never treated as "trust it by default". Assigning a fresh action id
+/// always replaces any previous entry wholesale, `close_after` included, so
+/// a superseding dispatch can never inherit (or fail to clear) the policy a
+/// request it replaced was carrying.
+#[derive(Debug, Clone, Copy)]
+struct PendingUploadAction {
+    /// Uniquely identifies this dispatch.
+    action: u64,
+    /// Whether *this* dispatch should retire the card once it completes,
+    /// captured fresh at dispatch time.
+    close_after: bool,
 }
 
 #[derive(Clone)]
@@ -1467,8 +1484,7 @@ impl App {
             modal_drag_input_release_pending: false,
             drag_keep_after_accept: HashSet::new(),
             close_after_output: HashSet::new(),
-            close_after_upload: HashSet::new(),
-            upload_action: HashMap::new(),
+            pending_upload: HashMap::new(),
             next_upload_action: 0,
             card_retention: HashMap::new(),
             card_committed_version: HashMap::new(),
@@ -2164,6 +2180,23 @@ impl App {
                     version,
                     action,
                 } => {
+                    // Round 8, Finding #2: action-identity is validated
+                    // *before* any status/revision reasoning runs, so a
+                    // superseded request's answer never touches the status
+                    // line, the notes log, or the current request's own
+                    // bookkeeping -- not even the "this is stale" bookkeeping
+                    // in `resolve_stale_output_completion` below, which is
+                    // reserved for a stale answer to the *current* action.
+                    match self.pending_upload.get(&card) {
+                        Some(pending) if pending.action == action => {}
+                        _ => {
+                            self.note(format!(
+                                "{card} finished an upload request a newer one has since \
+                                 replaced"
+                            ));
+                            continue;
+                        }
+                    }
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
                     // See the matching comment on `Outcome::Done` above.
@@ -2177,27 +2210,14 @@ impl App {
                         self.resolve_stale_output_completion(card, true);
                         continue;
                     }
-                    // Round 7, Finding #2: a second Upload request can
-                    // supersede this one before it finishes. If it has,
-                    // `close_after_upload`/`overflow_recovery_in_flight`
-                    // bookkeeping now belongs to that newer request, not
-                    // this stale answer -- leave it alone rather than
-                    // dismissing the card or retiring overflow on its behalf.
-                    if self
-                        .upload_action
-                        .get(&card)
-                        .is_some_and(|current| *current != action)
-                    {
-                        self.note(format!(
-                            "{card} finished an upload request a newer one has since replaced"
-                        ));
-                        continue;
-                    }
-                    self.upload_action.remove(&card);
+                    let close_after = self
+                        .pending_upload
+                        .remove(&card)
+                        .is_some_and(|pending| pending.close_after);
                     if let Some(retention) = self.card_retention.get_mut(&card) {
                         retention.0 = true;
                     }
-                    self.complete_upload(card);
+                    self.complete_upload(card, close_after);
                 }
                 Outcome::Opened {
                     card,
@@ -2292,24 +2312,27 @@ impl App {
                     error,
                     action,
                 } => {
-                    // Round 7, Finding #2: see the matching comment on
-                    // `Outcome::UploadDone`. A stale refusal for a superseded
-                    // request must not fail the card's *current* upload.
-                    if self
-                        .upload_action
-                        .get(&card)
-                        .is_some_and(|current| *current != action)
-                    {
-                        self.note(format!(
-                            "{card} refused an upload request a newer one has since replaced"
-                        ));
-                        continue;
-                    }
-                    self.upload_action.remove(&card);
+                    // Round 8, Finding #2: action-identity validated before
+                    // any status/logic runs (see the matching comment on
+                    // `Outcome::UploadDone`). A stale refusal for a
+                    // superseded request must not fail the card's *current*
+                    // upload.
+                    let close_after = match self.pending_upload.get(&card) {
+                        Some(pending) if pending.action == action => self
+                            .pending_upload
+                            .remove(&card)
+                            .is_some_and(|pending| pending.close_after),
+                        _ => {
+                            self.note(format!(
+                                "{card} refused an upload request a newer one has since replaced"
+                            ));
+                            continue;
+                        }
+                    };
                     // A failed upload leaves the card exactly where it is: the
                     // link the user asked for never arrived, so hiding it now
                     // would throw away the only copy they can still act on.
-                    self.fail_upload(card);
+                    self.fail_upload(card, close_after);
                     self.surface
                         .set_status(card, Some(format!("Action failed: {error}")));
                     self.note(format!("{card} upload refused: {error}"));
@@ -2669,19 +2692,30 @@ impl App {
                     self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
                     if self.cloud_settings.upload_enabled {
                         self.surface.set_status(id, Some("Uploading...".to_owned()));
-                        // Round 7, Finding #2: a fresh action id every
-                        // dispatch, unconditionally recorded as the card's
-                        // *current* upload below. A second Upload before the
-                        // first's outcome drains overwrites the entry, so the
+                        // Round 8, Finding #4: unconditionally insert a
+                        // fresh `PendingUploadAction` whose `close_after`
+                        // reflects the *current* config read -- never merely
+                        // conditionally inserting a flag on top of whatever a
+                        // previous, now-superseded dispatch may have left
+                        // behind. A second Upload before the first's outcome
+                        // drains wholesale replaces the entry, so the
                         // superseded request's eventual completion or
-                        // refusal is recognized as stale and left alone.
+                        // refusal is recognized as stale (action mismatch)
+                        // and can never inherit or leak this dispatch's own
+                        // close policy.
                         let action = self.next_upload_action;
                         self.next_upload_action = self.next_upload_action.wrapping_add(1);
                         if self.post_card_output(id, CardOutput::Upload(action), editors) {
-                            self.upload_action.insert(id, action);
-                            if self.config.recent_captures_overlay.close_after_upload {
-                                self.close_after_upload.insert(id);
-                            }
+                            self.pending_upload.insert(
+                                id,
+                                PendingUploadAction {
+                                    action,
+                                    close_after: self
+                                        .config
+                                        .recent_captures_overlay
+                                        .close_after_upload,
+                                },
+                            );
                         }
                     } else {
                         let reason = self
@@ -2701,7 +2735,7 @@ impl App {
                         continue;
                     }
                     self.visible_cards.remove(&id);
-                    self.close_after_upload.remove(&id);
+                    self.pending_upload.remove(&id);
                     self.dismiss_recent_capture(id, "dismissed");
                     self.note(format!("{id} dismissed"));
                 }
@@ -3004,7 +3038,9 @@ impl App {
         // An in-flight Save As or output already owns this card's outcome.
         // Retiring it here would invalidate that work, so overflow only records
         // that the card is no longer reachable and lets the outcome decide.
-        if self.close_after_output.contains(&id) || self.close_after_upload.contains(&id) {
+        if self.close_after_output.contains(&id)
+            || self.pending_upload.get(&id).is_some_and(|p| p.close_after)
+        {
             self.overflow_recovery_in_flight.insert(id);
             self.note(format!(
                 "{id} left the display while its output or upload action finishes"
@@ -3088,20 +3124,24 @@ impl App {
     }
 
     fn complete_output_action(&mut self, card: CardId) {
-        if self.close_after_output.remove(&card) && !self.close_after_upload.contains(&card) {
+        if self.close_after_output.remove(&card)
+            && !self
+                .pending_upload
+                .get(&card)
+                .is_some_and(|p| p.close_after)
+        {
             self.dismiss_recent_capture(card, "completed its action");
         }
     }
 
-    fn complete_upload(&mut self, card: CardId) {
-        if self.close_after_upload.remove(&card) {
+    fn complete_upload(&mut self, card: CardId, close_after: bool) {
+        if close_after {
             self.dismiss_recent_capture(card, "completed its upload");
         }
     }
 
-    fn fail_upload(&mut self, card: CardId) {
-        let was_waiting = self.close_after_upload.remove(&card);
-        if !was_waiting
+    fn fail_upload(&mut self, card: CardId, close_after: bool) {
+        if !close_after
             || !self.overflow_recovery_in_flight.contains(&card)
             || self.close_after_output.contains(&card)
         {
@@ -3119,28 +3159,33 @@ impl App {
     /// dismissing the card (round 6, Finding #1).
     ///
     /// `complete_output_action`/`complete_upload` unconditionally dismiss the
-    /// card once its `close_after_output`/`close_after_upload` flag clears --
-    /// correct for an ordinary completion, but exactly wrong for one that
-    /// raced a *later* Done: the card's live vault entry now holds that
-    /// Done's committed revision, not whatever this stale action exported,
-    /// so dismissal's `Job::Release` (fired the instant the editor that
-    /// produced the newer revision happens to have already closed) would
-    /// destroy a legitimately newer, still-live revision to make room for an
-    /// action that only ever knew about the one before it. This clears only
-    /// the flag this stale completion answered for and, mirroring
-    /// [`Self::fail_upload`]'s existing recovery-resume idiom, resolves any
-    /// overflow retirement that was waiting behind it against whatever the
-    /// card holds now instead of the stale action's own outcome.
+    /// card once its `close_after_output`/`pending_upload` close policy
+    /// clears -- correct for an ordinary completion, but exactly wrong for
+    /// one that raced a *later* Done: the card's live vault entry now holds
+    /// that Done's committed revision, not whatever this stale action
+    /// exported, so dismissal's `Job::Release` (fired the instant the editor
+    /// that produced the newer revision happens to have already closed)
+    /// would destroy a legitimately newer, still-live revision to make room
+    /// for an action that only ever knew about the one before it. This
+    /// clears only the bookkeeping this stale completion answered for and,
+    /// mirroring [`Self::fail_upload`]'s existing recovery-resume idiom,
+    /// resolves any overflow retirement that was waiting behind it against
+    /// whatever the card holds now instead of the stale action's own
+    /// outcome.
     fn resolve_stale_output_completion(&mut self, card: CardId, upload: bool) {
         let was_waiting = if upload {
-            self.close_after_upload.remove(&card)
+            self.pending_upload
+                .remove(&card)
+                .is_some_and(|p| p.close_after)
         } else {
             self.close_after_output.remove(&card)
         };
         let other_action_still_pending = if upload {
             self.close_after_output.contains(&card)
         } else {
-            self.close_after_upload.contains(&card)
+            self.pending_upload
+                .get(&card)
+                .is_some_and(|p| p.close_after)
         };
         if !was_waiting
             || !self.overflow_recovery_in_flight.contains(&card)
@@ -3325,8 +3370,7 @@ impl App {
             self.close_after_output.remove(&card);
         }
         self.visible_cards.remove(&card);
-        self.close_after_upload.remove(&card);
-        self.upload_action.remove(&card);
+        self.pending_upload.remove(&card);
         self.drag_keep_after_accept.remove(&card);
         self.card_retention.remove(&card);
         self.card_capture_ids.remove(&card);
@@ -5095,8 +5139,9 @@ impl App {
         }
     }
 
-    /// Whether `card`'s editor is frozen behind a Done pending its
-    /// commit/persist ack.
+    /// Whether `card`'s editor is frozen: either still waiting on a Done's
+    /// commit/persist ack, or that ack has already resolved but the host has
+    /// not yet drained [`Self::take_editor_close_result`] to finalize it.
     ///
     /// A modeless native panel shared with an editor (the system colour
     /// picker) keeps delivering events on its own schedule, independent of
@@ -5105,8 +5150,29 @@ impl App {
     /// events, rather than relying on the editor having already stopped
     /// asking for input. Used by [`Self::prepare_editor`] internally for the
     /// render-prep half of the same freeze (round 6, Finding #4).
-    pub fn editor_close_pending(&self, card: CardId) -> bool {
+    ///
+    /// Checking only `pending_editor_closes` (this method's previous, exact
+    /// behavior) left a real gap: [`Self::resolve_pending_editor_close`]
+    /// removes the card from `pending_editor_closes` and pushes its outcome
+    /// into `editor_close_results` the instant every required ack resolves
+    /// -- but the host does not actually finalize (close on success, reopen
+    /// on failure) until it separately drains that result via
+    /// [`Self::take_editor_close_result`], which for a still-showing editor
+    /// only happens once per frame from `show_editor`. Between those two
+    /// moments a stale "not frozen" answer let an async delivery (a color
+    /// picker change, a Smart Frame/Scene analysis result) mutate an editor
+    /// whose Done has already captured its authoritative snapshot -- for a
+    /// *successful* close this mutation would simply be discarded once the
+    /// editor is torn down, but for a close that turns out to have *failed*
+    /// and reopens the editor, an in-between mutation would silently land on
+    /// top of the reopened state as if Done had never happened (round 8,
+    /// Finding #1). Treating an unresolved result as frozen too closes that
+    /// gap: the freeze lifts only once the editor is torn down (success) or
+    /// the failure path has finished reopening it (failure), matching
+    /// exactly when a mutation becomes safe again.
+    pub fn editor_close_frozen(&self, card: CardId) -> bool {
         self.pending_editor_closes.contains_key(&card)
+            || self.editor_close_results.iter().any(|(c, _)| *c == card)
     }
 
     /// Asks the worker to prepare the latest settled editor revision for drag.
@@ -5127,8 +5193,10 @@ impl App {
         // still-open editor drifts to next. Preparing a later revision here
         // would cache drag bytes the committed revision never agreed to,
         // and a later native drag would then read those instead of the
-        // committed (possibly redacted) ones (round 6, Finding #4).
-        if self.pending_editor_closes.contains_key(&editor.card) {
+        // committed (possibly redacted) ones (round 6, Finding #4). The
+        // freeze persists through the ack-resolved-but-undrained window too
+        // (round 8, Finding #1) -- see `editor_close_frozen`.
+        if self.editor_close_frozen(editor.card) {
             return;
         }
         let captures = self.pipeline.captures();
@@ -6414,14 +6482,20 @@ impl App {
         let capture = self.card_capture_ids.get(&card).cloned();
         self.surface
             .set_status(card, Some("Uploading...".to_owned()));
-        // A recording never participates in `close_after_upload`/
-        // `upload_action` bookkeeping (see `route_recorded_card_event`), so
-        // this action id only needs to satisfy the shared `Job` shape --
-        // nothing ever checks it against a stored "current" value for this
-        // card, matching this path's existing untouched behavior.
+        // Round 8, Finding #3: this path previously allocated an action id
+        // but never recorded it in the card's upload bookkeeping, on the
+        // theory that a recording never auto-dismisses on upload completion
+        // so nothing needed to be "current". That reasoning missed that a
+        // *missing* `pending_upload` entry is exactly the signal
+        // `Outcome::UploadDone`/`Outcome::UploadRefused` treat as "trust
+        // this outcome" -- so a stale or duplicate recorded-media outcome
+        // could overwrite status/notes belonging to a newer, still-in-flight
+        // request. Track this action like any other upload; `close_after:
+        // false` preserves the existing, intentional behavior that a
+        // recording's own upload never retires the card by itself.
         let action = self.next_upload_action;
         self.next_upload_action = self.next_upload_action.wrapping_add(1);
-        if !self.pipeline.post(Job::UploadRecording {
+        if self.pipeline.post(Job::UploadRecording {
             card,
             capture,
             path,
@@ -6429,6 +6503,14 @@ impl App {
             file_name,
             action,
         }) {
+            self.pending_upload.insert(
+                card,
+                PendingUploadAction {
+                    action,
+                    close_after: false,
+                },
+            );
+        } else {
             self.note(format!(
                 "{card} could not be queued for upload: the capture worker has gone"
             ));
@@ -8812,7 +8894,13 @@ mod tests {
         app.card_capture_ids
             .insert(card, CaptureId("stale-upload-dismiss".into()));
         app.card_retention.insert(card, (false, false));
-        app.close_after_upload.insert(card);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 0,
+                close_after: true,
+            },
+        );
 
         let generation = 1;
         let committed = RevisionedFrame::from_document(editor.document(), 2)
@@ -8829,14 +8917,15 @@ mod tests {
             // Stale: answers for revision 1, the generation's pre-commit
             // revision, dispatched before the commit above landed.
             version: Some((generation, 1)),
-            // The revision check must short-circuit before the action-id
-            // check even looks at this value, so any id proves that.
+            // Matches the `pending_upload` entry above exactly, so this
+            // exercises the revision-staleness branch rather than the
+            // action-identity branch that now runs before it.
             action: 0,
         });
         app.drain_pipeline();
 
         assert!(
-            !app.close_after_upload.contains(&card),
+            !app.pending_upload.contains_key(&card),
             "the stale upload's own close-after-upload bookkeeping must still retire"
         );
         assert_eq!(
@@ -9385,15 +9474,21 @@ mod tests {
         let (mut app, surface) = app();
         let card = CardId(56);
         app.close_after_output.insert(card);
-        app.close_after_upload.insert(card);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 0,
+                close_after: true,
+            },
+        );
 
         app.complete_output_action(card);
 
         assert!(!app.close_after_output.contains(&card));
-        assert!(app.close_after_upload.contains(&card));
+        assert!(app.pending_upload.get(&card).is_some_and(|p| p.close_after));
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
 
-        app.complete_upload(card);
+        app.complete_upload(card, true);
 
         assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
     }
@@ -9403,14 +9498,20 @@ mod tests {
         let (mut app, surface) = app();
         let card = CardId(57);
         app.card_retention.insert(card, (true, false));
-        app.close_after_upload.insert(card);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 0,
+                close_after: true,
+            },
+        );
 
         app.handle_overflow(card, EditorSnapshots::EMPTY);
 
         assert!(app.overflow_recovery_in_flight.contains(&card));
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
 
-        app.complete_upload(card);
+        app.complete_upload(card, true);
 
         assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
         assert!(!app.overflow_recovery_in_flight.contains(&card));
@@ -9421,31 +9522,50 @@ mod tests {
         let (mut app, surface) = app();
         let card = CardId(58);
         app.card_retention.insert(card, (true, false));
-        app.close_after_upload.insert(card);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 0,
+                close_after: true,
+            },
+        );
         app.handle_overflow(card, EditorSnapshots::EMPTY);
 
-        app.fail_upload(card);
+        // Mirrors what `Outcome::UploadRefused` does before calling
+        // `fail_upload`: the action is validated and popped first, so by the
+        // time `fail_upload` (and the `handle_overflow` it may re-run) sees
+        // the card, `pending_upload` no longer carries a stale close policy
+        // that would make the resumed overflow think another upload is still
+        // outstanding.
+        app.pending_upload.remove(&card);
+        app.fail_upload(card, true);
 
         assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
-        assert!(!app.close_after_upload.contains(&card));
         assert!(!app.overflow_recovery_in_flight.contains(&card));
     }
 
     #[test]
     fn a_stale_upload_success_for_a_superseded_action_never_completes_the_cards_current_upload() {
-        // Round 7, Finding #2: two Upload requests can be dispatched for the
-        // same card before the first's outcome drains -- both workers are
-        // strictly FIFO, but nothing stopped a slow first completion from
-        // draining after a second dispatch had already replaced it. The
-        // completion for action 3 here answers a request the card no longer
-        // recognizes as current (action 5): it must retire quietly rather
-        // than mark retention, clear `close_after_upload`, or dismiss the
-        // card out from under the still-in-flight current request.
+        // Round 7, Finding #2 (action identity), reinforced by round 8's
+        // action-checked-first ordering: two Upload requests can be
+        // dispatched for the same card before the first's outcome drains --
+        // both workers are strictly FIFO, but nothing stopped a slow first
+        // completion from draining after a second dispatch had already
+        // replaced it. The completion for action 3 here answers a request
+        // the card no longer recognizes as current (action 5): it must
+        // retire quietly rather than mark retention, disturb the current
+        // action's `pending_upload` entry, or dismiss the card out from
+        // under the still-in-flight current request.
         let (mut app, surface) = app();
         let card = CardId(59);
         app.card_retention.insert(card, (false, false));
-        app.close_after_upload.insert(card);
-        app.upload_action.insert(card, 5);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 5,
+                close_after: true,
+            },
+        );
 
         app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
             card,
@@ -9456,7 +9576,7 @@ mod tests {
         app.drain_pipeline();
 
         assert!(
-            app.close_after_upload.contains(&card),
+            app.pending_upload.get(&card).is_some_and(|p| p.close_after),
             "a stale completion must leave the current upload's own bookkeeping intact"
         );
         assert_eq!(
@@ -9465,8 +9585,8 @@ mod tests {
             "a stale completion must never mark retention on the card's behalf"
         );
         assert_eq!(
-            app.upload_action.get(&card),
-            Some(&5),
+            app.pending_upload.get(&card).map(|p| p.action),
+            Some(5),
             "a stale completion must not disturb the card's current action id"
         );
         assert!(
@@ -9486,10 +9606,9 @@ mod tests {
         app.drain_pipeline();
 
         assert!(
-            !app.upload_action.contains_key(&card),
+            !app.pending_upload.contains_key(&card),
             "the current action's own completion must clear its bookkeeping"
         );
-        assert!(!app.close_after_upload.contains(&card));
         assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
         assert!(
             !app.card_retention.contains_key(&card),
@@ -9506,8 +9625,13 @@ mod tests {
         // bookkeeping out from under it.
         let (mut app, surface) = app();
         let card = CardId(60);
-        app.close_after_upload.insert(card);
-        app.upload_action.insert(card, 5);
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 5,
+                close_after: true,
+            },
+        );
 
         let stale_error = CliError::Core(CoreError::Platform("stale network error".to_owned()));
         app.pipeline
@@ -9519,12 +9643,12 @@ mod tests {
         app.drain_pipeline();
 
         assert!(
-            app.close_after_upload.contains(&card),
+            app.pending_upload.get(&card).is_some_and(|p| p.close_after),
             "a stale refusal must leave the current upload's own bookkeeping intact"
         );
         assert_eq!(
-            app.upload_action.get(&card),
-            Some(&5),
+            app.pending_upload.get(&card).map(|p| p.action),
+            Some(5),
             "a stale refusal must not disturb the card's current action id"
         );
         assert!(
@@ -9544,10 +9668,9 @@ mod tests {
         app.drain_pipeline();
 
         assert!(
-            !app.upload_action.contains_key(&card),
+            !app.pending_upload.contains_key(&card),
             "the current action's own refusal must clear its bookkeeping"
         );
-        assert!(!app.close_after_upload.contains(&card));
         assert!(
             app.notes()
                 .iter()
@@ -10917,6 +11040,99 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_recorded_media_upload_outcome_never_overwrites_a_newer_ones_status() {
+        // Round 8, Finding #3: `upload_recorded_media` used to allocate an
+        // action id without ever recording it in `pending_upload`, on the
+        // theory that a recording's own upload never dismisses the card so
+        // nothing needed to be "current". That missed that a *missing*
+        // `pending_upload` entry is exactly what `Outcome::UploadDone`/
+        // `Outcome::UploadRefused` treat as "trust this outcome" -- so if the
+        // user pressed Upload twice (retrying after what looked like a
+        // stall), a slow first completion could land after the second had
+        // already updated the card's status, silently reverting it.
+        //
+        // A real successful dispatch through `upload_recorded_media` cannot
+        // be produced hermetically in this test binary: it calls
+        // `refresh_cloud_settings` first, which always resolves to
+        // unavailable here since `cloud` is not part of the default feature
+        // set (see `a_stale_upload_completion_never_dismisses_a_card_holding_a_newer_committed_revision`
+        // for the same limitation on the plain-card upload path). This seeds
+        // `pending_upload` directly the way that function's fixed body does
+        // -- two dispatches, each a fresh action id with `close_after:
+        // false` -- and exercises the exact `Outcome::UploadDone` handling
+        // path a genuine stale recorded-media completion would race.
+        let (mut app, _surface) = app();
+        let root = scratch("recorded-media-stale-upload");
+        let handoff = durable_handoff(&root);
+        app.cloud_settings.upload_enabled = true;
+        app.cloud_settings.unavailable_reason = None;
+        app.recording.handoff = Some(handoff);
+        app.present_recorded_media(None);
+        let card = *app.recorded_media.keys().next().expect("recording card");
+
+        // First dispatch.
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 200,
+                close_after: false,
+            },
+        );
+        let first_action = app.pending_upload[&card].action;
+
+        // The user presses Upload again before the first request's outcome
+        // has drained; this is a fresh dispatch, so it must replace the
+        // tracked action rather than share it with the first.
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 201,
+                close_after: false,
+            },
+        );
+        let second_action = app.pending_upload[&card].action;
+        assert_ne!(
+            first_action, second_action,
+            "each dispatch must allocate and track its own action id"
+        );
+
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "uploaded and copied the private share link".to_owned(),
+            version: None,
+            action: first_action,
+        });
+        app.drain_pipeline();
+
+        assert!(
+            app.pending_upload
+                .get(&card)
+                .is_some_and(|p| p.action == second_action),
+            "a stale first completion must never clear or overwrite the second \
+             (current) dispatch's bookkeeping"
+        );
+
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "uploaded and copied the private share link".to_owned(),
+            version: None,
+            action: second_action,
+        });
+        app.drain_pipeline();
+
+        assert!(
+            !app.pending_upload.contains_key(&card),
+            "the current (second) dispatch's own completion must clear its bookkeeping"
+        );
+        assert!(
+            app.visible_cards.contains(&card),
+            "a recording's own upload must never dismiss the card, even on its \
+             genuine completion"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn automatic_cleanup_hides_a_recording_card_without_touching_its_file() {
         let (mut app, surface) = app();
         let root = scratch("auto-close-card");
@@ -11610,6 +11826,89 @@ mod tests {
                 .any(|note| note.contains("card:43 upload unavailable")),
             "{:?}",
             app.notes()
+        );
+    }
+
+    #[test]
+    fn a_superseding_upload_dispatch_replaces_a_stale_close_after_policy() {
+        // Round 8, Finding #4: a second Upload dispatch for the same card
+        // must always replace the tracked `PendingUploadAction` wholesale --
+        // fresh action id *and* the close-after policy read at that later
+        // dispatch time -- never conditionally leaving a previous dispatch's
+        // flag in place. This simulates what `CardEvent::Upload`'s handler
+        // does on each dispatch (see `app.rs`'s `CardEvent::Upload` arm):
+        // allocate a fresh action id and unconditionally `insert` a new
+        // `PendingUploadAction` capturing the *current* config read, which
+        // necessarily discards whatever the previous entry held.
+        let (mut app, surface) = app();
+        let card = CardId(61);
+
+        // First dispatch: close-after-upload is enabled.
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 100,
+                close_after: true,
+            },
+        );
+        let first = app.pending_upload[&card];
+
+        // The user (or a live config reload) disables close-after-upload
+        // before the first request's outcome drains, then presses Upload
+        // again for the same card -- the second dispatch unconditionally
+        // replaces the tracked entry, exactly as the real handler does.
+        app.pending_upload.insert(
+            card,
+            PendingUploadAction {
+                action: 101,
+                close_after: false,
+            },
+        );
+        let second = app.pending_upload[&card];
+        assert_ne!(
+            first.action, second.action,
+            "each dispatch must allocate and track its own action id"
+        );
+        assert!(
+            !second.close_after,
+            "the second (current) dispatch must reflect the now-disabled \
+             close-after policy, not inherit the first dispatch's stale flag"
+        );
+
+        // The stale first action's own completion must retire quietly.
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "uploaded and copied the private share link".to_owned(),
+            version: None,
+            action: first.action,
+        });
+        app.drain_pipeline();
+        assert!(
+            app.pending_upload
+                .get(&card)
+                .is_some_and(|p| p.action == second.action && !p.close_after),
+            "a stale completion must never disturb the current dispatch's own \
+             (correct, disabled) close policy"
+        );
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
+
+        // The current (second) action's own completion must honor its own
+        // (disabled) close policy rather than dismissing the card.
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "uploaded and copied the private share link".to_owned(),
+            version: None,
+            action: second.action,
+        });
+        app.drain_pipeline();
+        assert!(
+            !app.pending_upload.contains_key(&card),
+            "the current dispatch's own completion must clear its bookkeeping"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "the current dispatch's disabled close-after policy must be honored, \
+             not the earlier (superseded) dispatch's enabled one"
         );
     }
 

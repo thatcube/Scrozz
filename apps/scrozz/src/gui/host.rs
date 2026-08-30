@@ -949,9 +949,14 @@ impl Driver {
                     // open editor past what that Done committed, and the
                     // next render-prep pass would then cache drag bytes for
                     // a revision the committed thumbnail never agreed to
-                    // (round 6, Finding #4).
+                    // (round 6, Finding #4). The freeze also covers the
+                    // ack-resolved-but-undrained window (round 8, Finding
+                    // #1), so a change delivered after resolution but before
+                    // the host finalizes is rejected too, rather than
+                    // landing on top of a reopened (failure) or
+                    // about-to-vanish (success) editor.
                     if let Some((&card, editing)) = owner
-                        && !self.app.editor_close_pending(card)
+                        && !self.app.editor_close_frozen(card)
                     {
                         editing
                             .editor
@@ -963,7 +968,7 @@ impl Driver {
                     changed,
                 } => {
                     if let Some((&card, editing)) = owner
-                        && !self.app.editor_close_pending(card)
+                        && !self.app.editor_close_frozen(card)
                     {
                         if changed {
                             editing
@@ -2278,23 +2283,28 @@ impl eframe::App for Driver {
                 editing.window.request_foreground();
             }
         }
-        // A card whose Done-triggered close is still pending its commit
-        // (and, for a history-only editor, persist) ack has already
-        // captured and frozen its exact revision, exactly like the colour
-        // picker's own freeze above -- applying an analysis result now
-        // would set a new revision on a document already mid-commit. This
+        // A card whose Done-triggered close is still frozen -- either
+        // pending its commit/persist ack, or that ack has already resolved
+        // but `show_editor` has not yet drained the result below this tick
+        // (round 8, Finding #1) -- has already captured its exact revision,
+        // exactly like the colour picker's own freeze above. Applying an
+        // analysis result now would set a new revision on a document
+        // already mid-commit, or on one whose reopen (on failure) or
+        // teardown (on success) is imminent but not yet applied. This
         // result is deferred rather than dropped: `show_editor` resolves
-        // that pending close later this same tick, so a still-open (now
-        // unfrozen) editor sees it again next tick at the same revision
-        // Done captured, and an editor the close instead committed and
-        // removed simply finds nothing left to apply it to (round 7,
-        // Finding #1).
+        // the close later this same tick, so a still-open (now unfrozen)
+        // editor sees it again next tick at the same revision Done
+        // captured, and an editor the close instead committed and removed
+        // simply finds nothing left to apply it to on a later tick, once
+        // the freeze lifts and the deferred result is discarded by the
+        // `self.editors.get_mut` check above finding no editor at all
+        // (round 7, Finding #1).
         let mut deferred_smart_frame_results = Vec::new();
         while let Some(result) = self.app.take_smart_frame_result() {
             let Some(editing) = self.editors.get_mut(&result.card) else {
                 continue;
             };
-            if self.app.editor_close_pending(result.card) {
+            if self.app.editor_close_frozen(result.card) {
                 deferred_smart_frame_results.push(result);
                 continue;
             }
@@ -2970,7 +2980,7 @@ mod tests {
         // that Done's commit/persist ack. An unguarded `Changed`/`Closed`
         // event landing in that window would silently advance the editor
         // past the exact revision Done already captured, so both event
-        // arms must check `editor_close_pending` before mutating the editor
+        // arms must check `editor_close_frozen` before mutating the editor
         // -- but the panel itself really did change or close either way, so
         // `color_picker_generation` bookkeeping must clear regardless of
         // that freeze, or a resolved close could leave the app thinking a
@@ -2989,8 +2999,8 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the Changed arm");
         let changed_guard = changed
-            .find("editor_close_pending")
-            .expect("Changed must check the pending-close freeze");
+            .find("editor_close_frozen")
+            .expect("Changed must check the frozen-close freeze");
         let changed_apply = changed
             .find("apply_external_color")
             .expect("Changed applies the colour change");
@@ -3004,8 +3014,8 @@ mod tests {
             .map(|(_, after)| after)
             .expect("the Closed arm");
         let closed_guard = closed
-            .find("editor_close_pending")
-            .expect("Closed must check the pending-close freeze");
+            .find("editor_close_frozen")
+            .expect("Closed must check the frozen-close freeze");
         let closed_apply = closed
             .find("apply_external_color")
             .expect("Closed applies the colour change when it changed");
@@ -3032,10 +3042,12 @@ mod tests {
         // frame/document and is only waiting on its commit/persist ack.
         // Applying the result now would set a new revision on that exact
         // document mid-commit, so the delivery loop must check the same
-        // `editor_close_pending` freeze the colour picker checks -- but,
-        // unlike a native panel event, this result cannot simply be
-        // dropped once frozen (the analysis will never be recomputed), so
-        // a frozen result must be requeued rather than discarded.
+        // `editor_close_frozen` freeze the colour picker checks (broadened
+        // in round 8, Finding #1 to also cover the ack-resolved-but-
+        // undrained window) -- but, unlike a native panel event, this
+        // result cannot simply be dropped once frozen (the analysis will
+        // never be recomputed), so a frozen result must be requeued rather
+        // than discarded.
         let source = include_str!("host.rs");
         let block = source
             .split("while let Some(result) = self.app.take_smart_frame_result()")
@@ -3045,8 +3057,8 @@ mod tests {
             .expect("the Smart Frame delivery loop");
 
         let guard = block
-            .find("editor_close_pending")
-            .expect("delivery must check the pending-close freeze");
+            .find("editor_close_frozen")
+            .expect("delivery must check the frozen-close freeze");
         let deliver = block
             .find("deliver_analysis")
             .expect("delivery applies the analysis result");

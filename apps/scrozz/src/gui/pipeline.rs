@@ -1101,6 +1101,7 @@ impl Pipeline {
         let upload_cancellation = crate::cloud::ShareCancellation::default();
         let upload_cancel = upload_cancellation.clone();
         let upload_outcomes = outcome_tx.clone();
+        let upload_waker = waker.clone();
         let upload_history = jobs.clone();
 
         // Uploading is the one job that can block on a remote host for minutes,
@@ -1111,7 +1112,8 @@ impl Pipeline {
         let upload_worker = std::thread::Builder::new()
             .name("scrozz-upload".to_owned())
             .spawn(move || {
-                UploadWorker::new(upload_outcomes, upload_cancel, upload_history).run(&upload_rx);
+                UploadWorker::new(upload_outcomes, upload_waker, upload_cancel, upload_history)
+                    .run(&upload_rx);
             })
             .map_err(|err| {
                 CliError::Core(CoreError::Platform(format!(
@@ -4051,6 +4053,17 @@ enum UploadJob {
 
 struct UploadWorker {
     outcomes: Sender<Outcome>,
+    /// Wakes the reactive event loop after every outcome send, mirroring
+    /// [`HistoryReader`]'s own wake-on-send (round 8, Finding #5).
+    ///
+    /// Without this, a success or refusal delivered here sits in the
+    /// channel until *something else* happens to wake the window (a mouse
+    /// move, a repaint the OS scheduled for an unrelated reason, ...); on a
+    /// genuinely idle window the reactive loop can be parked indefinitely
+    /// and never drains it at all, leaving an upload silently "stuck"
+    /// forever from the user's perspective even though the worker finished
+    /// long ago.
+    waker: Option<SurfaceWaker>,
     cancellation: crate::cloud::ShareCancellation,
     history: Sender<Job>,
     links: HashMap<CardId, CachedShare>,
@@ -4087,14 +4100,27 @@ impl CachedShare {
 impl UploadWorker {
     fn new(
         outcomes: Sender<Outcome>,
+        waker: Option<SurfaceWaker>,
         cancellation: crate::cloud::ShareCancellation,
         history: Sender<Job>,
     ) -> Self {
         Self {
             outcomes,
+            waker,
             cancellation,
             history,
             links: HashMap::new(),
+        }
+    }
+
+    /// Sends `outcome` and, only once it actually landed, wakes the
+    /// reactive event loop so it drains promptly rather than waiting on
+    /// some unrelated repaint (round 8, Finding #5).
+    fn send_outcome(&self, outcome: Outcome) {
+        if self.outcomes.send(outcome).is_ok()
+            && let Some(waker) = &self.waker
+        {
+            waker();
         }
     }
 
@@ -4149,7 +4175,7 @@ impl UploadWorker {
                     self.links.insert(card, CachedShare::new(shared, version));
                 }
                 Err(error) => {
-                    let _ = self.outcomes.send(Outcome::UploadRefused {
+                    self.send_outcome(Outcome::UploadRefused {
                         card,
                         error,
                         action,
@@ -4159,7 +4185,7 @@ impl UploadWorker {
             }
         }
         let Some(shared) = self.links.get(&card) else {
-            let _ = self.outcomes.send(Outcome::UploadRefused {
+            self.send_outcome(Outcome::UploadRefused {
                 card,
                 error: CliError::Core(CoreError::Platform(
                     "the upload completed without a retained share link".to_owned(),
@@ -4188,7 +4214,7 @@ impl UploadWorker {
                 action,
             },
         };
-        let _ = self.outcomes.send(outcome);
+        self.send_outcome(outcome);
     }
 }
 
@@ -5835,6 +5861,7 @@ mod tests {
         };
         let mut worker = UploadWorker::new(
             outcomes,
+            None,
             crate::cloud::ShareCancellation::default(),
             history,
         );
@@ -5886,6 +5913,109 @@ mod tests {
             }
             other => panic!("expected an UploadDone from the cached link, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_successful_upload_wakes_the_window_event_loop() {
+        // Round 8, Finding #5: unlike `HistoryReader`, `UploadWorker` sent its
+        // outcomes without a `SurfaceWaker`, so a success or refusal it
+        // delivered could sit undrained until something unrelated woke the
+        // window. A cache hit exercises the success path deterministically,
+        // with no live `cloud` backend and no network call.
+        let (outcomes, outcome_rx) = std::sync::mpsc::channel();
+        let (history, _history_rx) = std::sync::mpsc::channel();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let version = ShareVersion {
+            generation: Some(1),
+            revision: 1,
+        };
+        let mut worker = UploadWorker::new(
+            outcomes,
+            Some(waker),
+            crate::cloud::ShareCancellation::default(),
+            history,
+        );
+        worker.links.insert(
+            CardId(60),
+            CachedShare {
+                shared: crate::cloud::Shared {
+                    url: "https://example.test/cached-wake".to_owned(),
+                    key: "capture.png".to_owned(),
+                    provider: "aws",
+                    expires_seconds: None,
+                    expires_at: None,
+                    lifecycle_rule: None,
+                    encrypted: false,
+                    tags: Vec::new(),
+                    media_kind: crate::cloud::ArtifactKind::Screenshot,
+                },
+                expires_at: None,
+                version,
+            },
+        );
+        let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
+            one_pixel_png(),
+            "capture.png".to_owned(),
+        )
+        .expect("a nonempty PNG is a valid artifact");
+
+        worker.upload(CardId(60), None, version, &artifact, 7);
+
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Ok(Outcome::UploadDone { .. })
+        ));
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "a successful upload must wake the reactive event loop so its \
+             outcome is drained promptly rather than waiting on an unrelated repaint"
+        );
+    }
+
+    #[test]
+    fn a_refused_upload_wakes_the_window_event_loop() {
+        // Round 8, Finding #5, refusal side: the "cloud" feature is off by
+        // default in this workspace's test build, so a fresh (uncached)
+        // upload deterministically refuses without any network call --
+        // this exercises the same wake requirement on the refusal path.
+        let (outcomes, outcome_rx) = std::sync::mpsc::channel();
+        let (history, _history_rx) = std::sync::mpsc::channel();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mut worker = UploadWorker::new(
+            outcomes,
+            Some(waker),
+            crate::cloud::ShareCancellation::default(),
+            history,
+        );
+        let version = ShareVersion {
+            generation: Some(2),
+            revision: 2,
+        };
+        let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
+            one_pixel_png(),
+            "capture.png".to_owned(),
+        )
+        .expect("a nonempty PNG is a valid artifact");
+
+        worker.upload(CardId(61), None, version, &artifact, 8);
+
+        assert!(matches!(
+            outcome_rx.try_recv(),
+            Ok(Outcome::UploadRefused { .. })
+        ));
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "a refused upload must also wake the reactive event loop, not \
+             just a successful one"
+        );
     }
 
     #[test]
