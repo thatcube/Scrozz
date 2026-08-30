@@ -676,6 +676,28 @@ pub struct App {
     close_after_upload: HashSet<CardId>,
     /// Whether each live card has another retained artifact and a visible export.
     card_retention: HashMap<CardId, (bool, bool)>,
+    /// The (editor generation, document revision) most recently committed by
+    /// Done for each card still tracked, used to detect a stale Copy/Save/
+    /// Upload completion racing a newer commit (round 5, Finding #2).
+    ///
+    /// Written synchronously inside [`App::commit_card_output`] at *dispatch*
+    /// time -- not from a later `CardOutputCommitted` acknowledgment. The
+    /// capture worker is a single strictly-FIFO thread, so an earlier
+    /// dispatched Copy/Save/Upload always has its own outcome emitted before
+    /// a later commit's ack; only recording the committed version at dispatch
+    /// time (mirroring the existing `card_retention` reset's timing) lets a
+    /// stale completion drained afterward actually be compared against it.
+    /// A `CardOutputCommitFailed` for the exact same tuple clears it again,
+    /// so a legitimate subsequent Save in the same still-open generation is
+    /// not permanently blocked by a commit that never actually succeeded.
+    ///
+    /// Cleared whenever a fresh editor opens for the card, so gating only
+    /// ever applies within one editing session -- never against a version
+    /// left over from a previous one. `next_editor_generation` is a `u64`
+    /// incremented once per newly opened editor and never reused within a
+    /// process's lifetime in practice, so a generation collision with a
+    /// stale tracked tuple is not a realistic concern.
+    card_committed_version: HashMap<CardId, (u64, u64)>,
     /// Durable identities used to re-check source retention at cleanup time.
     card_capture_ids: HashMap<CardId, CaptureId>,
     /// Cards awaiting a current history-retention answer before cleanup.
@@ -723,6 +745,22 @@ pub struct App {
     smart_frame_results: VecDeque<SmartFrameResult>,
     /// Captures retained only because their editor is open, not by the overlay.
     editor_only_cards: HashSet<CardId>,
+    /// Done-triggered closes waiting on their commit (and, for a
+    /// history-only editor, persist) job to answer before the host may
+    /// finalize them.
+    ///
+    /// Round 5 Finding #1/#4: closing the window (and marking the card no
+    /// longer editing) the instant Done posts these jobs let a plain
+    /// Copy/Save/Upload or a native drag -- issued in the gap before the
+    /// worker actually answers -- read the card's pre-edit bytes even though
+    /// the thumbnail already promised a redaction. Recording the pending
+    /// state here, and leaving the card `editing` and its frozen viewport in
+    /// [`Host`]'s editor map until [`Self::take_editor_close_result`] says
+    /// it may finalize, keeps every export routed through the still-open
+    /// (frozen) editor's own live render for the whole gap instead.
+    pending_editor_closes: HashMap<CardId, PendingEditorClose>,
+    /// Resolved [`PendingEditorClose`] entries the host has not yet drained.
+    editor_close_results: VecDeque<(CardId, EditorCloseOutcome)>,
     /// At most one full-resolution render per card is in flight at a time.
     editor_render_pending: HashMap<CardId, (u64, u64)>,
     /// A failed version is not retried until the document or editor changes.
@@ -888,6 +926,55 @@ impl<'a> EditorSnapshots<'a> {
     }
 }
 
+/// One Done-triggered close waiting on its async jobs to answer (round 5,
+/// Finding #1/#4).
+///
+/// `commit` gates every close (a plain Copy/Save/Upload or a native drag
+/// reads this card's own bytes once the editor is gone, so those bytes must
+/// be the committed revision before anything may finalize). `persist` only
+/// gates a history-only editor's close, because only a history-only editor's
+/// finalize releases its sole vault entry -- a live card's own bytes are
+/// already safe once `commit` lands, and gating on persist for it too would
+/// make Done unusable for a capture whose retention policy never durably
+/// stores it at all (persist then fails deterministically, every time).
+struct PendingEditorClose {
+    generation: u64,
+    revision: u64,
+    /// The committed frame, held so the thumbnail refresh can wait for
+    /// `commit` to land rather than showing it before the bytes underneath
+    /// are actually the ones just rendered.
+    frame: scrozz_core::Frame,
+    /// Whether this close also needs `persist` to resolve before finalizing.
+    editor_only: bool,
+    commit: Option<Result<(), String>>,
+    persist: Option<Result<(), String>>,
+}
+
+impl PendingEditorClose {
+    /// `None` while still waiting on a required ack; otherwise whether every
+    /// required ack that has arrived succeeded.
+    fn ready(&self) -> Option<bool> {
+        let commit = self.commit.as_ref()?;
+        if self.editor_only {
+            let persist = self.persist.as_ref()?;
+            Some(commit.is_ok() && persist.is_ok())
+        } else {
+            Some(commit.is_ok())
+        }
+    }
+}
+
+/// What a resolved [`PendingEditorClose`] means for the host's frozen editor.
+#[derive(Debug, Clone)]
+pub enum EditorCloseOutcome {
+    /// Every required job landed; the host may finalize through
+    /// [`App::editor_closed`] and drop its editor entry.
+    Committed,
+    /// A required job refused; the host must reopen the editor instead of
+    /// finalizing, so nothing discards the dirty document.
+    Failed(String),
+}
+
 #[derive(Clone)]
 enum CardOutput {
     Copy,
@@ -897,6 +984,11 @@ enum CardOutput {
 
 struct PendingSaveDialog {
     card: CardId,
+    /// Editor lifetime that produced `rendered`, so the eventual save can be
+    /// matched against the card's currently-committed revision rather than
+    /// trusted blindly (round 5, Finding #2). `None` alongside a `None`
+    /// `rendered` -- there was no live editor when the dialog opened.
+    generation: Option<u64>,
     rendered: Option<Box<RevisionedFrame>>,
     future: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>,
 }
@@ -1321,6 +1413,7 @@ impl App {
             close_after_output: HashSet::new(),
             close_after_upload: HashSet::new(),
             card_retention: HashMap::new(),
+            card_committed_version: HashMap::new(),
             card_capture_ids: HashMap::new(),
             pending_retention_close: HashSet::new(),
             pending_retention_overflow: HashSet::new(),
@@ -1347,6 +1440,8 @@ impl App {
             editor_requests: VecDeque::new(),
             smart_frame_results: VecDeque::new(),
             editor_only_cards: HashSet::new(),
+            pending_editor_closes: HashMap::new(),
+            editor_close_results: VecDeque::new(),
             editor_render_pending: HashMap::new(),
             editor_render_failed: HashMap::new(),
             next_editor_generation: 1,
@@ -1960,10 +2055,29 @@ impl App {
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
                 }
-                Outcome::Done { card, detail } => {
+                Outcome::Done {
+                    card,
+                    detail,
+                    version,
+                } => {
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
-                    if let Some(retention) = self.card_retention.get_mut(&card)
+                    // Round 5, Finding #2: a Save dispatched against a live
+                    // editor's revision can complete after a *later* Done has
+                    // already committed a newer revision and reset retention
+                    // for it. Only trust the completion when it is not known
+                    // to be stale -- i.e. no *different* revision has since
+                    // been committed for this exact editor generation. A
+                    // plain (no live editor) output has no version to race
+                    // and always applies, and the first completion of a fresh
+                    // editing session (nothing committed yet) is trusted too.
+                    let stale = version.is_some_and(|v| {
+                        self.card_committed_version
+                            .get(&card)
+                            .is_some_and(|current| *current != v)
+                    });
+                    if !stale
+                        && let Some(retention) = self.card_retention.get_mut(&card)
                         && detail.starts_with("saved")
                     {
                         retention.0 = true;
@@ -1971,10 +2085,20 @@ impl App {
                     }
                     self.complete_output_action(card);
                 }
-                Outcome::UploadDone { card, detail } => {
+                Outcome::UploadDone {
+                    card,
+                    detail,
+                    version,
+                } => {
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
-                    if let Some(retention) = self.card_retention.get_mut(&card) {
+                    // See the matching comment on `Outcome::Done` above.
+                    let stale = version.is_some_and(|v| {
+                        self.card_committed_version
+                            .get(&card)
+                            .is_some_and(|current| *current != v)
+                    });
+                    if !stale && let Some(retention) = self.card_retention.get_mut(&card) {
                         retention.0 = true;
                     }
                     self.complete_upload(card);
@@ -1986,6 +2110,11 @@ impl App {
                 } => {
                     let generation = self.next_editor_generation;
                     self.next_editor_generation = self.next_editor_generation.wrapping_add(1);
+                    // A brand-new editing session starts with a clean slate:
+                    // any version tracked from a prior session must not gate
+                    // this session's own first Done/Save completion (round 5,
+                    // Finding #2).
+                    self.card_committed_version.remove(&card);
                     if editor_only {
                         self.editor_only_cards.insert(card);
                     }
@@ -2070,6 +2199,83 @@ impl App {
                     self.surface
                         .set_status(card, Some(format!("Action failed: {error}")));
                     self.note(format!("{card} upload refused: {error}"));
+                }
+                Outcome::CardOutputCommitted {
+                    card,
+                    generation,
+                    revision,
+                } => {
+                    if let Some(pending) = self.pending_editor_closes.get_mut(&card)
+                        && pending.generation == generation
+                        && pending.revision == revision
+                    {
+                        pending.commit = Some(Ok(()));
+                    }
+                    self.resolve_pending_editor_close(card, generation, revision);
+                }
+                Outcome::CardOutputCommitFailed {
+                    card,
+                    generation,
+                    revision,
+                    error,
+                } => {
+                    if let Some(pending) = self.pending_editor_closes.get_mut(&card)
+                        && pending.generation == generation
+                        && pending.revision == revision
+                    {
+                        pending.commit = Some(Err(error.to_string()));
+                    }
+                    // The optimistic dispatch-time write in
+                    // `commit_card_output` never actually became durable --
+                    // clear it rather than leave a phantom "committed"
+                    // revision on record. Otherwise a legitimate Save the
+                    // user makes after Finding #1 reopens this same still-
+                    // live editor (a later revision, same generation) would
+                    // wrongly compare unequal to this failed attempt and be
+                    // suppressed as "stale" even though it is the only
+                    // record of the card's current content (round 5,
+                    // Finding #2).
+                    if self.card_committed_version.get(&card) == Some(&(generation, revision)) {
+                        self.card_committed_version.remove(&card);
+                    }
+                    self.surface
+                        .set_status(card, Some(format!("Action failed: {error}")));
+                    self.note(format!(
+                        "{card} editor {generation}'s committed edit could not be filed: {error}"
+                    ));
+                    self.resolve_pending_editor_close(card, generation, revision);
+                }
+                Outcome::EditorClosePersisted {
+                    card,
+                    generation,
+                    revision,
+                } => {
+                    if let Some(pending) = self.pending_editor_closes.get_mut(&card)
+                        && pending.generation == generation
+                        && pending.revision == revision
+                    {
+                        pending.persist = Some(Ok(()));
+                    }
+                    self.resolve_pending_editor_close(card, generation, revision);
+                }
+                Outcome::EditorClosePersistFailed {
+                    card,
+                    generation,
+                    revision,
+                    error,
+                } => {
+                    if let Some(pending) = self.pending_editor_closes.get_mut(&card)
+                        && pending.generation == generation
+                        && pending.revision == revision
+                    {
+                        pending.persist = Some(Err(error.to_string()));
+                    }
+                    self.surface
+                        .set_status(card, Some(format!("Action failed: {error}")));
+                    self.note(format!(
+                        "{card} editor {generation}'s edit could not be persisted: {error}"
+                    ));
+                    self.resolve_pending_editor_close(card, generation, revision);
                 }
                 Outcome::OutputRefused { card, error } => {
                     self.close_after_output.remove(&card);
@@ -2864,6 +3070,7 @@ impl App {
             ));
             return;
         }
+        let generation = editors.for_card(card).map(|editor| editor.generation);
         let rendered = match editors
             .for_card(card)
             .map(EditorSnapshot::render)
@@ -2884,6 +3091,7 @@ impl App {
         );
         self.pending_save_dialog = Some(PendingSaveDialog {
             card,
+            generation,
             rendered,
             future,
         });
@@ -2899,7 +3107,12 @@ impl App {
         let Poll::Ready(result) = pending.future.as_mut().poll(&mut context) else {
             return;
         };
-        let PendingSaveDialog { card, rendered, .. } = self
+        let PendingSaveDialog {
+            card,
+            generation,
+            rendered,
+            ..
+        } = self
             .pending_save_dialog
             .take()
             .expect("polled dialog exists");
@@ -2918,6 +3131,7 @@ impl App {
         let job = match rendered {
             Some(rendered) => Job::SaveImageTo {
                 card,
+                generation: generation.unwrap_or_default(),
                 rendered,
                 path,
             },
@@ -2981,10 +3195,19 @@ impl App {
         let generation = editor.generation;
         let rendered = Box::new(editor.render()?);
         Ok(match output {
-            CardOutput::Copy => Job::CopyImage { card, rendered },
-            CardOutput::Save(None) => Job::SaveImage { card, rendered },
+            CardOutput::Copy => Job::CopyImage {
+                card,
+                generation,
+                rendered,
+            },
+            CardOutput::Save(None) => Job::SaveImage {
+                card,
+                generation,
+                rendered,
+            },
             CardOutput::Save(Some(path)) => Job::SaveImageTo {
                 card,
+                generation,
                 rendered,
                 path,
             },
@@ -4642,6 +4865,7 @@ impl App {
         rendered: RevisionedFrame,
         data: DocumentData,
     ) {
+        let revision = rendered.revision();
         let job = Job::CommitCardOutput {
             card,
             generation,
@@ -4657,11 +4881,27 @@ impl App {
             if self.card_retention.contains_key(&card) {
                 self.card_retention.insert(card, (false, false));
             }
+            // Recorded *now*, synchronously, rather than once the commit is
+            // acknowledged: the capture worker is a single FIFO thread, so
+            // any Copy/Save/Upload dispatched earlier is always processed no
+            // later than this commit -- its completion can only be observed
+            // afterward. Comparing against a value set here is what lets a
+            // completion for an older revision of this same editor
+            // generation be recognised as stale and ignored, rather than
+            // wrongly re-marking this newly committed (and not yet exported)
+            // revision as retained/exported (round 5, Finding #2).
+            self.card_committed_version
+                .insert(card, (generation, revision));
         } else {
+            let error = "the capture worker has gone".to_string();
             self.note(format!(
                 "{card} editor {generation}'s committed edit could not be filed for export: \
-                 the capture worker has gone"
+                 {error}"
             ));
+            // Never leave the pending close waiting on an ack that a gone
+            // worker will now never send -- resolve it as failed instead of
+            // stalling the editor frozen-but-unfinalized forever.
+            self.fail_pending_editor_close(card, generation, revision, "commit", error);
         }
     }
 
@@ -4715,29 +4955,142 @@ impl App {
             data: Box::new(editor.editor.document().data()),
         };
         if !self.pipeline.post(job) {
+            let error = "the capture worker has gone".to_string();
             self.note(format!(
                 "{} editor {} revision {revision} could not be queued for history persistence: \
-                 the capture worker has gone",
+                 {error}",
                 editor.card, editor.generation
             ));
+            // Same reasoning as `commit_card_output`'s post-failure branch: a
+            // gone worker will never answer, so a history-only close waiting
+            // on this ack must not wait for it forever.
+            self.fail_pending_editor_close(
+                editor.card,
+                editor.generation,
+                revision,
+                "persist",
+                error,
+            );
         }
+    }
+
+    /// Begins a Done-triggered close: records the pending state that
+    /// [`Self::take_editor_close_result`] resolves once the commit job (and,
+    /// for a history-only editor, the persist job) posted right alongside
+    /// this call actually answers.
+    ///
+    /// Must be called before those jobs are posted, so their answer -- which
+    /// can arrive as soon as the very next `drain_pipeline` pass -- always
+    /// finds this entry already recorded (round 5, Finding #1/#4).
+    pub fn begin_editor_close(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        revision: u64,
+        frame: scrozz_core::Frame,
+    ) {
+        let editor_only = self.editor_only_cards.contains(&card);
+        self.pending_editor_closes.insert(
+            card,
+            PendingEditorClose {
+                generation,
+                revision,
+                frame,
+                editor_only,
+                commit: None,
+                persist: None,
+            },
+        );
+    }
+
+    /// Marks a pending close's commit (or persist) ack as an immediate
+    /// failure, for a job that could not even be posted (the worker is
+    /// gone). Named by which ack failed only for the log line; resolution
+    /// itself does not care which one it was.
+    fn fail_pending_editor_close(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        revision: u64,
+        which: &str,
+        error: String,
+    ) {
+        let Some(pending) = self.pending_editor_closes.get_mut(&card) else {
+            return;
+        };
+        if pending.generation != generation || pending.revision != revision {
+            return;
+        }
+        match which {
+            "commit" => pending.commit = Some(Err(error)),
+            "persist" => pending.persist = Some(Err(error)),
+            _ => unreachable!("fail_pending_editor_close called with an unknown ack name"),
+        }
+        self.resolve_pending_editor_close(card, generation, revision);
+    }
+
+    /// Resolves `card`'s pending close if every ack it needs has now
+    /// arrived, pushing the outcome for [`Self::take_editor_close_result`]
+    /// to drain.
+    fn resolve_pending_editor_close(&mut self, card: CardId, generation: u64, revision: u64) {
+        let Some(pending) = self.pending_editor_closes.get(&card) else {
+            return;
+        };
+        if pending.generation != generation || pending.revision != revision {
+            return;
+        }
+        let Some(success) = pending.ready() else {
+            return;
+        };
+        let pending = self
+            .pending_editor_closes
+            .remove(&card)
+            .expect("just matched above");
+        if success {
+            self.refresh_card_thumbnail(card, &pending.frame);
+            self.editor_close_results
+                .push_back((card, EditorCloseOutcome::Committed));
+        } else {
+            let error = pending
+                .commit
+                .and_then(Result::err)
+                .or_else(|| pending.persist.and_then(Result::err))
+                .unwrap_or_else(|| "the edit could not be filed durably".to_string());
+            self.editor_close_results
+                .push_back((card, EditorCloseOutcome::Failed(error)));
+        }
+    }
+
+    /// Takes one Done-triggered close that has finished waiting on its jobs.
+    ///
+    /// The host polls this once per frame for every editor it still has
+    /// mapped, finalizing through [`Self::editor_closed`] on `Committed` or
+    /// reopening the (already visually closed) window on `Failed`.
+    pub fn take_editor_close_result(&mut self) -> Option<(CardId, EditorCloseOutcome)> {
+        self.editor_close_results.pop_front()
     }
 
     /// Copies an image the editor has flattened.
     ///
     /// Routed through the worker so the PNG encode and the clipboard write stay
-    /// off the UI thread, exactly like a card's own copy.
-    pub fn copy_rendered(&mut self, card: CardId, rendered: RevisionedFrame) {
+    /// off the UI thread, exactly like a card's own copy. `generation` is the
+    /// editor's own lifetime, carried through so the completion can be matched
+    /// against the card's currently-committed revision (round 5, Finding #2)
+    /// rather than trusted blindly if a newer Done races it.
+    pub fn copy_rendered(&mut self, card: CardId, generation: u64, rendered: RevisionedFrame) {
         self.pipeline.post(Job::CopyImage {
             card,
+            generation,
             rendered: Box::new(rendered),
         });
     }
 
-    /// Saves an image the editor has flattened.
-    pub fn save_rendered(&mut self, card: CardId, rendered: RevisionedFrame) {
+    /// Saves an image the editor has flattened. See [`Self::copy_rendered`]
+    /// for why `generation` is threaded through.
+    pub fn save_rendered(&mut self, card: CardId, generation: u64, rendered: RevisionedFrame) {
         self.pipeline.post(Job::SaveImage {
             card,
+            generation,
             rendered: Box::new(rendered),
         });
     }
@@ -7707,6 +8060,552 @@ mod tests {
         );
     }
 
+    /// Drains `app`'s pipeline until `ready` reports true or two seconds pass.
+    ///
+    /// The capture worker runs on a real background thread even in tests, so
+    /// asserting on an outcome it produces needs a bounded poll rather than a
+    /// single `drain_pipeline` call.
+    fn drain_until(app: &mut App, mut ready: impl FnMut(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.drain_pipeline();
+            if ready(app) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the worker never produced the outcome this test is waiting for"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A fresh, unique path in the OS temp directory for a `SaveImageTo` job.
+    ///
+    /// Writing to an explicit path -- rather than through `Job::SaveImage`'s
+    /// configured-folder default, or `Job::CopyImage`'s system clipboard --
+    /// keeps these tests deterministic and free of side effects on whatever
+    /// real settings or pasteboard the test machine happens to have.
+    fn temp_export_path(name: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "scrozz-gui-finding2-{name}-{}-{}.png",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn a_stale_save_completion_is_ignored_once_a_newer_revision_is_committed() {
+        // Round 5, Finding #2: a Save dispatched against revision 1 of an
+        // editor's document can complete only after Done has since committed
+        // revision 2 for the very same editor generation (the capture worker
+        // is a single FIFO thread, so the Save -- dispatched first -- is
+        // always processed and its outcome emitted no later than the commit
+        // that superseded it, but that outcome is only *observed* here in a
+        // later frame). Marking retention off the stale completion would let
+        // an overflow or auto-close trust an export that in fact wrote the
+        // pre-edit revision, not the one the thumbnail now shows committed.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(201);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_capture_ids
+            .insert(card, CaptureId("stale-save".into()));
+        app.card_retention.insert(card, (false, false));
+
+        let generation = 1;
+        let stale_path = temp_export_path("stale-save");
+        let stale_rendered =
+            RevisionedFrame::from_document(editor.document(), 1).expect("render revision 1");
+        assert!(app.pipeline.post(Job::SaveImageTo {
+            card,
+            generation,
+            rendered: Box::new(stale_rendered),
+            path: stale_path.clone(),
+        }));
+
+        // Done commits revision 2 for the same generation immediately after
+        // dispatching the stale Save above -- exactly the ordering the
+        // finding describes.
+        let committed = RevisionedFrame::from_document(editor.document(), 2)
+            .expect("render committed revision 2");
+        app.commit_card_output(card, generation, committed, editor.document().data());
+        assert_eq!(
+            app.card_committed_version.get(&card),
+            Some(&(generation, 2)),
+            "the commit must be recorded synchronously, before the stale Save's own \
+             completion is ever drained"
+        );
+
+        drain_until(&mut app, |app| {
+            app.card_retention.get(&card) == Some(&(false, false)) && stale_path.exists()
+        });
+
+        assert!(
+            stale_path.exists(),
+            "the stale save must still actually write its file -- it is stale for \
+             retention purposes only, not silently dropped"
+        );
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(false, false)),
+            "a completion for a since-superseded revision must never mark retention, \
+             or a later overflow could treat the newly committed (and still \
+             unexported) revision as already safely saved"
+        );
+        let _ = std::fs::remove_file(&stale_path);
+    }
+
+    #[test]
+    fn the_first_save_completion_of_a_fresh_editing_session_is_trusted() {
+        // The counterpart to the stale case above: with no prior commit for
+        // this card, `card_committed_version` holds nothing to compare
+        // against, so the very first Save/Copy/Upload completion of a session
+        // must still be trusted -- otherwise every card's first export would
+        // wrongly be treated as unproven.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(202);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_retention.insert(card, (false, false));
+        assert_eq!(
+            app.card_committed_version.get(&card),
+            None,
+            "no Done has committed anything yet for this card"
+        );
+
+        let path = temp_export_path("first-save");
+        let rendered =
+            RevisionedFrame::from_document(editor.document(), 1).expect("render revision 1");
+        assert!(app.pipeline.post(Job::SaveImageTo {
+            card,
+            generation: 1,
+            rendered: Box::new(rendered),
+            path: path.clone(),
+        }));
+
+        drain_until(&mut app, |app| {
+            app.card_retention.get(&card) == Some(&(true, true))
+        });
+
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(true, true)),
+            "a completion with nothing tracked to compare against must be trusted"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_second_commit_supersedes_the_first_monotonically() {
+        // A second Done, committing a newer revision of the same editor
+        // generation, must fully replace the tracked version rather than
+        // merging with or being ignored in favor of the first -- otherwise a
+        // completion for the *first* commit's revision could still be
+        // (wrongly) trusted as current after a second, newer commit has since
+        // superseded it.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(206);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_retention.insert(card, (false, false));
+
+        let generation = 1;
+        let first = RevisionedFrame::from_document(editor.document(), 2)
+            .expect("render first committed revision");
+        app.commit_card_output(card, generation, first, editor.document().data());
+        assert_eq!(
+            app.card_committed_version.get(&card),
+            Some(&(generation, 2))
+        );
+
+        let second = RevisionedFrame::from_document(editor.document(), 3)
+            .expect("render second, newer committed revision");
+        app.commit_card_output(card, generation, second, editor.document().data());
+        assert_eq!(
+            app.card_committed_version.get(&card),
+            Some(&(generation, 3)),
+            "the second commit must fully supersede the first, not merge with it"
+        );
+
+        // A completion for the now-superseded first revision must not mark
+        // retention...
+        let stale_path = temp_export_path("superseded-save");
+        let stale = RevisionedFrame::from_document(editor.document(), 2)
+            .expect("render the now-superseded revision");
+        assert!(app.pipeline.post(Job::SaveImageTo {
+            card,
+            generation,
+            rendered: Box::new(stale),
+            path: stale_path.clone(),
+        }));
+        drain_until(&mut app, |app| stale_path.exists());
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(false, false)),
+            "a completion for the superseded first revision must be treated as stale"
+        );
+        let _ = std::fs::remove_file(&stale_path);
+
+        // ...but a completion matching the latest, second revision must.
+        let current_path = temp_export_path("current-after-supersede-save");
+        let current = RevisionedFrame::from_document(editor.document(), 3)
+            .expect("render the latest committed revision");
+        assert!(app.pipeline.post(Job::SaveImageTo {
+            card,
+            generation,
+            rendered: Box::new(current),
+            path: current_path.clone(),
+        }));
+        drain_until(&mut app, |app| {
+            app.card_retention.get(&card) == Some(&(true, true))
+        });
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(true, true)),
+            "a completion matching the latest committed revision must be trusted"
+        );
+        let _ = std::fs::remove_file(&current_path);
+    }
+
+    #[test]
+    fn a_save_completion_matching_the_exact_committed_revision_is_trusted() {
+        // A Save dispatched *after* Done has committed the same revision (the
+        // ordinary "commit, then export the result" order) must still mark
+        // retention: the gate only distinguishes stale completions, not every
+        // completion that happens to follow a commit.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(203);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_retention.insert(card, (false, false));
+
+        let generation = 1;
+        let committed = RevisionedFrame::from_document(editor.document(), 4)
+            .expect("render committed revision 4");
+        app.commit_card_output(card, generation, committed, editor.document().data());
+        assert_eq!(
+            app.card_committed_version.get(&card),
+            Some(&(generation, 4))
+        );
+
+        let path = temp_export_path("current-save");
+        let rendered = RevisionedFrame::from_document(editor.document(), 4)
+            .expect("render the exact committed revision");
+        assert!(app.pipeline.post(Job::SaveImageTo {
+            card,
+            generation,
+            rendered: Box::new(rendered),
+            path: path.clone(),
+        }));
+
+        drain_until(&mut app, |app| {
+            app.card_retention.get(&card) == Some(&(true, true))
+        });
+
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(true, true)),
+            "a completion for exactly the committed revision must mark retention"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reopening_a_card_clears_the_previous_sessions_committed_version() {
+        // Finding #2's gate is scoped to one editor generation. If a stale
+        // tracked version from a closed session survived into the next
+        // editing session unchanged, an early Save in the *new* session could
+        // be wrongly compared against -- and suppressed by -- bookkeeping
+        // that describes a session the user has already left.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(204);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_committed_version.insert(card, (7, 99));
+
+        assert!(app.pipeline.post(Job::Open(card)));
+        drain_until(&mut app, |app| {
+            !app.card_committed_version.contains_key(&card)
+        });
+
+        assert_eq!(
+            app.card_committed_version.get(&card),
+            None,
+            "opening a card for a new editing session must clear any version tracked \
+             from a previous one"
+        );
+    }
+
+    #[test]
+    fn a_failed_commit_clears_the_provisional_version_so_a_later_save_in_the_same_session_is_trusted()
+     {
+        // If the dispatch-time write in `commit_card_output` were left in
+        // place after the commit itself failed, it would permanently
+        // describe a revision that was never actually filed -- Finding #1
+        // keeps the editor open (or reopens it) after such a failure so the
+        // user can retry or continue editing, and a legitimate subsequent
+        // Save for a later revision in that same still-open generation must
+        // not be wrongly treated as stale against a commit that never
+        // actually happened.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(205);
+        // Deliberately not stored in the vault: `commit_rendered` then
+        // reports "already left the vault", giving a deterministic,
+        // network-free `CardOutputCommitFailed`.
+        let generation = 1;
+        let attempted = RevisionedFrame::from_document(editor.document(), 5)
+            .expect("render the attempted commit");
+        app.commit_card_output(card, generation, attempted, editor.document().data());
+        assert_eq!(
+            app.card_committed_version.get(&card),
+            Some(&(generation, 5)),
+            "the optimistic dispatch-time write happens before the worker can report \
+             the commit failed"
+        );
+
+        drain_until(&mut app, |app| {
+            !app.card_committed_version.contains_key(&card)
+        });
+        assert_eq!(
+            app.card_committed_version.get(&card),
+            None,
+            "a failed commit must clear the provisional version it optimistically \
+             recorded, not leave it describing a revision that was never filed"
+        );
+
+        // Now the user continues editing in the same still-open generation
+        // and saves a later revision -- this must be trusted, not compared
+        // against the failed attempt's stale bookkeeping.
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_retention.insert(card, (false, false));
+        let path = temp_export_path("post-failure-save");
+        let rendered = RevisionedFrame::from_document(editor.document(), 6)
+            .expect("render the later revision");
+        assert!(app.pipeline.post(Job::SaveImageTo {
+            card,
+            generation,
+            rendered: Box::new(rendered),
+            path: path.clone(),
+        }));
+
+        drain_until(&mut app, |app| {
+            app.card_retention.get(&card) == Some(&(true, true))
+        });
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(true, true)),
+            "a legitimate save after a failed commit must still be trusted"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pending_close_stays_frozen_until_its_commit_ack_arrives_then_reports_failure() {
+        // Round 5, Finding #1: `take_editor_close_result` must report nothing
+        // at all -- not a premature success -- while a Done-triggered close
+        // is still waiting on `CommitCardOutput`'s answer, and the card's own
+        // exportable bytes must never appear to update on the strength of a
+        // commit that has not actually landed. Only the ack decides.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(208);
+        // Deliberately never stored in the vault, so the commit this test
+        // posts deterministically fails ("already left the vault") without
+        // needing to simulate a real storage error.
+        assert!(app.pipeline.captures().get(card).is_none());
+
+        let generation = 1;
+        let revision = 2;
+        let rendered =
+            RevisionedFrame::from_document(editor.document(), revision).expect("render revision");
+        let frame = rendered.frame().clone();
+        app.begin_editor_close(card, generation, revision, frame);
+        app.commit_card_output(card, generation, rendered, editor.document().data());
+
+        assert!(
+            app.take_editor_close_result().is_none(),
+            "the close must stay frozen (report nothing) until the commit's ack \
+             actually arrives, however quickly the worker itself runs"
+        );
+        assert!(
+            app.pipeline.captures().get(card).is_none(),
+            "a not-yet-acknowledged commit must not leave any live bytes behind for \
+             a plain Copy/Save/Upload or a native drag to read"
+        );
+
+        drain_until(&mut app, |app| {
+            !app.pending_editor_closes.contains_key(&card)
+        });
+
+        match app.take_editor_close_result() {
+            Some((got_card, EditorCloseOutcome::Failed(_))) => assert_eq!(got_card, card),
+            other => panic!("expected the refused commit to resolve as Failed, got {other:?}"),
+        }
+        assert!(
+            app.pipeline.captures().get(card).is_none(),
+            "a refused commit must never leave partially-committed bytes behind either"
+        );
+    }
+
+    #[test]
+    fn a_refused_persist_for_an_editor_only_card_reports_failure_not_success() {
+        // Round 5, Finding #1: for an editor-only card, `persist_editor`'s
+        // ack gates the close exactly as much as the commit does -- a
+        // history-only card's sole vault entry is released only once both
+        // acks say the edit is durably filed. `store_test_capture` always
+        // seeds `capture_id: None`, so `persist_document` deterministically
+        // fails ("captured while history was unavailable") without needing
+        // to simulate a real history-store error. The close resolving as
+        // anything but `Failed` here would let the host release this card's
+        // only cache entry despite the edit never having been saved to
+        // history.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(209);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.editor_only_cards.insert(card);
+
+        let generation = 1;
+        let revision = editor.state().revision();
+        let committed_frame = RevisionedFrame::from_document(editor.document(), revision)
+            .expect("render the committed revision");
+        let frame = committed_frame.frame().clone();
+        app.begin_editor_close(card, generation, revision, frame);
+        // The commit itself succeeds (the card is in the vault); only
+        // persist is made to fail here.
+        app.commit_card_output(card, generation, committed_frame, editor.document().data());
+        app.persist_editor(EditorSnapshot::new(card, generation, &editor));
+
+        drain_until(&mut app, |app| {
+            !app.pending_editor_closes.contains_key(&card)
+        });
+
+        match app.take_editor_close_result() {
+            Some((got_card, EditorCloseOutcome::Failed(_))) => assert_eq!(got_card, card),
+            other => panic!(
+                "an editor-only card whose persist ack failed must resolve Failed, \
+                 never Committed, got {other:?}"
+            ),
+        }
+        assert!(
+            app.editor_only_cards.contains(&card),
+            "the App itself must never release an editor-only card's cache on a \
+             Failed close -- only `editor_closed`, which the host calls solely on \
+             Committed, does that"
+        );
+    }
+
+    #[test]
+    fn a_live_cards_refused_persist_does_not_block_its_commit_only_close() {
+        // The counterpart to the editor-only case above: a live (not
+        // editor-only) card's close needs only the commit ack, because its
+        // own bytes are already safe once that lands -- gating it on persist
+        // too would make Done unusable for any capture whose retention
+        // policy never durably stores it (persist then fails every time,
+        // deterministically, since `store_test_capture` always seeds
+        // `capture_id: None`).
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(210);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        assert!(!app.editor_only_cards.contains(&card));
+
+        let generation = 1;
+        let revision = editor.state().revision();
+        let committed_frame = RevisionedFrame::from_document(editor.document(), revision)
+            .expect("render the committed revision");
+        let frame = committed_frame.frame().clone();
+        app.begin_editor_close(card, generation, revision, frame);
+        app.commit_card_output(card, generation, committed_frame, editor.document().data());
+        app.persist_editor(EditorSnapshot::new(card, generation, &editor));
+
+        drain_until(&mut app, |app| {
+            !app.pending_editor_closes.contains_key(&card)
+        });
+
+        match app.take_editor_close_result() {
+            Some((got_card, EditorCloseOutcome::Committed)) => assert_eq!(got_card, card),
+            other => panic!(
+                "a live card must close committed off the commit ack alone, even \
+                 though its (irrelevant) persist ack always fails, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_worker_gone_persist_post_failure_resolves_the_pending_close_instead_of_hanging() {
+        // Round 5, Finding #1: `persist_editor`'s post-failure branch (the
+        // capture worker itself is gone, so `pipeline.post` returns false and
+        // no ack will ever arrive) must still resolve any pending close
+        // waiting on it -- otherwise a card whose worker died mid-session
+        // would freeze its window shut forever, with no ack ever able to
+        // unfreeze it.
+        let (mut app, _surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(211);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.editor_only_cards.insert(card);
+
+        let generation = 1;
+        let revision = editor.state().revision();
+        let committed_frame = RevisionedFrame::from_document(editor.document(), revision)
+            .expect("render the committed revision");
+        let frame = committed_frame.frame().clone();
+        app.begin_editor_close(card, generation, revision, frame);
+        app.commit_card_output(card, generation, committed_frame, editor.document().data());
+        drain_until(&mut app, |app| {
+            app.pending_editor_closes
+                .get(&card)
+                .is_some_and(|pending| pending.commit.is_some())
+        });
+        // The commit ack has actually been drained and recorded now (not
+        // merely dispatched); only persist remains outstanding. Stop the
+        // worker so `persist_editor`'s post fails immediately, exactly like
+        // a worker that has already gone.
+        app.pipeline.stop();
+
+        app.persist_editor(EditorSnapshot::new(card, generation, &editor));
+
+        match app.take_editor_close_result() {
+            Some((got_card, EditorCloseOutcome::Failed(_))) => assert_eq!(got_card, card),
+            other => panic!(
+                "a persist that could not even be posted must resolve the pending \
+                 close as Failed immediately, not leave it hanging forever, got \
+                 {other:?}"
+            ),
+        }
+    }
+
     #[test]
     fn an_overflow_racing_a_fresh_open_defers_instead_of_retiring_the_opening_card() {
         // Finding #4 (round 4), the same deadline race as the sibling
@@ -7850,6 +8749,7 @@ mod tests {
         app.close_after_output.insert(card);
         app.pending_save_dialog = Some(PendingSaveDialog {
             card,
+            generation: None,
             rendered: None,
             future: Box::pin(std::future::pending()),
         });
@@ -7928,6 +8828,7 @@ mod tests {
         app.close_after_output.insert(card);
         app.pending_save_dialog = Some(PendingSaveDialog {
             card,
+            generation: None,
             rendered: None,
             future: Box::pin(std::future::ready(None)),
         });
@@ -7955,6 +8856,7 @@ mod tests {
         app.close_after_output.insert(card);
         app.pending_save_dialog = Some(PendingSaveDialog {
             card,
+            generation: None,
             rendered: None,
             future: Box::pin(std::future::ready(None)),
         });
@@ -7987,6 +8889,7 @@ mod tests {
             app.close_after_output.insert(card);
             app.pending_save_dialog = Some(PendingSaveDialog {
                 card,
+                generation: None,
                 rendered: None,
                 future: Box::pin(std::future::pending()),
             });
@@ -9768,13 +10671,19 @@ mod tests {
             let rendered = match job {
                 Job::CopyImage {
                     card: got,
+                    generation,
                     rendered,
                 }
                 | Job::SaveImage {
                     card: got,
+                    generation,
                     rendered,
                 } => {
                     assert_eq!(got, card);
+                    assert_eq!(
+                        generation, 1,
+                        "the output must be bound to this editor lifetime"
+                    );
                     rendered
                 }
                 Job::UploadImage {

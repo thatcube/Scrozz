@@ -1002,9 +1002,9 @@ impl Driver {
                 Intent::Copy | Intent::Save => match editor.render() {
                     Ok(rendered) => {
                         if intent == Intent::Copy {
-                            self.app.copy_rendered(card, rendered);
+                            self.app.copy_rendered(card, generation, rendered);
                         } else {
-                            self.app.save_rendered(card, rendered);
+                            self.app.save_rendered(card, generation, rendered);
                         }
                     }
                     Err(error) => {
@@ -1079,12 +1079,31 @@ impl Driver {
                 if exit == EditorWindowExit::Done && editor.state().is_dirty() {
                     match editor.render() {
                         Ok(rendered) => {
-                            self.app.refresh_card_thumbnail(card, rendered.frame());
+                            let revision = rendered.revision();
+                            let frame = rendered.frame().clone();
+                            // Freezes this editor mapped (though `window.show`
+                            // above may already have closed its native
+                            // viewport for this frame) until the commit --
+                            // and, for a history-only editor, the persist --
+                            // job posted right below actually answers.
+                            // Round 5 Finding #1/#4: finalizing immediately
+                            // let a plain Copy/Save/Upload or a native drag,
+                            // posted in the gap before that answer, read the
+                            // card's pre-edit bytes even though the
+                            // thumbnail already promised the redaction --
+                            // leaving this entry mapped keeps a frozen
+                            // `editor.render()` (unchanged since this exact
+                            // Done) as every export's source for the whole
+                            // gap instead of falling back to the card's
+                            // stale, pre-commit vault bytes.
+                            self.app
+                                .begin_editor_close(card, generation, revision, frame);
                             // Files the same committed frame into the card's
                             // own exportable bytes, so a plain Copy, Save or
-                            // Upload posted after this window closes reads
-                            // the redaction the thumbnail just committed to,
-                            // never the original pixels underneath it.
+                            // Upload posted once the pending close above
+                            // resolves reads the redaction the thumbnail is
+                            // about to commit to, never the original pixels
+                            // underneath it.
                             self.app.commit_card_output(
                                 card,
                                 generation,
@@ -1093,6 +1112,11 @@ impl Driver {
                             );
                             self.app
                                 .persist_editor(EditorSnapshot::new(card, generation, editor));
+                            // Finalizing (thumbnail refresh, `editor_closed`,
+                            // dropping this map entry) is deferred to the
+                            // pending-close drain below, once the jobs just
+                            // posted actually answer.
+                            continue;
                         }
                         Err(error) => {
                             // `show` already closed the native viewport for
@@ -1131,6 +1155,43 @@ impl Driver {
         }
         for card in to_remove {
             self.editors.remove(&card);
+        }
+
+        // Drains Done-triggered closes whose commit (and, for a
+        // history-only editor, persist) job has now answered (round 5,
+        // Finding #1/#4). This is separate from the loop above because the
+        // answer can arrive on any later frame, long after `window.show`
+        // stopped being called for a viewport that already visually closed
+        // -- the entry stays mapped here specifically so it keeps being
+        // that answer's target.
+        while let Some((card, outcome)) = self.app.take_editor_close_result() {
+            let Some(editing) = self.editors.get_mut(&card) else {
+                continue;
+            };
+            match outcome {
+                crate::gui::app::EditorCloseOutcome::Committed => {
+                    let generation = editing.generation;
+                    self.app.editor_closed(
+                        EditorSnapshot::new(card, generation, &editing.editor),
+                        true,
+                    );
+                    if self.color_picker_generation == Some(generation) {
+                        if let Err(error) = self.color_picker.close() {
+                            tracing::warn!(%error, "the system colour picker could not close");
+                        }
+                        self.color_picker_generation = None;
+                    }
+                    self.editors.remove(&card);
+                }
+                crate::gui::app::EditorCloseOutcome::Failed(reason) => {
+                    tracing::warn!(
+                        %card,
+                        %reason,
+                        "Done's committed edit could not be filed durably; reopening the editor"
+                    );
+                    editing.window.reopen();
+                }
+            }
         }
 
         if self.color_picker.is_open() {
