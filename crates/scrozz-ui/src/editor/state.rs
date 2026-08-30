@@ -23,15 +23,17 @@
 
 use scrozz_annotate::{
     AnalysisCancellation, Background, BackgroundImage, DocumentData, GeneratedStyle,
-    SensitiveRegionReview, SmartFrameAnalysis, SmartFramePreset, SmartFramePresetSettings,
-    SourceInsets, smart_frame::provisional_with_style,
+    ImageOrientation, SensitiveRegionReview, SmartFrameAnalysis, SmartFramePreset,
+    SmartFramePresetSettings, SourceInsets, smart_frame::provisional_with_style,
 };
 use scrozz_annotate::{
     Annotation, AnnotationId, AnnotationKind, ArrowStyle, Beautification, Color, Document, History,
     REDACT_INTENSITY_DEFAULT, RedactStyle, Style, geom,
 };
 use scrozz_core::{ContentRevision, LogicalPoint, LogicalRect, LogicalSize, Result};
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
+
+use super::crop::{BoundaryAxis, BoundarySegment, StructuralBoundaryIndex, source_span};
 
 /// How close, in *screen* points, a pointer must come to a resize handle.
 ///
@@ -68,8 +70,11 @@ pub const MAX_ZOOM: f32 = 8.0;
 /// The multiplier applied by one zoom-in or zoom-out step.
 pub const ZOOM_STEP: f32 = 1.25;
 
-/// Screen-point reach for snapping a crop edge to the source boundary.
-pub const CROP_SNAP_TOLERANCE: f64 = 8.0;
+/// Screen-point reach for entering crop-edge snapping.
+pub const CROP_SNAP_TOLERANCE: f64 = 6.0;
+
+/// Screen-point distance at which an active crop snap releases.
+pub const CROP_SNAP_RELEASE_TOLERANCE: f64 = 12.0;
 
 /// The thinnest stroke the editor offers.
 ///
@@ -112,6 +117,7 @@ pub enum Tool {
 impl Tool {
     /// Every tool, in palette order.
     pub const ALL: [Self; 11] = [
+        Self::Crop,
         Self::Select,
         Self::Arrow,
         Self::Line,
@@ -122,7 +128,6 @@ impl Tool {
         Self::Highlight,
         Self::Redact,
         Self::Counter,
-        Self::Crop,
     ];
 
     /// The tool's name, for tooltips and accessibility.
@@ -396,12 +401,40 @@ struct CropSession {
     rect: LogicalRect,
     aspect: CropAspect,
     snap_edges: bool,
+    orientation: ImageOrientation,
+    snap_x: Option<CropSnapLock>,
+    snap_y: Option<CropSnapLock>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CropDrag {
     Move,
     Resize(Handle),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropRatioAxis {
+    Width,
+    Height,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropSnapEdge {
+    Low,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropSnapKind {
+    Source,
+    Structural,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CropSnapLock {
+    segment: BoundarySegment,
+    edge: CropSnapEdge,
+    kind: CropSnapKind,
 }
 
 /// What the pointer is doing between press and release.
@@ -528,6 +561,14 @@ pub enum Command {
     CancelCrop,
     /// Clear the committed crop and return to the original image bounds.
     RevertCrop,
+    /// Rotate the pending crop result 90 degrees counter-clockwise.
+    RotateCropLeft,
+    /// Rotate the pending crop result 90 degrees clockwise.
+    RotateCropRight,
+    /// Flip the pending crop result horizontally.
+    FlipCropHorizontal,
+    /// Flip the pending crop result vertically.
+    FlipCropVertical,
     /// Send the selection behind everything else.
     SendToBack,
     /// Bring the selection in front of everything else.
@@ -573,7 +614,11 @@ impl Command {
             | Self::ZoomIn
             | Self::ZoomOut
             | Self::ZoomReset
-            | Self::CancelCrop => false,
+            | Self::CancelCrop
+            | Self::RotateCropLeft
+            | Self::RotateCropRight
+            | Self::FlipCropHorizontal
+            | Self::FlipCropVertical => false,
         }
     }
 }
@@ -723,6 +768,7 @@ pub struct EditorState {
     caret: usize,
     preedit: Option<Range<usize>>,
     crop: Option<CropSession>,
+    crop_boundaries: Option<Arc<StructuralBoundaryIndex>>,
     zoom: f32,
     fit_zoom: bool,
     pan: (f32, f32),
@@ -768,6 +814,7 @@ impl EditorState {
             caret: 0,
             preedit: None,
             crop: None,
+            crop_boundaries: None,
             zoom: 1.0,
             fit_zoom: true,
             pan: (0.0, 0.0),
@@ -853,6 +900,9 @@ impl EditorState {
                     .unwrap_or_else(|| self.document.logical_bounds()),
                 aspect: CropAspect::Freeform,
                 snap_edges: true,
+                orientation: self.document.orientation(),
+                snap_x: None,
+                snap_y: None,
             });
         } else {
             self.crop = None;
@@ -1282,6 +1332,7 @@ impl EditorState {
             if self.selection == Some(id) {
                 self.selection = None;
             }
+            self.synchronize_scene_history();
             if fresh
                 && self
                     .history
@@ -1345,6 +1396,7 @@ impl EditorState {
             self.preedit = None;
             return true;
         }
+        self.synchronize_scene_history();
         let cancelled = self
             .history
             .abandon(&mut self.document)
@@ -1541,6 +1593,80 @@ impl EditorState {
         self.crop.map(|crop| crop.rect)
     }
 
+    /// Orientation previewed by crop mode, or the committed orientation.
+    #[must_use]
+    pub fn display_orientation(&self) -> ImageOrientation {
+        self.crop
+            .map_or_else(|| self.document.orientation(), |crop| crop.orientation)
+    }
+
+    /// Full image bounds in the coordinate system currently displayed.
+    #[must_use]
+    pub fn display_bounds(&self) -> LogicalRect {
+        LogicalRect::new(
+            LogicalPoint::new(0.0, 0.0),
+            self.display_orientation()
+                .apply_size(self.document.logical_size()),
+        )
+    }
+
+    /// Visible bounds in the coordinate system currently displayed.
+    #[must_use]
+    pub fn display_content_bounds(&self) -> LogicalRect {
+        if self.crop_mode() {
+            self.display_bounds()
+        } else {
+            self.document.display_content_bounds()
+        }
+    }
+
+    /// Maps a source point into the coordinate system currently displayed.
+    #[must_use]
+    pub fn source_to_display(&self, point: LogicalPoint) -> LogicalPoint {
+        self.display_orientation()
+            .apply_point(point, self.document.logical_size())
+    }
+
+    /// Maps a displayed point back into source coordinates.
+    #[must_use]
+    pub fn display_to_source(&self, point: LogicalPoint) -> LogicalPoint {
+        self.display_orientation()
+            .invert_point(point, self.document.logical_size())
+    }
+
+    /// Maps a source rectangle into the coordinate system currently displayed.
+    #[must_use]
+    pub fn source_rect_to_display(&self, rect: LogicalRect) -> LogicalRect {
+        self.display_orientation()
+            .apply_rect(rect, self.document.logical_size())
+    }
+
+    /// Crop rectangle as it appears after pending rotation or reflection.
+    #[must_use]
+    pub fn pending_crop_display(&self) -> Option<LogicalRect> {
+        self.pending_crop()
+            .map(|rect| self.source_rect_to_display(rect))
+    }
+
+    /// Reusable structural snap index produced off the pointer path.
+    pub fn set_crop_boundaries(&mut self, boundaries: Arc<StructuralBoundaryIndex>) {
+        self.crop_boundaries = Some(boundaries);
+    }
+
+    /// Structural segments currently holding a crop edge.
+    #[must_use]
+    pub fn active_crop_snap_segments(&self) -> Vec<BoundarySegment> {
+        let Some(crop) = self.crop else {
+            return Vec::new();
+        };
+        [crop.snap_x, crop.snap_y]
+            .into_iter()
+            .flatten()
+            .filter(|lock| lock.kind == CropSnapKind::Structural)
+            .map(|lock| lock.segment)
+            .collect()
+    }
+
     /// Current crop aspect preset.
     #[must_use]
     pub fn crop_aspect(&self) -> Option<CropAspect> {
@@ -1553,7 +1679,7 @@ impl EditorState {
             return;
         };
         crop.aspect = aspect;
-        if let Some(ratio) = aspect.ratio(self.document.logical_size()) {
+        if let Some(ratio) = self.crop_source_ratio(crop) {
             crop.rect = crop_rect_with_size(
                 crop.rect,
                 crop.rect.size.width,
@@ -1580,6 +1706,8 @@ impl EditorState {
             && crop.snap_edges != enabled
         {
             crop.snap_edges = enabled;
+            crop.snap_x = None;
+            crop.snap_y = None;
             self.touch_view();
         }
     }
@@ -1589,12 +1717,29 @@ impl EditorState {
         let Some(mut crop) = self.crop else {
             return;
         };
-        let ratio = crop.aspect.ratio(self.document.logical_size());
-        let height = ratio.map_or(crop.rect.size.height, |ratio| width / ratio);
+        let ratio = self.crop_source_ratio(crop);
+        let raw_width = if crop.orientation.swaps_axes() {
+            crop.rect.size.width
+        } else {
+            width
+        };
+        let raw_height = if crop.orientation.swaps_axes() {
+            width
+        } else {
+            ratio.map_or(crop.rect.size.height, |ratio| width / ratio)
+        };
+        let (raw_width, raw_height) = if crop.orientation.swaps_axes() {
+            (
+                ratio.map_or(raw_width, |ratio| raw_height * ratio),
+                raw_height,
+            )
+        } else {
+            (raw_width, raw_height)
+        };
         crop.rect = crop_rect_with_size(
             crop.rect,
-            width,
-            height,
+            raw_width,
+            raw_height,
             self.document.logical_bounds(),
             ratio,
         );
@@ -1609,12 +1754,21 @@ impl EditorState {
         let Some(mut crop) = self.crop else {
             return;
         };
-        let ratio = crop.aspect.ratio(self.document.logical_size());
-        let width = ratio.map_or(crop.rect.size.width, |ratio| height * ratio);
+        let ratio = self.crop_source_ratio(crop);
+        let raw_width = if crop.orientation.swaps_axes() {
+            height
+        } else {
+            ratio.map_or(crop.rect.size.width, |ratio| height * ratio)
+        };
+        let raw_height = if crop.orientation.swaps_axes() {
+            ratio.map_or(crop.rect.size.height, |ratio| height / ratio)
+        } else {
+            height
+        };
         crop.rect = crop_rect_with_size(
             crop.rect,
-            width,
-            height,
+            raw_width,
+            raw_height,
             self.document.logical_bounds(),
             ratio,
         );
@@ -1630,7 +1784,7 @@ impl EditorState {
             return;
         };
         crop.aspect = crop.aspect.swapped();
-        let ratio = crop.aspect.ratio(self.document.logical_size());
+        let ratio = self.crop_source_ratio(crop);
         crop.rect = crop_rect_with_size(
             crop.rect,
             crop.rect.size.height,
@@ -1646,29 +1800,107 @@ impl EditorState {
     #[must_use]
     pub fn crop_pixel_sizes(&self) -> Option<((u32, u32), (u32, u32))> {
         let crop = self.crop?;
-        let scale = self.document.source().frame.scale.get();
-        let quantise = |value: f64| {
-            value
-                .mul_add(scale, 0.0)
-                .round()
-                .clamp(1.0, f64::from(u32::MAX)) as u32
+        let orient = |(width, height)| {
+            if crop.orientation.swaps_axes() {
+                (height, width)
+            } else {
+                (width, height)
+            }
         };
         Some((
-            (
-                quantise(crop.rect.size.width),
-                quantise(crop.rect.size.height),
-            ),
-            (
-                self.document.source().frame.width(),
-                self.document.source().frame.height(),
-            ),
+            orient(self.document.source_crop_pixel_size(Some(crop.rect)).ok()?),
+            orient(self.document.source_crop_pixel_size(None).ok()?),
         ))
+    }
+
+    /// Rotate the pending result without changing the committed document.
+    pub fn rotate_crop_left(&mut self) {
+        self.transform_crop(ImageOrientation::RotateLeft, true);
+    }
+
+    /// Rotate the pending result without changing the committed document.
+    pub fn rotate_crop_right(&mut self) {
+        self.transform_crop(ImageOrientation::RotateRight, true);
+    }
+
+    /// Reflect the pending result across its displayed vertical axis.
+    pub fn flip_crop_horizontal(&mut self) {
+        self.transform_crop(ImageOrientation::FlipHorizontal, false);
+    }
+
+    /// Reflect the pending result across its displayed horizontal axis.
+    pub fn flip_crop_vertical(&mut self) {
+        self.transform_crop(ImageOrientation::FlipVertical, false);
+    }
+
+    fn transform_crop(&mut self, operation: ImageOrientation, swaps_aspect: bool) {
+        if let Some(crop) = self.crop.as_mut() {
+            crop.orientation = crop.orientation.then(operation);
+            if swaps_aspect {
+                crop.aspect = crop.aspect.swapped();
+            }
+            crop.snap_x = None;
+            crop.snap_y = None;
+            self.touch();
+            self.touch_view();
+        }
+    }
+
+    fn crop_source_ratio(&self, crop: CropSession) -> Option<f64> {
+        crop.aspect
+            .ratio(crop.orientation.apply_size(self.document.logical_size()))
+            .map(|ratio| {
+                if crop.orientation.swaps_axes() {
+                    1.0 / ratio
+                } else {
+                    ratio
+                }
+            })
     }
 
     /// Whether a pointer gesture is in progress.
     #[must_use]
     pub fn is_dragging(&self) -> bool {
         self.drag != Drag::Idle
+    }
+
+    /// Crop resize handle whose drag is currently active.
+    #[must_use]
+    pub fn active_crop_handle(&self) -> Option<Handle> {
+        match self.drag {
+            Drag::CropAdjust {
+                action: CropDrag::Resize(handle),
+                ..
+            } => Some(handle),
+            _ => None,
+        }
+    }
+
+    /// The source handle mapped into the pending displayed orientation.
+    #[must_use]
+    pub fn visual_crop_handle(&self, handle: Handle) -> Handle {
+        let vector = match handle {
+            Handle::TopLeft => (-1, -1),
+            Handle::Top => (0, -1),
+            Handle::TopRight => (1, -1),
+            Handle::Right => (1, 0),
+            Handle::BottomRight => (1, 1),
+            Handle::Bottom => (0, 1),
+            Handle::BottomLeft => (-1, 1),
+            Handle::Left => (-1, 0),
+            Handle::ArrowStart | Handle::ArrowEnd => return handle,
+        };
+        match self.display_orientation().apply_vector(vector) {
+            (-1, -1) => Handle::TopLeft,
+            (0, -1) => Handle::Top,
+            (1, -1) => Handle::TopRight,
+            (1, 0) => Handle::Right,
+            (1, 1) => Handle::BottomRight,
+            (0, 1) => Handle::Bottom,
+            (-1, 1) => Handle::BottomLeft,
+            (-1, 0) => Handle::Left,
+            _ => handle,
+        }
     }
 
     /// Whether the active gesture is viewport panning.
@@ -1732,7 +1964,10 @@ impl EditorState {
                 false
             }
             Tool::Crop => {
-                if let Some(crop) = self.crop {
+                if let Some(mut crop) = self.crop {
+                    crop.snap_x = None;
+                    crop.snap_y = None;
+                    self.crop = Some(crop);
                     let action = self
                         .crop_handle_at(point)
                         .map(CropDrag::Resize)
@@ -1964,7 +2199,15 @@ impl EditorState {
                     changed = self.document.remove(id).is_some();
                 }
             }
-            Drag::CropAdjust { .. } => {}
+            Drag::CropAdjust { .. } => {
+                if let Some(crop) = self.crop.as_mut() {
+                    crop.snap_x = None;
+                    crop.snap_y = None;
+                }
+                self.history.seal();
+                self.touch_view();
+                return;
+            }
             _ => {}
         }
         self.commit();
@@ -2004,11 +2247,14 @@ impl EditorState {
     pub fn cancel_drag(&mut self) {
         let drag = std::mem::replace(&mut self.drag, Drag::Idle);
         if let Drag::CropAdjust { start, .. } = &drag {
-            if let Some(crop) = self.crop.as_mut()
-                && crop.rect != *start
-            {
+            if let Some(crop) = self.crop.as_mut() {
+                let changed = crop.rect != *start;
                 crop.rect = *start;
-                self.touch_view();
+                crop.snap_x = None;
+                crop.snap_y = None;
+                if changed {
+                    self.touch_view();
+                }
             }
             self.history.seal();
             return;
@@ -2102,12 +2348,52 @@ impl EditorState {
     pub fn crop_handle_at(&self, point: LogicalPoint) -> Option<Handle> {
         let crop = self.crop?;
         let tolerance = self.handle_tolerance();
-        Handle::ALL
+        let corners = [
+            Handle::TopLeft,
+            Handle::TopRight,
+            Handle::BottomRight,
+            Handle::BottomLeft,
+        ];
+        if let Some(handle) = corners
             .into_iter()
             .map(|handle| (handle, geom::distance(handle.position(&crop.rect), point)))
             .filter(|(_, distance)| *distance <= tolerance)
             .min_by(|(_, left), (_, right)| left.total_cmp(right))
             .map(|(handle, _)| handle)
+        {
+            return Some(handle);
+        }
+
+        let left = crop.rect.origin.x;
+        let top = crop.rect.origin.y;
+        let right = geom::max_x(&crop.rect);
+        let bottom = geom::max_y(&crop.rect);
+        [
+            (
+                Handle::Top,
+                (point.y - top).abs(),
+                point.x >= left - tolerance && point.x <= right + tolerance,
+            ),
+            (
+                Handle::Right,
+                (point.x - right).abs(),
+                point.y >= top - tolerance && point.y <= bottom + tolerance,
+            ),
+            (
+                Handle::Bottom,
+                (point.y - bottom).abs(),
+                point.x >= left - tolerance && point.x <= right + tolerance,
+            ),
+            (
+                Handle::Left,
+                (point.x - left).abs(),
+                point.y >= top - tolerance && point.y <= bottom + tolerance,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, distance, within)| *within && *distance <= tolerance)
+        .min_by(|(_, left, _), (_, right, _)| left.total_cmp(right))
+        .map(|(handle, _, _)| handle)
     }
 
     fn update_crop_drag(
@@ -2119,37 +2405,72 @@ impl EditorState {
         constrain: bool,
         disable_snap: bool,
     ) {
-        let Some(crop) = self.crop else {
+        let Some(mut crop) = self.crop else {
             return;
         };
         let bounds = self.document.logical_bounds();
         let snap = crop.snap_edges && !disable_snap;
-        let tolerance = CROP_SNAP_TOLERANCE / self.view_scale;
+        if !snap {
+            crop.snap_x = None;
+            crop.snap_y = None;
+        }
+        let entry_tolerance = CROP_SNAP_TOLERANCE / self.view_scale;
+        let release_tolerance = CROP_SNAP_RELEASE_TOLERANCE / self.view_scale;
         let ratio = if constrain && crop.aspect == CropAspect::Freeform {
             Some(1.0)
         } else {
-            crop.aspect.ratio(self.document.logical_size())
+            self.crop_source_ratio(crop)
         };
         let next = match action {
-            CropDrag::Move => move_crop(
-                start,
-                point.x - grab.x,
-                point.y - grab.y,
-                bounds,
-                snap,
-                tolerance,
-            ),
+            CropDrag::Move => {
+                let mut next = move_crop(start, point.x - grab.x, point.y - grab.y, bounds);
+                if snap {
+                    snap_moved_crop(
+                        &mut next,
+                        bounds,
+                        self.crop_boundaries.as_deref(),
+                        &mut crop.snap_x,
+                        &mut crop.snap_y,
+                        entry_tolerance,
+                        release_tolerance,
+                    );
+                }
+                next
+            }
             CropDrag::Resize(handle) => {
-                let point = if snap {
-                    snap_resize_point(point, handle, bounds, tolerance)
-                } else {
-                    point
+                let point = snap_resize_point(
+                    point,
+                    handle,
+                    grab,
+                    start,
+                    bounds,
+                    self.crop_boundaries.as_deref(),
+                    &mut crop.snap_x,
+                    &mut crop.snap_y,
+                    snap,
+                    entry_tolerance,
+                    release_tolerance,
+                );
+                let ratio_axis = match (crop.snap_x.is_some(), crop.snap_y.is_some()) {
+                    (true, false) => Some(CropRatioAxis::Width),
+                    (false, true) => Some(CropRatioAxis::Height),
+                    _ => None,
                 };
-                resize_crop(start, handle, grab, point, bounds, ratio)
+                resize_crop(start, handle, grab, point, bounds, ratio, ratio_axis)
             }
         };
+        crop.snap_x = crop
+            .snap_x
+            .filter(|lock| snap_lock_matches_rect(*lock, next));
+        crop.snap_y = crop
+            .snap_y
+            .filter(|lock| snap_lock_matches_rect(*lock, next));
         if next != crop.rect {
-            self.crop = Some(CropSession { rect: next, ..crop });
+            crop.rect = next;
+            self.crop = Some(crop);
+            self.touch_view();
+        } else if self.crop != Some(crop) {
+            self.crop = Some(crop);
             self.touch_view();
         }
     }
@@ -2238,14 +2559,7 @@ impl EditorState {
             }
             Command::Nudge { dx, dy } => {
                 if let Some(crop) = self.crop {
-                    let next = move_crop(
-                        crop.rect,
-                        dx,
-                        dy,
-                        self.document.logical_bounds(),
-                        crop.snap_edges,
-                        CROP_SNAP_TOLERANCE / self.view_scale,
-                    );
+                    let next = move_crop(crop.rect, dx, dy, self.document.logical_bounds());
                     if next != crop.rect {
                         self.crop = Some(CropSession { rect: next, ..crop });
                         self.touch_view();
@@ -2279,12 +2593,19 @@ impl EditorState {
             Command::ApplyCrop => {
                 if let Some(crop) = self.crop.take() {
                     self.drag = Drag::Idle;
+                    self.document.resolve_crop(Some(crop.rect))?;
                     let before = self.document.crop();
-                    let _ = self.document.set_crop(Some(crop.rect));
+                    let before_orientation = self.document.orientation();
+                    self.document.set_orientation(crop.orientation);
+                    self.document.set_crop(Some(crop.rect))?;
                     self.tool = Tool::Select;
-                    if self.document.crop() != before {
+                    if self.document.crop() != before
+                        || self.document.orientation() != before_orientation
+                    {
                         self.commit();
                         self.touch();
+                    } else {
+                        self.touch_view();
                     }
                 }
                 Intent::None
@@ -2308,6 +2629,22 @@ impl EditorState {
                 } else {
                     self.touch_view();
                 }
+                Intent::None
+            }
+            Command::RotateCropLeft => {
+                self.rotate_crop_left();
+                Intent::None
+            }
+            Command::RotateCropRight => {
+                self.rotate_crop_right();
+                Intent::None
+            }
+            Command::FlipCropHorizontal => {
+                self.flip_crop_horizontal();
+                Intent::None
+            }
+            Command::FlipCropVertical => {
+                self.flip_crop_vertical();
                 Intent::None
             }
             Command::SendToBack => {
@@ -3466,31 +3803,14 @@ fn crop_rect_with_size(
     )
 }
 
-fn move_crop(
-    start: LogicalRect,
-    dx: f64,
-    dy: f64,
-    bounds: LogicalRect,
-    snap: bool,
-    tolerance: f64,
-) -> LogicalRect {
-    let mut rect = LogicalRect::new(
-        LogicalPoint::new(start.origin.x + dx, start.origin.y + dy),
-        start.size,
-    );
-    if snap {
-        if (rect.origin.x - bounds.origin.x).abs() <= tolerance {
-            rect.origin.x = bounds.origin.x;
-        } else if (geom::max_x(&bounds) - geom::max_x(&rect)).abs() <= tolerance {
-            rect.origin.x = geom::max_x(&bounds) - rect.size.width;
-        }
-        if (rect.origin.y - bounds.origin.y).abs() <= tolerance {
-            rect.origin.y = bounds.origin.y;
-        } else if (geom::max_y(&bounds) - geom::max_y(&rect)).abs() <= tolerance {
-            rect.origin.y = geom::max_y(&bounds) - rect.size.height;
-        }
-    }
-    clamp_crop_origin(rect, bounds)
+fn move_crop(start: LogicalRect, dx: f64, dy: f64, bounds: LogicalRect) -> LogicalRect {
+    clamp_crop_origin(
+        LogicalRect::new(
+            LogicalPoint::new(start.origin.x + dx, start.origin.y + dy),
+            start.size,
+        ),
+        bounds,
+    )
 }
 
 fn resize_crop(
@@ -3500,13 +3820,27 @@ fn resize_crop(
     point: LogicalPoint,
     bounds: LogicalRect,
     ratio: Option<f64>,
+    ratio_axis: Option<CropRatioAxis>,
 ) -> LogicalRect {
-    let raw = handle.resize(&start, point.x - grab.x, point.y - grab.y);
+    let dragged_x = crop_dragged_x(start, handle, grab, point);
+    let dragged_y = crop_dragged_y(start, handle, grab, point);
+    let raw = geom::from_edges(
+        dragged_x.map_or(start.origin.x, |(moving, fixed)| moving.min(fixed)),
+        dragged_y.map_or(start.origin.y, |(moving, fixed)| moving.min(fixed)),
+        dragged_x.map_or_else(|| geom::max_x(&start), |(moving, fixed)| moving.max(fixed)),
+        dragged_y.map_or_else(|| geom::max_y(&start), |(moving, fixed)| moving.max(fixed)),
+    );
     let (proposed_width, proposed_height) = match ratio {
-        Some(ratio) if matches!(handle, Handle::Left | Handle::Right) => {
+        Some(ratio)
+            if matches!(handle, Handle::Left | Handle::Right)
+                || ratio_axis == Some(CropRatioAxis::Width) =>
+        {
             (raw.size.width, raw.size.width / ratio)
         }
-        Some(ratio) if matches!(handle, Handle::Top | Handle::Bottom) => {
+        Some(ratio)
+            if matches!(handle, Handle::Top | Handle::Bottom)
+                || ratio_axis == Some(CropRatioAxis::Height) =>
+        {
             (raw.size.height * ratio, raw.size.height)
         }
         Some(ratio) if raw.size.width / raw.size.height > ratio => {
@@ -3523,19 +3857,15 @@ fn resize_crop(
         ratio,
     );
     let center = geom::center(&start);
-    let x = if handle.moves_left() {
-        geom::max_x(&start) - width
-    } else if handle.moves_right() {
-        start.origin.x
-    } else {
-        center.x - width / 2.0
+    let x = match dragged_x {
+        Some((moving, fixed)) if moving <= fixed => fixed - width,
+        Some((_, fixed)) => fixed,
+        None => center.x - width / 2.0,
     };
-    let y = if handle.moves_top() {
-        geom::max_y(&start) - height
-    } else if handle.moves_bottom() {
-        start.origin.y
-    } else {
-        center.y - height / 2.0
+    let y = match dragged_y {
+        Some((moving, fixed)) if moving <= fixed => fixed - height,
+        Some((_, fixed)) => fixed,
+        None => center.y - height / 2.0,
     };
     clamp_crop_origin(
         LogicalRect::new(LogicalPoint::new(x, y), LogicalSize::new(width, height)),
@@ -3543,27 +3873,311 @@ fn resize_crop(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn snap_resize_point(
     mut point: LogicalPoint,
     handle: Handle,
+    grab: LogicalPoint,
+    crop: LogicalRect,
     bounds: LogicalRect,
-    tolerance: f64,
+    boundaries: Option<&StructuralBoundaryIndex>,
+    snap_x: &mut Option<CropSnapLock>,
+    snap_y: &mut Option<CropSnapLock>,
+    enabled: bool,
+    entry_tolerance: f64,
+    release_tolerance: f64,
 ) -> LogicalPoint {
-    if handle.moves_left() || handle.moves_right() {
-        if (point.x - bounds.origin.x).abs() <= tolerance {
-            point.x = bounds.origin.x;
-        } else if (point.x - geom::max_x(&bounds)).abs() <= tolerance {
-            point.x = geom::max_x(&bounds);
-        }
+    if !enabled {
+        *snap_x = None;
+        *snap_y = None;
+        return point;
     }
-    if handle.moves_top() || handle.moves_bottom() {
-        if (point.y - bounds.origin.y).abs() <= tolerance {
-            point.y = bounds.origin.y;
-        } else if (point.y - geom::max_y(&bounds)).abs() <= tolerance {
-            point.y = geom::max_y(&bounds);
-        }
+    if let Some((moving, fixed)) = crop_dragged_x(crop, handle, grab, point) {
+        let snapped = snap_coordinate(
+            moving,
+            BoundaryAxis::Vertical,
+            source_span(crop, BoundaryAxis::Vertical),
+            bounds,
+            boundaries,
+            snap_x,
+            if moving <= fixed {
+                CropSnapEdge::Low
+            } else {
+                CropSnapEdge::High
+            },
+            entry_tolerance,
+            release_tolerance,
+        );
+        point.x += snapped - moving;
+    } else {
+        *snap_x = None;
+    }
+    if let Some((moving, fixed)) = crop_dragged_y(crop, handle, grab, point) {
+        let snapped = snap_coordinate(
+            moving,
+            BoundaryAxis::Horizontal,
+            source_span(crop, BoundaryAxis::Horizontal),
+            bounds,
+            boundaries,
+            snap_y,
+            if moving <= fixed {
+                CropSnapEdge::Low
+            } else {
+                CropSnapEdge::High
+            },
+            entry_tolerance,
+            release_tolerance,
+        );
+        point.y += snapped - moving;
+    } else {
+        *snap_y = None;
     }
     point
+}
+
+fn crop_dragged_x(
+    start: LogicalRect,
+    handle: Handle,
+    grab: LogicalPoint,
+    point: LogicalPoint,
+) -> Option<(f64, f64)> {
+    if handle.moves_left() {
+        Some((start.origin.x + point.x - grab.x, geom::max_x(&start)))
+    } else if handle.moves_right() {
+        Some((geom::max_x(&start) + point.x - grab.x, start.origin.x))
+    } else {
+        None
+    }
+}
+
+fn crop_dragged_y(
+    start: LogicalRect,
+    handle: Handle,
+    grab: LogicalPoint,
+    point: LogicalPoint,
+) -> Option<(f64, f64)> {
+    if handle.moves_top() {
+        Some((start.origin.y + point.y - grab.y, geom::max_y(&start)))
+    } else if handle.moves_bottom() {
+        Some((geom::max_y(&start) + point.y - grab.y, start.origin.y))
+    } else {
+        None
+    }
+}
+
+fn snap_lock_matches_rect(lock: CropSnapLock, rect: LogicalRect) -> bool {
+    let coordinate = match (lock.segment.axis, lock.edge) {
+        (BoundaryAxis::Vertical, CropSnapEdge::Low) => rect.origin.x,
+        (BoundaryAxis::Vertical, CropSnapEdge::High) => geom::max_x(&rect),
+        (BoundaryAxis::Horizontal, CropSnapEdge::Low) => rect.origin.y,
+        (BoundaryAxis::Horizontal, CropSnapEdge::High) => geom::max_y(&rect),
+    };
+    let span = source_span(rect, lock.segment.axis);
+    (coordinate - lock.segment.position).abs() <= 1.0e-6 && lock.segment.overlaps(span.0, span.1)
+}
+
+fn snap_moved_crop(
+    rect: &mut LogicalRect,
+    bounds: LogicalRect,
+    boundaries: Option<&StructuralBoundaryIndex>,
+    snap_x: &mut Option<CropSnapLock>,
+    snap_y: &mut Option<CropSnapLock>,
+    entry_tolerance: f64,
+    release_tolerance: f64,
+) {
+    let vertical_span = source_span(*rect, BoundaryAxis::Vertical);
+    let left = rect.origin.x;
+    let right = geom::max_x(rect);
+    let (x, edge) = snap_moved_axis(
+        left,
+        right,
+        BoundaryAxis::Vertical,
+        vertical_span,
+        bounds,
+        boundaries,
+        snap_x,
+        entry_tolerance,
+        release_tolerance,
+    );
+    rect.origin.x += match edge {
+        CropSnapEdge::Low => x - left,
+        CropSnapEdge::High => x - right,
+    };
+
+    let horizontal_span = source_span(*rect, BoundaryAxis::Horizontal);
+    let top = rect.origin.y;
+    let bottom = geom::max_y(rect);
+    let (y, edge) = snap_moved_axis(
+        top,
+        bottom,
+        BoundaryAxis::Horizontal,
+        horizontal_span,
+        bounds,
+        boundaries,
+        snap_y,
+        entry_tolerance,
+        release_tolerance,
+    );
+    rect.origin.y += match edge {
+        CropSnapEdge::Low => y - top,
+        CropSnapEdge::High => y - bottom,
+    };
+    *rect = clamp_crop_origin(*rect, bounds);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snap_moved_axis(
+    low: f64,
+    high: f64,
+    axis: BoundaryAxis,
+    span: (f64, f64),
+    bounds: LogicalRect,
+    boundaries: Option<&StructuralBoundaryIndex>,
+    lock: &mut Option<CropSnapLock>,
+    entry_tolerance: f64,
+    release_tolerance: f64,
+) -> (f64, CropSnapEdge) {
+    if let Some(active) = *lock {
+        let position = match active.edge {
+            CropSnapEdge::Low => low,
+            CropSnapEdge::High => high,
+        };
+        if (position - active.segment.position).abs() <= release_tolerance
+            && active.segment.overlaps(span.0, span.1)
+        {
+            return (active.segment.position, active.edge);
+        }
+        *lock = None;
+    }
+
+    let low_match = nearest_snap(
+        axis,
+        low,
+        span,
+        bounds,
+        boundaries,
+        CropSnapEdge::Low,
+        entry_tolerance,
+    );
+    let high_match = nearest_snap(
+        axis,
+        high,
+        span,
+        bounds,
+        boundaries,
+        CropSnapEdge::High,
+        entry_tolerance,
+    );
+    let selected = match (low_match, high_match) {
+        (Some(left), Some(right)) => {
+            if (left.segment.position - low).abs() <= (right.segment.position - high).abs() {
+                left
+            } else {
+                right
+            }
+        }
+        (Some(lock), None) | (None, Some(lock)) => lock,
+        (None, None) => return (low, CropSnapEdge::Low),
+    };
+    *lock = Some(selected);
+    (selected.segment.position, selected.edge)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snap_coordinate(
+    position: f64,
+    axis: BoundaryAxis,
+    span: (f64, f64),
+    bounds: LogicalRect,
+    boundaries: Option<&StructuralBoundaryIndex>,
+    lock: &mut Option<CropSnapLock>,
+    edge: CropSnapEdge,
+    entry_tolerance: f64,
+    release_tolerance: f64,
+) -> f64 {
+    if let Some(active) = *lock {
+        if active.edge == edge
+            && (position - active.segment.position).abs() <= release_tolerance
+            && active.segment.overlaps(span.0, span.1)
+        {
+            return active.segment.position;
+        }
+        *lock = None;
+    }
+    if let Some(next) = nearest_snap(
+        axis,
+        position,
+        span,
+        bounds,
+        boundaries,
+        edge,
+        entry_tolerance,
+    ) {
+        *lock = Some(next);
+        next.segment.position
+    } else {
+        position
+    }
+}
+
+fn nearest_snap(
+    axis: BoundaryAxis,
+    position: f64,
+    span: (f64, f64),
+    bounds: LogicalRect,
+    boundaries: Option<&StructuralBoundaryIndex>,
+    edge: CropSnapEdge,
+    tolerance: f64,
+) -> Option<CropSnapLock> {
+    let bounds_segment = |position, start, end| BoundarySegment {
+        axis,
+        position,
+        start,
+        end,
+        confidence: 1.0,
+    };
+    let source_span = match axis {
+        BoundaryAxis::Vertical => (bounds.origin.y, bounds.origin.y + bounds.size.height),
+        BoundaryAxis::Horizontal => (bounds.origin.x, bounds.origin.x + bounds.size.width),
+    };
+    let positions = match axis {
+        BoundaryAxis::Vertical => (bounds.origin.x, geom::max_x(&bounds)),
+        BoundaryAxis::Horizontal => (bounds.origin.y, geom::max_y(&bounds)),
+    };
+    let source = [positions.0, positions.1]
+        .into_iter()
+        .map(|position| bounds_segment(position, source_span.0, source_span.1))
+        .filter(|segment| (segment.position - position).abs() <= tolerance)
+        .min_by(|left, right| {
+            (left.position - position)
+                .abs()
+                .total_cmp(&(right.position - position).abs())
+        })
+        .map(|segment| CropSnapLock {
+            segment,
+            edge,
+            kind: CropSnapKind::Source,
+        });
+    let structural = boundaries
+        .and_then(|index| index.nearest(axis, position, span, tolerance))
+        .map(|segment| CropSnapLock {
+            segment,
+            edge,
+            kind: CropSnapKind::Structural,
+        });
+    match (source, structural) {
+        (Some(source), Some(structural)) => {
+            if (source.segment.position - position).abs()
+                <= (structural.segment.position - position).abs()
+            {
+                Some(source)
+            } else {
+                Some(structural)
+            }
+        }
+        (Some(lock), None) | (None, Some(lock)) => Some(lock),
+        (None, None) => None,
+    }
 }
 
 fn fit_crop_size(

@@ -76,8 +76,9 @@ pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject,
 pub use document::{
     Alignment, AnnotationMut, AspectPreset, AutomaticBackground, Background, BackgroundImage,
     Beautification, BeautificationPreset, BuiltInBackground, CanvasInsets, Document, DocumentData,
-    ExactOutputSize, GeneratedStyle, GeneratedTemplate, Scene, SceneAutomatic, ScenePreset,
-    SceneProperty, SourceInsets, SubjectAppearance, Watermark,
+    CropExpansion, CropResolution, ExactOutputSize, GeneratedStyle, GeneratedTemplate,
+    ImageOrientation, Scene, SceneAutomatic, ScenePreset, SceneProperty, SourceInsets,
+    SubjectAppearance, Watermark,
 };
 pub use history::History;
 pub use render::{Renderer, SkiaRenderer};

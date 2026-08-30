@@ -4,9 +4,12 @@ mod common;
 
 use common::{document, frame_with, near, pixel, rect};
 use scrozz_annotate::{
-    Annotation, Document, DocumentData, Renderer, SkiaRenderer, Style, document::Background,
+    Annotation, CropExpansion, Document, DocumentData, ImageOrientation, Renderer, SkiaRenderer,
+    Style, document::Background,
 };
-use scrozz_core::{Capture, CaptureTarget, LogicalPoint, Provenance, ScaleFactor, WindowId};
+use scrozz_core::{
+    Capture, CaptureTarget, LogicalPoint, LogicalSize, Provenance, ScaleFactor, WindowId,
+};
 
 /// A 100×100 document whose pixels encode their own coordinates, so a crop that
 /// lands one pixel off is detectable rather than merely plausible.
@@ -384,4 +387,102 @@ fn a_window_capture_crop_round_trips() {
     doc.set_crop(Some(rect(5.0, 5.0, 40.0, 40.0))).unwrap();
     let restored = Document::from_data(capture, doc.data()).unwrap();
     assert_eq!(restored.crop(), Some(rect(5.0, 5.0, 40.0, 40.0)));
+}
+
+#[test]
+fn rotation_and_flip_apply_after_crop_without_resampling() {
+    let mut rotated = coded();
+    rotated.set_crop(Some(rect(10.0, 20.0, 3.0, 2.0))).unwrap();
+    rotated.set_orientation(ImageOrientation::RotateRight);
+    let frame = SkiaRenderer::new().render(&rotated).unwrap();
+    assert_eq!((frame.width(), frame.height()), (2, 3));
+    assert_eq!(pixel(&frame, 0, 0), [10, 21, 128, 255]);
+    assert_eq!(pixel(&frame, 1, 0), [10, 20, 128, 255]);
+    assert_eq!(pixel(&frame, 0, 2), [12, 21, 128, 255]);
+
+    let mut flipped = coded();
+    flipped.set_crop(Some(rect(10.0, 20.0, 3.0, 2.0))).unwrap();
+    flipped.set_orientation(ImageOrientation::FlipHorizontal);
+    let frame = SkiaRenderer::new().render(&flipped).unwrap();
+    assert_eq!((frame.width(), frame.height()), (3, 2));
+    assert_eq!(pixel(&frame, 0, 0), [12, 20, 128, 255]);
+    assert_eq!(pixel(&frame, 2, 1), [10, 21, 128, 255]);
+}
+
+#[test]
+fn orientation_round_trips_and_legacy_documents_default_to_identity() {
+    let mut doc = coded();
+    doc.set_orientation(ImageOrientation::Transverse);
+    let json = serde_json::to_string(&doc.data()).unwrap();
+    let data: DocumentData = serde_json::from_str(&json).unwrap();
+    let restored = Document::from_data(doc.source().clone(), data).unwrap();
+    assert_eq!(restored.orientation(), ImageOrientation::Transverse);
+
+    let legacy = r#"{"version":5,"annotations":[],"beautification":null,"crop":null,"next_id":1}"#;
+    let data: DocumentData = serde_json::from_str(legacy).unwrap();
+    assert_eq!(data.orientation, ImageOrientation::Identity);
+}
+
+#[test]
+fn outward_crop_resolution_is_an_asymmetric_scene_handoff() {
+    let doc = coded();
+    let resolution = doc
+        .resolve_crop(Some(rect(-12.0, 8.0, 140.0, 110.0)))
+        .unwrap();
+
+    assert_eq!(resolution.source_crop, Some(rect(0.0, 8.0, 100.0, 92.0)));
+    assert_eq!(
+        resolution.expansion,
+        CropExpansion {
+            left: 12.0,
+            top: 0.0,
+            right: 28.0,
+            bottom: 18.0,
+        }
+    );
+    assert_eq!(
+        resolution
+            .expansion
+            .apply_orientation(ImageOrientation::RotateRight),
+        CropExpansion {
+            left: 18.0,
+            top: 12.0,
+            right: 0.0,
+            bottom: 28.0,
+        }
+    );
+    assert_eq!(doc.crop(), None, "resolving a handoff must not mutate");
+}
+
+#[test]
+fn every_orientation_has_exact_inverse_point_and_rectangle_mappings() {
+    let source = LogicalSize::new(100.0, 80.0);
+    let area = rect(13.0, 17.0, 29.0, 31.0);
+    for orientation in [
+        ImageOrientation::Identity,
+        ImageOrientation::RotateRight,
+        ImageOrientation::Rotate180,
+        ImageOrientation::RotateLeft,
+        ImageOrientation::FlipHorizontal,
+        ImageOrientation::FlipVertical,
+        ImageOrientation::Transpose,
+        ImageOrientation::Transverse,
+    ] {
+        for point in [
+            LogicalPoint::new(0.0, 0.0),
+            LogicalPoint::new(37.0, 23.0),
+            LogicalPoint::new(100.0, 80.0),
+        ] {
+            assert_eq!(
+                orientation.invert_point(orientation.apply_point(point, source), source),
+                point,
+                "{orientation:?}"
+            );
+        }
+        assert_eq!(
+            orientation.invert_rect(orientation.apply_rect(area, source), source),
+            area,
+            "{orientation:?}"
+        );
+    }
 }

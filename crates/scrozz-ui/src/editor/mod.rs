@@ -29,6 +29,7 @@
 
 #![allow(missing_docs)]
 
+pub mod crop;
 pub mod paint;
 pub mod scene;
 pub mod state;
@@ -36,14 +37,19 @@ pub mod toolbar;
 
 use egui::{Key, Modifiers, Ui};
 use scrozz_annotate::Document;
-use scrozz_core::{Frame, LogicalPoint, LogicalRect};
+use scrozz_core::{Frame, LogicalPoint, LogicalRect, PixelFormat};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::{Arc, mpsc},
+};
 
 pub use paint::{CanvasView, Preview, to_color_image};
 pub use scene::EditorScene;
 pub use state::{
-    CROP_SNAP_TOLERANCE, Caret, Command, CropAspect, EditorState, Handle, Intent, MAX_ZOOM,
-    MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE, NUDGE_COARSE, SceneDraft, SmartFrameDraft, TextEdit, Tool,
-    ZOOM_STEP,
+    CROP_SNAP_RELEASE_TOLERANCE, CROP_SNAP_TOLERANCE, Caret, Command, CropAspect, EditorState,
+    Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE, MIN_ZOOM, NUDGE, NUDGE_COARSE, SceneDraft,
+    SmartFrameDraft, TextEdit, Tool, ZOOM_STEP,
 };
 pub use toolbar::{PALETTE, STROKE_MAX, STROKE_MIN};
 
@@ -106,6 +112,7 @@ pub struct EditorUi {
     preview: Preview,
     color_popover: toolbar::ColorPopover,
     arrow_popover: toolbar::ArrowPopover,
+    crop_preprocessor: CropBoundaryPreprocessor,
     /// A decision reached while painting, returned at the end of the frame.
     pending: Option<Intent>,
     /// Whether the Scene side panel is shown for this editor session.
@@ -121,6 +128,7 @@ impl EditorUi {
             preview: Preview::default(),
             color_popover: toolbar::ColorPopover::default(),
             arrow_popover: toolbar::ArrowPopover::default(),
+            crop_preprocessor: CropBoundaryPreprocessor::default(),
             pending: None,
             show_smart_frame: false,
         }
@@ -290,6 +298,9 @@ impl EditorUi {
         let theme = theme_for(ui);
         let icons = shared_icons(ui.ctx());
         let surface = crate::paint::Surface::new(&theme, &icons, crate::motion::Motion::at(0.0));
+        if self.state.crop_mode() {
+            self.crop_preprocessor.update(ui.ctx(), &mut self.state);
+        }
 
         let inspector_was_open = self.color_popover.is_open() || self.arrow_popover.is_open();
         let inspector_activation = toolbar::inspector_control_activation(ui);
@@ -366,7 +377,111 @@ impl EditorUi {
                 Input::Text(edit) => self.state.text_edit(&edit),
             }
         }
+
         result
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceKey {
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: PixelFormat,
+    scale_bits: u64,
+    sample_hash: u64,
+}
+
+impl SourceKey {
+    fn new(frame: &Frame) -> Self {
+        let mut hash = DefaultHasher::new();
+        frame.data.len().hash(&mut hash);
+        for offset in [
+            0,
+            frame.data.len() / 4,
+            frame.data.len() / 2,
+            frame.data.len().saturating_mul(3) / 4,
+        ] {
+            frame
+                .data
+                .get(offset..offset.saturating_add(32).min(frame.data.len()))
+                .unwrap_or_default()
+                .hash(&mut hash);
+        }
+        Self {
+            width: frame.width(),
+            height: frame.height(),
+            stride: frame.stride,
+            format: frame.format,
+            scale_bits: frame.scale.get().to_bits(),
+            sample_hash: hash.finish(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CropBoundaryPreprocessor {
+    key: Option<SourceKey>,
+    cancellation: scrozz_annotate::AnalysisCancellation,
+    receiver: Option<mpsc::Receiver<scrozz_core::Result<crop::StructuralBoundaryIndex>>>,
+    ready: Option<Arc<crop::StructuralBoundaryIndex>>,
+}
+
+impl CropBoundaryPreprocessor {
+    fn update(&mut self, ctx: &egui::Context, state: &mut EditorState) {
+        let frame = &state.document().source().frame;
+        let current = SourceKey::new(frame);
+        if self.key != Some(current) {
+            self.cancellation.cancel();
+            self.key = Some(current);
+            self.cancellation = scrozz_annotate::AnalysisCancellation::default();
+            self.receiver = None;
+            self.ready = None;
+        }
+
+        if self.ready.is_none() && self.receiver.is_none() {
+            let (sender, receiver) = mpsc::channel();
+            let frame = frame.clone();
+            let cancellation = self.cancellation.clone();
+            let repaint = ctx.clone();
+            match std::thread::Builder::new()
+                .name("scrozz-crop-boundaries".to_owned())
+                .spawn(move || {
+                    let result = crop::StructuralBoundaryIndex::analyze(&frame, &cancellation);
+                    let _ = sender.send(result);
+                    repaint.request_repaint();
+                }) {
+                Ok(_) => self.receiver = Some(receiver),
+                Err(error) => {
+                    tracing::warn!(%error, "could not start crop boundary preprocessing");
+                }
+            }
+        }
+
+        let completed = self
+            .receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some(result) = completed {
+            self.receiver = None;
+            match result {
+                Ok(index) if self.key == Some(current) => {
+                    let index = Arc::new(index);
+                    state.set_crop_boundaries(Arc::clone(&index));
+                    self.ready = Some(index);
+                }
+                Ok(_) | Err(scrozz_core::Error::Cancelled) => {}
+                Err(error) => tracing::warn!(%error, "crop boundary preprocessing failed"),
+            }
+        } else if let Some(index) = &self.ready {
+            state.set_crop_boundaries(Arc::clone(index));
+        }
+    }
+}
+
+impl Drop for CropBoundaryPreprocessor {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
     }
 }
 

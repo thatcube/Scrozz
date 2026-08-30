@@ -4,8 +4,8 @@
 
 use egui::accesskit::{Action, ActionData, ActionRequest, Node, NodeId, Toggled, TreeId};
 use egui::{
-    Context, Event, Key, Modifiers, MouseWheelUnit, PointerButton, RawInput, Rect, TouchPhase,
-    pos2, vec2,
+    Context, CursorIcon, Event, Key, Modifiers, MouseWheelUnit, PointerButton, RawInput, Rect,
+    TouchPhase, pos2, vec2,
 };
 use scrozz_annotate::{Annotation, ArrowStyle, Color, Document};
 use scrozz_core::{
@@ -13,9 +13,10 @@ use scrozz_core::{
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
 use scrozz_ui::editor::{
-    EditorUi, Intent, PALETTE, Tool, editor_layout, toolbar::COLOR_CONTROL_ID,
+    Command, EditorUi, Intent, PALETTE, TextEdit, Tool, editor_layout, fit, rect_to_screen,
+    toolbar::COLOR_CONTROL_ID,
 };
-use scrozz_ui::{Theme, theme};
+use scrozz_ui::{Space, Theme, theme};
 
 const SIZE: [f32; 2] = [1040.0, 720.0];
 
@@ -407,7 +408,7 @@ fn middle_mouse_space_drag_and_trackpad_scroll_pan_a_zoomed_canvas() {
 }
 
 #[test]
-fn crop_panel_exposes_dimensions_aspect_snap_cancel_apply_and_revert() {
+fn crop_panel_exposes_dimensions_transforms_zoom_snap_and_transaction_actions() {
     let mut driver = Driver::new(false, 1.0);
     let mut editor = editor();
     let revision = editor.state().revision();
@@ -417,10 +418,30 @@ fn crop_panel_exposes_dimensions_aspect_snap_cancel_apply_and_revert() {
     let _ = access_node(&output, |label| label == "Aspect ratio: Freeform");
     let _ = access_node(&output, |label| label.starts_with("Crop width:"));
     let _ = access_node(&output, |label| label.starts_with("Crop height:"));
-    let _ = access_node(&output, |label| label == "Swap");
-    let _ = access_node(&output, |label| label == "Snap to edges");
+    let update = output.platform_output.accesskit_update.as_ref().unwrap();
+    let labels: Vec<_> = update
+        .nodes
+        .iter()
+        .filter_map(|(_, node)| node.label())
+        .collect();
+    for expected in [
+        "Swap",
+        "Rotate left",
+        "Rotate right",
+        "Flip horizontal",
+        "Flip vertical",
+        "Zoom -",
+        "Zoom +",
+        "Fit",
+        "Snap to edges",
+    ] {
+        assert!(
+            labels.contains(&expected),
+            "missing {expected:?} from crop controls: {labels:?}"
+        );
+    }
     let (tree, cancel, _) = access_node(&output, |label| label == "Cancel");
-    let _ = access_node(&output, |label| label == "Crop");
+    let _ = access_node(&output, |label| label == "Apply");
 
     let _ = driver.frame(&mut editor, SIZE, vec![activate(tree, cancel)]);
     assert!(!editor.state().crop_mode());
@@ -437,6 +458,95 @@ fn crop_panel_exposes_dimensions_aspect_snap_cancel_apply_and_revert() {
     editor.state_mut().set_tool(Tool::Crop);
     let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
     let _ = access_node(&output, |label| label == "Revert to Original");
+}
+
+#[test]
+fn crop_canvas_uses_default_inside_and_resize_cursors_only_on_edges() {
+    let mut driver = Driver::new(false, 1.0);
+    let mut editor = editor();
+    editor.state_mut().set_tool(Tool::Crop);
+    editor.state_mut().set_crop_width(80.0);
+    editor.state_mut().set_crop_height(60.0);
+
+    let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(SIZE[0], SIZE[1]));
+    let (_, canvas) = editor_layout(full);
+    let content = editor.state().display_content_bounds();
+    let image = fit(content, canvas.shrink(Space::LG), 1.0, (0.0, 0.0));
+    let crop = rect_to_screen(
+        editor.state().pending_crop_display().unwrap(),
+        image,
+        content,
+    );
+
+    let (_, inside) = driver.frame(&mut editor, SIZE, vec![Event::PointerMoved(crop.center())]);
+    assert_eq!(inside.platform_output.cursor_icon, CursorIcon::Default);
+
+    let (_, edge) = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![Event::PointerMoved(crop.left_center())],
+    );
+    assert_eq!(
+        edge.platform_output.cursor_icon,
+        CursorIcon::ResizeHorizontal
+    );
+
+    let (_, corner) = driver.frame(
+        &mut editor,
+        SIZE,
+        vec![Event::PointerMoved(crop.left_top())],
+    );
+    assert_eq!(corner.platform_output.cursor_icon, CursorIcon::ResizeNwSe);
+}
+
+#[test]
+fn transformed_text_caret_has_a_visible_segment_and_valid_ime_bounds() {
+    let mut editor = editor();
+    editor.state_mut().set_tool(Tool::Text);
+    editor
+        .state_mut()
+        .pointer_pressed(LogicalPoint::new(20.0, 20.0));
+    editor.state_mut().pointer_released();
+    editor
+        .state_mut()
+        .text_edit(&TextEdit::Insert("note".to_owned()));
+    editor.state_mut().command(Command::Escape).unwrap();
+
+    editor.state_mut().set_tool(Tool::Crop);
+    editor
+        .state_mut()
+        .command(Command::RotateCropRight)
+        .unwrap();
+    editor.state_mut().command(Command::ApplyCrop).unwrap();
+
+    let text = editor.document().annotations()[0].bounds();
+    let inside = LogicalPoint::new(
+        text.origin.x + text.size.width / 2.0,
+        text.origin.y + text.size.height / 2.0,
+    );
+    editor.state_mut().pointer_pressed(inside);
+    editor.state_mut().pointer_released();
+    assert!(editor.state().editing_text().is_some());
+
+    let mut driver = Driver::new(false, 1.0);
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    let ime = output
+        .platform_output
+        .ime
+        .expect("editing transformed text should publish IME geometry");
+    for rect in [ime.rect, ime.cursor_rect] {
+        assert!(rect.width() > 0.0);
+        assert!(rect.height() > 0.0);
+        assert!(
+            [rect.min.x, rect.min.y, rect.max.x, rect.max.y]
+                .into_iter()
+                .all(f32::is_finite)
+        );
+    }
+    assert!(
+        ime.cursor_rect.width() > ime.cursor_rect.height(),
+        "a 90-degree rotation should turn the caret into a horizontal segment"
+    );
 }
 
 #[test]
