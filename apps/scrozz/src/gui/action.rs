@@ -322,6 +322,16 @@ mod tests {
     }
 
     #[test]
+    fn settings_and_quit_have_distinct_menu_routes() {
+        assert_eq!(
+            Action::from_tray(TrayAction::OpenSettings),
+            Action::OpenSettings
+        );
+        assert_eq!(Action::from_tray(TrayAction::Quit), Action::Quit);
+        assert_ne!(TrayAction::OpenSettings.id(), TrayAction::Quit.id());
+    }
+
+    #[test]
     fn every_bindable_shortcut_names_a_real_action_and_a_real_tray_item() {
         // Three vocabularies, one set of identifiers. If they ever disagree, a
         // hotkey fires into nothing and a menu item shows the wrong keys.

@@ -41,10 +41,11 @@ use std::{
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2_app_kit::{NSApplicationDidChangeScreenParametersNotification, NSEvent, NSScreen};
+use objc2_app_kit::{NSApplicationDidChangeScreenParametersNotification, NSScreen};
 use objc2_core_foundation::{
     CFNumber, CFPreferencesCopyAppValue, CFPreferencesGetAppBooleanValue, CFString,
 };
+use objc2_core_graphics::CGEvent;
 use objc2_foundation::{MainThreadMarker, NSNotification, NSNotificationCenter, NSRect};
 use scrozz_core::{Display, DisplayId, Error, LogicalPoint, LogicalRect, Result, ScaleFactor};
 
@@ -59,7 +60,6 @@ use crate::overlay::{AppKitRect, appkit_to_logical};
 /// plus this chrome keeps capture cards clear in both states.
 const AUTO_HIDE_DOCK_CHROME: f64 = 20.0;
 const DEFAULT_DOCK_TILE_SIZE: f64 = 64.0;
-static REFERENCE_HEIGHT_BITS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DockEdge {
@@ -100,11 +100,9 @@ const fn ns_rect(rect: NSRect) -> AppKitRect {
 #[must_use]
 pub fn reference_height(mtm: MainThreadMarker) -> f64 {
     crate::macos::activity::record_display_enumeration();
-    let height = NSScreen::screens(mtm)
+    NSScreen::screens(mtm)
         .firstObject()
-        .map_or(0.0, |screen| screen.frame().size.height);
-    REFERENCE_HEIGHT_BITS.store(height.to_bits(), Ordering::Release);
-    height
+        .map_or(0.0, |screen| screen.frame().size.height)
 }
 
 /// Converts one `NSScreen` into a Scrozz [`Display`].
@@ -261,9 +259,12 @@ fn reserve_auto_hidden_dock(
 /// ```
 pub fn displays() -> Result<Vec<Display>> {
     let mtm = main_thread("enumerating displays")?;
-    let reference = reference_height(mtm);
     crate::macos::activity::record_display_enumeration();
-    Ok(NSScreen::screens(mtm)
+    let screens = NSScreen::screens(mtm);
+    let reference = screens
+        .firstObject()
+        .map_or(0.0, |screen| screen.frame().size.height);
+    Ok(screens
         .iter()
         .enumerate()
         .map(|(index, screen)| to_display(&screen, reference, index == 0))
@@ -278,9 +279,12 @@ pub fn displays() -> Result<Vec<Display>> {
 /// [`Error::TargetGone`] if the machine reports no screens.
 pub fn primary_display() -> Result<Display> {
     let mtm = main_thread("reading the primary display")?;
-    let reference = reference_height(mtm);
     crate::macos::activity::record_display_enumeration();
-    NSScreen::screens(mtm)
+    let screens = NSScreen::screens(mtm);
+    let reference = screens
+        .firstObject()
+        .map_or(0.0, |screen| screen.frame().size.height);
+    screens
         .firstObject()
         .map(|screen| to_display(&screen, reference, true))
         .ok_or_else(|| Error::TargetGone("no displays are connected".to_owned()))
@@ -298,11 +302,20 @@ pub fn primary_display() -> Result<Display> {
 /// if there are no displays.
 pub fn display_at(point: LogicalPoint) -> Result<Display> {
     let all = displays()?;
-    all.iter()
-        .find(|display| contains(display.bounds, point))
-        .or_else(|| all.first())
+    display_for_point(&all, point)
         .cloned()
         .ok_or_else(|| Error::TargetGone("no displays are connected".to_owned()))
+}
+
+/// Selects the display containing `point` from an already-enumerated snapshot.
+///
+/// The primary display is the fallback for dead space between screens.
+#[must_use]
+pub fn display_for_point(displays: &[Display], point: LogicalPoint) -> Option<&Display> {
+    displays
+        .iter()
+        .find(|display| contains(display.bounds, point))
+        .or_else(|| displays.first())
 }
 
 /// The display containing the pointer.
@@ -315,18 +328,15 @@ pub fn display_at(point: LogicalPoint) -> Result<Display> {
 ///
 /// Returns [`Error::Platform`] off the main thread.
 pub fn pointer_location() -> Result<LogicalPoint> {
-    let mtm = main_thread("reading the pointer location")?;
-    let cached = f64::from_bits(REFERENCE_HEIGHT_BITS.load(Ordering::Acquire));
-    let reference = if cached.is_finite() && cached > 0.0 {
-        cached
-    } else {
-        reference_height(mtm)
-    };
-    // The display refresh paths update the cached reference height. Sampling
-    // the pointer therefore stays a pure NSEvent read instead of enumerating
-    // NSScreen on every idle hover probe.
-    let location = NSEvent::mouseLocation();
-    Ok(LogicalPoint::new(location.x, reference - location.y))
+    let _mtm = main_thread("reading the pointer location")?;
+    let event = CGEvent::new(None)
+        .ok_or_else(|| Error::TargetGone("CoreGraphics did not expose the pointer".to_owned()))?;
+    let location = CGEvent::location(Some(&event));
+    crate::macos::activity::record_pointer_sample();
+    // Quartz global coordinates already use Scrozz's top-left origin and
+    // downward-positive y-axis. Unlike NSEvent.mouseLocation, this path does not
+    // ask AppKit to enumerate NSScreen while converting every hover sample.
+    Ok(LogicalPoint::new(location.x, location.y))
 }
 
 /// The display containing the pointer.
@@ -336,7 +346,10 @@ pub fn pointer_location() -> Result<LogicalPoint> {
 /// Returns [`Error::Platform`] off the main thread, and [`Error::TargetGone`]
 /// if there are no displays.
 pub fn active_display() -> Result<Display> {
-    display_at(pointer_location()?)
+    let displays = displays()?;
+    display_for_point(&displays, pointer_location()?)
+        .cloned()
+        .ok_or_else(|| Error::TargetGone("no displays are connected".to_owned()))
 }
 
 /// Event-driven invalidation for cached display geometry.
@@ -353,13 +366,13 @@ pub struct DisplayChangeMonitor {
 
 impl DisplayChangeMonitor {
     /// Installs one process-local AppKit screen-parameter observer.
-    pub fn new() -> Result<Self> {
+    pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self> {
         let _mtm = main_thread("observing display changes")?;
         let center = NSNotificationCenter::defaultCenter();
         let generation = Arc::new(AtomicU64::new(0));
         let callback_generation = Arc::clone(&generation);
         let block = RcBlock::new(move |_notification: NonNull<NSNotification>| {
-            callback_generation.fetch_add(1, Ordering::Release);
+            record_display_change(&callback_generation, wake.as_ref());
         });
         // SAFETY: the notification name is an AppKit process-lifetime constant,
         // the copied block owns its Arc, and a nil queue delivers synchronously
@@ -384,12 +397,21 @@ impl DisplayChangeMonitor {
     /// Returns true once for one or more notifications since the last read.
     pub fn changed(&mut self) -> bool {
         let generation = self.generation.load(Ordering::Acquire);
-        if generation == self.observed_generation {
-            return false;
-        }
-        self.observed_generation = generation;
-        true
+        take_generation(generation, &mut self.observed_generation)
     }
+}
+
+fn record_display_change(generation: &AtomicU64, wake: &(dyn Fn() + Send + Sync)) {
+    generation.fetch_add(1, Ordering::Release);
+    wake();
+}
+
+fn take_generation(generation: u64, observed_generation: &mut u64) -> bool {
+    if generation == *observed_generation {
+        return false;
+    }
+    *observed_generation = generation;
+    true
 }
 
 impl Drop for DisplayChangeMonitor {
@@ -417,6 +439,7 @@ fn contains(rect: LogicalRect, point: LogicalPoint) -> bool {
 mod tests {
     use super::*;
     use scrozz_core::LogicalSize;
+    use std::sync::atomic::AtomicUsize;
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
         LogicalRect::new(LogicalPoint::new(x, y), LogicalSize::new(width, height))
@@ -465,5 +488,28 @@ mod tests {
             }),
         );
         assert_eq!(safe, rect(80.0, 33.0, 1648.0, 1084.0));
+    }
+
+    #[test]
+    fn one_display_change_generation_is_consumed_once() {
+        let mut observed = 0;
+        assert!(!take_generation(0, &mut observed));
+        assert!(take_generation(1, &mut observed));
+        assert!(!take_generation(1, &mut observed));
+        assert!(take_generation(3, &mut observed));
+        assert!(!take_generation(3, &mut observed));
+    }
+
+    #[test]
+    fn a_display_change_wakes_the_hidden_root() {
+        let generation = AtomicU64::new(0);
+        let wakes = AtomicUsize::new(0);
+
+        record_display_change(&generation, &|| {
+            wakes.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
     }
 }

@@ -202,6 +202,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 
   <!-- Scrozz lives in the menu bar and shows no window at rest (D27). -->
   <key>LSUIElement</key>               <true/>
+  <key>NSSupportsAutomaticTermination</key><false/>
 
   <!-- Shown in the permission prompt, so it says why rather than just asking. -->
   <key>NSCameraUsageDescription</key>

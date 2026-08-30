@@ -8,6 +8,12 @@
 //! somewhere else later. There is exactly one, it is on the main thread, and it
 //! calls [`App::tick`] — everything that blocks is already on a worker.
 
+#[cfg(target_os = "macos")]
+use std::{
+    fs::{self, OpenOptions},
+    io::Write as _,
+    path::PathBuf,
+};
 use std::{
     sync::{Arc, Mutex, mpsc::channel},
     time::{Duration, Instant},
@@ -53,6 +59,7 @@ pub const HEADLESS_ENV: &str = "SCROZZ_GUI_HEADLESS";
 
 /// Headless polling cadence when there is no native event loop to wake.
 const IDLE: Duration = Duration::from_millis(16);
+#[cfg(not(target_os = "macos"))]
 const IDLE_FALLBACK_WAKE: Duration = Duration::from_millis(250);
 /// Native preview playback and queued child-viewport input must advance at UI
 /// cadence even while the shared transparent root is parked.
@@ -63,16 +70,123 @@ const VIDEO_EDITOR_TICK: Duration = Duration::from_millis(16);
 /// appears at once; slow enough that an idle menu-bar app is still idle.
 const RECORDING_TICK: Duration = Duration::from_millis(50);
 const DISPLAY_REFRESH: Duration = Duration::from_millis(250);
+#[cfg(target_os = "macos")]
+const APPKIT_BOOTSTRAP_SETTLE: Duration = Duration::from_millis(250);
 
 type SharedGeometry = Arc<Mutex<RecentCapturesOverlayGeometry>>;
 const PARKED_ROOT_ORIGIN: f32 = -100_000.0;
 
+#[cfg(target_os = "macos")]
+const LIFECYCLE_DIAGNOSTIC_FILE_ENV: &str = "SCROZZ_LIFECYCLE_DIAGNOSTIC_FILE";
+
+#[cfg(target_os = "macos")]
+struct LifecycleDiagnostic {
+    path: PathBuf,
+    temporary: PathBuf,
+    baseline: scrozz_shell::macos::activity::NativeActivitySnapshot,
+}
+
+#[cfg(target_os = "macos")]
+impl LifecycleDiagnostic {
+    fn start(
+        baseline: scrozz_shell::macos::activity::NativeActivitySnapshot,
+    ) -> scrozz_core::Result<Self> {
+        let path = if let Some(path) = std::env::var_os(LIFECYCLE_DIAGNOSTIC_FILE_ENV) {
+            PathBuf::from(path)
+        } else {
+            dirs::config_dir()
+                .or_else(dirs::data_dir)
+                .ok_or_else(|| {
+                    CoreError::Storage(
+                        "no platform directory is available for lifecycle diagnostics".to_owned(),
+                    )
+                })?
+                .join("Scrozz")
+                .join("last-lifecycle.json")
+        };
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        let diagnostic = Self {
+            path,
+            temporary,
+            baseline,
+        };
+        diagnostic.persist("starting", None, false, RootSurfaceMode::Hidden)?;
+        Ok(diagnostic)
+    }
+
+    fn persist(
+        &self,
+        state: &str,
+        reason: Option<crate::gui::app::ExitReason>,
+        lease_active: bool,
+        root_mode: RootSurfaceMode,
+    ) -> scrozz_core::Result<()> {
+        let activity = scrozz_shell::macos::activity::snapshot().since(self.baseline);
+        let document = serde_json::json!({
+            "schema": 1,
+            "pid": std::process::id(),
+            "state": state,
+            "exit_reason": reason.map(crate::gui::app::ExitReason::label),
+            "automatic_termination_lease_active": lease_active,
+            "root_mode": format!("{root_mode:?}"),
+            "native_activity": {
+                "screen_preflights": activity.screen_preflights,
+                "screen_requests": activity.screen_requests,
+                "display_enumerations": activity.display_enumerations,
+                "pointer_samples": activity.pointer_samples,
+                "root_redraws": activity.root_redraws,
+                "automatic_termination_disables": activity.automatic_termination_disables,
+                "automatic_termination_enables": activity.automatic_termination_enables,
+            },
+        });
+        let bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
+            CoreError::Storage(format!("could not encode lifecycle diagnostic: {error}"))
+        })?;
+        let parent = self.path.parent().ok_or_else(|| {
+            CoreError::Storage(format!(
+                "lifecycle diagnostic path has no parent: {}",
+                self.path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            CoreError::Storage(format!(
+                "could not create lifecycle diagnostic directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.temporary)
+            .map_err(|error| {
+                CoreError::Storage(format!(
+                    "could not open lifecycle diagnostic {}: {error}",
+                    self.temporary.display()
+                ))
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            CoreError::Storage(format!(
+                "could not write lifecycle diagnostic {}: {error}",
+                self.temporary.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            CoreError::Storage(format!(
+                "could not sync lifecycle diagnostic {}: {error}",
+                self.temporary.display()
+            ))
+        })?;
+        drop(file);
+        scrozz_shell::replace_file(&self.temporary, &self.path)
+    }
+}
+
 /// Something that can drive an [`App`] to completion.
 /// Writes the final report the way `main` would have.
 ///
-/// Needed because the windowed host cannot always return: see
-/// [`Driver::logic`] for why quitting sometimes has to leave the process
-/// directly, which means the report has to be written before it does.
+/// Needed because the windowed host owns the app until eframe has completed its
+/// native teardown, so the final report crosses that ownership boundary.
 pub type Emit = Box<dyn FnOnce(&Report) + Send>;
 
 pub trait Host {
@@ -177,7 +291,7 @@ impl Host for Headless {
     fn run(self: Box<Self>, mut app: App) -> CliResult<Report> {
         tracing::info!("running headless");
         loop {
-            if app.tick() == Tick::Stop {
+            if matches!(app.tick(), Tick::Stop(_)) {
                 break;
             }
             std::thread::sleep(IDLE);
@@ -284,7 +398,10 @@ impl Windowed {
         let geometry = card_surface_geometry(base_geometry, 1);
         let pointer_geometry = Arc::new(Mutex::new(geometry));
         let native = BehaviorController::default();
-        let (client, selection) = ClientOverlaySelector::managed(geometry);
+        let handle = RecentCapturesOverlayHandle::new();
+        let selector_waker = handle.clone();
+        let (client, selection) =
+            ClientOverlaySelector::managed(geometry, Arc::new(move || selector_waker.wake()));
         let client: Arc<dyn CaptureSelector> = client;
         let (selector, plan) = for_current_session(client);
         tracing::info!(
@@ -294,7 +411,7 @@ impl Windowed {
             "resolved interactive selector"
         );
         Self {
-            handle: RecentCapturesOverlayHandle::new(),
+            handle,
             emit,
             base_geometry,
             geometry,
@@ -340,16 +457,28 @@ impl Host for Windowed {
         let pin_lock_escapes = app.pin_lock_escapes().to_vec();
         tracing::info!(?geometry, "opening the overlay");
         #[cfg(target_os = "macos")]
-        let display_changes = match scrozz_shell::macos::display::DisplayChangeMonitor::new() {
-            Ok(monitor) => Some(monitor),
-            Err(error) => {
-                tracing::warn!(%error, "display-change notifications are unavailable");
-                None
+        let display_changes = {
+            let display_waker = handle.clone();
+            match scrozz_shell::macos::display::DisplayChangeMonitor::new(Arc::new(move || {
+                display_waker.wake();
+            })) {
+                Ok(monitor) => Some(monitor),
+                Err(error) => {
+                    tracing::warn!(%error, "display-change notifications are unavailable");
+                    None
+                }
             }
         };
         #[cfg(target_os = "macos")]
         let native_activity_start = scrozz_shell::macos::activity::snapshot();
-
+        #[cfg(target_os = "macos")]
+        let lifecycle_diagnostic = match LifecycleDiagnostic::start(native_activity_start) {
+            Ok(diagnostic) => Some(diagnostic),
+            Err(error) => {
+                tracing::error!(%error, "lifecycle diagnostic could not be started");
+                None
+            }
+        };
         let options = RecentCapturesOverlayOptions {
             geometry,
             settings: app.recent_captures_overlay_settings(),
@@ -421,13 +550,22 @@ impl Host for Windowed {
                     base_geometry,
                     display_scale,
                     pointer_geometry,
+                    #[cfg(not(target_os = "macos"))]
                     next_active_display_refresh: Instant::now(),
                     #[cfg(target_os = "macos")]
                     display_changes,
                     #[cfg(target_os = "macos")]
                     native_activity_start,
+                    #[cfg(target_os = "macos")]
+                    lifecycle_diagnostic,
+                    #[cfg(target_os = "macos")]
+                    automatic_termination: None,
+                    #[cfg(target_os = "macos")]
+                    appkit_bootstrap_frame_completed_at: None,
                     pin_panels: crate::gui::panel::PinPanels::default(),
                     root_mode: RootSurfaceMode::Hidden,
+                    parked_root_bootstrap_pending: false,
+                    parked_root_ordered_out: false,
                     card_arm: None,
                     shown_card_target: None,
                     startup_rehide: true,
@@ -641,14 +779,25 @@ struct Driver {
     /// Native pixels per logical point on the display owning the card root.
     display_scale: Option<ScaleFactor>,
     pointer_geometry: SharedGeometry,
+    #[cfg(not(target_os = "macos"))]
     next_active_display_refresh: Instant,
     #[cfg(target_os = "macos")]
     display_changes: Option<scrozz_shell::macos::display::DisplayChangeMonitor>,
     #[cfg(target_os = "macos")]
     native_activity_start: scrozz_shell::macos::activity::NativeActivitySnapshot,
+    #[cfg(target_os = "macos")]
+    lifecycle_diagnostic: Option<LifecycleDiagnostic>,
+    #[cfg(target_os = "macos")]
+    automatic_termination: Option<scrozz_shell::macos::termination::AutomaticTerminationGuard>,
+    #[cfg(target_os = "macos")]
+    appkit_bootstrap_frame_completed_at: Option<Instant>,
     pin_panels: crate::gui::panel::PinPanels,
     /// Last presentation role applied to the shared native root window.
     root_mode: RootSurfaceMode,
+    /// The visible off-screen root needs one committed frame before child registration.
+    parked_root_bootstrap_pending: bool,
+    /// The auxiliary viewport was registered before the parked root was ordered out.
+    parked_root_ordered_out: bool,
     /// Hidden resize/scale barrier before the next first visible card frame.
     card_arm: Option<CardArm>,
     /// Geometry and scale used by the currently visible card framebuffer.
@@ -670,6 +819,43 @@ struct ActiveDrag {
 }
 
 impl Driver {
+    #[cfg(target_os = "macos")]
+    fn record_lifecycle(&self, state: &str) {
+        let lease_active = self
+            .automatic_termination
+            .as_ref()
+            .is_some_and(scrozz_shell::macos::termination::AutomaticTerminationGuard::is_active);
+        if let Some(diagnostic) = &self.lifecycle_diagnostic
+            && let Err(error) =
+                diagnostic.persist(state, self.app.exit_reason(), lease_active, self.root_mode)
+        {
+            tracing::error!(%error, state, "lifecycle diagnostic could not be persisted");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn acquire_automatic_termination_after_bootstrap(&mut self) -> Tick {
+        if self.automatic_termination.is_some() {
+            return Tick::Continue;
+        }
+        debug_assert!(
+            self.appkit_bootstrap_frame_completed_at
+                .is_some_and(|completed| completed.elapsed() >= APPKIT_BOOTSTRAP_SETTLE),
+            "the app lease must follow AppKit's initial root-window bootstrap"
+        );
+        match scrozz_shell::macos::termination::AutomaticTerminationGuard::acquire() {
+            Ok(guard) => {
+                self.automatic_termination = Some(guard);
+                self.record_lifecycle("running-post-bootstrap");
+                Tick::Continue
+            }
+            Err(error) => {
+                tracing::error!(%error, "automatic termination could not be inhibited");
+                self.app.stop_for_native_lifecycle(error.to_string())
+            }
+        }
+    }
+
     /// Draws the annotation editor's window while one is open.
     ///
     /// Copy and save go back through the worker rather than being written
@@ -857,20 +1043,60 @@ impl Driver {
     }
 
     fn refresh_display_state(&mut self) {
-        let (geometry, scale) = refreshed_work_area(
-            self.base_geometry,
-            self.display_scale,
-            &mut self.display_id,
-            self.app
-                .recent_captures_overlay_settings()
-                .follow_active_display,
-        );
-        if geometry != self.base_geometry || scale != self.display_scale {
-            self.base_geometry = geometry;
-            self.display_scale = scale;
-            self.selection.set_cards_geometry(geometry);
+        #[cfg(target_os = "macos")]
+        {
+            let Ok(displays) = scrozz_shell::macos::display::displays() else {
+                return;
+            };
+            let active = scrozz_shell::macos::display::pointer_location()
+                .ok()
+                .and_then(|point| scrozz_shell::macos::display::display_for_point(&displays, point))
+                .cloned();
+            let display = select_recent_captures_display(
+                &displays,
+                self.display_id.as_ref(),
+                active.as_ref(),
+                self.app
+                    .recent_captures_overlay_settings()
+                    .follow_active_display,
+            );
+            if let Some(display) = display {
+                let geometry = geometry_for_display(display);
+                let scale = Some(display.scale);
+                self.display_id = Some(display.id.clone());
+                if geometry != self.base_geometry || scale != self.display_scale {
+                    self.base_geometry = geometry;
+                    self.display_scale = scale;
+                    self.selection.set_cards_geometry(geometry);
+                }
+            }
+
+            let displays = DisplaySet::new(displays);
+            let support = pin_support(&displays);
+            self.overlay.apply_pin_topology(PinTopology {
+                displays,
+                active_display: active.map(|display| display.id),
+                support,
+            });
         }
-        self.overlay.refresh_pin_topology();
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let (geometry, scale) = refreshed_work_area(
+                self.base_geometry,
+                self.display_scale,
+                &mut self.display_id,
+                self.app
+                    .recent_captures_overlay_settings()
+                    .follow_active_display,
+            );
+            if geometry != self.base_geometry || scale != self.display_scale {
+                self.base_geometry = geometry;
+                self.display_scale = scale;
+                self.selection.set_cards_geometry(geometry);
+            }
+            self.overlay.refresh_pin_topology();
+        }
     }
 
     fn native_display_parameters_changed(&mut self) -> bool {
@@ -891,6 +1117,9 @@ impl Driver {
             return;
         }
         self.stopped = true;
+        self.app.record_native_event_loop_exit();
+        #[cfg(target_os = "macos")]
+        self.record_lifecycle("shutdown-recorded");
         let report = self.app.report();
         if let Ok(mut slot) = self.sink.lock() {
             *slot = Some(report);
@@ -909,17 +1138,6 @@ impl Driver {
         self.pin_panels.prepare_for_winit_teardown();
         if let Err(error) = self.native.prepare_for_winit_teardown() {
             tracing::error!(%error, "the root window could not be returned to winit");
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let activity =
-                scrozz_shell::macos::activity::snapshot().since(self.native_activity_start);
-            tracing::info!(
-                screen_preflights = activity.screen_preflights,
-                screen_requests = activity.screen_requests,
-                display_enumerations = activity.display_enumerations,
-                "native lifecycle activity"
-            );
         }
     }
 
@@ -1040,7 +1258,7 @@ impl Driver {
         );
     }
 
-    fn sync_root_visibility(&mut self, ctx: &egui::Context) {
+    fn sync_root_visibility(&mut self, ctx: &egui::Context, refresh_requested: bool) {
         let selector_visible = self.selection.wants_visible_selector();
         let history_open = self
             .app
@@ -1061,7 +1279,11 @@ impl Driver {
             self.handle.needs_visible_surface(),
             auxiliary_open,
         );
-        if visible_surface_refresh_due(self.root_mode, mode) {
+        if display_refresh_requested(
+            refresh_requested,
+            visible_surface_refresh_due(self.root_mode, mode),
+            self.handle.has_pending_content(),
+        ) {
             self.refresh_display_state();
         }
         if mode == RootSurfaceMode::Cards {
@@ -1080,12 +1302,16 @@ impl Driver {
         match mode {
             RootSurfaceMode::Selector => {
                 self.startup_rehide = false;
+                self.parked_root_bootstrap_pending = false;
+                self.parked_root_ordered_out = false;
                 self.native.set_visible(true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.request_repaint();
             }
             RootSurfaceMode::Parked => {
                 self.startup_rehide = false;
+                self.parked_root_bootstrap_pending = parked_root_requires_bootstrap(self.root_mode);
+                self.parked_root_ordered_out = false;
                 self.native
                     .apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 let frame = scrozz_core::LogicalRect::new(
@@ -1101,11 +1327,17 @@ impl Driver {
                     PARKED_ROOT_ORIGIN,
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
+                // eframe skips App::ui for an invisible root with no visible
+                // descendants. Keep this 1x1 off-screen bootstrap visible for
+                // one pass so the immediate Settings/editor viewport can be
+                // registered, then order it out at the end of that UI pass.
                 self.native.set_visible(true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.request_repaint();
             }
             RootSurfaceMode::Hidden => {
+                self.parked_root_bootstrap_pending = false;
+                self.parked_root_ordered_out = false;
                 self.native
                     .apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 self.native.set_cursor(scrozz_shell::OverlayCursor::Arrow);
@@ -1125,6 +1357,51 @@ impl Driver {
             }
         }
         self.root_mode = mode;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn order_out_parked_root_after_auxiliary_registration(&mut self, ctx: &egui::Context) {
+        if self.root_mode != RootSurfaceMode::Parked || self.parked_root_ordered_out {
+            return;
+        }
+        self.native.set_visible(false);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.parked_root_ordered_out = true;
+        self.record_lifecycle("auxiliary-registered-root-ordered-out");
+    }
+
+    fn show_capture_surface(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.selection.owns_surface() {
+            self.selection.ui(ui);
+            return;
+        }
+
+        eframe::App::ui(&mut self.overlay, ui, frame);
+
+        // The editor pass comes first so a same-frame edit changes the
+        // revision this lookup asks for. The overlay draw and native call
+        // remain adjacent: once the card arms, nothing slow is allowed
+        // between that event and the platform taking the held pointer.
+        let editor = self
+            .editing
+            .as_ref()
+            .map(|editing| EditorSnapshot::new(editing.card, editing.generation, &editing.editor));
+        let started = self.app.pump_drag_starts_with_editor(editor);
+        if started > 0 {
+            tracing::debug!(started, "drag: began within the gesture frame");
+        }
+    }
+
+    fn reconcile_pin_panels(&mut self, ctx: &egui::Context) {
+        let native = self
+            .pin_panels
+            .reconcile(&self.handle.native_pin_requests());
+        if native.pending_adoption {
+            ctx.request_repaint_after(Duration::from_millis(32));
+        }
+        for failure in native.failures {
+            self.handle.native_pin_failure(failure.pin, failure.reason);
+        }
     }
 
     fn show_settings(&mut self, ctx: &egui::Context) {
@@ -1362,10 +1639,29 @@ enum RootSurfaceMode {
     Selector,
 }
 
+const fn parked_root_requires_bootstrap(previous: RootSurfaceMode) -> bool {
+    matches!(previous, RootSurfaceMode::Hidden)
+}
+
 fn visible_surface_refresh_due(previous: RootSurfaceMode, next: RootSurfaceMode) -> bool {
     matches!(next, RootSurfaceMode::Cards | RootSurfaceMode::Selector)
         && previous != next
         && !(previous == RootSurfaceMode::ArmingCards && next == RootSurfaceMode::Cards)
+}
+
+const fn display_refresh_requested(
+    native_or_fallback: bool,
+    visible_surface_transition: bool,
+    pending_card: bool,
+) -> bool {
+    native_or_fallback || visible_surface_transition || pending_card
+}
+
+const fn live_surface_needs_display_fallback(
+    mode: RootSurfaceMode,
+    follow_active_display: bool,
+) -> bool {
+    follow_active_display && matches!(mode, RootSurfaceMode::Cards)
 }
 
 const fn root_surface_mode(
@@ -1625,6 +1921,25 @@ impl eframe::App for Driver {
     /// [`Self::on_exit`] stops native mutation, orders utility surfaces out, and
     /// releases Scrozz's retains before eframe drops its viewport map.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        if self.automatic_termination.is_none()
+            && let Some(completed) = self.appkit_bootstrap_frame_completed_at
+        {
+            let remaining = APPKIT_BOOTSTRAP_SETTLE.saturating_sub(completed.elapsed());
+            if !remaining.is_zero() {
+                ctx.request_repaint_after(remaining);
+                return;
+            }
+            if let Tick::Stop(reason) = self.acquire_automatic_termination_after_bootstrap() {
+                tracing::error!(
+                    exit_reason = reason.label(),
+                    "closing the root viewport after native lifecycle failure"
+                );
+                self.finish_shutdown();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+        }
         self.announce_panel();
         self.overlay.logic(ctx);
         if std::mem::take(&mut self.permission_resume_armed) {
@@ -1636,31 +1951,23 @@ impl eframe::App for Driver {
         if selector_owned_the_window || selector_owns_the_window {
             self.overlay.invalidate_passthrough_cache();
         }
-        let follow_active_display = self
-            .app
-            .recent_captures_overlay_settings()
-            .follow_active_display;
-        let now = Instant::now();
-        let active_display_refresh_due =
-            follow_active_display && now >= self.next_active_display_refresh;
         #[cfg(not(target_os = "macos"))]
-        let disconnected_display_check_due =
-            follow_active_display && now >= self.next_active_display_refresh;
+        let disconnected_display_check_due = {
+            let follow_active_display = self
+                .app
+                .recent_captures_overlay_settings()
+                .follow_active_display;
+            live_surface_needs_display_fallback(self.root_mode, follow_active_display)
+                && Instant::now() >= self.next_active_display_refresh
+        };
         #[cfg(target_os = "macos")]
         let disconnected_display_check_due = false;
-        if active_display_refresh_due || disconnected_display_check_due {
-            self.next_active_display_refresh = now + DISPLAY_REFRESH;
-        }
-        if self.native_display_parameters_changed()
-            || active_display_refresh_due
-            || disconnected_display_check_due
-        {
-            self.refresh_display_state();
-        }
         #[cfg(not(target_os = "macos"))]
-        if follow_active_display {
-            ctx.request_repaint_after(DISPLAY_REFRESH);
+        if disconnected_display_check_due {
+            self.next_active_display_refresh = Instant::now() + DISPLAY_REFRESH;
         }
+        let display_refresh_requested =
+            self.native_display_parameters_changed() || disconnected_display_check_due;
 
         let editor = self
             .editing
@@ -1675,6 +1982,8 @@ impl eframe::App for Driver {
         }
         if self.app.take_settings_request() {
             self.settings.open();
+            #[cfg(target_os = "macos")]
+            self.record_lifecycle("settings-requested");
         }
         if self.editing.is_none()
             && let Some(request) = self.app.take_editor_request()
@@ -1706,11 +2015,26 @@ impl eframe::App for Driver {
                     .deliver_analysis(result.revision, result.result);
             }
         }
-        self.sync_root_visibility(ctx);
-        if !self.stopped && tick == Tick::Stop {
+        self.sync_root_visibility(ctx, display_refresh_requested);
+        if !self.stopped
+            && let Tick::Stop(reason) = tick
+        {
+            tracing::info!(exit_reason = reason.label(), "closing the root viewport");
             self.overlay.flush_pin_states(ctx);
+            #[cfg(target_os = "macos")]
+            self.record_lifecycle("root-close-requested");
             self.finish_shutdown();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        if live_surface_needs_display_fallback(
+            self.root_mode,
+            self.app
+                .recent_captures_overlay_settings()
+                .follow_active_display,
+        ) {
+            ctx.request_repaint_after(DISPLAY_REFRESH);
         }
 
         if let Some(remaining) = self.app.remaining_deadline() {
@@ -1727,6 +2051,7 @@ impl eframe::App for Driver {
         if self.app.video_editor_is_open() || self.video_editor.is_open() {
             ctx.request_repaint_after(VIDEO_EDITOR_TICK);
         }
+        #[cfg(not(target_os = "macos"))]
         if matches!(
             self.root_mode,
             RootSurfaceMode::Hidden | RootSurfaceMode::Parked
@@ -1740,6 +2065,20 @@ impl eframe::App for Driver {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        scrozz_shell::macos::activity::record_root_redraw();
+        #[cfg(target_os = "macos")]
+        if self.parked_root_bootstrap_pending {
+            self.parked_root_bootstrap_pending = false;
+            self.record_lifecycle("auxiliary-root-bootstrap-committed");
+            // Immediate child viewports must be registered on every parent UI
+            // pass. Preserve already-open pins while delaying only the new
+            // auxiliary child until the root's visible bootstrap is committed.
+            self.show_capture_surface(ui, frame);
+            self.reconcile_pin_panels(ui.ctx());
+            ui.ctx().request_repaint();
+            return;
+        }
         let permission = self.app.permission_prompt();
         if let Some(response) = self.permission.show(ui.ctx(), permission.as_ref()) {
             if response == scrozz_ui::permission::PermissionResponse::UseApplePicker {
@@ -1758,32 +2097,16 @@ impl eframe::App for Driver {
         self.show_camera_settings(ui.ctx());
         self.show_history(ui.ctx());
         self.service_history_drag(ui.ctx());
+        self.show_capture_surface(ui, frame);
+        self.reconcile_pin_panels(ui.ctx());
+        #[cfg(target_os = "macos")]
+        self.order_out_parked_root_after_auxiliary_registration(ui.ctx());
 
-        if self.selection.owns_surface() {
-            self.selection.ui(ui);
-        } else {
-            self.overlay.ui(ui, frame);
-
-            // The editor pass comes first so a same-frame edit changes the
-            // revision this lookup asks for. The overlay draw and native call
-            // remain adjacent: once the card arms, nothing slow is allowed
-            // between that event and the platform taking the held pointer.
-            let editor = self.editing.as_ref().map(|editing| {
-                EditorSnapshot::new(editing.card, editing.generation, &editing.editor)
-            });
-            let started = self.app.pump_drag_starts_with_editor(editor);
-            if started > 0 {
-                tracing::debug!(started, "drag: began within the gesture frame");
-            }
-        }
-        let native = self
-            .pin_panels
-            .reconcile(&self.handle.native_pin_requests());
-        if native.pending_adoption {
-            ui.ctx().request_repaint_after(Duration::from_millis(32));
-        }
-        for failure in native.failures {
-            self.handle.native_pin_failure(failure.pin, failure.reason);
+        #[cfg(target_os = "macos")]
+        if self.appkit_bootstrap_frame_completed_at.is_none() {
+            self.appkit_bootstrap_frame_completed_at = Some(Instant::now());
+            self.record_lifecycle("appkit-bootstrap-frame-completed");
+            ui.ctx().request_repaint_after(APPKIT_BOOTSTRAP_SETTLE);
         }
     }
 
@@ -1797,6 +2120,27 @@ impl eframe::App for Driver {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.finish_shutdown();
         self.prepare_native_teardown();
+        #[cfg(target_os = "macos")]
+        if let Some(mut guard) = self.automatic_termination.take() {
+            guard.release();
+        }
+        #[cfg(target_os = "macos")]
+        self.record_lifecycle("on-exit-complete");
+        #[cfg(target_os = "macos")]
+        {
+            let activity =
+                scrozz_shell::macos::activity::snapshot().since(self.native_activity_start);
+            tracing::info!(
+                screen_preflights = activity.screen_preflights,
+                screen_requests = activity.screen_requests,
+                display_enumerations = activity.display_enumerations,
+                pointer_samples = activity.pointer_samples,
+                root_redraws = activity.root_redraws,
+                automatic_termination_disables = activity.automatic_termination_disables,
+                automatic_termination_enables = activity.automatic_termination_enables,
+                "native lifecycle activity"
+            );
+        }
     }
 }
 
@@ -1905,6 +2249,26 @@ fn pin_displays(_geometry: RecentCapturesOverlayGeometry) -> (DisplaySet, Option
 }
 
 fn query_pin_topology() -> Option<PinTopology> {
+    #[cfg(target_os = "macos")]
+    {
+        let displays = scrozz_shell::macos::display::displays().ok()?;
+        let active_display = scrozz_shell::macos::display::pointer_location()
+            .ok()
+            .and_then(|point| scrozz_shell::macos::display::display_for_point(&displays, point))
+            .map(|display| display.id.clone());
+        let displays = DisplaySet::new(displays);
+        if displays.displays().is_empty() {
+            return None;
+        }
+        let support = pin_support(&displays);
+        Some(PinTopology {
+            displays,
+            active_display,
+            support,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
     let backend = match crate::platform::display_topology() {
         Ok(backend) => backend,
         Err(error) => {
@@ -1912,12 +2276,17 @@ fn query_pin_topology() -> Option<PinTopology> {
             return None;
         }
     };
+    #[cfg(not(target_os = "macos"))]
     let active_display = backend.active_display().ok().map(|display| display.id);
+    #[cfg(not(target_os = "macos"))]
     let displays = DisplaySet::new(backend.displays().ok()?);
+    #[cfg(not(target_os = "macos"))]
     if displays.displays().is_empty() {
         return None;
     }
+    #[cfg(not(target_os = "macos"))]
     let support = pin_support(&displays);
+    #[cfg(not(target_os = "macos"))]
     Some(PinTopology {
         displays,
         active_display,
@@ -2021,32 +2390,13 @@ fn local_pointer(
     egui::pos2(point.x as f32 - origin.x, point.y as f32 - origin.y)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn refreshed_work_area(
     current: RecentCapturesOverlayGeometry,
     current_scale: Option<ScaleFactor>,
     display_id: &mut Option<DisplayId>,
     follow_active_display: bool,
 ) -> (RecentCapturesOverlayGeometry, Option<ScaleFactor>) {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(displays) = scrozz_shell::macos::display::displays() {
-            let active = follow_active_display
-                .then(scrozz_shell::macos::display::active_display)
-                .and_then(Result::ok);
-            let display = select_recent_captures_display(
-                &displays,
-                display_id.as_ref(),
-                active.as_ref(),
-                follow_active_display,
-            );
-            if let Some(display) = display {
-                *display_id = Some(display.id.clone());
-                return (geometry_for_display(display), Some(display.scale));
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
     if let Ok(backend) = crate::platform::display_topology()
         && let Ok(displays) = backend.displays()
     {
@@ -2185,12 +2535,20 @@ mod tests {
     #[test]
     fn native_drags_are_started_in_the_ui_pass() {
         assert_eq!(
-            driver_pass("pump_drag_starts_with_editor"),
+            driver_pass("self.show_capture_surface"),
             "ui",
             "native drags must begin inside the frame that drew the gesture, \
              while the mouse button is still down — not in the logic pass, \
              which runs a frame earlier and would act on a released button"
         );
+        let source = include_str!("host.rs");
+        let capture_surface = source
+            .split("fn show_capture_surface")
+            .nth(1)
+            .and_then(|body| body.split_once("fn reconcile_pin_panels"))
+            .map(|(body, _)| body)
+            .expect("capture surface UI pass");
+        assert!(capture_surface.contains("pump_drag_starts_with_editor"));
     }
 
     #[test]
@@ -2260,15 +2618,25 @@ mod tests {
         let editor = ui
             .find("self.show_editor(ui.ctx())")
             .expect("the editor is updated");
-        let overlay = ui
-            .find("self.overlay.ui(ui, frame)")
+        let capture_surface_call = ui[editor..]
+            .find("self.show_capture_surface(ui, frame)")
+            .map(|offset| editor + offset)
+            .expect("capture surface is drawn");
+        let capture_surface = src
+            .split("fn show_capture_surface")
+            .nth(1)
+            .and_then(|body| body.split_once("fn reconcile_pin_panels"))
+            .map(|(body, _)| body)
+            .expect("capture surface UI pass");
+        let overlay = capture_surface
+            .find("eframe::App::ui(&mut self.overlay, ui, frame)")
             .expect("cards are drawn");
-        let drag = ui
+        let drag = capture_surface
             .find("pump_drag_starts_with_editor")
             .expect("native drags are pumped");
 
         assert!(
-            edits < editor && editor < overlay && overlay < drag,
+            edits < editor && editor < capture_surface_call && overlay < drag,
             "shortcut ownership must settle before editor input, and that input must advance the \
              revision before an adjacent overlay draw and native drag start"
         );
@@ -2489,6 +2857,53 @@ mod tests {
             !visible_surface_refresh_due(RootSurfaceMode::ArmingCards, RootSurfaceMode::Cards),
             "the hidden framebuffer barrier is one capture transition, not a second query"
         );
+        assert!(
+            !live_surface_needs_display_fallback(RootSurfaceMode::Hidden, true),
+            "an idle follow-active root must not poll"
+        );
+        assert!(
+            !live_surface_needs_display_fallback(RootSurfaceMode::Parked, true),
+            "Settings and editor frames must not poll"
+        );
+        assert!(
+            live_surface_needs_display_fallback(RootSurfaceMode::Cards, true),
+            "only a truly live non-macOS card surface may use the fallback"
+        );
+
+        let idle_refreshes = (0..240)
+            .filter(|_| display_refresh_requested(false, false, false))
+            .count();
+        assert_eq!(
+            idle_refreshes, 0,
+            "60 seconds of idle/follow-active Settings frames must enumerate zero displays"
+        );
+    }
+
+    #[test]
+    fn display_events_and_visible_card_transitions_refresh_exactly_once() {
+        assert_eq!(
+            [true, false]
+                .into_iter()
+                .filter(|changed| display_refresh_requested(*changed, false, false))
+                .count(),
+            1,
+            "one consumed display-change notification causes one refresh"
+        );
+        assert!(display_refresh_requested(
+            false,
+            visible_surface_refresh_due(RootSurfaceMode::Hidden, RootSurfaceMode::Cards),
+            false
+        ));
+        assert!(display_refresh_requested(false, false, true));
+        assert!(!display_refresh_requested(
+            false,
+            visible_surface_refresh_due(RootSurfaceMode::Cards, RootSurfaceMode::Cards),
+            false,
+        ));
+        assert!(
+            display_refresh_requested(true, true, true),
+            "coincident native and visibility triggers collapse to one refresh decision"
+        );
     }
 
     #[test]
@@ -2508,6 +2923,15 @@ mod tests {
 
         assert!(on_exit.contains("self.finish_shutdown()"));
         assert!(on_exit.contains("self.prepare_native_teardown()"));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(on_exit.contains("self.automatic_termination.take()"));
+            assert!(
+                on_exit.find("self.prepare_native_teardown()")
+                    < on_exit.find("self.automatic_termination.take()"),
+                "automatic termination must remain inhibited until native adapters are retired"
+            );
+        }
         let implementation = source
             .split("#[cfg(test)]")
             .next()
@@ -2516,6 +2940,99 @@ mod tests {
             !implementation.contains("std::process::exit(0)"),
             "native teardown must complete instead of bypassing destructors"
         );
+    }
+
+    #[test]
+    fn automatic_termination_is_inhibited_only_after_eframe_bootstrap() {
+        let source = include_str!("host.rs");
+        let run_native = source
+            .split("eframe::run_native(")
+            .next()
+            .expect("host setup precedes eframe");
+        assert!(
+            !run_native.contains("AutomaticTerminationGuard::acquire"),
+            "AppKit balances its bootstrap lease after run_native starts"
+        );
+        assert!(
+            source.contains("automatic_termination: None"),
+            "the Driver must begin without an early lease"
+        );
+        assert!(
+            source.contains("appkit_bootstrap_frame_completed_at: None"),
+            "the Driver must wait for its initial root frame"
+        );
+
+        let logic = source
+            .split("impl eframe::App for Driver")
+            .nth(1)
+            .and_then(|driver| driver.split_once("fn logic(&mut self, ctx:"))
+            .map(|(_, logic)| logic)
+            .expect("Driver logic pass");
+        let acquire = logic
+            .find("self.acquire_automatic_termination_after_bootstrap()")
+            .expect("post-bootstrap Driver logic acquires the app lease");
+        let settle = logic
+            .find("APPKIT_BOOTSTRAP_SETTLE.saturating_sub")
+            .expect("Driver waits for AppKit to balance its bootstrap lease");
+        let app_work = logic
+            .find("self.announce_panel()")
+            .expect("Driver app work follows lifecycle setup");
+        assert!(
+            settle < acquire && acquire < app_work,
+            "the post-bootstrap lease must precede all normal Driver work"
+        );
+        let ui = logic
+            .split_once("fn ui(&mut self, ui:")
+            .map(|(_, ui)| ui)
+            .expect("Driver UI pass");
+        assert!(
+            ui.contains("appkit_bootstrap_frame_completed_at = Some(Instant::now())")
+                && ui.contains("request_repaint_after(APPKIT_BOOTSTRAP_SETTLE)"),
+            "the first completed root frame must schedule exactly one post-bootstrap lease wake"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lifecycle_diagnostic_persists_the_exact_exit_reason() {
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-lifecycle-diagnostic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let diagnostic = LifecycleDiagnostic {
+            path: root.join("last-lifecycle.json"),
+            temporary: root.join("last-lifecycle.tmp"),
+            baseline: scrozz_shell::macos::activity::snapshot(),
+        };
+        diagnostic
+            .persist(
+                "shutdown-recorded",
+                Some(crate::gui::app::ExitReason::NativeEventLoop),
+                false,
+                RootSurfaceMode::Parked,
+            )
+            .expect("diagnostic write");
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&diagnostic.path).expect("durable diagnostic"))
+                .expect("diagnostic JSON");
+        assert_eq!(document["state"], "shutdown-recorded");
+        assert_eq!(document["exit_reason"], "native-event-loop");
+        assert_eq!(document["root_mode"], "Parked");
+        std::fs::remove_dir_all(root).expect("diagnostic cleanup");
+    }
+
+    #[test]
+    fn parked_root_bootstraps_only_from_an_invisible_surface() {
+        assert!(parked_root_requires_bootstrap(RootSurfaceMode::Hidden));
+        assert!(
+            !parked_root_requires_bootstrap(RootSurfaceMode::ArmingCards),
+            "ArmingCards can already own auxiliary child viewports that must remain registered"
+        );
+        assert!(!parked_root_requires_bootstrap(RootSurfaceMode::Cards));
+        assert!(!parked_root_requires_bootstrap(RootSurfaceMode::Selector));
+        assert!(!parked_root_requires_bootstrap(RootSurfaceMode::Parked));
     }
 
     #[test]
@@ -2535,6 +3052,78 @@ mod tests {
         assert!(visibility.contains("self.app.permission_prompt().is_some()"));
         assert!(visibility.contains(".is_visible()"));
         assert!(visibility.contains("self.sync_card_visibility(ctx)"));
+
+        let parked = visibility
+            .split("RootSurfaceMode::Parked =>")
+            .nth(1)
+            .and_then(|body| body.split_once("RootSurfaceMode::Hidden =>"))
+            .map(|(body, _)| body)
+            .expect("parked root branch");
+        assert!(parked.contains("self.native.set_visible(true)"));
+        assert!(parked.contains("ViewportCommand::Visible(true)"));
+        assert!(parked.contains("parked_root_requires_bootstrap(self.root_mode)"));
+        assert!(parked.contains("ctx.request_repaint()"));
+        assert!(
+            !parked.contains("ViewportCommand::Close"),
+            "an auxiliary child bootstraps through the root but never destroys it"
+        );
+
+        let order_out = source
+            .split("fn order_out_parked_root_after_auxiliary_registration")
+            .nth(1)
+            .and_then(|body| body.split_once("fn show_settings"))
+            .map(|(body, _)| body)
+            .expect("post-registration root order-out");
+        assert!(order_out.contains("self.native.set_visible(false)"));
+        assert!(order_out.contains("ViewportCommand::Visible(false)"));
+        assert!(
+            !order_out.contains("ViewportCommand::Close"),
+            "the registered child keeps the event loop alive while the root is ordered out"
+        );
+        let ui = source
+            .split("impl eframe::App for Driver")
+            .nth(1)
+            .expect("Driver implementation")
+            .split("fn ui(&mut self, ui:")
+            .nth(1)
+            .expect("Driver UI pass");
+        let barrier = ui
+            .find("if self.parked_root_bootstrap_pending")
+            .expect("parked-root bootstrap barrier");
+        let barrier_end = ui[barrier..]
+            .find("return;")
+            .map(|offset| barrier + offset)
+            .expect("bootstrap barrier return");
+        let settings = ui
+            .find("self.show_settings")
+            .expect("Settings registration");
+        let capture_surface = ui[settings..]
+            .find("self.show_capture_surface")
+            .map(|offset| settings + offset)
+            .expect("capture child registration");
+        let pin_reconcile = ui[capture_surface..]
+            .find("self.reconcile_pin_panels")
+            .map(|offset| capture_surface + offset)
+            .expect("native pin reconciliation");
+        let order_out = ui[pin_reconcile..]
+            .find("self.order_out_parked_root_after_auxiliary_registration")
+            .map(|offset| pin_reconcile + offset)
+            .expect("root order-out");
+        assert!(
+            barrier < settings,
+            "the root visibility command must commit before an immediate child is registered"
+        );
+        assert!(
+            ui[barrier..barrier_end].contains("self.show_capture_surface")
+                && ui[barrier..barrier_end].contains("self.reconcile_pin_panels"),
+            "the bootstrap pass must preserve already-open pin child viewports"
+        );
+        assert!(
+            settings < capture_surface
+                && capture_surface < pin_reconcile
+                && pin_reconcile < order_out,
+            "the root may be ordered out only after every child viewport and native pin is registered"
+        );
     }
 
     #[test]
@@ -2606,24 +3195,28 @@ mod tests {
     }
 
     #[test]
-    fn hidden_root_retains_a_bounded_event_loop_fallback() {
+    fn macos_hidden_root_has_no_periodic_idle_wake() {
         let source = include_str!("host.rs");
         let logic = source
             .split("impl eframe::App for Driver")
             .nth(1)
             .and_then(|driver| driver.split("fn logic(&mut self, ctx:").nth(1))
-            .and_then(|body| body.split_once("fn ui(&mut self, ui:"))
+            .and_then(|body| body.split_once("\n    fn ui("))
             .map(|(body, _)| body)
             .expect("Driver logic pass");
 
-        assert!(logic.contains("IDLE_FALLBACK_WAKE"));
-        assert!(IDLE_FALLBACK_WAKE >= Duration::from_millis(100));
-
-        // A recording advances from the same tick, so a hidden root must wake
-        // faster while one is in flight than the ordinary idle fallback.
+        #[cfg(target_os = "macos")]
+        assert!(
+            logic.contains("#[cfg(not(target_os = \"macos\"))]\n        if matches!("),
+            "macOS producers wake the root explicitly; idle frames must not poll AppKit"
+        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(logic.contains("ctx.request_repaint_after(IDLE_FALLBACK_WAKE)"));
+            assert!(IDLE_FALLBACK_WAKE >= Duration::from_millis(100));
+        }
         assert!(logic.contains("recording_is_busy()"));
         assert!(logic.contains("RECORDING_TICK"));
-        assert!(RECORDING_TICK < IDLE_FALLBACK_WAKE);
     }
 
     #[test]

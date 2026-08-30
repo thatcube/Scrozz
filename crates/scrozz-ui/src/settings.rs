@@ -2056,6 +2056,11 @@ mod tests {
     #[test]
     fn first_open_and_reopen_both_request_foregrounding() {
         let mut window = SettingsWindow::default();
+        assert_ne!(
+            settings_viewport_id(),
+            egui::ViewportId::ROOT,
+            "Settings must remain a child; replacing the root lets eframe stop the app"
+        );
         assert_eq!(window.open(), OpenDisposition::FirstOpen);
         assert!(window.open);
         assert!(std::mem::take(&mut window.focus_requested));

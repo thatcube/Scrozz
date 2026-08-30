@@ -45,5 +45,10 @@ serde_json.workspace = true
 image.workspace = true
 rfd.workspace = true
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
 [lints]
 workspace = true
