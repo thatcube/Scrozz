@@ -29,6 +29,10 @@ pub const DEFAULT_PIN_MAX_EDGE: f64 = 420.0;
 pub const MAX_PIN_PHYSICAL_EDGE: u32 = 4_096;
 /// Largest physical backing surface a pin viewport may allocate.
 pub const MAX_PIN_PHYSICAL_PIXELS: u64 = 8 * 1_024 * 1_024;
+/// Smallest recoverable interactive pin width, in logical points.
+pub const MIN_PIN_LOGICAL_WIDTH: f64 = 44.0;
+/// Smallest recoverable interactive pin height, in logical points.
+pub const MIN_PIN_LOGICAL_HEIGHT: f64 = 32.0;
 
 /// Invalid source geometry for a pinned capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +474,7 @@ pub struct PinnedSurface {
     chrome_policy: PinChromePolicy,
     escapes: Vec<LockEscape>,
     state: PinState,
+    last_native_frame: Option<LogicalRect>,
 }
 
 impl PinnedSurface {
@@ -502,6 +507,7 @@ impl PinnedSurface {
             chrome_policy,
             escapes,
             state: PinState::new(frame, scale, Some(display.id.clone())),
+            last_native_frame: None,
         };
         surface.enforce_chrome_policy();
         let _ = surface.reconcile(&DisplaySet::new(vec![display.clone()]));
@@ -540,6 +546,7 @@ impl PinnedSurface {
             chrome_policy,
             escapes,
             state,
+            last_native_frame: None,
         };
         surface.enforce_chrome_policy();
         if surface.reconcile(displays).is_none() {
@@ -591,9 +598,7 @@ impl PinnedSurface {
         // Exceptionally large captures may need an initial fit below the normal
         // 10% interactive floor. Keep that fitted size reachable instead of
         // making the first resize jump to a window larger than the display.
-        let minimum = PinScale::fit(self.natural_size, DEFAULT_PIN_MAX_EDGE)
-            .get()
-            .min(MIN_PIN_SCALE);
+        let minimum = minimum_scale(self.natural_size);
         let maximum = displays
             .display_for_frame(self.state.frame)
             .or_else(|| self.state.display.as_ref().and_then(|id| displays.get(id)))
@@ -626,7 +631,7 @@ impl PinnedSurface {
         Ok(())
     }
 
-    /// Reconcile geometry reported by the native child window after a drag.
+    /// Reconcile geometry reported by the native child window after a move or resize.
     ///
     /// The window manager is the source of truth while the pointer owns the
     /// drag. The resulting state remains clamped to a work area and snapped to
@@ -640,9 +645,61 @@ impl PinnedSurface {
         else {
             return false;
         };
-        self.state.scale = bounded_scale(self.natural_size, self.state.scale.get(), display);
+        let previous = self.state.frame;
+        let native_baseline = self.last_native_frame.unwrap_or(previous);
+        let native_unchanged = self.last_native_frame == Some(frame);
+        let width_changed = (frame.size.width - native_baseline.size.width).abs();
+        let height_changed = (frame.size.height - native_baseline.size.height).abs();
+        let resized = width_changed > 0.5 || height_changed > 0.5;
+
+        let requested_scale = if resized {
+            let width_scale = frame.size.width / self.natural_size.width;
+            let height_scale = frame.size.height / self.natural_size.height;
+            if width_changed / native_baseline.size.width.max(1.0)
+                >= height_changed / native_baseline.size.height.max(1.0)
+            {
+                width_scale
+            } else {
+                height_scale
+            }
+        } else {
+            self.state.scale.get()
+        };
+        self.state.scale = PinScale::for_surface(
+            requested_scale,
+            minimum_scale(self.natural_size),
+            maximum_scale(self.natural_size, display),
+        );
+        let reported = frame;
+        self.last_native_frame = Some(reported);
         let mut frame = frame;
         frame.size = scaled_size(self.natural_size, self.state.scale);
+
+        if resized {
+            let reported_right = reported.origin.x + reported.size.width;
+            let reported_bottom = reported.origin.y + reported.size.height;
+            let baseline_right = native_baseline.origin.x + native_baseline.size.width;
+            let baseline_bottom = native_baseline.origin.y + native_baseline.size.height;
+            let left_moved = (frame.origin.x - native_baseline.origin.x).abs();
+            let right_moved = (reported_right - baseline_right).abs();
+            let top_moved = (frame.origin.y - native_baseline.origin.y).abs();
+            let bottom_moved = (reported_bottom - baseline_bottom).abs();
+
+            if left_moved > right_moved {
+                frame.origin.x = reported_right - frame.size.width;
+            } else if width_changed <= 0.5 && height_changed > 0.5 {
+                frame.origin.x = previous.origin.x + (previous.size.width - frame.size.width) / 2.0;
+            }
+            if top_moved > bottom_moved {
+                frame.origin.y = reported_bottom - frame.size.height;
+            } else if height_changed <= 0.5 && width_changed > 0.5 {
+                frame.origin.y =
+                    previous.origin.y + (previous.size.height - frame.size.height) / 2.0;
+            }
+        } else if native_unchanged {
+            frame.origin = previous.origin;
+        }
+
         frame = displays.clamp_visible(frame, display, LogicalSize::new(48.0, 32.0));
         frame.origin = snap_origin(frame.origin, display.scale);
         frame = displays.clamp_visible(frame, display, LogicalSize::new(48.0, 32.0));
@@ -765,6 +822,14 @@ fn validate_natural_size(size: LogicalSize) -> Result<(), InvalidPinSize> {
 fn bounded_scale(size: LogicalSize, requested: f64, display: &Display) -> PinScale {
     let maximum = maximum_scale(size, display);
     PinScale::for_surface(requested, f64::MIN_POSITIVE, maximum)
+}
+
+fn minimum_scale(size: LogicalSize) -> f64 {
+    PinScale::fit(size, DEFAULT_PIN_MAX_EDGE)
+        .get()
+        .min(MIN_PIN_SCALE)
+        .max(MIN_PIN_LOGICAL_WIDTH / size.width)
+        .max(MIN_PIN_LOGICAL_HEIGHT / size.height)
 }
 
 fn maximum_scale(size: LogicalSize, display: &Display) -> f64 {
@@ -1235,6 +1300,157 @@ mod tests {
         assert!(frame.origin.x + frame.size.width >= 48.0);
         assert!(frame.origin.y + frame.size.height >= display.work_area.origin.y + 32.0);
         assert_eq!(frame.origin.x * display.scale.get() % 1.0, 0.0);
+    }
+
+    #[test]
+    fn native_edge_resize_updates_scale_and_preserves_aspect_ratio() {
+        let display = display("main", 0.0, 1_600.0, 24.0, 1_000.0, 2.0, true);
+        let set = DisplaySet::new(vec![display.clone()]);
+        let state = PinState::new(
+            LogicalRect::new(
+                LogicalPoint::new(300.0, 300.0),
+                LogicalSize::new(400.0, 200.0),
+            ),
+            PinScale::ORIGINAL,
+            Some(display.id.clone()),
+        );
+        let mut pin = PinnedSurface::restore_with_natural_size(
+            PinId::from("edge-resize"),
+            LogicalSize::new(400.0, 200.0),
+            state,
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+            &set,
+        )
+        .unwrap()
+        .unwrap();
+
+        let reported = LogicalRect::new(
+            LogicalPoint::new(300.0, 300.0),
+            LogicalSize::new(600.0, 200.0),
+        );
+        assert!(pin.sync_native_frame(reported, &set));
+        assert_eq!(pin.state.scale.get(), 1.5);
+        assert_eq!(pin.state.frame.size, LogicalSize::new(600.0, 300.0));
+        assert_eq!(pin.state.frame.origin, LogicalPoint::new(300.0, 250.0));
+    }
+
+    #[test]
+    fn repeated_stale_native_resize_reports_do_not_oscillate_scale() {
+        let display = display("main", 0.0, 1_600.0, 24.0, 1_000.0, 2.0, true);
+        let set = DisplaySet::new(vec![display.clone()]);
+        let state = PinState::new(
+            LogicalRect::new(
+                LogicalPoint::new(300.0, 300.0),
+                LogicalSize::new(400.0, 200.0),
+            ),
+            PinScale::ORIGINAL,
+            Some(display.id.clone()),
+        );
+        let mut pin = PinnedSurface::restore_with_natural_size(
+            PinId::from("stale-resize"),
+            LogicalSize::new(400.0, 200.0),
+            state,
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+            &set,
+        )
+        .unwrap()
+        .unwrap();
+        let reported = LogicalRect::new(
+            LogicalPoint::new(300.0, 300.0),
+            LogicalSize::new(600.0, 200.0),
+        );
+
+        assert!(pin.sync_native_frame(reported, &set));
+        let corrected = pin.state().clone();
+        assert!(!pin.sync_native_frame(reported, &set));
+        assert_eq!(pin.state(), &corrected);
+    }
+
+    #[test]
+    fn native_sync_does_not_reapply_an_application_nudge() {
+        let display = display("main", 0.0, 1_600.0, 24.0, 1_000.0, 2.0, true);
+        let set = DisplaySet::new(vec![display.clone()]);
+        let state = PinState::new(
+            LogicalRect::new(
+                LogicalPoint::new(300.0, 300.0),
+                LogicalSize::new(400.0, 200.0),
+            ),
+            PinScale::ORIGINAL,
+            Some(display.id.clone()),
+        );
+        let mut pin = PinnedSurface::restore_with_natural_size(
+            PinId::from("nudge-sync"),
+            LogicalSize::new(400.0, 200.0),
+            state,
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+            &set,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(!pin.sync_native_frame(pin.state().frame, &set));
+        assert!(pin.nudge(Direction::Right, NudgeStep::Fine, &set));
+        let nudged = pin.state().clone();
+        assert!(!pin.sync_native_frame(nudged.frame, &set));
+        assert_eq!(pin.state(), &nudged);
+    }
+
+    #[test]
+    fn native_corner_resize_keeps_the_opposite_corner_anchored() {
+        let display = display("main", 0.0, 1_600.0, 24.0, 1_000.0, 2.0, true);
+        let set = DisplaySet::new(vec![display.clone()]);
+        let state = PinState::new(
+            LogicalRect::new(
+                LogicalPoint::new(300.0, 300.0),
+                LogicalSize::new(400.0, 200.0),
+            ),
+            PinScale::ORIGINAL,
+            Some(display.id.clone()),
+        );
+        let mut pin = PinnedSurface::restore_with_natural_size(
+            PinId::from("corner-resize"),
+            LogicalSize::new(400.0, 200.0),
+            state,
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+            &set,
+        )
+        .unwrap()
+        .unwrap();
+
+        let reported = LogicalRect::new(
+            LogicalPoint::new(200.0, 250.0),
+            LogicalSize::new(500.0, 250.0),
+        );
+        assert!(pin.sync_native_frame(reported, &set));
+        assert_eq!(pin.state.scale.get(), 1.25);
+        assert_eq!(pin.state.frame.size, LogicalSize::new(500.0, 250.0));
+        assert_eq!(pin.state.frame.origin.x + pin.state.frame.size.width, 700.0);
+        assert_eq!(
+            pin.state.frame.origin.y + pin.state.frame.size.height,
+            500.0
+        );
+    }
+
+    #[test]
+    fn interactive_scale_keeps_small_sources_large_enough_to_close() {
+        let display = display("main", 0.0, 1_600.0, 24.0, 1_000.0, 2.0, true);
+        let set = DisplaySet::new(vec![display.clone()]);
+        let mut pin = PinnedSurface::on_display(
+            PinId::from("small-source"),
+            LogicalSize::new(100.0, 20.0),
+            &display,
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+        )
+        .unwrap();
+
+        pin.set_scale(0.0, &set);
+        assert!(pin.state.frame.size.width >= MIN_PIN_LOGICAL_WIDTH);
+        assert!(pin.state.frame.size.height >= MIN_PIN_LOGICAL_HEIGHT);
     }
 
     #[test]

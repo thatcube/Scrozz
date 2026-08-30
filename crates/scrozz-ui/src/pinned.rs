@@ -6,22 +6,22 @@
 //! frame; geometry reconciliation and persistence remain in the overlay host.
 
 use egui::{
-    Align, Align2, Button, Color32, CornerRadius, FontId, Key, Layout, Pos2, Rect, Response, Sense,
-    Slider, Stroke, StrokeKind, TextureId, Ui, UiBuilder, Vec2, ViewportCommand, WidgetInfo,
-    WidgetType,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Key, Pos2, Rect, ResizeDirection, Response,
+    Sense, Stroke, StrokeKind, TextureId, Ui, Vec2, ViewportCommand, WidgetInfo, WidgetType,
 };
 use scrozz_core::{
-    DisplaySet, LogicalPoint, LogicalRect, LogicalSize, MAX_OPACITY, MIN_OPACITY, NudgeStep,
-    PinBorder, PinChrome, PinDirection, PinnedSurface,
+    DisplaySet, LogicalPoint, LogicalRect, LogicalSize, NudgeStep, PinDirection, PinnedSurface,
 };
 
 use crate::theme::{Appearance, Theme};
 
-const TOOLBAR_HEIGHT: f32 = 42.0;
-const TOOLBAR_INSET: f32 = 8.0;
-const TOOLBAR_MIN_WIDTH: f32 = 340.0;
-const CONTROL_HEIGHT: f32 = 28.0;
-const LOCK_BADGE_HEIGHT: f32 = 27.0;
+const CONTROL_DIAMETER: f32 = 38.0;
+const CONTROL_INSET: f32 = 8.0;
+const CONTROL_GAP: f32 = 8.0;
+const ZOOM_PILL_SIZE: Vec2 = Vec2::new(66.0, 30.0);
+const GRIP_SIZE: Vec2 = Vec2::new(54.0, 16.0);
+const RESIZE_EDGE: f32 = 7.0;
+const RESIZE_CORNER: f32 = 16.0;
 
 /// What changed while drawing a pinned capture.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -32,6 +32,8 @@ pub struct PinFrameResponse {
     pub close: bool,
     /// The user requested a nudge that the compositor cannot honor.
     pub positioning_unavailable: bool,
+    /// Open the detached action menu at this window-local point.
+    pub menu_at: Option<Pos2>,
 }
 
 /// Inputs needed to render one pinned capture.
@@ -56,6 +58,10 @@ pub struct PinFrame<'a> {
     pub theme: &'a Theme,
     /// Hover behavior, overridable by deterministic rendering harnesses.
     pub chrome_visibility: ChromeVisibility,
+    /// A global pointer probe says the pointer is over this locked pin.
+    pub locked_hovered: bool,
+    /// The pointer is over one of the locked pin's interactive control islands.
+    pub locked_control_hovered: bool,
 }
 
 /// Whether hover chrome should be inferred from live input or forced.
@@ -77,7 +83,12 @@ pub fn draw(ui: &mut Ui, mut frame: PinFrame<'_>) -> PinFrameResponse {
     let rect = ui.max_rect();
     let state = frame.surface.state().clone();
     let opacity = state.opacity.get() as f32;
-    let content_alpha = if frame.native_opacity { 1.0 } else { opacity };
+    let locked_hover_alpha = if state.locked && frame.locked_hovered {
+        0.5
+    } else {
+        1.0
+    };
+    let content_alpha = if frame.native_opacity { 1.0 } else { opacity } * locked_hover_alpha;
     let radius = state.chrome.corner_radius as f32;
     // A window capture's outermost pixels contain its native antialiasing and
     // shadow. Drawing beyond the viewport clips exactly those D9 edges.
@@ -123,38 +134,11 @@ pub fn draw(ui: &mut Ui, mut frame: PinFrame<'_>) -> PinFrameResponse {
     };
     body.widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, frame.name));
 
-    // An egui context menu cannot escape a tiny native viewport. When the
-    // toolbar cannot fit, keep the whole image as a direct recovery target;
-    // unpinning does not delete the capture from History.
-    let secondary_released_in_pin = ui.input(|input| {
-        input.events.iter().any(|event| {
-            matches!(
-                event,
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Secondary,
-                    pressed: false,
-                    ..
-                } if rect.contains(*pos)
-            )
-        })
-    });
-    if !state.locked {
-        if toolbar_fits(rect) {
-            body.context_menu(|ui| {
-                if ui.button("Close pinned capture").clicked() {
-                    output.close = true;
-                    ui.close();
-                }
-                if ui.button("Reset to original size").clicked() {
-                    reset_scale(ui, frame.surface, frame.displays);
-                    output.changed = true;
-                    ui.close();
-                }
-            });
-        } else if secondary_released_in_pin {
-            output.close = true;
-        }
+    if !state.locked
+        && let Some(position) = secondary_release_position(ui)
+        && rect.contains(position)
+    {
+        output.menu_at = Some(position);
     }
 
     if let Some(border) = state.chrome.border {
@@ -169,27 +153,25 @@ pub fn draw(ui: &mut Ui, mut frame: PinFrame<'_>) -> PinFrameResponse {
         );
     }
 
-    if !state.locked && body.drag_started() {
+    let resize_started = !state.locked && begin_resize(ui, rect);
+    if !state.locked && !resize_started && body.drag_started() {
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
     }
 
     let viewport_focused =
         ui.input(|input| input.viewport().focused.is_some_and(std::convert::identity));
-    if state.locked {
-        draw_lock_badge(
-            ui,
-            rect,
-            frame.theme,
-            content_alpha,
-            frame.surface.lock_escapes(),
-        );
-    } else if chrome_is_visible(
+    let chrome_visible = chrome_is_visible(
         frame.chrome_visibility,
-        body.hovered(),
+        if state.locked {
+            frame.locked_hovered
+        } else {
+            body.hovered()
+        },
         viewport_focused,
         ui.ctx().memory(|memory| memory.focused().is_some()),
-    ) {
-        draw_toolbar(ui, rect, &mut frame, &mut output);
+    );
+    if chrome_visible {
+        draw_controls(ui, rect, &mut frame, &mut output);
     }
 
     // Controls get first refusal on keys (notably slider arrows and menu
@@ -206,6 +188,20 @@ pub fn draw(ui: &mut Ui, mut frame: PinFrame<'_>) -> PinFrameResponse {
     output
 }
 
+fn secondary_release_position(ui: &Ui) -> Option<Pos2> {
+    ui.input(|input| {
+        input.events.iter().rev().find_map(|event| match event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                ..
+            } => Some(*pos),
+            _ => None,
+        })
+    })
+}
+
 fn chrome_is_visible(
     visibility: ChromeVisibility,
     hovered: bool,
@@ -215,10 +211,6 @@ fn chrome_is_visible(
     matches!(visibility, ChromeVisibility::Visible)
         || matches!(visibility, ChromeVisibility::Auto)
             && (hovered || viewport_focused || widget_focused)
-}
-
-fn toolbar_fits(window: Rect) -> bool {
-    window.width() >= TOOLBAR_MIN_WIDTH && window.height() >= TOOLBAR_HEIGHT + TOOLBAR_INSET * 2.0
 }
 
 fn handle_keys(
@@ -269,140 +261,91 @@ fn handle_keys(
     send_geometry(ui, surface);
 }
 
-fn draw_toolbar(
+fn draw_controls(
     ui: &mut Ui,
     window: Rect,
     frame: &mut PinFrame<'_>,
     output: &mut PinFrameResponse,
 ) {
-    let toolbar = Rect::from_min_max(
-        window.min + Vec2::splat(TOOLBAR_INSET),
-        Pos2::new(
-            window.max.x - TOOLBAR_INSET,
-            (window.min.y + TOOLBAR_INSET + TOOLBAR_HEIGHT).min(window.max.y),
-        ),
-    );
-    let palette = &frame.theme.palette;
-    let toolbar_fill = match palette.appearance {
-        Appearance::Dark => Color32::from_rgba_unmultiplied(19, 20, 28, 232),
-        Appearance::Light => Color32::from_rgba_unmultiplied(250, 250, 253, 235),
-    };
-    ui.painter()
-        .rect_filled(toolbar, CornerRadius::same(10), toolbar_fill);
-    ui.painter().rect_stroke(
-        toolbar,
-        CornerRadius::same(10),
-        Stroke::new(1.0, palette.hairline),
-        StrokeKind::Inside,
-    );
-
-    ui.scope_builder(
-        UiBuilder::new().max_rect(toolbar.shrink2(Vec2::new(8.0, 7.0))),
-        |ui| {
-            ui.style_mut().spacing.item_spacing = Vec2::new(5.0, 0.0);
-            ui.style_mut().visuals.widgets.inactive.fg_stroke.color = palette.text;
-            ui.style_mut().visuals.widgets.hovered.fg_stroke.color = palette.text;
-            ui.style_mut().visuals.widgets.active.fg_stroke.color = palette.text;
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let mut opacity = frame.surface.state().opacity.get();
-                let opacity_response = ui
-                    .add_sized(
-                        [78.0, CONTROL_HEIGHT],
-                        Slider::new(&mut opacity, MIN_OPACITY..=MAX_OPACITY)
-                            .show_value(false)
-                            .text("Opacity"),
-                    )
-                    .on_hover_text(format!("Opacity: {:.0}%", opacity * 100.0));
-                if opacity_response.changed() {
-                    frame.surface.set_opacity(opacity);
-                }
-
-                if compact_button(ui, "-", "Decrease pinned capture size").clicked() {
-                    change_scale(ui, frame.surface, frame.displays, 1.0 / 1.1);
-                }
-                let scale_percent = format!("{:.0}%", frame.surface.state().scale.get() * 100.0);
-                ui.label(scale_percent)
-                    .on_hover_text("Pinned capture scale");
-                if compact_button(ui, "+", "Increase pinned capture size").clicked() {
-                    change_scale(ui, frame.surface, frame.displays, 1.1);
-                }
-
-                if frame.surface.allows_synthetic_chrome() {
-                    ui.menu_button("Style", |ui| {
-                        let mut chrome = frame.surface.state().chrome;
-                        let mut changed = ui
-                            .add(
-                                Slider::new(&mut chrome.corner_radius, 0.0..=32.0)
-                                    .text("Corner radius"),
-                            )
-                            .changed();
-                        changed |= ui.checkbox(&mut chrome.shadow, "Shadow").changed();
-                        let mut border = chrome.border.is_some();
-                        if ui.checkbox(&mut border, "Border").changed() {
-                            chrome.border = border.then(|| PinBorder::new(1.0));
-                            changed = true;
-                        }
-                        if let Some(mut outline) = chrome.border
-                            && ui
-                                .add(
-                                    Slider::new(&mut outline.width, 0.5..=6.0).text("Border width"),
-                                )
-                                .changed()
-                        {
-                            chrome.border = Some(outline);
-                            changed = true;
-                        }
-                        if changed {
-                            frame.surface.set_chrome(PinChrome::new(
-                                chrome.corner_radius,
-                                chrome.shadow,
-                                chrome.border,
-                            ));
-                        }
-                    });
-                }
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if compact_button(ui, "Close", "Close pinned capture").clicked() {
-                        output.close = true;
-                    }
-                    let can_lock = frame.click_through && frame.surface.has_lock_escape();
-                    let lock = ui.add_enabled(
-                        can_lock,
-                        Button::new("Lock").min_size(Vec2::new(44.0, CONTROL_HEIGHT)),
-                    );
-                    let lock = if !frame.click_through {
-                        lock.on_disabled_hover_text(
-                            "Click-through is unavailable in this desktop session",
-                        )
-                    } else if !frame.surface.has_lock_escape() {
-                        lock.on_disabled_hover_text(
-                            "Start command forwarding, enable the tray menu, or register an Unlock Pinned Captures hotkey first",
-                        )
-                    } else {
-                        lock.on_hover_text("Lock and pass pointer input through")
-                    };
-                    if lock.clicked() && frame.surface.set_locked(true).is_ok() {
-                        ui.ctx()
-                            .send_viewport_cmd(ViewportCommand::MousePassthrough(true));
-                    }
-                });
-            });
-        },
-    );
-}
-
-fn compact_button(ui: &mut Ui, label: &str, help: &str) -> Response {
-    ui.add_sized(
-        [if label.len() > 2 { 44.0 } else { 27.0 }, CONTROL_HEIGHT],
-        Button::new(label),
+    let layout = control_layout(window);
+    if circle_control(
+        ui,
+        layout.close,
+        ControlIcon::Close,
+        true,
+        "Close pinned capture",
     )
-    .on_hover_text(help)
-}
+    .clicked()
+    {
+        output.close = true;
+    }
 
-fn change_scale(ui: &Ui, surface: &mut PinnedSurface, displays: &DisplaySet, factor: f64) {
-    surface.set_scale(surface.state().scale.get() * factor, displays);
-    send_geometry(ui, surface);
+    if let Some(lock_rect) = layout.lock {
+        let can_lock =
+            frame.surface.state().locked || frame.click_through && frame.surface.has_lock_escape();
+        let help = if frame.surface.state().locked {
+            "Unlock pinned capture"
+        } else if !frame.click_through {
+            "Click-through is unavailable in this desktop session"
+        } else if !frame.surface.has_lock_escape() {
+            "Enable the Scrozz menu, command forwarding, or a global unlock hotkey first"
+        } else {
+            "Lock and pass pointer input through"
+        };
+        let lock = circle_control(ui, lock_rect, ControlIcon::Lock, can_lock, help);
+        if lock.clicked() {
+            let next = !frame.surface.state().locked;
+            if frame.surface.set_locked(next).is_ok() {
+                let over_control = ui.input(|input| {
+                    input
+                        .pointer
+                        .latest_pos()
+                        .is_some_and(|point| pointer_over_control(window, point))
+                });
+                ui.ctx()
+                    .send_viewport_cmd(ViewportCommand::MousePassthrough(next && !over_control));
+                output.changed = true;
+            }
+        }
+    }
+
+    if let Some(zoom) = layout.zoom {
+        pill(ui, zoom);
+        ui.painter().text(
+            zoom.center(),
+            Align2::CENTER_CENTER,
+            format!("{:.0}%", frame.surface.state().scale.get() * 100.0),
+            FontId::proportional(12.0),
+            Color32::WHITE,
+        );
+        ui.interact(zoom, ui.id().with("pin-scale"), Sense::hover())
+            .on_hover_text("Pinned capture scale")
+            .widget_info(|| {
+                WidgetInfo::labeled(
+                    WidgetType::Label,
+                    true,
+                    format!("{:.0}% scale", frame.surface.state().scale.get() * 100.0),
+                )
+            });
+    }
+
+    if let Some(grip) = layout.grip {
+        pill(ui, grip);
+        for offset in [-8.0, 0.0, 8.0] {
+            ui.painter().circle_filled(
+                Pos2::new(grip.center().x + offset, grip.center().y),
+                1.5,
+                Color32::from_white_alpha(210),
+            );
+        }
+        let grip = ui
+            .interact(grip, ui.id().with("pin-move-grip"), Sense::drag())
+            .on_hover_cursor(CursorIcon::Grab)
+            .on_hover_text("Drag to move");
+        if !frame.surface.state().locked && grip.drag_started() {
+            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+        }
+    }
 }
 
 fn reset_scale(ui: &Ui, surface: &mut PinnedSurface, displays: &DisplaySet) {
@@ -418,48 +361,267 @@ fn send_geometry(ui: &Ui, surface: &PinnedSurface) {
         .send_viewport_cmd(ViewportCommand::InnerSize(frame.size()));
 }
 
-fn draw_lock_badge(
-    ui: &Ui,
-    window: Rect,
-    theme: &Theme,
-    opacity: f32,
-    escapes: &[scrozz_core::LockEscape],
-) {
-    let width = 202.0_f32.min((window.width() - 16.0).max(0.0));
-    if width <= 0.0 || window.height() < LOCK_BADGE_HEIGHT + 8.0 {
-        return;
-    }
-    let rect = Rect::from_min_size(
+#[derive(Clone, Copy)]
+struct ControlLayout {
+    close: Rect,
+    lock: Option<Rect>,
+    zoom: Option<Rect>,
+    grip: Option<Rect>,
+}
+
+fn control_layout(window: Rect) -> ControlLayout {
+    let diameter = CONTROL_DIAMETER
+        .min(window.width().max(0.0))
+        .min(window.height().max(0.0));
+    let y = window.min.y + CONTROL_INSET.min((window.height() - diameter).max(0.0) / 2.0);
+    let left = Rect::from_min_size(
         Pos2::new(
-            window.center().x - width / 2.0,
-            window.max.y - LOCK_BADGE_HEIGHT - 8.0,
+            window.min.x + CONTROL_INSET.min(window.width() - diameter),
+            y,
         ),
-        Vec2::new(width, LOCK_BADGE_HEIGHT),
+        Vec2::splat(diameter),
     );
-    let fill = match theme.palette.appearance {
-        Appearance::Dark => Color32::from_rgba_unmultiplied(12, 13, 18, 218),
-        Appearance::Light => Color32::from_rgba_unmultiplied(250, 250, 253, 226),
-    };
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(8), alpha(fill, opacity));
-    let label = if escapes.contains(&scrozz_core::LockEscape::TrayMenu) {
-        "Locked - unlock from the Scrozz menu"
-    } else if escapes.contains(&scrozz_core::LockEscape::GlobalHotkey) {
-        "Locked - use the global unlock hotkey"
-    } else if escapes.contains(&scrozz_core::LockEscape::CommandLine) {
-        "Locked - run `scrozz history unlock-pins`"
+    let right = Rect::from_min_size(
+        Pos2::new(
+            window.max.x - diameter - CONTROL_INSET.min(window.width() - diameter),
+            y,
+        ),
+        Vec2::splat(diameter),
+    );
+    let enough_for_both = window.width() >= diameter * 2.0 + CONTROL_INSET * 2.0 + CONTROL_GAP;
+    let (close, lock) = if cfg!(target_os = "macos") {
+        (left, enough_for_both.then_some(right))
     } else {
-        "Locked"
+        (right, enough_for_both.then_some(left))
     };
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(11.0),
-        alpha(theme.palette.text, opacity),
+    let zoom = (window.width() >= ZOOM_PILL_SIZE.x + diameter * 2.0 + CONTROL_INSET * 4.0
+        && window.height() >= ZOOM_PILL_SIZE.y + CONTROL_INSET * 2.0)
+        .then(|| {
+            Rect::from_center_size(
+                Pos2::new(
+                    window.center().x,
+                    window.min.y + CONTROL_INSET + ZOOM_PILL_SIZE.y / 2.0,
+                ),
+                ZOOM_PILL_SIZE,
+            )
+        });
+    let grip = (window.width() >= GRIP_SIZE.x + CONTROL_INSET * 2.0
+        && window.height() >= CONTROL_DIAMETER + GRIP_SIZE.y + CONTROL_INSET * 3.0)
+        .then(|| {
+            Rect::from_center_size(
+                Pos2::new(
+                    window.center().x,
+                    window.max.y - CONTROL_INSET - GRIP_SIZE.y / 2.0,
+                ),
+                GRIP_SIZE,
+            )
+        });
+    ControlLayout {
+        close,
+        lock,
+        zoom,
+        grip,
+    }
+}
+
+/// Whether a pointer in pin-local coordinates is over Close or Lock.
+#[must_use]
+pub fn pointer_over_control(window: Rect, pointer: Pos2) -> bool {
+    let layout = control_layout(window);
+    layout.close.expand(2.0).contains(pointer)
+        || layout
+            .lock
+            .is_some_and(|rect| rect.expand(2.0).contains(pointer))
+}
+
+#[derive(Clone, Copy)]
+enum ControlIcon {
+    Close,
+    Lock,
+}
+
+fn circle_control(
+    ui: &mut Ui,
+    rect: Rect,
+    icon: ControlIcon,
+    enabled: bool,
+    help: &str,
+) -> Response {
+    let response = ui
+        .interact(
+            rect,
+            ui.id().with(("pin-control", icon as u8)),
+            if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(help);
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let center = rect.center()
+        + if pressed {
+            Vec2::new(0.0, 1.0)
+        } else {
+            Vec2::ZERO
+        };
+    ui.painter().circle_filled(
+        center + Vec2::new(0.0, 2.0),
+        rect.width() / 2.0,
+        Color32::from_black_alpha(if hovered { 72 } else { 48 }),
     );
-    ui.interact(rect, ui.id().with("pin-lock-guidance"), Sense::hover())
-        .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, label));
+    ui.painter().circle_filled(
+        center,
+        rect.width() / 2.0,
+        if enabled {
+            Color32::from_rgba_unmultiplied(246, 247, 249, if hovered { 248 } else { 224 })
+        } else {
+            Color32::from_rgba_unmultiplied(210, 212, 218, 150)
+        },
+    );
+    let ink = if enabled {
+        Color32::from_rgb(27, 29, 34)
+    } else {
+        Color32::from_gray(120)
+    };
+    match icon {
+        ControlIcon::Close => draw_close_icon(ui, center, rect.width(), ink),
+        ControlIcon::Lock => draw_lock_icon(ui, center, rect.width(), ink),
+    }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, help));
+    response
+}
+
+fn draw_close_icon(ui: &Ui, center: Pos2, diameter: f32, color: Color32) {
+    let arm = diameter * 0.16;
+    let stroke = Stroke::new((diameter * 0.075).max(1.5), color);
+    ui.painter().line_segment(
+        [center + Vec2::new(-arm, -arm), center + Vec2::new(arm, arm)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [center + Vec2::new(arm, -arm), center + Vec2::new(-arm, arm)],
+        stroke,
+    );
+}
+
+fn draw_lock_icon(ui: &Ui, center: Pos2, diameter: f32, color: Color32) {
+    let width = diameter * 0.34;
+    let body = Rect::from_center_size(
+        center + Vec2::new(0.0, diameter * 0.09),
+        Vec2::new(width, diameter * 0.28),
+    );
+    ui.painter()
+        .rect_filled(body, CornerRadius::same((diameter * 0.05) as u8), color);
+    let shackle = Rect::from_center_size(
+        center + Vec2::new(0.0, -diameter * 0.08),
+        Vec2::new(width * 0.66, diameter * 0.25),
+    );
+    ui.painter().rect_stroke(
+        shackle,
+        CornerRadius::same((diameter * 0.12) as u8),
+        Stroke::new((diameter * 0.065).max(1.5), color),
+        StrokeKind::Inside,
+    );
+}
+
+fn pill(ui: &Ui, rect: Rect) {
+    ui.painter().rect_filled(
+        rect.translate(Vec2::new(0.0, 2.0)),
+        CornerRadius::same((rect.height() / 2.0) as u8),
+        Color32::from_black_alpha(52),
+    );
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same((rect.height() / 2.0) as u8),
+        Color32::from_rgba_unmultiplied(20, 22, 28, 214),
+    );
+}
+
+fn begin_resize(ui: &mut Ui, window: Rect) -> bool {
+    let handles = resize_handles(window);
+    for (index, (direction, rect, cursor)) in handles.into_iter().enumerate() {
+        let response = ui
+            .interact(rect, ui.id().with(("pin-resize", index)), Sense::drag())
+            .on_hover_cursor(cursor);
+        if response.drag_started() {
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::BeginResize(direction));
+            return true;
+        }
+    }
+    false
+}
+
+fn resize_handles(window: Rect) -> [(ResizeDirection, Rect, CursorIcon); 8] {
+    let corner = RESIZE_CORNER
+        .min(window.width().max(0.0))
+        .min(window.height().max(0.0));
+    let edge = RESIZE_EDGE
+        .min(window.width().max(0.0))
+        .min(window.height().max(0.0));
+    [
+        (
+            ResizeDirection::NorthWest,
+            Rect::from_min_size(window.min, Vec2::splat(corner)),
+            CursorIcon::ResizeNwSe,
+        ),
+        (
+            ResizeDirection::NorthEast,
+            Rect::from_min_size(
+                Pos2::new(window.max.x - corner, window.min.y),
+                Vec2::splat(corner),
+            ),
+            CursorIcon::ResizeNeSw,
+        ),
+        (
+            ResizeDirection::SouthWest,
+            Rect::from_min_size(
+                Pos2::new(window.min.x, window.max.y - corner),
+                Vec2::splat(corner),
+            ),
+            CursorIcon::ResizeNeSw,
+        ),
+        (
+            ResizeDirection::SouthEast,
+            Rect::from_min_size(window.max - Vec2::splat(corner), Vec2::splat(corner)),
+            CursorIcon::ResizeNwSe,
+        ),
+        (
+            ResizeDirection::North,
+            Rect::from_min_max(
+                Pos2::new(window.min.x + corner, window.min.y),
+                Pos2::new(window.max.x - corner, window.min.y + edge),
+            ),
+            CursorIcon::ResizeVertical,
+        ),
+        (
+            ResizeDirection::South,
+            Rect::from_min_max(
+                Pos2::new(window.min.x + corner, window.max.y - edge),
+                Pos2::new(window.max.x - corner, window.max.y),
+            ),
+            CursorIcon::ResizeVertical,
+        ),
+        (
+            ResizeDirection::West,
+            Rect::from_min_max(
+                Pos2::new(window.min.x, window.min.y + corner),
+                Pos2::new(window.min.x + edge, window.max.y - corner),
+            ),
+            CursorIcon::ResizeHorizontal,
+        ),
+        (
+            ResizeDirection::East,
+            Rect::from_min_max(
+                Pos2::new(window.max.x - edge, window.min.y + corner),
+                Pos2::new(window.max.x, window.max.y - corner),
+            ),
+            CursorIcon::ResizeHorizontal,
+        ),
+    ]
 }
 
 fn alpha(color: Color32, amount: f32) -> Color32 {
@@ -567,11 +729,9 @@ impl crate::harness::Scene for PinnedScene {
                 native_opacity: false,
                 click_through: true,
                 theme: &theme,
-                chrome_visibility: if self.locked {
-                    ChromeVisibility::Hidden
-                } else {
-                    ChromeVisibility::Visible
-                },
+                chrome_visibility: ChromeVisibility::Visible,
+                locked_hovered: self.locked,
+                locked_control_hovered: false,
             },
         );
     }
@@ -644,7 +804,7 @@ fn sane_zoom(zoom_factor: f32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::{Event, Modifiers, PointerButton};
+    use egui::{Event, Modifiers, PointerButton, UiBuilder};
     use scrozz_core::{Display, DisplayId, LockEscape, PinChromePolicy, PinId, ScaleFactor};
 
     fn displays() -> DisplaySet {
@@ -741,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn secondary_click_closes_a_pin_too_small_for_its_toolbar() {
+    fn secondary_click_opens_the_detached_menu_even_for_a_tiny_pin() {
         let set = displays();
         let mut surface = PinnedSurface::on_display(
             PinId("tiny".into()),
@@ -756,7 +916,7 @@ mod tests {
             surface.state().frame.size.width as f32,
             surface.state().frame.size.height as f32,
         );
-        assert!(size.y < TOOLBAR_HEIGHT);
+        assert!(size.y <= CONTROL_DIAMETER);
 
         let context = egui::Context::default();
         let point = Pos2::new(2.0, 2.0);
@@ -788,6 +948,8 @@ mod tests {
                         click_through: true,
                         theme: &Theme::for_appearance(Appearance::Dark),
                         chrome_visibility: ChromeVisibility::Auto,
+                        locked_hovered: false,
+                        locked_control_hovered: false,
                     },
                 ));
             });
@@ -799,11 +961,10 @@ mod tests {
             !pass(vec![Event::PointerMoved(point), event(true)]).close,
             "secondary press alone must not close the pin"
         );
+        let released = pass(vec![event(false)]);
+        assert!(!released.close);
+        assert_eq!(released.menu_at, Some(point));
         let outside = Pos2::new(size.x + 100.0, size.y + 100.0);
-        assert!(
-            pass(vec![event(false), Event::PointerMoved(outside)]).close,
-            "secondary release anywhere on the tiny pin must close it"
-        );
         let outside_event = |pressed| Event::PointerButton {
             pos: outside,
             button: PointerButton::Secondary,
@@ -812,13 +973,15 @@ mod tests {
         };
         let _ = pass(vec![Event::PointerMoved(outside), outside_event(true)]);
         assert!(
-            !pass(vec![outside_event(false), Event::PointerMoved(point)]).close,
+            pass(vec![outside_event(false), Event::PointerMoved(point)])
+                .menu_at
+                .is_none(),
             "a release outside the pin must not borrow a later inside pointer position"
         );
     }
 
     #[test]
-    fn secondary_click_does_not_immediately_close_a_toolbar_sized_pin() {
+    fn secondary_click_opens_the_detached_menu_for_a_regular_pin() {
         let set = displays();
         let mut surface = PinnedSurface::on_display(
             PinId("regular".into()),
@@ -832,8 +995,6 @@ mod tests {
             surface.state().frame.size.width as f32,
             surface.state().frame.size.height as f32,
         );
-        assert!(toolbar_fits(Rect::from_min_size(Pos2::ZERO, size)));
-
         let context = egui::Context::default();
         let point = Pos2::new(size.x / 2.0, size.y / 2.0);
         let event = |pressed| Event::PointerButton {
@@ -865,6 +1026,8 @@ mod tests {
                             click_through: true,
                             theme: &Theme::for_appearance(Appearance::Dark),
                             chrome_visibility: ChromeVisibility::Auto,
+                            locked_hovered: false,
+                            locked_control_hovered: false,
                         },
                     ));
                 },
@@ -874,10 +1037,35 @@ mod tests {
         };
 
         let _ = pass(vec![Event::PointerMoved(point), event(true)]);
-        assert!(
-            !pass(vec![Event::PointerMoved(point), event(false)]).close,
-            "a regular pin should open its context menu rather than close immediately"
-        );
+        let released = pass(vec![Event::PointerMoved(point), event(false)]);
+        assert!(!released.close);
+        assert_eq!(released.menu_at, Some(point));
+    }
+
+    #[test]
+    fn responsive_controls_keep_close_when_lock_and_zoom_do_not_fit() {
+        let tiny = control_layout(Rect::from_min_size(Pos2::ZERO, Vec2::new(54.0, 32.0)));
+        assert!(tiny.lock.is_none());
+        assert!(tiny.zoom.is_none());
+        assert!(tiny.grip.is_none());
+        assert!(tiny.close.width() > 0.0);
+
+        let full = control_layout(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 260.0)));
+        assert!(full.lock.is_some());
+        assert!(full.zoom.is_some());
+        assert!(full.grip.is_some());
+    }
+
+    #[test]
+    fn locked_control_hit_regions_cover_close_and_lock_only() {
+        let window = Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 260.0));
+        let layout = control_layout(window);
+        assert!(pointer_over_control(window, layout.close.center()));
+        assert!(pointer_over_control(
+            window,
+            layout.lock.expect("wide pins show lock").center()
+        ));
+        assert!(!pointer_over_control(window, window.center()));
     }
 
     #[test]

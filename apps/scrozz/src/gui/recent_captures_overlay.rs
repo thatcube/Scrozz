@@ -426,6 +426,9 @@ impl RecentCapturesOverlayCards {
                     self.pinned.remove(&pin.0);
                     out.push(CardEvent::Unpin(CaptureId(pin.0)));
                 }
+                RecentCapturesOverlayEvent::PinActionRequested { pin, action } => {
+                    out.push(CardEvent::PinnedAction(CaptureId(pin.0), action));
+                }
                 RecentCapturesOverlayEvent::PinUnavailable { card, reason } => {
                     if let Some(ours) = self.mapped.get(&card.0).copied() {
                         out.push(CardEvent::PinUnavailable { card: ours, reason });
@@ -687,6 +690,25 @@ mod tests {
             })
         );
         assert_eq!(surface.poll(), None, "the drag was drained twice");
+    }
+
+    #[test]
+    fn durable_pin_actions_do_not_require_a_live_card_mapping() {
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
+        surface
+            .handle
+            .report(RecentCapturesOverlayEvent::PinActionRequested {
+                pin: scrozz_core::PinId("capture-17".into()),
+                action: scrozz_ui::recent_captures_overlay::PinnedCaptureAction::ExtractText,
+            });
+
+        assert_eq!(
+            surface.poll(),
+            Some(CardEvent::PinnedAction(
+                CaptureId("capture-17".into()),
+                scrozz_ui::recent_captures_overlay::PinnedCaptureAction::ExtractText,
+            ))
+        );
     }
 
     #[test]

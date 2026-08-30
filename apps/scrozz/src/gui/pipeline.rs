@@ -211,6 +211,8 @@ pub enum HistoryOperation {
     Copy,
     /// Export the rendered capture.
     Save,
+    /// Recognize text from the rendered capture and copy it.
+    ExtractText,
     /// Prepare a promised-file drag.
     Drag,
     /// Change retention protection.
@@ -233,6 +235,7 @@ impl HistoryOperation {
             Self::OpenEditor => "open editor",
             Self::Copy => "copy capture",
             Self::Save => "save capture",
+            Self::ExtractText => "extract text",
             Self::Drag => "drag capture",
             Self::Pin => "change pinned state",
             Self::Delete => "delete capture",
@@ -414,6 +417,22 @@ pub(crate) enum Job {
     CopyHistory(CaptureId),
     /// Save a stored document.
     SaveHistory(CaptureId),
+    /// Save a stored document to an explicitly chosen path.
+    SaveHistoryTo {
+        /// Durable capture to render.
+        capture: CaptureId,
+        /// Native-dialog destination.
+        path: std::path::PathBuf,
+    },
+    /// Upload a stored document through the configured provider.
+    UploadHistory {
+        /// Durable capture to render.
+        capture: CaptureId,
+        /// Session-local upload identity.
+        card: CardId,
+    },
+    /// Recognize text in a stored document and copy it.
+    ExtractHistoryText(CaptureId),
     /// Pre-render a stored document before a drag gesture starts.
     PrepareHistoryDrag(CaptureId),
     /// Change a stored capture's pinned state.
@@ -1845,6 +1864,11 @@ impl Worker {
                 Job::OpenHistoryRecording { capture } => self.open_history_recording(capture),
                 Job::CopyHistory(capture) => self.copy_history(capture),
                 Job::SaveHistory(capture) => self.save_history(capture),
+                Job::SaveHistoryTo { capture, path } => {
+                    self.save_history_to(capture, &path);
+                }
+                Job::UploadHistory { capture, card } => self.upload_history(capture, card),
+                Job::ExtractHistoryText(capture) => self.extract_history_text(capture),
                 Job::PrepareHistoryDrag(capture) => self.prepare_history_drag(capture),
                 Job::SetPinned { capture, pinned } => self.set_pinned(capture, pinned),
                 Job::Delete(capture) => self.delete(capture),
@@ -2848,6 +2872,41 @@ impl Worker {
             Ok(format!("saved to {}", path.display()))
         });
         self.answer_history(HistoryOperation::Save, capture, result);
+    }
+
+    fn save_history_to(&mut self, capture: CaptureId, destination: &std::path::Path) {
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            let path = crate::output::export_to_path(rendered.bytes.as_slice(), destination)?;
+            Ok(format!("saved to {}", path.display()))
+        });
+        self.answer_history(HistoryOperation::Save, capture, result);
+    }
+
+    fn upload_history(&mut self, capture: CaptureId, card: CardId) {
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
+                rendered.bytes.as_ref().clone(),
+                format!("Screenshot-{}.png", capture.0),
+            )?;
+            self.queue_upload(card, Some(capture), ShareVersion::original(), artifact)
+        });
+        self.answer_upload(card, result);
+    }
+
+    fn extract_history_text(&mut self, capture: CaptureId) {
+        use scrozz_ocr::Ocr as _;
+
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            let engine = crate::platform::ocr_engine(scrozz_ocr::Options::default());
+            let blocks = engine.recognize(&rendered.frame)?;
+            let text = scrozz_ocr::plain_text(&blocks);
+            if text.trim().is_empty() {
+                return Err(CliError::usage("no text was found in this capture"));
+            }
+            scrozz_export::SystemClipboard::new().write_text(&text)?;
+            Ok("extracted text and copied it to the clipboard".to_owned())
+        });
+        self.answer_history(HistoryOperation::ExtractText, capture, result);
     }
 
     fn prepare_history_drag(&mut self, capture: CaptureId) {

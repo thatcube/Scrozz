@@ -34,7 +34,7 @@ use std::{
 use scrozz_core::{ColorSpace, Frame, PinState, Provenance, Transform as ColorTransform};
 use scrozz_store::CaptureId;
 use scrozz_ui::card::CardMedia;
-use scrozz_ui::recent_captures_overlay::RecentCapturesAutoCloseAction;
+use scrozz_ui::recent_captures_overlay::{PinnedCaptureAction, RecentCapturesAutoCloseAction};
 use scrozz_ui::{ScrollHudAction, ScrollHudState};
 
 use crate::gui::action::CaptureKind;
@@ -465,6 +465,8 @@ pub enum CardEvent {
     PinChanged(CaptureId, PinState),
     /// A pin closed and must not restore.
     Unpin(CaptureId),
+    /// A content action requested by a durable pin.
+    PinnedAction(CaptureId, PinnedCaptureAction),
     /// A native pin request was truthfully refused.
     PinUnavailable {
         /// Card that was not pinned.
@@ -496,7 +498,10 @@ impl CardEvent {
             | Self::Pin(id, _, _)
             | Self::PinUnavailable { card: id, .. } => Some(*id),
             Self::Save { card, .. } | Self::Drag { card, .. } => Some(*card),
-            Self::PinChanged(..) | Self::Unpin(..) | Self::PinPositioningUnavailable { .. } => None,
+            Self::PinChanged(..)
+            | Self::Unpin(..)
+            | Self::PinnedAction(..)
+            | Self::PinPositioningUnavailable { .. } => None,
         }
     }
 }

@@ -2446,21 +2446,12 @@ fn append_support_gap(label: &str, support: &scrozz_shell::pin::Support, gaps: &
 /// An exact pointer source for the click-through logic, if one is available.
 ///
 fn pointer_probe(geometry: SharedGeometry) -> Option<scrozz_ui::PointerProbe> {
-    #[cfg(target_os = "macos")]
-    {
-        Some(Arc::new(move || {
-            let current = *geometry.lock().ok()?;
-            scrozz_shell::macos::display::pointer_location()
-                .ok()
-                .map(|point| local_pointer(current, point))
-        }))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = geometry;
-        None
-    }
+    Some(Arc::new(move || {
+        let current = *geometry.lock().ok()?;
+        scrozz_shell::pointer_location()
+            .ok()
+            .map(|point| local_pointer(current, point))
+    }))
 }
 
 fn local_pointer(

@@ -128,7 +128,7 @@ use scrozz_ui::{
         PermissionPrompt as PermissionUiPrompt, PermissionStage as PermissionUiStage,
         PickerFallback,
     },
-    recent_captures_overlay::RecentCapturesAutoCloseAction,
+    recent_captures_overlay::{PinnedCaptureAction, RecentCapturesAutoCloseAction},
     settings::{
         AfterCaptureCell, AfterCaptureEdit, AfterCaptureMedia, AfterCaptureRow, ShortcutEdit,
         ShortcutRow,
@@ -745,6 +745,10 @@ pub struct App {
     recorded_history_id: Option<CaptureId>,
     /// A native destination chooser polled without blocking the application event loop.
     pending_save_dialog: Option<PendingSaveDialog>,
+    /// A modeless destination chooser for a durable pinned capture.
+    pending_pin_save_dialog: Option<PendingPinSaveDialog>,
+    /// Synthetic upload identities awaiting a pinned-capture result.
+    pending_pin_uploads: HashMap<CardId, CaptureId>,
     /// Secret-free private-sharing configuration, as the UI sees it.
     cloud_settings: scrozz_ui::CloudSettingsModel,
     /// A pending request to open the Sharing settings viewport.
@@ -851,6 +855,11 @@ enum CardOutput {
 struct PendingSaveDialog {
     card: CardId,
     rendered: Option<Box<RevisionedFrame>>,
+    future: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>,
+}
+
+struct PendingPinSaveDialog {
+    capture: CaptureId,
     future: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>,
 }
 
@@ -1326,6 +1335,8 @@ impl App {
             recorded_media_targets: HashMap::new(),
             recorded_history_id: None,
             pending_save_dialog: None,
+            pending_pin_save_dialog: None,
+            pending_pin_uploads: HashMap::new(),
             cloud_settings,
             sharing_settings_requested: false,
             connection_test: None,
@@ -1407,6 +1418,7 @@ impl App {
         self.sync_camera_settings_window();
         self.drain_pipeline();
         self.drain_save_dialog();
+        self.drain_pin_save_dialog();
         self.drain_connection_test();
         self.drain_cards(editor);
         // After the HUD's own events: an abort raised this frame must beat the
@@ -1435,7 +1447,7 @@ impl App {
 
     /// Whether the host should keep polling a modeless native Save As future.
     pub(crate) const fn has_pending_save_dialog(&self) -> bool {
-        self.pending_save_dialog.is_some()
+        self.pending_save_dialog.is_some() || self.pending_pin_save_dialog.is_some()
     }
 
     fn drain_tray(&mut self) -> Tick {
@@ -1921,6 +1933,11 @@ impl App {
                     self.complete_output_action(card);
                 }
                 Outcome::UploadDone { card, detail } => {
+                    if let Some(capture) = self.pending_pin_uploads.remove(&card) {
+                        self.note(format!("pinned capture {} {detail}", capture.0));
+                        self.pipeline.post(Job::Release(card));
+                        continue;
+                    }
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
                     if let Some(retention) = self.card_retention.get_mut(&card) {
@@ -1997,6 +2014,14 @@ impl App {
                     self.note(format!("{card} refused: {error}"));
                 }
                 Outcome::UploadRefused { card, error } => {
+                    if let Some(capture) = self.pending_pin_uploads.remove(&card) {
+                        self.note(format!(
+                            "pinned capture {} upload refused: {error}",
+                            capture.0
+                        ));
+                        self.pipeline.post(Job::Release(card));
+                        continue;
+                    }
                     // A failed upload leaves the card exactly where it is: the
                     // link the user asked for never arrived, so hiding it now
                     // would throw away the only copy they can still act on.
@@ -2409,6 +2434,9 @@ impl App {
                     });
                     self.note(format!("pinned capture {} closed", capture.0));
                 }
+                CardEvent::PinnedAction(capture, action) => {
+                    self.perform_pinned_capture_action(capture, action);
+                }
                 CardEvent::PinUnavailable { card, reason } => {
                     self.note(format!("{card} could not be pinned: {reason}"));
                 }
@@ -2443,6 +2471,52 @@ impl App {
                     self.finish_scrolling_hud();
                 }
             }
+        }
+    }
+
+    fn perform_pinned_capture_action(&mut self, capture: CaptureId, action: PinnedCaptureAction) {
+        let queued = match action {
+            PinnedCaptureAction::Annotate => {
+                self.perform_history_action(HistoryAction::OpenEditor(capture.clone()))
+            }
+            PinnedCaptureAction::Copy => self.pipeline.post(Job::CopyHistory(capture.clone())),
+            PinnedCaptureAction::SaveAs => {
+                self.begin_pin_save_dialog(capture.clone());
+                true
+            }
+            PinnedCaptureAction::Upload => {
+                self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                if !self.cloud_settings.upload_enabled {
+                    let reason = self
+                        .cloud_settings
+                        .unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "sharing is unavailable".to_owned());
+                    self.note(format!(
+                        "pinned capture {} upload unavailable: {reason}",
+                        capture.0
+                    ));
+                    return;
+                }
+                let card = self.pipeline.allocate();
+                let posted = self.pipeline.post(Job::UploadHistory {
+                    capture: capture.clone(),
+                    card,
+                });
+                if posted {
+                    self.pending_pin_uploads.insert(card, capture.clone());
+                }
+                posted
+            }
+            PinnedCaptureAction::ExtractText => {
+                self.pipeline.post(Job::ExtractHistoryText(capture.clone()))
+            }
+        };
+        if !queued {
+            self.note(format!(
+                "pinned capture {} action could not be queued: the capture worker has gone",
+                capture.0
+            ));
         }
     }
 
@@ -2830,6 +2904,52 @@ impl App {
             self.close_after_output.remove(&card);
             self.note(format!(
                 "{card} could not be queued for save: the capture worker has gone"
+            ));
+        }
+    }
+
+    fn begin_pin_save_dialog(&mut self, capture: CaptureId) {
+        if self.has_pending_save_dialog() {
+            self.note(format!(
+                "pinned capture {} stayed on screen because another Save As dialog is open",
+                capture.0
+            ));
+            return;
+        }
+        let future = Box::pin(
+            rfd::AsyncFileDialog::new()
+                .set_title("Save Pinned Capture")
+                .set_file_name("Scrozz Capture.png")
+                .add_filter("PNG image", &["png"])
+                .save_file(),
+        );
+        self.pending_pin_save_dialog = Some(PendingPinSaveDialog { capture, future });
+    }
+
+    fn drain_pin_save_dialog(&mut self) {
+        let Some(pending) = self.pending_pin_save_dialog.as_mut() else {
+            return;
+        };
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let Poll::Ready(result) = pending.future.as_mut().poll(&mut context) else {
+            return;
+        };
+        let PendingPinSaveDialog { capture, .. } = self
+            .pending_pin_save_dialog
+            .take()
+            .expect("polled pin save dialog exists");
+        let Some(file) = result else {
+            self.note(format!("pinned capture {} save was cancelled", capture.0));
+            return;
+        };
+        if !self.pipeline.post(Job::SaveHistoryTo {
+            capture: capture.clone(),
+            path: file.path().to_path_buf(),
+        }) {
+            self.note(format!(
+                "pinned capture {} could not be queued for save: the capture worker has gone",
+                capture.0
             ));
         }
     }
