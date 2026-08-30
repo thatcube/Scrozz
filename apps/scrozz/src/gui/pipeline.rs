@@ -2027,7 +2027,10 @@ impl Worker {
             }
         };
 
-        let include_window_shadow = target.is_window();
+        // Only a window capture has a shadow to include, and the user can turn
+        // it off for good in Settings or skip it for one shot with the modifier.
+        let include_window_shadow =
+            target.is_window() && crate::settings::window_shadow(policy).unwrap_or(true);
         let request = CaptureRequest {
             target,
             cursor: CursorMode::Hidden,
@@ -2061,7 +2064,18 @@ impl Worker {
         policy: &AfterCaptureSettings,
     ) -> CliResult<ReadyCapture> {
         let mut document = Document::new(capture);
-        let apply_smart_frame = crate::settings::smart_frame_after_capture(policy)?;
+        // Presentation is a Scenes decision now, resolved per capture type with
+        // the pane's own `default` fallback. `AllInOne` has already resolved to
+        // a concrete mode by the time a capture exists; treating it as Region
+        // matches what the user dragged.
+        let scene_slug = match kind {
+            CaptureKind::Window => "window",
+            CaptureKind::Fullscreen => "full-screen",
+            CaptureKind::AllDisplays => "all-displays",
+            CaptureKind::Scrolling => "scrolling",
+            CaptureKind::Region | CaptureKind::AllInOne => "region",
+        };
+        let apply_smart_frame = crate::settings::scene_for_capture(policy, scene_slug)?.is_some();
         let editor_source = if apply_smart_frame {
             Some(Arc::new(
                 FrameEncoder::new().encode(&document.source().frame, ImageFormat::Png)?,

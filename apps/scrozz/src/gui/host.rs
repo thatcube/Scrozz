@@ -1439,22 +1439,33 @@ impl Driver {
     fn show_settings(&mut self, ctx: &egui::Context) {
         let edits = self.settings.show(
             ctx,
-            scrozz_ui::settings::BuildInfo {
-                version: crate::build_info::VERSION,
-                build: crate::build_info::BUILD,
+            &scrozz_ui::settings::SettingsInput {
+                build: scrozz_ui::settings::BuildInfo {
+                    version: crate::build_info::VERSION,
+                    build: crate::build_info::BUILD,
+                },
+                shortcuts: &self.app.shortcut_rows(),
+                after_capture: &self.app.after_capture_rows(),
+                recording: self.app.recording_settings_pane(),
+                recent_captures_overlay: self.app.recent_captures_overlay_settings(),
+                scenes: self.app.scenes_model(),
+                capture: self.app.capture_settings(),
+                platform: scrozz_ui::settings::SettingsPlatform::current(),
             },
-            &self.app.shortcut_rows(),
-            &self.app.after_capture_rows(),
-            self.app.recording_settings_pane(),
-            self.app.recent_captures_overlay_settings(),
         );
         self.app.set_keyboard_owner(
             KeyboardOwner::ShortcutRecorder,
-            self.settings.is_recording(),
+            self.settings.is_recording() || self.settings.is_editing_text(),
         );
         self.app.edit_shortcuts(&edits.shortcuts);
         self.app.edit_after_capture(&edits.after_capture);
         self.app.edit_recording_settings(&edits.recording);
+        if let Some(capture) = edits.capture {
+            self.app.edit_capture_settings(capture);
+        }
+        for event in edits.scenes {
+            self.app.handle_scenes_event(event);
+        }
         if let Some(settings) = edits.recent_captures_overlay {
             self.app.edit_recent_captures_overlay(settings);
         }
