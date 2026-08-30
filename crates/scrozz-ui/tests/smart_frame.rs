@@ -419,6 +419,32 @@ fn crop_mutation_invalidates_in_flight_scene_analysis() {
 }
 
 #[test]
+fn unchanged_crop_keeps_in_flight_scene_analysis_valid() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame { revision, .. } = state.begin_scene() else {
+        panic!("expected analysis intent");
+    };
+    state.set_tool(Tool::Crop);
+    state.command(Command::ApplyCrop).unwrap();
+    assert!(
+        state.smart_frame_analysis_pending(),
+        "applying the initial full-frame crop must not invalidate analysis"
+    );
+    let analyzed = Beautification::preset(BeautificationPreset::Story);
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: analyzed.clone(),
+            inset_explanation: "current full-frame snapshot".to_owned(),
+        }),
+    );
+
+    assert_eq!(state.document().scene(), Some(&analyzed));
+    assert!(!state.smart_frame_analysis_pending());
+}
+
+#[test]
 fn manual_preset_choice_cancels_in_flight_analysis() {
     let mut state = EditorState::new(document(Provenance::Region));
     let Intent::AnalyzeSmartFrame {

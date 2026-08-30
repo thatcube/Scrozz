@@ -1610,8 +1610,11 @@ impl Document {
     /// zero-pixel image, and silently ignoring the request would leave the
     /// editor showing a selection the document does not have.
     pub fn set_crop(&mut self, area: Option<LogicalRect>) -> Result<()> {
-        self.crop = normalize_crop(self.logical_bounds(), area)?;
-        self.touch();
+        let crop = normalize_crop(self.logical_bounds(), area)?;
+        if self.crop != crop {
+            self.crop = crop;
+            self.touch();
+        }
         Ok(())
     }
 
