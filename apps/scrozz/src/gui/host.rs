@@ -2278,15 +2278,34 @@ impl eframe::App for Driver {
                 editing.window.request_foreground();
             }
         }
+        // A card whose Done-triggered close is still pending its commit
+        // (and, for a history-only editor, persist) ack has already
+        // captured and frozen its exact revision, exactly like the colour
+        // picker's own freeze above -- applying an analysis result now
+        // would set a new revision on a document already mid-commit. This
+        // result is deferred rather than dropped: `show_editor` resolves
+        // that pending close later this same tick, so a still-open (now
+        // unfrozen) editor sees it again next tick at the same revision
+        // Done captured, and an editor the close instead committed and
+        // removed simply finds nothing left to apply it to (round 7,
+        // Finding #1).
+        let mut deferred_smart_frame_results = Vec::new();
         while let Some(result) = self.app.take_smart_frame_result() {
             let Some(editing) = self.editors.get_mut(&result.card) else {
                 continue;
             };
+            if self.app.editor_close_pending(result.card) {
+                deferred_smart_frame_results.push(result);
+                continue;
+            }
             if editing.generation == result.generation {
                 editing
                     .editor
                     .deliver_analysis(result.revision, result.result);
             }
+        }
+        for result in deferred_smart_frame_results {
+            self.app.requeue_smart_frame_result(result);
         }
 
         self.sync_root_visibility(ctx, display_refresh_requested);
@@ -3002,6 +3021,56 @@ mod tests {
             "the panel really did close either way, so ownership bookkeeping must \
              clear after (and regardless of) the pending-close freeze -- never let \
              a frozen mutation also suppress noticing the native panel is gone"
+        );
+    }
+
+    #[test]
+    fn smart_frame_delivery_freezes_a_card_whose_close_is_pending_but_never_loses_the_result() {
+        // Round 7, Finding #1: an asynchronous Smart Frame analysis is the
+        // other delivery that can land in a still-open editor on its own
+        // schedule, after that editor's own Done has already captured a
+        // frame/document and is only waiting on its commit/persist ack.
+        // Applying the result now would set a new revision on that exact
+        // document mid-commit, so the delivery loop must check the same
+        // `editor_close_pending` freeze the colour picker checks -- but,
+        // unlike a native panel event, this result cannot simply be
+        // dropped once frozen (the analysis will never be recomputed), so
+        // a frozen result must be requeued rather than discarded.
+        let source = include_str!("host.rs");
+        let block = source
+            .split("while let Some(result) = self.app.take_smart_frame_result()")
+            .nth(1)
+            .and_then(|body| body.split_once("self.sync_root_visibility"))
+            .map(|(body, _)| body)
+            .expect("the Smart Frame delivery loop");
+
+        let guard = block
+            .find("editor_close_pending")
+            .expect("delivery must check the pending-close freeze");
+        let deliver = block
+            .find("deliver_analysis")
+            .expect("delivery applies the analysis result");
+        assert!(
+            guard < deliver,
+            "the freeze must be checked before the result is applied to the editor"
+        );
+
+        let requeue = block
+            .find("requeue_smart_frame_result")
+            .expect("a frozen result must be put back rather than dropped");
+        assert!(
+            guard < requeue,
+            "the requeue is the frozen branch's outcome, so it must follow the check \
+             that decided the card was frozen"
+        );
+
+        let deferred_push = block
+            .find("deferred_smart_frame_results.push")
+            .expect("the frozen branch must hold the result rather than deliver it");
+        assert!(
+            guard < deferred_push && deferred_push < deliver,
+            "the frozen branch (push, then continue) must come between the freeze \
+             check and the non-frozen delivery it skips past"
         );
     }
 

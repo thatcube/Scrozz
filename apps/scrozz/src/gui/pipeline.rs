@@ -467,7 +467,15 @@ pub(crate) enum Job {
     /// The worker also applies this policy after every future capture.
     EnforceRetention(RetentionPolicy),
     /// Upload a card's untouched capture and copy the returned link.
-    Upload(CardId),
+    Upload {
+        /// Which card.
+        card: CardId,
+        /// The dispatching action id this upload answers for (round 7,
+        /// Finding #2). Travels back on `Outcome::UploadDone`/
+        /// `Outcome::UploadRefused` so a completion for a since-superseded
+        /// Upload request can be told apart from the card's current one.
+        action: u64,
+    },
     /// Upload an already-rendered editor revision instead of the original.
     ///
     /// The counterpart of [`Job::CopyImage`] and [`Job::SaveImage`], and it
@@ -480,6 +488,8 @@ pub(crate) enum Job {
         generation: u64,
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
+        /// See [`Job::Upload::action`].
+        action: u64,
     },
     /// Upload the durable media a recording card is showing.
     UploadRecording {
@@ -493,6 +503,8 @@ pub(crate) enum Job {
         content_type: String,
         /// Safe file name for the remote object.
         file_name: String,
+        /// See [`Job::Upload::action`].
+        action: u64,
     },
     /// Persist successful remote metadata on the store-owning worker.
     RememberShare {
@@ -793,6 +805,14 @@ pub enum Outcome {
         /// was rendered from, when a live editor produced it. See
         /// [`Outcome::Done::version`].
         version: Option<(u64, u64)>,
+        /// The dispatching action id this completion answers for (round 7,
+        /// Finding #2). A second Upload request can be dispatched for the
+        /// same card before an earlier one's outcome is drained; comparing
+        /// this against the card's *current* action lets the main thread
+        /// tell the two apart and ignore a stale answer instead of acting on
+        /// bookkeeping (`close_after_upload`/`overflow_recovery_in_flight`)
+        /// that now belongs to the newer request.
+        action: u64,
     },
     /// A card action failed.
     Refused {
@@ -807,6 +827,8 @@ pub enum Outcome {
         card: CardId,
         /// Why.
         error: CliError,
+        /// See [`Outcome::UploadDone::action`].
+        action: u64,
     },
     /// A requested card output failed.
     OutputRefused {
@@ -1986,19 +2008,21 @@ impl Worker {
                 } => self.save_image_to(card, generation, &rendered, &path),
                 Job::Save(card) => self.save(card),
                 Job::SaveTo { card, path } => self.save_to(card, &path),
-                Job::Upload(card) => self.upload(card),
+                Job::Upload { card, action } => self.upload(card, action),
                 Job::UploadImage {
                     card,
                     generation,
                     rendered,
-                } => self.upload_image(card, generation, &rendered),
+                    action,
+                } => self.upload_image(card, generation, &rendered, action),
                 Job::UploadRecording {
                     card,
                     capture,
                     path,
                     content_type,
                     file_name,
-                } => self.upload_recording(card, capture, &path, content_type, file_name),
+                    action,
+                } => self.upload_recording(card, capture, &path, content_type, file_name, action),
                 Job::RememberShare {
                     capture_id,
                     sharing,
@@ -2903,7 +2927,7 @@ impl Worker {
     /// into a channel. The revision travelling with the bytes is the vault's
     /// own, so a share can never be attributed to a revision the user did not
     /// approve — see [`CaptureBytes`].
-    fn upload(&mut self, card: CardId) {
+    fn upload(&mut self, card: CardId, action: u64) {
         let result = self.cached_entry(card, "upload").and_then(|cached| {
             let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
                 cached.bytes.full.as_ref().clone(),
@@ -2914,9 +2938,10 @@ impl Worker {
                 cached.capture_id.clone(),
                 ShareVersion::of(&cached.bytes),
                 artifact,
+                action,
             )
         });
-        self.answer_upload(card, result);
+        self.answer_upload(card, action, result);
     }
 
     /// Uploads the exact revision an open editor produced, never the original.
@@ -2924,7 +2949,13 @@ impl Worker {
     /// The revision travels with the bytes, so a share can only ever be
     /// attributed to the pixels the user approved — the same rule Copy, Save
     /// and drag already follow for a destructively redacted document.
-    fn upload_image(&mut self, card: CardId, generation: u64, rendered: &RevisionedFrame) {
+    fn upload_image(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        action: u64,
+    ) {
         let capture_id = self.vault.cached(card).and_then(|cached| cached.capture_id);
         let result = FrameEncoder::new()
             .encode(rendered.frame(), ImageFormat::Png)
@@ -2944,9 +2975,10 @@ impl Worker {
                         revision: rendered.revision(),
                     },
                     artifact,
+                    action,
                 )
             });
-        self.answer_upload(card, result);
+        self.answer_upload(card, action, result);
     }
 
     /// Uploads a durable recording a card is showing.
@@ -2960,6 +2992,7 @@ impl Worker {
         path: &std::path::Path,
         content_type: String,
         file_name: String,
+        action: u64,
     ) {
         let result = std::fs::read(path)
             .map_err(|error| {
@@ -2974,9 +3007,9 @@ impl Worker {
             .and_then(|artifact| {
                 // A finished recording's durable file is immutable for the
                 // lifetime of its card, so it is always revision zero.
-                self.queue_upload(card, capture, ShareVersion::original(), artifact)
+                self.queue_upload(card, capture, ShareVersion::original(), artifact, action)
             });
-        self.answer_upload(card, result);
+        self.answer_upload(card, action, result);
     }
 
     fn queue_upload(
@@ -2985,6 +3018,7 @@ impl Worker {
         capture_id: Option<CaptureId>,
         version: ShareVersion,
         artifact: crate::cloud::FinalizedArtifact,
+        action: u64,
     ) -> CliResult<()> {
         self.uploads
             .send(UploadJob::Share {
@@ -2992,6 +3026,7 @@ impl Worker {
                 capture_id,
                 version,
                 artifact,
+                action,
             })
             .map_err(|_| {
                 CliError::Core(CoreError::Platform("the upload worker has gone".to_owned()))
@@ -3003,13 +3038,17 @@ impl Worker {
     /// A refusal here is [`Outcome::UploadRefused`] rather than
     /// [`Outcome::OutputRefused`] so the card shows the reason: the user
     /// pressed Upload and is watching that card for an answer.
-    fn answer_upload(&mut self, card: CardId, result: CliResult<()>) {
+    fn answer_upload(&mut self, card: CardId, action: u64, result: CliResult<()>) {
         let outcome = match result {
             Ok(()) => Outcome::Started {
                 card,
                 detail: "upload queued".to_owned(),
             },
-            Err(error) => Outcome::UploadRefused { card, error },
+            Err(error) => Outcome::UploadRefused {
+                card,
+                error,
+                action,
+            },
         };
         let _ = self.outcomes.send(outcome);
     }
@@ -4003,6 +4042,8 @@ enum UploadJob {
         capture_id: Option<CaptureId>,
         version: ShareVersion,
         artifact: crate::cloud::FinalizedArtifact,
+        /// See [`Outcome::UploadDone::action`].
+        action: u64,
     },
     Release(CardId),
     Stop,
@@ -4065,11 +4106,12 @@ impl UploadWorker {
                     capture_id,
                     version,
                     artifact,
+                    action,
                 } => {
                     if self.cancellation.is_cancelled() {
                         break;
                     }
-                    self.upload(card, capture_id, version, &artifact);
+                    self.upload(card, capture_id, version, &artifact, action);
                 }
                 UploadJob::Release(card) => {
                     self.links.remove(&card);
@@ -4086,6 +4128,7 @@ impl UploadWorker {
         capture_id: Option<CaptureId>,
         version: ShareVersion,
         artifact: &crate::cloud::FinalizedArtifact,
+        action: u64,
     ) {
         if self
             .links
@@ -4106,7 +4149,11 @@ impl UploadWorker {
                     self.links.insert(card, CachedShare::new(shared, version));
                 }
                 Err(error) => {
-                    let _ = self.outcomes.send(Outcome::UploadRefused { card, error });
+                    let _ = self.outcomes.send(Outcome::UploadRefused {
+                        card,
+                        error,
+                        action,
+                    });
                     return;
                 }
             }
@@ -4117,6 +4164,7 @@ impl UploadWorker {
                 error: CliError::Core(CoreError::Platform(
                     "the upload completed without a retained share link".to_owned(),
                 )),
+                action,
             });
             return;
         };
@@ -4128,6 +4176,7 @@ impl UploadWorker {
                     .version
                     .generation
                     .map(|g| (g, shared.version.revision)),
+                action,
             },
             Err(error) => Outcome::UploadRefused {
                 card,
@@ -4136,6 +4185,7 @@ impl UploadWorker {
                      Press Upload again to retry the clipboard; Scrozz reuses the object while \
                      its signed URL remains valid"
                 ))),
+                action,
             },
         };
         let _ = self.outcomes.send(outcome);
@@ -5812,11 +5862,14 @@ mod tests {
             "capture.png".to_owned(),
         )
         .expect("a nonempty PNG is a valid artifact");
-        worker.upload(CardId(50), None, version, &artifact);
+        worker.upload(CardId(50), None, version, &artifact, 21);
 
         match outcome_rx.try_recv() {
             Ok(Outcome::UploadDone {
-                card, version: got, ..
+                card,
+                version: got,
+                action,
+                ..
             }) => {
                 assert_eq!(card, CardId(50));
                 assert_eq!(
@@ -5824,6 +5877,11 @@ mod tests {
                     Some((3, 11)),
                     "UploadDone must report the exact (generation, revision) the \
                      reused cached link was made from, not an absent or stale pair"
+                );
+                assert_eq!(
+                    action, 21,
+                    "UploadDone must report the exact action id it answers for \
+                     (round 7, Finding #2)"
                 );
             }
             other => panic!("expected an UploadDone from the cached link, got {other:?}"),
@@ -5867,10 +5925,19 @@ mod tests {
     #[test]
     fn uploading_a_card_that_was_never_captured_is_refused_too() {
         let pipeline = start_pipeline();
-        assert!(pipeline.post(Job::Upload(CardId(8))));
+        assert!(pipeline.post(Job::Upload {
+            card: CardId(8),
+            action: 1,
+        }));
 
         match wait_for(&pipeline) {
-            Some(Outcome::UploadRefused { card, .. }) => assert_eq!(card, CardId(8)),
+            Some(Outcome::UploadRefused { card, action, .. }) => {
+                assert_eq!(card, CardId(8));
+                assert_eq!(
+                    action, 1,
+                    "a refusal must report the exact action id it answers for"
+                );
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
@@ -5901,12 +5968,13 @@ mod tests {
             },
         );
 
-        worker.upload(CardId(9));
+        worker.upload(CardId(9), 5);
 
         let UploadJob::Share {
             card,
             artifact,
             version,
+            action,
             ..
         } = upload_rx.try_recv().unwrap()
         else {
@@ -5917,6 +5985,10 @@ mod tests {
         assert_eq!(artifact.content_type(), "image/png");
         assert_eq!(version.generation, Some(4));
         assert_eq!(version.revision, 7);
+        assert_eq!(
+            action, 5,
+            "the action id must travel from the capture worker to the upload worker unchanged"
+        );
         assert!(matches!(
             outcome_rx.try_recv(),
             Ok(Outcome::Started {

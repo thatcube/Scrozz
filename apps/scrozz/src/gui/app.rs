@@ -674,6 +674,27 @@ pub struct App {
     /// cloud upload is confirmed successful" means exactly that: a copy or a
     /// save finishing first must not take the card away before the link exists.
     close_after_upload: HashSet<CardId>,
+    /// The action id of the *current* outstanding upload request for each
+    /// card (round 7, Finding #2).
+    ///
+    /// A card can have a second Upload dispatched before the first one's
+    /// outcome has been drained -- `close_after_upload` and
+    /// `overflow_recovery_in_flight` are flat, non-identified sentinels, so
+    /// without this map the first (now-superseded) request's eventual
+    /// completion or refusal would incorrectly clear bookkeeping that now
+    /// belongs to the request that replaced it, potentially dismissing the
+    /// card or retiring overflow recovery while the newer upload is still
+    /// legitimately in flight. `Outcome::UploadDone`/`Outcome::UploadRefused`
+    /// carry the action id they answer for; a completion whose action no
+    /// longer matches the map's entry for its card is a stale answer to a
+    /// superseded request and is ignored rather than acted on. Assigning a
+    /// fresh action id always overwrites any previous entry, so the newest
+    /// dispatch is unconditionally the one whose completion is trusted.
+    upload_action: HashMap<CardId, u64>,
+    /// Source of the action ids stored in `upload_action`. Monotonically
+    /// increasing and never reused within a process's lifetime in practice,
+    /// mirroring `next_editor_generation`.
+    next_upload_action: u64,
     /// Whether each live card has another retained artifact and a visible export.
     card_retention: HashMap<CardId, (bool, bool)>,
     /// The (editor generation, document revision) most recently committed by
@@ -1008,7 +1029,13 @@ pub enum EditorCloseOutcome {
 enum CardOutput {
     Copy,
     Save(Option<PathBuf>),
-    Upload,
+    /// The upload action id this dispatch answers for (round 7, Finding #2).
+    ///
+    /// Carried through `Job::Upload`/`Job::UploadImage` and back on
+    /// `Outcome::UploadDone`/`Outcome::UploadRefused` so a completion for a
+    /// since-superseded upload request can be told apart from the card's
+    /// current one.
+    Upload(u64),
 }
 
 struct PendingSaveDialog {
@@ -1027,7 +1054,7 @@ impl CardOutput {
         match self {
             Self::Copy => "copy",
             Self::Save(_) => "save",
-            Self::Upload => "upload",
+            Self::Upload(_) => "upload",
         }
     }
 }
@@ -1441,6 +1468,8 @@ impl App {
             drag_keep_after_accept: HashSet::new(),
             close_after_output: HashSet::new(),
             close_after_upload: HashSet::new(),
+            upload_action: HashMap::new(),
+            next_upload_action: 0,
             card_retention: HashMap::new(),
             card_committed_version: HashMap::new(),
             card_capture_ids: HashMap::new(),
@@ -2133,6 +2162,7 @@ impl App {
                     card,
                     detail,
                     version,
+                    action,
                 } => {
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
@@ -2147,6 +2177,23 @@ impl App {
                         self.resolve_stale_output_completion(card, true);
                         continue;
                     }
+                    // Round 7, Finding #2: a second Upload request can
+                    // supersede this one before it finishes. If it has,
+                    // `close_after_upload`/`overflow_recovery_in_flight`
+                    // bookkeeping now belongs to that newer request, not
+                    // this stale answer -- leave it alone rather than
+                    // dismissing the card or retiring overflow on its behalf.
+                    if self
+                        .upload_action
+                        .get(&card)
+                        .is_some_and(|current| *current != action)
+                    {
+                        self.note(format!(
+                            "{card} finished an upload request a newer one has since replaced"
+                        ));
+                        continue;
+                    }
+                    self.upload_action.remove(&card);
                     if let Some(retention) = self.card_retention.get_mut(&card) {
                         retention.0 = true;
                     }
@@ -2240,7 +2287,25 @@ impl App {
                         .set_status(card, Some(format!("Action failed: {error}")));
                     self.note(format!("{card} refused: {error}"));
                 }
-                Outcome::UploadRefused { card, error } => {
+                Outcome::UploadRefused {
+                    card,
+                    error,
+                    action,
+                } => {
+                    // Round 7, Finding #2: see the matching comment on
+                    // `Outcome::UploadDone`. A stale refusal for a superseded
+                    // request must not fail the card's *current* upload.
+                    if self
+                        .upload_action
+                        .get(&card)
+                        .is_some_and(|current| *current != action)
+                    {
+                        self.note(format!(
+                            "{card} refused an upload request a newer one has since replaced"
+                        ));
+                        continue;
+                    }
+                    self.upload_action.remove(&card);
                     // A failed upload leaves the card exactly where it is: the
                     // link the user asked for never arrived, so hiding it now
                     // would throw away the only copy they can still act on.
@@ -2604,10 +2669,19 @@ impl App {
                     self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
                     if self.cloud_settings.upload_enabled {
                         self.surface.set_status(id, Some("Uploading...".to_owned()));
-                        if self.post_card_output(id, CardOutput::Upload, editors)
-                            && self.config.recent_captures_overlay.close_after_upload
-                        {
-                            self.close_after_upload.insert(id);
+                        // Round 7, Finding #2: a fresh action id every
+                        // dispatch, unconditionally recorded as the card's
+                        // *current* upload below. A second Upload before the
+                        // first's outcome drains overwrites the entry, so the
+                        // superseded request's eventual completion or
+                        // refusal is recognized as stale and left alone.
+                        let action = self.next_upload_action;
+                        self.next_upload_action = self.next_upload_action.wrapping_add(1);
+                        if self.post_card_output(id, CardOutput::Upload(action), editors) {
+                            self.upload_action.insert(id, action);
+                            if self.config.recent_captures_overlay.close_after_upload {
+                                self.close_after_upload.insert(id);
+                            }
                         }
                     } else {
                         let reason = self
@@ -3252,6 +3326,7 @@ impl App {
         }
         self.visible_cards.remove(&card);
         self.close_after_upload.remove(&card);
+        self.upload_action.remove(&card);
         self.drag_keep_after_accept.remove(&card);
         self.card_retention.remove(&card);
         self.card_capture_ids.remove(&card);
@@ -3284,7 +3359,7 @@ impl App {
                 CardOutput::Copy => Job::Copy(card),
                 CardOutput::Save(None) => Job::Save(card),
                 CardOutput::Save(Some(path)) => Job::SaveTo { card, path },
-                CardOutput::Upload => Job::Upload(card),
+                CardOutput::Upload(action) => Job::Upload { card, action },
             });
         };
 
@@ -3307,10 +3382,11 @@ impl App {
                 rendered,
                 path,
             },
-            CardOutput::Upload => Job::UploadImage {
+            CardOutput::Upload(action) => Job::UploadImage {
                 card,
                 generation,
                 rendered,
+                action,
             },
         })
     }
@@ -4836,6 +4912,23 @@ impl App {
         self.smart_frame_results.pop_front()
     }
 
+    /// Puts back a Smart Frame result the host could not deliver this tick.
+    ///
+    /// The result's card had a Done-triggered close pending (round 6,
+    /// Finding #4's freeze): delivering now would set a new revision on a
+    /// document a commit is already mid-flight for, so the host defers
+    /// rather than applying or discarding it. The freeze can only resolve
+    /// two ways -- a committed close removes the editor entirely, so a
+    /// later delivery attempt finds nothing to apply to and drops the
+    /// result on its own; a failed close reopens the editor at the exact
+    /// revision Done captured (nothing else could have mutated it while
+    /// frozen), so the result is still valid to apply once the freeze
+    /// lifts. Either way this never needs to inspect the freeze's outcome
+    /// itself (round 7, Finding #1).
+    pub fn requeue_smart_frame_result(&mut self, result: SmartFrameResult) {
+        self.smart_frame_results.push_back(result);
+    }
+
     /// The durable Smart Frame preset library currently in force.
     #[must_use]
     pub fn smart_frame_presets(&self) -> &[SmartFramePreset] {
@@ -6321,12 +6414,20 @@ impl App {
         let capture = self.card_capture_ids.get(&card).cloned();
         self.surface
             .set_status(card, Some("Uploading...".to_owned()));
+        // A recording never participates in `close_after_upload`/
+        // `upload_action` bookkeeping (see `route_recorded_card_event`), so
+        // this action id only needs to satisfy the shared `Job` shape --
+        // nothing ever checks it against a stored "current" value for this
+        // card, matching this path's existing untouched behavior.
+        let action = self.next_upload_action;
+        self.next_upload_action = self.next_upload_action.wrapping_add(1);
         if !self.pipeline.post(Job::UploadRecording {
             card,
             capture,
             path,
             content_type,
             file_name,
+            action,
         }) {
             self.note(format!(
                 "{card} could not be queued for upload: the capture worker has gone"
@@ -8728,6 +8829,9 @@ mod tests {
             // Stale: answers for revision 1, the generation's pre-commit
             // revision, dispatched before the commit above landed.
             version: Some((generation, 1)),
+            // The revision check must short-circuit before the action-id
+            // check even looks at this value, so any id proves that.
+            action: 0,
         });
         app.drain_pipeline();
 
@@ -9325,6 +9429,131 @@ mod tests {
         assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
         assert!(!app.close_after_upload.contains(&card));
         assert!(!app.overflow_recovery_in_flight.contains(&card));
+    }
+
+    #[test]
+    fn a_stale_upload_success_for_a_superseded_action_never_completes_the_cards_current_upload() {
+        // Round 7, Finding #2: two Upload requests can be dispatched for the
+        // same card before the first's outcome drains -- both workers are
+        // strictly FIFO, but nothing stopped a slow first completion from
+        // draining after a second dispatch had already replaced it. The
+        // completion for action 3 here answers a request the card no longer
+        // recognizes as current (action 5): it must retire quietly rather
+        // than mark retention, clear `close_after_upload`, or dismiss the
+        // card out from under the still-in-flight current request.
+        let (mut app, surface) = app();
+        let card = CardId(59);
+        app.card_retention.insert(card, (false, false));
+        app.close_after_upload.insert(card);
+        app.upload_action.insert(card, 5);
+
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "uploaded and copied the private share link".to_owned(),
+            version: None,
+            action: 3,
+        });
+        app.drain_pipeline();
+
+        assert!(
+            app.close_after_upload.contains(&card),
+            "a stale completion must leave the current upload's own bookkeeping intact"
+        );
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(false, false)),
+            "a stale completion must never mark retention on the card's behalf"
+        );
+        assert_eq!(
+            app.upload_action.get(&card),
+            Some(&5),
+            "a stale completion must not disturb the card's current action id"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "a stale completion must never dismiss a card whose current upload is still \
+             in flight"
+        );
+
+        // The genuine completion, for the card's actual current action, must
+        // still behave exactly as an ordinary (non-stale) success would.
+        app.pipeline.inject_outcome_for_test(Outcome::UploadDone {
+            card,
+            detail: "uploaded and copied the private share link".to_owned(),
+            version: None,
+            action: 5,
+        });
+        app.drain_pipeline();
+
+        assert!(
+            !app.upload_action.contains_key(&card),
+            "the current action's own completion must clear its bookkeeping"
+        );
+        assert!(!app.close_after_upload.contains(&card));
+        assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
+        assert!(
+            !app.card_retention.contains_key(&card),
+            "the card's own completion dismisses (and thereby retires) it entirely"
+        );
+    }
+
+    #[test]
+    fn a_stale_upload_refusal_for_a_superseded_action_never_fails_the_cards_current_upload() {
+        // The refusal counterpart of the success case above: `UploadRefused`
+        // is versioned by action id alone (it carries no editor generation/
+        // revision the way `UploadDone` does), so this is the only guard
+        // standing between an old failure and clearing the current request's
+        // bookkeeping out from under it.
+        let (mut app, surface) = app();
+        let card = CardId(60);
+        app.close_after_upload.insert(card);
+        app.upload_action.insert(card, 5);
+
+        let stale_error = CliError::Core(CoreError::Platform("stale network error".to_owned()));
+        app.pipeline
+            .inject_outcome_for_test(Outcome::UploadRefused {
+                card,
+                error: stale_error,
+                action: 3,
+            });
+        app.drain_pipeline();
+
+        assert!(
+            app.close_after_upload.contains(&card),
+            "a stale refusal must leave the current upload's own bookkeeping intact"
+        );
+        assert_eq!(
+            app.upload_action.get(&card),
+            Some(&5),
+            "a stale refusal must not disturb the card's current action id"
+        );
+        assert!(
+            !app.notes()
+                .iter()
+                .any(|note| note.contains("upload refused")),
+            "a stale refusal must not report a failure for the card's current upload"
+        );
+
+        let current_error = CliError::Core(CoreError::Platform("current network error".to_owned()));
+        app.pipeline
+            .inject_outcome_for_test(Outcome::UploadRefused {
+                card,
+                error: current_error,
+                action: 5,
+            });
+        app.drain_pipeline();
+
+        assert!(
+            !app.upload_action.contains_key(&card),
+            "the current action's own refusal must clear its bookkeeping"
+        );
+        assert!(!app.close_after_upload.contains(&card));
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("upload refused")),
+            "the current action's refusal must still be reported"
+        );
     }
 
     #[test]
@@ -11173,7 +11402,11 @@ mod tests {
         let editor_snapshot = EditorSnapshot::new(card, 1, &editor);
         let snapshot = EditorSnapshots::new(std::slice::from_ref(&editor_snapshot));
 
-        for output in [CardOutput::Copy, CardOutput::Save(None), CardOutput::Upload] {
+        for output in [
+            CardOutput::Copy,
+            CardOutput::Save(None),
+            CardOutput::Upload(7),
+        ] {
             let job = App::card_output_job(card, output, snapshot).expect("the document renders");
             let rendered = match job {
                 Job::CopyImage {
@@ -11197,15 +11430,20 @@ mod tests {
                     card: got,
                     generation,
                     rendered,
+                    action,
                 } => {
                     assert_eq!(got, card);
                     assert_eq!(
                         generation, 1,
                         "the share must be bound to this editor lifetime"
                     );
+                    assert_eq!(
+                        action, 7,
+                        "the upload action id must travel with the render"
+                    );
                     rendered
                 }
-                Job::Copy(_) | Job::Save(_) | Job::Upload(_) => {
+                Job::Copy(_) | Job::Save(_) | Job::Upload { .. } => {
                     panic!("an edited card fell back to its original capture")
                 }
                 _ => panic!("the card output was routed to an unrelated job"),
@@ -11232,13 +11470,23 @@ mod tests {
         // rendering any editor's document.
         let card = CardId(43);
 
-        for output in [CardOutput::Copy, CardOutput::Save(None), CardOutput::Upload] {
+        for output in [
+            CardOutput::Copy,
+            CardOutput::Save(None),
+            CardOutput::Upload(9),
+        ] {
             let job = App::card_output_job(card, output.clone(), EditorSnapshots::EMPTY)
                 .expect("no editor to render means this never fails");
             match (output, job) {
                 (CardOutput::Copy, Job::Copy(got)) => assert_eq!(got, card),
                 (CardOutput::Save(None), Job::Save(got)) => assert_eq!(got, card),
-                (CardOutput::Upload, Job::Upload(got)) => assert_eq!(got, card),
+                (CardOutput::Upload(want_action), Job::Upload { card: got, action }) => {
+                    assert_eq!(got, card);
+                    assert_eq!(
+                        action, want_action,
+                        "the upload action id must travel with the plain job"
+                    );
+                }
                 (_, other) => panic!(
                     "with no editor open, output must use the card's own bytes, not {other:?}"
                 ),
