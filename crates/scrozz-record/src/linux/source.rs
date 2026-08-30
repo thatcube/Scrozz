@@ -190,38 +190,41 @@ impl PortalLifetime {
             .name("scrozz-portal-session".into())
             .spawn(move || {
                 runtime.block_on(async move {
-                    let closed = match session.receive_closed().await {
-                        Ok(closed) => closed,
-                        Err(error) => {
-                            let _ = terminal_tx.send(Error::Platform(format!(
-                                "could not monitor the ScreenCast portal session: {error}"
-                            )));
-                            let _ = session.close().await;
-                            return;
-                        }
-                    };
-                    futures_util::pin_mut!(closed);
-                    loop {
-                        if shutdown_rx.try_recv().is_ok() {
-                            break;
-                        }
-                        match tokio::time::timeout(Duration::from_millis(20), closed.next()).await {
-                            Ok(Some(_)) => {
-                                let _ = terminal_tx.send(Error::TargetGone(
-                                    "the ScreenCast portal closed the recording session".into(),
-                                ));
+                    {
+                        let closed = match session.receive_closed().await {
+                            Ok(closed) => closed,
+                            Err(error) => {
+                                let _ = terminal_tx.send(Error::Platform(format!(
+                                    "could not monitor the ScreenCast portal session: {error}"
+                                )));
+                                let _ = session.close().await;
+                                return;
+                            }
+                        };
+                        futures_util::pin_mut!(closed);
+                        loop {
+                            if shutdown_rx.try_recv().is_ok() {
                                 break;
                             }
-                            Ok(None) => {
-                                let _ = terminal_tx.send(Error::Platform(
-                                    "the ScreenCast portal close monitor ended unexpectedly".into(),
-                                ));
-                                break;
+                            match tokio::time::timeout(Duration::from_millis(20), closed.next()).await
+                            {
+                                Ok(Some(_)) => {
+                                    let _ = terminal_tx.send(Error::TargetGone(
+                                        "the ScreenCast portal closed the recording session".into(),
+                                    ));
+                                    break;
+                                }
+                                Ok(None) => {
+                                    let _ = terminal_tx.send(Error::Platform(
+                                        "the ScreenCast portal close monitor ended unexpectedly"
+                                            .into(),
+                                    ));
+                                    break;
+                                }
+                                Err(_) => {}
                             }
-                            Err(_) => {}
                         }
                     }
-                    drop(closed);
                     if let Err(error) = session.close().await {
                         tracing::warn!(%error, "could not explicitly close the ScreenCast portal session");
                     }

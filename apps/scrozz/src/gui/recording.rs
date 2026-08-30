@@ -405,6 +405,87 @@ impl RecordingState {
         self.settings_panel.take()
     }
 
+    /// Pixel-free camera health for the running recording.
+    #[must_use]
+    pub fn camera_status(&self) -> Option<scrozz_record::CameraRuntimeStatus> {
+        self.machine
+            .as_ref()
+            .and_then(RecordingMachine::camera_status)
+    }
+
+    /// The freshest camera frame on the corrected recording clock.
+    #[must_use]
+    pub fn camera_preview(&self) -> Option<scrozz_record::CameraPreview> {
+        self.machine
+            .as_ref()
+            .and_then(RecordingMachine::camera_preview)
+    }
+
+    /// Applies a live camera composition change to the running recording.
+    ///
+    /// This is deliberately separate from [`Self::apply_settings`]: composition
+    /// is the one preference the machine accepts *while* recording, and it must
+    /// reach the native session rather than only the pending pane copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the machine says when it will not accept the change, or
+    /// the unavailability reason when no engine is linked.
+    pub fn apply_camera(
+        &mut self,
+        camera: scrozz_record::settings::CameraSettings,
+    ) -> scrozz_core::Result<()> {
+        let Some(machine) = self.machine.as_mut() else {
+            return Err(self.unavailable_error());
+        };
+        machine.update_camera(camera)?;
+        if let Some(settings) = &mut self.settings_panel {
+            settings.camera = camera;
+        }
+        Ok(())
+    }
+
+    /// Applies camera composition live when possible, otherwise stages it for
+    /// the next recording without mutating an active selection/countdown.
+    pub fn apply_camera_preference(
+        &mut self,
+        camera: scrozz_record::settings::CameraSettings,
+    ) -> scrozz_core::Result<()> {
+        let live_camera = matches!(
+            self.phase(),
+            Some(RecordingPhase::Recording | RecordingPhase::Paused)
+        ) && self.camera_status().is_some();
+        if live_camera {
+            return self.apply_camera(camera);
+        }
+
+        let mut settings = self.settings();
+        settings.camera = camera;
+        settings.validate()?;
+        if self.is_busy() {
+            self.settings_panel = Some(settings);
+            Ok(())
+        } else {
+            self.apply_settings(settings)
+        }
+    }
+
+    /// Selects the stable camera used by the next recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the machine says once a selection owns it, or the
+    /// unavailability reason when no engine is linked.
+    pub fn select_camera_device(
+        &mut self,
+        device: Option<scrozz_record::CameraDeviceId>,
+    ) -> scrozz_core::Result<()> {
+        let Some(machine) = self.machine.as_mut() else {
+            return Err(self.unavailable_error());
+        };
+        machine.set_camera_device(device)
+    }
+
     /// Drops every retained interaction event and its private source.
     ///
     /// Called on shutdown so nothing derived from an input tap outlives the

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use scrozz_core::{CaptureTarget, Error, Result};
 
-use crate::{Quality, RecordingRequest, RecordingResolution, VideoCodec};
+use crate::{CameraRequest, Quality, RecordingRequest, RecordingResolution, VideoCodec};
 
 /// Linux encoder quality on the donor implementation's 1–100 policy scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -166,6 +166,8 @@ pub struct RecordingConfig {
     pub microphone: bool,
     /// Capture desktop output.
     pub system_audio: bool,
+    /// Optional camera capture and composition.
+    pub camera: Option<CameraRequest>,
     /// Frames per second.
     pub fps: NonZeroU32,
     /// Composite the pointer.
@@ -215,6 +217,7 @@ impl TryFrom<&RecordingRequest> for RecordingConfig {
             codec: request.video_codec,
             microphone: request.microphone,
             system_audio: request.system_audio,
+            camera: request.camera.clone(),
             fps,
             show_cursor: request.show_cursor,
         })

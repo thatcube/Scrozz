@@ -37,12 +37,14 @@ use windows::{
 };
 
 use crate::{
-    Recording, RecordingMetadata, RecordingRequest, RecordingResolution, RecordingSession,
-    RecordingState, SessionEvent, VideoCodec,
+    CameraFeed, CameraFrame, CameraRecordingMetadata, CameraRuntimeStatus, Recording,
+    RecordingMetadata, RecordingRequest, RecordingResolution, RecordingSession, RecordingState,
+    SessionEvent, VideoCodec, camera::CameraCompositor, settings::CameraSettings,
 };
 
 use super::{
     audio::{AudioCapture, qpc_now_hns},
+    camera::CameraCapture,
     com::{Apartment, MediaFoundation},
     device::Device,
     encoder::Encoder,
@@ -74,6 +76,7 @@ pub fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
         *destination = absolute_path(destination)?;
     }
     let elapsed_hns = Arc::new(AtomicU64::new(0));
+    let camera = request.camera.as_ref().map(CameraFeed::new).transpose()?;
     let (commands_tx, commands_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (events_tx, events_rx) = mpsc::channel();
@@ -83,6 +86,7 @@ pub fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
         .spawn({
             let elapsed_hns = Arc::clone(&elapsed_hns);
             let worker_state = Arc::clone(&state);
+            let worker_camera = camera.clone();
             move || {
                 let _ended = EndStateGuard(Arc::clone(&worker_state));
                 match Worker::initialize(
@@ -91,6 +95,7 @@ pub fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
                     Arc::clone(&elapsed_hns),
                     Arc::clone(&worker_state),
                     events_tx.clone(),
+                    worker_camera,
                 ) {
                     Ok(worker) => {
                         if ready_tx.send(Ok(())).is_ok() {
@@ -114,6 +119,7 @@ pub fn start(request: &RecordingRequest) -> Result<Box<dyn RecordingSession>> {
             state,
             elapsed_hns,
             terminal: TerminalCache::default(),
+            camera,
         })),
         Ok(Err(error)) => {
             let _ = thread.join();
@@ -135,6 +141,7 @@ struct WindowsSession {
     state: Arc<SharedSessionState>,
     elapsed_hns: Arc<AtomicU64>,
     terminal: TerminalCache,
+    camera: Option<CameraFeed>,
 }
 
 struct EndStateGuard(Arc<SharedSessionState>);
@@ -148,6 +155,7 @@ impl Drop for EndStateGuard {
 #[derive(Debug)]
 enum WorkerEvent {
     FirstFrame,
+    Warning(String),
     Terminal(Box<Result<NativeRecording>>),
 }
 
@@ -182,6 +190,7 @@ impl RecordingSession for WindowsSession {
         }
         match self.events.try_recv() {
             Ok(WorkerEvent::FirstFrame) => Some(SessionEvent::FirstFrame),
+            Ok(WorkerEvent::Warning(warning)) => Some(SessionEvent::Warning(warning)),
             Ok(WorkerEvent::Terminal(result)) => {
                 self.terminal.cache(*result);
                 self.terminal.emit()
@@ -196,6 +205,25 @@ impl RecordingSession for WindowsSession {
 
     fn engine_elapsed_secs(&self) -> Option<f64> {
         Some(self.elapsed_hns.load(Ordering::Acquire) as f64 / HNS_PER_SECOND as f64)
+    }
+
+    fn camera_status(&self) -> Option<CameraRuntimeStatus> {
+        self.camera.as_ref().map(CameraFeed::status)
+    }
+
+    fn camera_preview(&self) -> Option<crate::CameraPreview> {
+        self.camera.as_ref().and_then(|camera| {
+            let elapsed =
+                Duration::from_nanos(self.elapsed_hns.load(Ordering::Acquire).saturating_mul(100));
+            camera.preview(elapsed)
+        })
+    }
+
+    fn update_camera(&mut self, settings: CameraSettings) -> Result<()> {
+        self.camera
+            .as_ref()
+            .ok_or_else(|| Error::InvalidRequest("this recording has no active camera".into()))?
+            .update_settings(settings)
     }
 
     fn stop(mut self: Box<Self>) -> Result<Recording> {
@@ -246,7 +274,7 @@ impl WindowsSession {
     fn receive_terminal(&mut self) {
         while !self.terminal.is_some() {
             match self.events.recv() {
-                Ok(WorkerEvent::FirstFrame) => {}
+                Ok(WorkerEvent::FirstFrame | WorkerEvent::Warning(_)) => {}
                 Ok(WorkerEvent::Terminal(result)) => self.terminal.cache(*result),
                 Err(_) => self.cache_disconnected_terminal(),
             }
@@ -304,6 +332,9 @@ struct Worker {
     frames: Receiver<FramePacket>,
     signals: Receiver<Signal>,
     audio: Option<AudioCapture>,
+    camera: Option<CameraCapture>,
+    camera_feed: Option<CameraFeed>,
+    camera_compositor: CameraCompositor,
     mixer: Option<Mixer>,
     encoder: Option<Encoder>,
     output: OutputPaths,
@@ -321,7 +352,7 @@ struct Worker {
     min_raw_hns: i64,
     target_validator: target::TargetValidator,
     next_target_validation: Instant,
-    _device: Device,
+    device: Device,
     _media_foundation: MediaFoundation,
     _apartment: Apartment,
 }
@@ -333,9 +364,18 @@ impl Worker {
         elapsed_hns: Arc<AtomicU64>,
         state: Arc<SharedSessionState>,
         events: Sender<WorkerEvent>,
+        camera_feed: Option<CameraFeed>,
     ) -> Result<Self> {
         let output = output_paths(request.destination.as_deref())?;
-        Self::initialize_at(request, commands, elapsed_hns, state, events, output)
+        Self::initialize_at(
+            request,
+            commands,
+            elapsed_hns,
+            state,
+            events,
+            camera_feed,
+            output,
+        )
     }
 
     fn initialize_at(
@@ -344,6 +384,7 @@ impl Worker {
         elapsed_hns: Arc<AtomicU64>,
         state: Arc<SharedSessionState>,
         events: Sender<WorkerEvent>,
+        camera_feed: Option<CameraFeed>,
         mut output: OutputPaths,
     ) -> Result<Self> {
         resolve_video_codec(request.video_codec)?;
@@ -360,6 +401,7 @@ impl Worker {
                     .into(),
             });
         }
+
         let media_foundation = MediaFoundation::start()?;
         let startup_qpc = qpc_now_hns()
             .map_err(|error| Error::Platform(format!("could not timestamp startup: {error}")))?;
@@ -374,6 +416,9 @@ impl Worker {
             request.resolution,
         )
         .map_err(plan_error)?;
+        if let Some(camera) = &camera_feed {
+            camera.set_output_size(encoder_plan.output_width, encoder_plan.output_height)?;
+        }
         let device = Device::new()?;
         let wants_audio = request.system_audio || request.microphone;
         let encoder = Encoder::new(&output.temporary_path, &device, encoder_plan, wants_audio)?;
@@ -394,6 +439,26 @@ impl Worker {
         };
 
         let paused = Arc::new(AtomicBool::new(false));
+        let camera = match (request.camera.clone(), camera_feed.clone()) {
+            (Some(camera_request), Some(feed)) => {
+                match CameraCapture::start_with_pause(
+                    camera_request,
+                    feed.clone(),
+                    Arc::clone(&paused),
+                ) {
+                    Ok(camera) => {
+                        feed.activate();
+                        Some(camera)
+                    }
+                    Err(error) => {
+                        drop(audio);
+                        encoder.discard();
+                        return Err(output.discard(error));
+                    }
+                }
+            }
+            _ => None,
+        };
         let (frames_tx, frames) = mpsc::sync_channel(FRAME_QUEUE_CAPACITY);
         let (signals_tx, signals) = mpsc::channel();
         let capture = match Capture::start(
@@ -422,6 +487,9 @@ impl Worker {
             frames,
             signals,
             audio,
+            camera,
+            camera_feed,
+            camera_compositor: CameraCompositor::default(),
             mixer: wants_audio.then(|| {
                 Mixer::new(
                     AUDIO_SAMPLE_RATE,
@@ -446,7 +514,7 @@ impl Worker {
             min_raw_hns: startup_qpc.saturating_sub(AUDIO_SETTLE_HNS),
             target_validator,
             next_target_validation: Instant::now() + TARGET_REVALIDATION_INTERVAL,
-            _device: device,
+            device,
             _media_foundation: media_foundation,
             _apartment: apartment,
         })
@@ -462,6 +530,9 @@ impl Worker {
             }
             if let Some(error) = self.audio.as_ref().and_then(AudioCapture::try_failure) {
                 break EndCause::Failed(error);
+            }
+            if let Some(warning) = self.camera.as_ref().and_then(CameraCapture::try_warning) {
+                let _ = self.events.send(WorkerEvent::Warning(warning));
             }
             if let Err(error) = self.validate_target() {
                 break EndCause::Failed(error.to_string());
@@ -511,6 +582,13 @@ impl Worker {
         let now = qpc_now_hns()
             .map_err(|error| Error::Platform(format!("could not timestamp pause: {error}")))?;
         self.paused.store(true, Ordering::Release);
+        if let Some(camera) = &self.camera {
+            let (pending, superseded) = camera.take_latest_frame();
+            if let Some(feed) = &self.camera_feed {
+                feed.note_drops(superseded + usize::from(pending.is_some()));
+                feed.clear_frames();
+            }
+        }
         self.timeline.pause(now);
         self.state.set(SessionState::Paused);
         self.publish_elapsed();
@@ -524,6 +602,13 @@ impl Worker {
         let now = qpc_now_hns()
             .map_err(|error| Error::Platform(format!("could not timestamp resume: {error}")))?;
         self.min_raw_hns = now;
+        if let Some(camera) = &self.camera {
+            let (pending, superseded) = camera.take_latest_frame();
+            if let Some(feed) = &self.camera_feed {
+                feed.note_drops(superseded + usize::from(pending.is_some()));
+                feed.clear_frames();
+            }
+        }
         self.timeline.resume(now);
         self.paused.store(false, Ordering::Release);
         self.state.set(SessionState::Running);
@@ -542,7 +627,7 @@ impl Worker {
         }
     }
 
-    fn write_frame(&mut self, frame: FramePacket) -> Result<()> {
+    fn write_frame(&mut self, mut frame: FramePacket) -> Result<()> {
         if frame.raw_hns < self.min_raw_hns || self.timeline.is_paused() {
             return Ok(());
         }
@@ -560,6 +645,26 @@ impl Worker {
             self.publish_elapsed();
             return Ok(());
         };
+        self.drain_camera_frames()?;
+        if let Some(camera) = &self.camera_feed {
+            let settings = camera.settings();
+            let camera_frame = camera.frame_for(hns_duration(stream_hns));
+            if camera_frame.is_some() || settings.presenter {
+                let mut screen = self.device.download_bgra(&frame.texture)?;
+                let width = screen.width();
+                let height = screen.height();
+                let stride = screen.stride;
+                self.camera_compositor.compose_optional(
+                    &mut screen.data,
+                    width,
+                    height,
+                    stride,
+                    camera_frame.as_ref(),
+                    settings,
+                )?;
+                frame.texture = self.device.upload_bgra(&screen)?;
+            }
+        }
         self.encoder
             .as_mut()
             .expect("encoder lives until finalisation")
@@ -572,6 +677,28 @@ impl Worker {
             .media_end_hns
             .max(schedule.timestamp_hns.saturating_add(schedule.duration_hns));
         self.publish_elapsed();
+        Ok(())
+    }
+
+    fn drain_camera_frames(&mut self) -> Result<()> {
+        let (Some(camera), Some(feed)) = (&self.camera, &self.camera_feed) else {
+            return Ok(());
+        };
+        let (packet, superseded) = camera.take_latest_frame();
+        feed.note_drops(superseded);
+        let Some(packet) = packet else {
+            return Ok(());
+        };
+        if packet.raw_hns < self.min_raw_hns {
+            feed.note_drop();
+            return Ok(());
+        }
+        self.validate_native_timestamp(packet.raw_hns, "Media Foundation camera frame")?;
+        let Some(stream_hns) = self.timeline.project(packet.raw_hns) else {
+            return Ok(());
+        };
+        let frame = CameraFrame::new(packet.pixels, hns_duration(stream_hns), packet.orientation)?;
+        let _ = feed.push(frame)?;
         Ok(())
     }
 
@@ -662,6 +789,17 @@ impl Worker {
         if let Some(capture) = self.capture.take() {
             capture.close();
         }
+        if let Some(mut camera) = self.camera.take() {
+            camera.stop();
+        }
+        let camera_metadata = self.camera_feed.as_ref().map(|camera| {
+            let metadata = Box::new(CameraRecordingMetadata::from_runtime(
+                camera.settings(),
+                &camera.status(),
+            ));
+            camera.stop();
+            metadata
+        });
 
         let mut runtime_error = match cause {
             EndCause::Requested | EndCause::TargetClosed => None,
@@ -742,6 +880,7 @@ impl Worker {
                 video_frames,
                 audio_channels,
                 None,
+                camera_metadata,
             ),
             Outcome::Complete => Err(self.output.discard(Error::Codec(
                 "recording ended before any media reached the output file".into(),
@@ -752,6 +891,7 @@ impl Worker {
                 video_frames,
                 audio_channels,
                 Some(reason),
+                camera_metadata,
             ),
             Outcome::Unusable(reason) => Err(self.output.discard(Error::Codec(reason))),
         }
@@ -764,6 +904,7 @@ impl Worker {
         video_frames: u64,
         audio_channels: u16,
         mut partial_reason: Option<String>,
+        camera: Option<Box<CameraRecordingMetadata>>,
     ) -> Result<NativeRecording> {
         let metadata = RecordingMetadata {
             size: Some(PhysicalSize::new(
@@ -781,6 +922,7 @@ impl Worker {
             quality: Some(self.quality),
             resolution: Some(self.resolution),
             interaction_editable: None,
+            camera,
         };
         let path = match promote_output(&mut self.output) {
             Ok(()) => self.output.final_path.clone(),
@@ -838,6 +980,10 @@ impl Worker {
         self.next_target_validation = now + TARGET_REVALIDATION_INTERVAL;
         self.target_validator.validate()
     }
+}
+
+fn hns_duration(value: i64) -> Duration {
+    Duration::from_nanos(value.max(0).cast_unsigned().saturating_mul(100))
 }
 
 enum EndCause {

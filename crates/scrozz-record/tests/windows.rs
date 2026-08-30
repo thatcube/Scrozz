@@ -38,6 +38,7 @@ fn windows_caps() -> EngineCapabilities {
         video: true,
         system_audio: true,
         microphone: true,
+        camera: true,
         pause_resume: true,
         display: true,
         window: true,
@@ -59,6 +60,11 @@ fn capability_matrix_matches_windows_contract() {
     request.show_cursor = true;
     request.system_audio = true;
     request.microphone = true;
+    let camera_settings = scrozz_record::settings::CameraSettings {
+        enabled: true,
+        ..scrozz_record::settings::CameraSettings::default()
+    };
+    request.camera = Some(scrozz_record::CameraRequest::new(camera_settings));
     assert!(scrozz_record::validate_capabilities(caps, &request, None).is_ok());
 
     let mut hevc = request.clone();

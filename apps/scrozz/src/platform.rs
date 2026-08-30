@@ -139,7 +139,11 @@ pub fn start_recording(
     request: &scrozz_record::RecordingRequest,
 ) -> CliResult<Box<dyn scrozz_record::RecordingSession>> {
     guard("recording the screen", "scrozz-record")?;
-    let mut settings = crate::settings::load_recording_settings()?;
+    let (persisted, _) = crate::settings::stored_settings()?;
+    let mut settings = crate::settings::recording_settings_from(&persisted)?;
+    let camera_device = crate::settings::camera_device_from(&persisted)?;
+    let mut request = request.clone();
+    apply_persisted_camera(&mut request, &settings, camera_device);
     settings.cursor = if request.show_cursor {
         scrozz_core::CursorMode::Visible
     } else {
@@ -148,7 +152,22 @@ pub fn start_recording(
     if !request.show_cursor {
         settings.cursor_smoothing = false;
     }
-    Ok(scrozz_record::start_with_settings(request, &settings)?)
+    Ok(scrozz_record::start_with_settings(&request, &settings)?)
+}
+
+fn apply_persisted_camera(
+    request: &mut scrozz_record::RecordingRequest,
+    settings: &scrozz_record::RecordingSettings,
+    device: Option<scrozz_record::CameraDeviceId>,
+) {
+    if request.camera.is_some() || !settings.camera.enabled {
+        return;
+    }
+    let mut camera = scrozz_record::CameraRequest::new(settings.camera);
+    if let Some(device) = device {
+        camera = camera.with_device(device);
+    }
+    request.camera = Some(camera);
 }
 
 /// The capture history, at its default location.
@@ -314,6 +333,37 @@ mod tests {
         let text = err.to_human();
         assert!(text.contains("scrozz-somewhere"), "{text}");
         assert!(text.contains("doing a thing"), "{text}");
+    }
+
+    #[test]
+    fn cli_camera_uses_persisted_device_unless_the_request_is_explicit() {
+        let persisted = scrozz_record::CameraDeviceId::new("external-camera").unwrap();
+        let explicit = scrozz_record::CameraDeviceId::new("explicit-camera").unwrap();
+        let mut settings = scrozz_record::RecordingSettings::shipped();
+        settings.camera.enabled = true;
+        let mut request =
+            scrozz_record::RecordingRequest::new(scrozz_core::CaptureTarget::AllDisplays);
+
+        apply_persisted_camera(&mut request, &settings, Some(persisted.clone()));
+        assert_eq!(
+            request
+                .camera
+                .as_ref()
+                .and_then(|camera| camera.device_id.as_ref()),
+            Some(&persisted)
+        );
+
+        request.camera =
+            Some(scrozz_record::CameraRequest::new(settings.camera).with_device(explicit.clone()));
+        apply_persisted_camera(&mut request, &settings, Some(persisted));
+        assert_eq!(
+            request
+                .camera
+                .as_ref()
+                .and_then(|camera| camera.device_id.as_ref()),
+            Some(&explicit),
+            "an explicit --camera selection remains authoritative"
+        );
     }
 
     #[test]

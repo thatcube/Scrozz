@@ -142,6 +142,7 @@ impl Command {
             Self::List(args) => match args.what {
                 ListWhat::Displays => "list.displays".into(),
                 ListWhat::Windows => "list.windows".into(),
+                ListWhat::Cameras => "list.cameras".into(),
             },
             Self::History(args) => match args.command {
                 HistoryCommand::List { .. } => "history.list".into(),
@@ -1319,6 +1320,58 @@ pub struct RecordArgs {
     #[arg(long)]
     pub system_audio: bool,
 
+    /// Capture a camera. Optionally name a stable device id; omit the value for
+    /// the platform default.
+    #[arg(long, num_args = 0..=1, default_missing_value = "default", value_name = "DEVICE")]
+    pub camera: Option<String>,
+
+    /// Use the camera as the primary canvas.
+    #[arg(long, requires = "camera")]
+    pub presenter: bool,
+
+    /// Hide the shared-screen inset in presenter mode.
+    #[arg(long, requires = "presenter")]
+    pub presenter_camera_only: bool,
+
+    /// Camera safe-area anchor.
+    #[arg(
+        long,
+        default_value = "bottom-right",
+        value_parser = [
+            "top-left",
+            "top-center",
+            "top-right",
+            "bottom-left",
+            "bottom-center",
+            "bottom-right"
+        ]
+    )]
+    pub camera_position: String,
+
+    /// Camera size as a percentage of the shorter output edge.
+    #[arg(long, default_value_t = 22, value_parser = clap::value_parser!(u8).range(8..=50))]
+    pub camera_size: u8,
+
+    /// Camera mask.
+    #[arg(
+        long,
+        default_value = "circle",
+        value_parser = ["circle", "rounded", "square", "rectangle"]
+    )]
+    pub camera_shape: String,
+
+    /// Keep camera pixels unmirrored.
+    #[arg(long, requires = "camera")]
+    pub no_camera_mirror: bool,
+
+    /// Disable the camera border.
+    #[arg(long, requires = "camera")]
+    pub no_camera_border: bool,
+
+    /// Disable the camera shadow.
+    #[arg(long, requires = "camera")]
+    pub no_camera_shadow: bool,
+
     /// Frames per second.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     pub fps: u32,
@@ -1337,7 +1390,23 @@ pub struct RecordArgs {
     /// running Scrozz instance; there is no session in a fresh process to stop.
     #[arg(
         long,
-        conflicts_with_all = ["target", "microphone", "system_audio", "fps", "cursor", "output"]
+        conflicts_with_all = [
+            "target",
+            "microphone",
+            "system_audio",
+            "camera",
+            "presenter",
+            "presenter_camera_only",
+            "camera_position",
+            "camera_size",
+            "camera_shape",
+            "no_camera_mirror",
+            "no_camera_border",
+            "no_camera_shadow",
+            "fps",
+            "cursor",
+            "output"
+        ]
     )]
     pub stop: bool,
 
@@ -1367,6 +1436,8 @@ pub enum ListWhat {
     ///
     /// Unavailable on Wayland, which has no window enumeration protocol.
     Windows,
+    /// Connected camera devices.
+    Cameras,
 }
 
 // ---------------------------------------------------------------------------
@@ -2872,6 +2943,43 @@ mod tests {
     }
 
     #[test]
+    fn record_camera_options_require_an_explicit_camera_action() {
+        let Some(Command::Record(args)) = parse(&[
+            "scrozz",
+            "record",
+            "--camera",
+            "stable-device",
+            "--presenter",
+            "--presenter-camera-only",
+            "--camera-position",
+            "top-left",
+            "--camera-size",
+            "32",
+            "--camera-shape",
+            "square",
+            "--no-camera-mirror",
+            "--no-camera-border",
+            "--no-camera-shadow",
+        ])
+        .command
+        else {
+            panic!("expected record")
+        };
+        assert_eq!(args.camera.as_deref(), Some("stable-device"));
+        assert!(args.presenter);
+        assert!(args.presenter_camera_only);
+        assert_eq!(args.camera_position, "top-left");
+        assert_eq!(args.camera_size, 32);
+        assert_eq!(args.camera_shape, "square");
+        assert!(args.no_camera_mirror);
+        assert!(args.no_camera_border);
+        assert!(args.no_camera_shadow);
+
+        reject(&["scrozz", "record", "--presenter"]);
+        reject(&["scrozz", "record", "--no-camera-mirror"]);
+    }
+
+    #[test]
     fn an_absurd_frame_rate_is_rejected() {
         reject(&["scrozz", "record", "--fps", "0"]);
         reject(&["scrozz", "record", "--fps", "1000"]);
@@ -2887,6 +2995,7 @@ mod tests {
         reject(&["scrozz", "record", "--stop", "--output", "a.mp4"]);
         reject(&["scrozz", "record", "--stop", "--cursor"]);
         reject(&["scrozz", "record", "--stop", "--system-audio"]);
+        reject(&["scrozz", "record", "--stop", "--camera"]);
     }
 
     #[test]
@@ -2917,6 +3026,11 @@ mod tests {
             panic!("expected list")
         };
         assert_eq!(args.what, ListWhat::Windows);
+
+        let Some(Command::List(args)) = parse(&["scrozz", "list", "cameras"]).command else {
+            panic!("expected list")
+        };
+        assert_eq!(args.what, ListWhat::Cameras);
     }
 
     #[test]

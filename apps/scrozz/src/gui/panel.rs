@@ -341,7 +341,7 @@ pub struct BehaviorController {
     /// `NSView *` / `HWND` / X11 window itself, not the panel behaviour built
     /// on top of it.
     surface: Rc<RefCell<Option<NativeSurface>>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     overlay: Rc<RefCell<Option<NativeOverlay>>>,
     #[cfg(target_os = "linux")]
     x11_focus: Rc<RefCell<Option<scrozz_shell::X11FocusLease>>>,
@@ -397,7 +397,7 @@ impl BehaviorController {
         if self.teardown_started.get() {
             return;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some(overlay) = self.overlay.borrow_mut().as_mut()
             && let Err(error) = overlay.apply(behavior)
         {
@@ -423,7 +423,7 @@ impl BehaviorController {
             self.set_cursor(OverlayCursor::Arrow);
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux", test)))]
         let _ = behavior;
     }
 
@@ -521,7 +521,7 @@ impl BehaviorController {
         }
         self.surface.borrow_mut().take();
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some(mut overlay) = self.overlay.borrow_mut().take() {
             overlay.restore_native_class()?;
         }
@@ -545,7 +545,7 @@ impl BehaviorController {
         *self.surface.borrow_mut() = Some(surface);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn install(&self, overlay: NativeOverlay) {
         if self.teardown_started.get() {
             return;
@@ -631,6 +631,31 @@ unsafe fn adopt_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Option
     if let Err(error) = overlay.set_visible(false) {
         tracing::warn!(%error, "could not order the initial overlay out");
     }
+    (report, Some(overlay))
+}
+
+/// Adopts the Win32 overlay window and keeps the adapter alive.
+///
+/// The adapter restores every style it set when it is dropped, so the retained
+/// value — not the call — is what keeps the overlay non-activating, topmost,
+/// and excluded from display capture (`WDA_EXCLUDEFROMCAPTURE`).
+///
+/// # Safety
+///
+/// `hwnd` must name the live top-level window this process just created.
+#[cfg(target_os = "windows")]
+unsafe fn adopt_and_retain_hwnd(hwnd: *mut c_void) -> (PanelReport, Option<NativeOverlay>) {
+    // SAFETY: forwarded from this function's own contract.
+    let adopted = unsafe { NativeOverlay::from_hwnd(hwnd) };
+    let mut overlay = match adopted {
+        Ok(overlay) => overlay,
+        Err(err) => return (PanelReport::unsupported(err.to_string()), None),
+    };
+    let report = match overlay.apply(&OverlayBehavior::capture_card()) {
+        Ok(report) if report.non_activating => PanelReport::converted(report.detail),
+        Ok(report) => PanelReport::unsupported(report.detail),
+        Err(err) => return (PanelReport::unsupported(err.to_string()), None),
+    };
     (report, Some(overlay))
 }
 
@@ -727,7 +752,23 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
             PanelReport::unsupported(detail)
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+                return PanelReport::unsupported(
+                    "the overlay window is not a Win32 window, so it cannot be excluded from capture",
+                );
+            };
+            let (report, overlay) =
+                // SAFETY: the creation-context handle borrows this live top-level window.
+                unsafe { adopt_and_retain_hwnd(win32.hwnd.get() as *mut c_void) };
+            if let Some(overlay) = overlay {
+                controller.install(overlay);
+            }
+            report
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = handle;
             let _ = controller;

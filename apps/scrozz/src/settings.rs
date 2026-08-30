@@ -28,8 +28,11 @@ use crate::{
 };
 use scrozz_core::CursorMode;
 use scrozz_record::{
-    RecordingSettings,
-    settings::{ClickStyle, KeystrokeScope, OverlayAnchor, OverlaySize, OverlayTheme, Rgba8},
+    CameraDeviceId, RecordingSettings,
+    settings::{
+        CameraPlacement, CameraShape, ClickStyle, KeystrokeScope, OverlayAnchor, OverlaySize,
+        OverlayTheme, Rgba8,
+    },
 };
 use scrozz_shell::ScreenshotSound;
 use std::path::PathBuf;
@@ -64,6 +67,18 @@ const RECORDING_KEY_SCOPE_KEY: &str = "record.keystroke-scope";
 const RECORDING_KEY_POSITION_KEY: &str = "record.keystroke-position";
 const RECORDING_KEY_SIZE_KEY: &str = "record.keystroke-size";
 const RECORDING_KEY_THEME_KEY: &str = "record.keystroke-theme";
+const CAMERA_ENABLED_KEY: &str = "record.camera";
+const CAMERA_DEVICE_KEY: &str = "record.camera-device";
+const CAMERA_POSITION_KEY: &str = "record.camera-position";
+const CAMERA_PLACEMENT_X_KEY: &str = "record.camera-placement-x";
+const CAMERA_PLACEMENT_Y_KEY: &str = "record.camera-placement-y";
+const CAMERA_SIZE_KEY: &str = "record.camera-size";
+const CAMERA_SHAPE_KEY: &str = "record.camera-shape";
+const CAMERA_PRESENTER_KEY: &str = "record.camera-presenter";
+const CAMERA_PRESENTER_SCREEN_KEY: &str = "record.camera-presenter-screen";
+const CAMERA_MIRROR_KEY: &str = "record.camera-mirror";
+const CAMERA_BORDER_KEY: &str = "record.camera-border";
+const CAMERA_SHADOW_KEY: &str = "record.camera-shadow";
 
 /// What a setting accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,7 +299,68 @@ pub fn recording_settings_from(persisted: &AfterCaptureSettings) -> CliResult<Re
         OverlaySize::from_slug(&value(RECORDING_KEY_SIZE_KEY)?).map_err(CliError::Core)?;
     settings.keystrokes.theme =
         OverlayTheme::from_slug(&value(RECORDING_KEY_THEME_KEY)?).map_err(CliError::Core)?;
+    settings.camera.enabled = parse_bool(CAMERA_ENABLED_KEY, &value(CAMERA_ENABLED_KEY)?)?;
+    settings.camera.position =
+        OverlayAnchor::from_slug(&value(CAMERA_POSITION_KEY)?).map_err(CliError::Core)?;
+    settings.camera.placement = camera_placement(
+        parse_i64(CAMERA_PLACEMENT_X_KEY, &value(CAMERA_PLACEMENT_X_KEY)?)?,
+        parse_i64(CAMERA_PLACEMENT_Y_KEY, &value(CAMERA_PLACEMENT_Y_KEY)?)?,
+    )?;
+    settings.camera.size = parse_i64(CAMERA_SIZE_KEY, &value(CAMERA_SIZE_KEY)?)? as f32 / 100.0;
+    settings.camera.shape =
+        CameraShape::from_slug(&value(CAMERA_SHAPE_KEY)?).map_err(CliError::Core)?;
+    settings.camera.presenter = parse_bool(CAMERA_PRESENTER_KEY, &value(CAMERA_PRESENTER_KEY)?)?;
+    settings.camera.presenter_screen = parse_bool(
+        CAMERA_PRESENTER_SCREEN_KEY,
+        &value(CAMERA_PRESENTER_SCREEN_KEY)?,
+    )?;
+    settings.camera.mirror = parse_bool(CAMERA_MIRROR_KEY, &value(CAMERA_MIRROR_KEY)?)?;
+    settings.camera.border = parse_bool(CAMERA_BORDER_KEY, &value(CAMERA_BORDER_KEY)?)?;
+    settings.camera.shadow = parse_bool(CAMERA_SHADOW_KEY, &value(CAMERA_SHADOW_KEY)?)?;
     settings.validate().map_err(CliError::Core)
+}
+
+/// Reads the stable camera device preference from a loaded settings document.
+///
+/// `None` means "whatever the platform calls the default camera": a persisted
+/// id is a platform identifier that survives reboots, never a native handle.
+///
+/// # Errors
+///
+/// Returns a usage error when the persisted identifier is malformed.
+pub fn camera_device_from(persisted: &AfterCaptureSettings) -> CliResult<Option<CameraDeviceId>> {
+    let shortcuts = Shortcuts::default();
+    let value = resolve(lookup(CAMERA_DEVICE_KEY)?, &shortcuts, persisted).0;
+    if value == "default" {
+        return Ok(None);
+    }
+    CameraDeviceId::new(value).map(Some).map_err(CliError::Core)
+}
+
+/// Writes the stable camera device preference into a settings document.
+pub fn apply_camera_device(persisted: &mut AfterCaptureSettings, device: Option<&CameraDeviceId>) {
+    persisted.set_value(
+        CAMERA_DEVICE_KEY,
+        device.map_or("default", CameraDeviceId::as_str),
+    );
+}
+
+/// Rebuilds free camera placement from its two persisted thousandths.
+///
+/// Both coordinates are `-1` when no drag has happened, so a half-written pair
+/// is a real error rather than a silently re-anchored camera.
+fn camera_placement(x: i64, y: i64) -> CliResult<Option<CameraPlacement>> {
+    match (x, y) {
+        (-1, -1) => Ok(None),
+        (x @ 0..=1_000, y @ 0..=1_000) => {
+            CameraPlacement::new(x as f32 / 1_000.0, y as f32 / 1_000.0)
+                .map(Some)
+                .map_err(CliError::Core)
+        }
+        _ => Err(CliError::usage(format!(
+            "{CAMERA_PLACEMENT_X_KEY} and {CAMERA_PLACEMENT_Y_KEY} must both be -1 or both be 0..=1000"
+        ))),
+    }
 }
 
 /// Atomically persists every recording setting represented by the settings UI.
@@ -311,6 +387,31 @@ pub fn save_recording_settings(
     store
         .update(profile, |persisted| {
             apply_recording_settings(persisted, settings);
+            Ok(())
+        })
+        .map_err(CliError::Core)
+}
+
+/// Atomically persists the camera composition and its stable device choice.
+///
+/// One update rather than two so a crash between them cannot leave a device
+/// selected for a composition that was never written.
+///
+/// # Errors
+///
+/// Returns a usage error for settings that fail validation, or a storage error
+/// when the document cannot be read or atomically replaced.
+pub fn save_camera_preferences(
+    store: &AfterCaptureStore,
+    settings: RecordingSettings,
+    device: Option<&CameraDeviceId>,
+) -> CliResult<AfterCaptureSettings> {
+    settings.validate().map_err(CliError::Core)?;
+    let profile = store.inferred_profile();
+    store
+        .update(profile, |persisted| {
+            apply_recording_settings(persisted, settings);
+            apply_camera_device(persisted, device);
             Ok(())
         })
         .map_err(CliError::Core)
@@ -365,9 +466,49 @@ fn apply_recording_settings(persisted: &mut AfterCaptureSettings, settings: Reco
             RECORDING_KEY_THEME_KEY,
             settings.keystrokes.theme.slug().to_owned(),
         ),
+        (CAMERA_ENABLED_KEY, settings.camera.enabled.to_string()),
+        (
+            CAMERA_POSITION_KEY,
+            settings.camera.position.slug().to_owned(),
+        ),
+        (
+            CAMERA_PLACEMENT_X_KEY,
+            settings
+                .camera
+                .placement
+                .map_or(-1, |placement| (placement.x * 1_000.0).round() as i64)
+                .to_string(),
+        ),
+        (
+            CAMERA_PLACEMENT_Y_KEY,
+            settings
+                .camera
+                .placement
+                .map_or(-1, |placement| (placement.y * 1_000.0).round() as i64)
+                .to_string(),
+        ),
+        (
+            CAMERA_SIZE_KEY,
+            ((settings.camera.size * 100.0).round() as i64).to_string(),
+        ),
+        (CAMERA_SHAPE_KEY, settings.camera.shape.slug().to_owned()),
+        (CAMERA_PRESENTER_KEY, settings.camera.presenter.to_string()),
+        (
+            CAMERA_PRESENTER_SCREEN_KEY,
+            settings.camera.presenter_screen.to_string(),
+        ),
+        (CAMERA_MIRROR_KEY, settings.camera.mirror.to_string()),
+        (CAMERA_BORDER_KEY, settings.camera.border.to_string()),
+        (CAMERA_SHADOW_KEY, settings.camera.shadow.to_string()),
     ] {
         persisted.set_value(key, value);
     }
+}
+
+fn parse_i64(key: &str, value: &str) -> CliResult<i64> {
+    value
+        .parse()
+        .map_err(|_| CliError::usage(format!("{key} must be a whole number, not {value:?}")))
 }
 
 fn parse_bool(key: &str, value: &str) -> CliResult<bool> {
@@ -517,6 +658,91 @@ pub const SETTINGS: &[Setting] = &[
         kind: Kind::Bool,
         default: "false",
         description: "Record system audio output.",
+    },
+    Setting {
+        key: CAMERA_ENABLED_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Capture a camera and composite it into screen recordings.",
+    },
+    Setting {
+        key: CAMERA_DEVICE_KEY,
+        kind: Kind::Path,
+        default: "default",
+        description: "Stable camera device identifier, or `default`.",
+    },
+    Setting {
+        key: CAMERA_POSITION_KEY,
+        kind: Kind::Choice(&[
+            "top-left",
+            "top-center",
+            "top-right",
+            "bottom-left",
+            "bottom-center",
+            "bottom-right",
+        ]),
+        default: "bottom-right",
+        description: "Safe-area camera anchor.",
+    },
+    Setting {
+        key: CAMERA_SIZE_KEY,
+        kind: Kind::Int { min: 8, max: 50 },
+        default: "22",
+        description: "Camera height as a percentage of the shorter output edge.",
+    },
+    Setting {
+        key: CAMERA_PLACEMENT_X_KEY,
+        kind: Kind::Int {
+            min: -1,
+            max: 1_000,
+        },
+        default: "-1",
+        description: "Normalized dragged camera x position in thousandths; -1 uses the anchor.",
+    },
+    Setting {
+        key: CAMERA_PLACEMENT_Y_KEY,
+        kind: Kind::Int {
+            min: -1,
+            max: 1_000,
+        },
+        default: "-1",
+        description: "Normalized dragged camera y position in thousandths; -1 uses the anchor.",
+    },
+    Setting {
+        key: CAMERA_SHAPE_KEY,
+        kind: Kind::Choice(&["circle", "rounded", "square", "rectangle"]),
+        default: "circle",
+        description: "Camera mask shape.",
+    },
+    Setting {
+        key: CAMERA_PRESENTER_KEY,
+        kind: Kind::Bool,
+        default: "false",
+        description: "Use the camera as the primary presenter canvas.",
+    },
+    Setting {
+        key: CAMERA_PRESENTER_SCREEN_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Show the shared screen as an inset in presenter mode.",
+    },
+    Setting {
+        key: CAMERA_MIRROR_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Mirror camera preview and recorded composition.",
+    },
+    Setting {
+        key: CAMERA_BORDER_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Draw a high-contrast camera border.",
+    },
+    Setting {
+        key: CAMERA_SHADOW_KEY,
+        kind: Kind::Bool,
+        default: "true",
+        description: "Draw a restrained camera shadow.",
     },
     Setting {
         key: RECORDING_CURSOR_KEY,
@@ -1058,6 +1284,61 @@ mod tests {
         assert!(!defaults.keystrokes.enabled);
         assert_eq!(defaults.keystrokes.scope, KeystrokeScope::ModifiersOnly);
         assert_eq!(defaults.cursor, CursorMode::Visible);
+    }
+
+    #[test]
+    fn camera_preferences_round_trip_without_native_handles() {
+        let root = scratch("camera");
+        let _cleanup = Scratch(root.clone());
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let camera = scrozz_record::settings::CameraSettings {
+            enabled: true,
+            position: OverlayAnchor::TopLeft,
+            placement: Some(CameraPlacement::new(0.333, 0.667).expect("fixture placement")),
+            size: 0.34,
+            shape: CameraShape::Square,
+            presenter: true,
+            presenter_screen: false,
+            mirror: false,
+            border: false,
+            shadow: true,
+        };
+        let mut expected = RecordingSettings::shipped();
+        expected.camera = camera;
+
+        let persisted = store
+            .update(InstallProfile::Fresh, |persisted| {
+                apply_recording_settings(persisted, expected);
+                apply_camera_device(persisted, Some(&CameraDeviceId::new("stable-camera-id")?));
+                Ok(())
+            })
+            .unwrap();
+
+        let reloaded = recording_settings_from(&persisted).unwrap();
+        assert_eq!(reloaded.camera, camera);
+        assert_eq!(
+            camera_device_from(&persisted)
+                .unwrap()
+                .as_ref()
+                .map(CameraDeviceId::as_str),
+            Some("stable-camera-id")
+        );
+
+        // A stable device id is a platform identifier, never a native handle.
+        let encoded = std::fs::read_to_string(root.join("settings.json")).unwrap();
+        assert!(encoded.contains("stable-camera-id"));
+        assert!(!encoded.contains("AVCaptureDevice"));
+    }
+
+    #[test]
+    fn missing_camera_preferences_never_enable_capture() {
+        let defaults = recording_settings_from(&AfterCaptureSettings::fresh()).unwrap();
+        assert!(!defaults.camera.enabled);
+        assert!(
+            camera_device_from(&AfterCaptureSettings::fresh())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

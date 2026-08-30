@@ -6,12 +6,15 @@ use std::time::Duration;
 
 use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, vec2};
 use scrozz_record::{
+    CameraDevice, CameraDeviceId, CameraDeviceState, CameraPermission, CameraRecordingMetadata,
     Recording,
     edit::{EditOutput, EditPlan, SourceMetadata, TrimRange, VideoDocument},
     transcode::{ExportCapabilities, ExportCapability},
 };
 use scrozz_ui::{
-    Theme, TranscodeView, VideoEditor, VideoEditorAction, VideoEditorModel, VideoPreview,
+    CameraLiveModel, CameraSettingsAction, CameraSettingsModel, CameraSettingsPanel,
+    RecordingSettingsAction, RecordingSettingsPanel, Theme, TranscodeView, VideoEditor,
+    VideoEditorAction, VideoEditorModel, VideoPreview,
     harness::{RecordingFixture, Scenario, SceneRegistry, SoftwareRenderer, VirtualClock},
 };
 
@@ -77,6 +80,209 @@ fn click<T>(context: &egui::Context, point: Pos2, mut draw: impl FnMut(&mut egui
         vec![Event::PointerMoved(point), event(false)],
         draw,
     )
+}
+
+#[test]
+fn camera_settings_preview_is_explicit_and_permission_aware() {
+    let context = new_context();
+    let theme = Theme::dark();
+    let device = CameraDevice {
+        id: CameraDeviceId::new("stable-camera").unwrap(),
+        name: "Studio camera".to_owned(),
+        state: CameraDeviceState::Available,
+        is_default: true,
+    };
+    let settings = scrozz_record::settings::CameraSettings {
+        enabled: true,
+        ..scrozz_record::settings::CameraSettings::default()
+    };
+    let denied = run_ui(&context, Vec::new(), |ui| {
+        CameraSettingsPanel::new(
+            CameraSettingsModel {
+                settings,
+                devices: std::slice::from_ref(&device),
+                selected_device: None,
+                capture_configuration_locked: false,
+                permission: CameraPermission::Denied,
+                preview: None,
+                preview_status: None,
+                error: None,
+            },
+            &theme,
+        )
+        .show(ui)
+    });
+    assert!(!denied.preview_response.enabled());
+
+    let ready = run_ui(&context, Vec::new(), |ui| {
+        CameraSettingsPanel::new(
+            CameraSettingsModel {
+                settings,
+                devices: std::slice::from_ref(&device),
+                selected_device: Some(&device.id),
+                capture_configuration_locked: false,
+                permission: CameraPermission::Authorized,
+                preview: None,
+                preview_status: None,
+                error: None,
+            },
+            &theme,
+        )
+        .show(ui)
+    });
+    assert!(ready.preview_response.enabled());
+    let started = click(&context, ready.preview_response.rect.center(), |ui| {
+        CameraSettingsPanel::new(
+            CameraSettingsModel {
+                settings,
+                devices: std::slice::from_ref(&device),
+                selected_device: Some(&device.id),
+                capture_configuration_locked: false,
+                permission: CameraPermission::Authorized,
+                preview: None,
+                preview_status: None,
+                error: None,
+            },
+            &theme,
+        )
+        .show(ui)
+    });
+    assert!(
+        started
+            .actions
+            .contains(&CameraSettingsAction::StartPreview)
+    );
+}
+
+#[test]
+fn live_recording_pane_keeps_camera_privacy_state_visible_and_composition_live() {
+    let context = new_context();
+    let theme = Theme::dark();
+    let status = scrozz_record::CameraRuntimeStatus {
+        active: true,
+        privacy_indicator_visible: true,
+        device_state: CameraDeviceState::Available,
+        frames_received: 12,
+        dropped_frames: 1,
+        queued_frames: 3,
+        warning: None,
+    };
+    let camera = scrozz_record::settings::CameraSettings {
+        enabled: true,
+        ..scrozz_record::settings::CameraSettings::default()
+    };
+    let mut settings = scrozz_record::RecordingSettings::shipped();
+    settings.camera = camera;
+    let model = CameraLiveModel {
+        settings: camera,
+        status: &status,
+        preview: None,
+        enabled: true,
+    };
+
+    let live = run_ui(&context, Vec::new(), |ui| {
+        RecordingSettingsPanel::new(settings, scrozz_record::EngineCapabilities::ALL, &theme)
+            .with_active_recording(true)
+            .with_camera(model)
+            .show(ui)
+    });
+    // Nothing moved, so nothing is sent into the running native session.
+    assert!(live.actions.is_empty());
+    assert_eq!(live.settings.camera, camera);
+    assert!(status.privacy_indicator_visible);
+
+    // Presenter is reachable while every other preference is locked.
+    let presenter = run_ui(&context, Vec::new(), |ui| {
+        RecordingSettingsPanel::new(settings, scrozz_record::EngineCapabilities::ALL, &theme)
+            .with_active_recording(true)
+            .with_camera(CameraLiveModel {
+                settings: scrozz_record::settings::CameraSettings {
+                    presenter: true,
+                    ..camera
+                },
+                ..model
+            })
+            .show(ui)
+    });
+    assert!(presenter.actions.is_empty());
+    assert!(presenter.settings.camera.presenter);
+}
+
+#[test]
+fn live_camera_controls_are_inert_when_the_camera_is_unavailable() {
+    let context = new_context();
+    let theme = Theme::dark();
+    let status = scrozz_record::CameraRuntimeStatus {
+        active: false,
+        privacy_indicator_visible: false,
+        device_state: CameraDeviceState::Disconnected,
+        frames_received: 0,
+        dropped_frames: 0,
+        queued_frames: 0,
+        warning: Some("the camera was disconnected".to_owned()),
+    };
+    let camera = scrozz_record::settings::CameraSettings {
+        enabled: true,
+        ..scrozz_record::settings::CameraSettings::default()
+    };
+    let mut settings = scrozz_record::RecordingSettings::shipped();
+    settings.camera = camera;
+    let response = run_ui(&context, Vec::new(), |ui| {
+        RecordingSettingsPanel::new(settings, scrozz_record::EngineCapabilities::ALL, &theme)
+            .with_active_recording(true)
+            .with_camera(CameraLiveModel {
+                settings: camera,
+                status: &status,
+                preview: None,
+                enabled: false,
+            })
+            .show(ui)
+    });
+    assert!(
+        !response
+            .actions
+            .iter()
+            .any(|action| matches!(action, RecordingSettingsAction::CameraChanged(_))),
+        "a disconnected camera must not emit live composition changes"
+    );
+}
+
+#[test]
+fn editor_accepts_camera_composition_metadata_without_mutating_source() {
+    let mut recording = Recording::synthetic("editor-camera.mp4", 20.0, "UI test").unwrap();
+    recording.metadata.camera = Some(Box::new(CameraRecordingMetadata {
+        presenter: false,
+        presenter_screen: true,
+        shape: scrozz_record::settings::CameraShape::Circle,
+        mirrored: true,
+        dropped_frames: 2,
+    }));
+    let document = VideoDocument::open_fixture(
+        recording.clone(),
+        SourceMetadata {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            audio_channels: 2,
+        },
+    )
+    .unwrap();
+    let plan = EditPlan::video(&document).unwrap();
+    let context = new_context();
+    let theme = Theme::dark();
+    let _ = run_ui(&context, Vec::new(), |ui| {
+        VideoEditor::new(
+            VideoEditorModel {
+                document: &document,
+                plan,
+                preview: VideoPreview::default(),
+                transcode: TranscodeView::Idle,
+            },
+            &theme,
+        )
+        .show(ui)
+    });
+    assert_eq!(document.recording(), &recording);
 }
 
 fn document(audio_channels: u16) -> VideoDocument {
@@ -478,6 +684,12 @@ fn filmstrip_timeline_drag_updates_trim_without_overwriting_source_state() {
     assert_eq!(changed.output, plan.output);
 }
 
+const CAMERA_SCENARIOS: &[Scenario] = &[
+    Scenario::RecordingCamera,
+    Scenario::RecordingPresenter,
+    Scenario::CameraSettings,
+];
+
 const VIDEO_SCENARIOS: &[Scenario] = &[
     Scenario::VideoEditing,
     Scenario::VideoEditingNarrow,
@@ -505,7 +717,7 @@ fn every_video_scenario_has_real_deterministic_scene_and_fixture() {
     let placeholders = registry.placeholder_scenarios();
     let renderer = SoftwareRenderer::production();
 
-    for &scenario in VIDEO_SCENARIOS {
+    for &scenario in VIDEO_SCENARIOS.iter().chain(CAMERA_SCENARIOS.iter()) {
         assert!(
             !placeholders.contains(&scenario),
             "{} still uses a placeholder",
@@ -514,8 +726,15 @@ fn every_video_scenario_has_real_deterministic_scene_and_fixture() {
         let first_fixture = scenario.fixture();
         let second_fixture = scenario.fixture();
         assert!(
-            matches!(first_fixture.recording, Some(RecordingFixture::Editor(_))),
-            "{} must use RecordingFixture::Editor",
+            matches!(
+                first_fixture.recording,
+                Some(
+                    RecordingFixture::Editor(_)
+                        | RecordingFixture::CameraLive(_)
+                        | RecordingFixture::CameraSettings(_)
+                )
+            ),
+            "{} must carry a real recording fixture",
             scenario.slug()
         );
         assert_eq!(

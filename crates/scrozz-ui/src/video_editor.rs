@@ -1334,6 +1334,12 @@ fn draw_inspector(
         inspector_panel(ui, theme, "Audio", |ui| {
             draw_audio_controls(ui, theme, document, running, plan, plan_changed);
         });
+        if document.recording().metadata.camera.is_some() {
+            ui.add_space(Space::SM);
+            inspector_panel(ui, theme, "Camera", |ui| {
+                draw_camera_metadata(ui, theme, document);
+            });
+        }
         ui.add_space(Space::SM);
         inspector_panel(ui, theme, "Export", |ui| {
             draw_export_controls(
@@ -1372,6 +1378,13 @@ fn draw_inspector(
                 .show(ui, |ui| {
                     draw_audio_controls(ui, theme, document, running, plan, plan_changed);
                 });
+            if document.recording().metadata.camera.is_some() {
+                rule(ui, theme);
+                CollapsingHeader::new("Camera")
+                    .id_salt("video-editor-stacked-camera")
+                    .default_open(true)
+                    .show(ui, |ui| draw_camera_metadata(ui, theme, document));
+            }
             rule(ui, theme);
             CollapsingHeader::new("Export")
                 .id_salt("video-editor-stacked-export")
@@ -1389,6 +1402,53 @@ fn draw_inspector(
                     draw_transcode_status(ui, theme, transcode, actions, reveal_response);
                 });
         });
+    }
+
+    fn draw_camera_metadata(ui: &mut Ui, theme: &Theme, document: &VideoDocument) {
+        let Some(camera) = document.recording().metadata.camera.as_deref() else {
+            return;
+        };
+        body(
+            ui,
+            theme,
+            if camera.presenter {
+                if camera.presenter_screen {
+                    "Presenter camera with shared-screen inset"
+                } else {
+                    "Camera-only presenter recording"
+                }
+            } else {
+                "Camera picture in picture"
+            },
+        );
+        caption(
+            ui,
+            theme,
+            format!(
+                "{} · {}{}",
+                match camera.shape {
+                    scrozz_record::settings::CameraShape::Circle => "Circle",
+                    scrozz_record::settings::CameraShape::Rounded => "Rounded rectangle",
+                    scrozz_record::settings::CameraShape::Square => "Square",
+                    scrozz_record::settings::CameraShape::Rectangle => "Rectangle",
+                },
+                if camera.mirrored {
+                    "mirrored"
+                } else {
+                    "unmirrored"
+                },
+                if camera.dropped_frames == 0 {
+                    String::new()
+                } else {
+                    format!(" · {} dropped frames", camera.dropped_frames)
+                }
+            ),
+        );
+        caption(
+            ui,
+            theme,
+            "Camera composition is preserved in preview and export; the source file is never overwritten.",
+        );
     }
 }
 

@@ -61,6 +61,37 @@ report an explicit unsupported capability until their native decode and audio
 adapters are complete; they never substitute a synthetic clock or static source
 thumbnail for playback.
 
+Camera capture follows the same native-adapter rule. macOS uses AVFoundation,
+Windows uses a Media Foundation source reader, and Linux's opt-in native recorder
+uses V4L2 read or mmap streaming I/O. All three feed the same bounded
+freshest-frame queue and the same deterministic PiP/presenter compositor; camera
+timestamps are mapped onto each recorder's pause-free media clock before
+composition, so a live picture-in-picture to presenter switch never moves the
+recording clock. Device enumeration is passive: it names devices and their state
+without opening one. Permission prompts and camera activation happen only after
+an explicit Preview or Record action, and every stop, pause, revocation and drop
+path releases the native device and clears the in-app privacy indicator with it.
+
+Windows applies `WDA_EXCLUDEFROMCAPTURE` to Scrozz's own non-activating overlay
+through `WindowsOverlay`, so the live camera controls stay on screen without
+entering the video. X11 and current Wayland capture paths cannot promise
+per-window exclusion; there Scrozz suppresses its overlay chrome while
+recording, and the camera's own activity stays visible through the system
+privacy indicator rather than through a Scrozz surface that would be recorded.
+
+Two Linux camera limits are refusals, not gaps to be papered over:
+
+* **Self-capture recursion.** Because X11 and Wayland cannot exclude a single
+  window from a display capture, a camera preview shown over a running display
+  recording would record itself, once per frame, forever. Scrozz refuses to open
+  a preview while a recording owns the camera on every platform, and says so,
+  rather than compositing a picture of its own preview into the video.
+* **MJPEG-only cameras.** The V4L2 adapter negotiates packed `YUYV` and nothing
+  else. A camera that can only emit MJPEG is reported as
+  `Error::Unsupported { what: "V4L2 camera pixel format", .. }` naming the device
+  path, because a silent in-process JPEG decode per frame would be a latency and
+  dependency cost the recorder has not agreed to pay.
+
 Completed recordings and editor exports cross into the aggregate UI through
 `scrozz_record::handoff::FinalizedMediaHandoff`. The handoff carries durable
 ownership, a canonical media path, the exact content type and codec, a bounded

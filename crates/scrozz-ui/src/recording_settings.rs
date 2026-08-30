@@ -4,10 +4,13 @@ use egui::{Color32, ComboBox, Frame, RichText, Stroke, Ui};
 use scrozz_core::CursorMode;
 use scrozz_record::{
     EngineCapabilities, RecordingSettings,
-    settings::{ClickStyle, KeystrokeScope, OverlayAnchor, OverlaySize, OverlayTheme, Rgba8},
+    settings::{
+        CameraSettings, ClickStyle, KeystrokeScope, OverlayAnchor, OverlaySize, OverlayTheme, Rgba8,
+    },
 };
 
 use crate::{
+    camera_settings::{CameraLiveModel, live_controls},
     harness::{Scene, SceneCtx},
     recording_controls::{body, button, caption, heading, panel, rule, section_label},
     theme::{Radius, Space, Text, Theme, corner},
@@ -18,6 +21,18 @@ use crate::{
 pub enum RecordingSettingsAction {
     /// Persist and apply a changed settings value.
     Changed(RecordingSettings),
+    /// Open the camera device and preview surface.
+    ///
+    /// Its own window rather than a section here: choosing a camera is the one
+    /// recording preference that needs a live picture, and a preview must be an
+    /// explicit act with an obvious way out.
+    OpenCamera,
+    /// Apply a camera composition change to the running recording.
+    ///
+    /// Separate from [`Self::Changed`] because it is the one preference the
+    /// state machine accepts *while* recording, and it must reach the live
+    /// native session rather than only the persisted settings file.
+    CameraChanged(CameraSettings),
     /// Close the panel.
     Close,
     /// Save settings and begin target selection.
@@ -41,6 +56,7 @@ pub struct RecordingSettingsPanel<'a> {
     capabilities: EngineCapabilities,
     theme: &'a Theme,
     active: bool,
+    camera: Option<CameraLiveModel<'a>>,
 }
 
 impl<'a> RecordingSettingsPanel<'a> {
@@ -56,6 +72,7 @@ impl<'a> RecordingSettingsPanel<'a> {
             capabilities,
             theme,
             active: false,
+            camera: None,
         }
     }
 
@@ -68,6 +85,13 @@ impl<'a> RecordingSettingsPanel<'a> {
     #[must_use]
     pub const fn with_active_recording(mut self, active: bool) -> Self {
         self.active = active;
+        self
+    }
+
+    /// Supplies live camera state so composition stays adjustable while running.
+    #[must_use]
+    pub const fn with_camera(mut self, camera: CameraLiveModel<'a>) -> Self {
+        self.camera = Some(camera);
         self
     }
 
@@ -214,6 +238,38 @@ impl<'a> RecordingSettingsPanel<'a> {
                 &mut self.settings.after_capture.recent_captures_overlay,
                 "Add to Recent Captures",
             );
+
+            ui.add_space(Space::MD);
+            section_label(ui, self.theme, "Camera");
+            ui.checkbox(
+                &mut self.settings.camera.enabled,
+                "Include a camera in recordings",
+            );
+            caption(
+                ui,
+                self.theme,
+                "No camera is opened until you preview it or start a recording.",
+            );
+            if button(
+                ui,
+                self.theme,
+                "Camera\u{2026}",
+                false,
+                self.capabilities.camera,
+            )
+            .clicked()
+            {
+                ui.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("recording-settings-camera"), true);
+                });
+            }
+            if !self.capabilities.camera {
+                caption(
+                    ui,
+                    self.theme,
+                    "This build has no native camera adapter, so camera recording is unavailable.",
+                );
+            }
         });
         let mut actions = Vec::new();
         if before != self.settings {
@@ -224,6 +280,12 @@ impl<'a> RecordingSettingsPanel<'a> {
             .unwrap_or(false);
         if close {
             actions.push(RecordingSettingsAction::Close);
+        }
+        let camera = ui
+            .data_mut(|data| data.remove_temp::<bool>(egui::Id::new("recording-settings-camera")))
+            .unwrap_or(false);
+        if camera {
+            actions.push(RecordingSettingsAction::OpenCamera);
         }
         let start = ui
             .data_mut(|data| data.remove_temp::<bool>(egui::Id::new("recording-settings-start")))
@@ -244,20 +306,35 @@ impl<'a> RecordingSettingsPanel<'a> {
     /// "what is Scrozz watching right now" has to be visible without stopping
     /// the recording to find out.
     fn show_live(self, ui: &mut Ui) -> RecordingSettingsResponse {
+        let mut actions = Vec::new();
+        let mut settings = self.settings;
         let inner = panel(ui, self.theme, 500.0, |ui| {
             heading(ui, self.theme, "Recording");
             ui.add_space(Space::MD);
-            recording_indicator(ui, self.theme, self.settings);
+            recording_indicator(ui, self.theme, settings);
             ui.add_space(Space::MD);
             body(
                 ui,
                 self.theme,
                 "Recording preferences are locked while a recording is running. Stop the recording to change them.",
             );
+            if let Some(camera) = self.camera {
+                // The running native session is the authority here, not the
+                // pane's copy: a composition changed live must read back as what
+                // is being recorded, never as what was last persisted.
+                settings.camera = camera.settings;
+                ui.add_space(Space::MD);
+                rule(ui, self.theme);
+                ui.add_space(Space::MD);
+                if let Some(changed) = live_controls(ui, self.theme, camera) {
+                    settings.camera = changed;
+                    actions.push(RecordingSettingsAction::CameraChanged(changed));
+                }
+            }
         });
         RecordingSettingsResponse {
-            actions: Vec::new(),
-            settings: self.settings,
+            actions,
+            settings,
             response: inner.response,
         }
     }
@@ -433,6 +510,45 @@ impl Scene for RecordingSettingsScene {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     RecordingSettingsPanel::new(settings, EngineCapabilities::ALL, &theme).show(ui);
+                },
+            );
+        });
+    }
+}
+
+/// Deterministic live recording surface with an active camera.
+#[derive(Debug, Default)]
+pub struct RecordingCameraScene;
+
+impl Scene for RecordingCameraScene {
+    fn name(&self) -> &str {
+        "recording-camera"
+    }
+
+    fn setup(&self, ctx: &egui::Context) {
+        crate::recording_controls::install_scene_theme(ctx);
+    }
+
+    fn ui(&self, ui: &mut Ui, ctx: &SceneCtx<'_>) {
+        let Some(crate::harness::RecordingFixture::CameraLive(snapshot)) =
+            ctx.fixture.recording.as_ref()
+        else {
+            ui.label("recording-camera scene received the wrong fixture");
+            return;
+        };
+        let mut settings = RecordingSettings::shipped();
+        settings.camera = snapshot.settings;
+        let theme = crate::recording_controls::scene_theme(ctx.theme);
+        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.add_space(Space::XL);
+            ui.allocate_ui_with_layout(
+                egui::vec2(540.0, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    RecordingSettingsPanel::new(settings, EngineCapabilities::ALL, &theme)
+                        .with_active_recording(true)
+                        .with_camera(snapshot.model())
+                        .show(ui);
                 },
             );
         });

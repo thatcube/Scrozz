@@ -220,7 +220,7 @@ pub enum OpenDisposition {
 /// host reads the live policy from the recording lifecycle each frame and
 /// applies whatever the pane asks for, so the window can never hold a stale
 /// copy of a privacy-relevant setting.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct RecordingPane {
     /// The policy currently being edited.
     pub settings: RecordingSettings,
@@ -228,6 +228,11 @@ pub struct RecordingPane {
     pub capabilities: EngineCapabilities,
     /// Whether a recording is running, which locks the pane.
     pub active: bool,
+    /// Live camera state, present only while a camera recording is running.
+    ///
+    /// Composition is the one preference the state machine accepts mid
+    /// recording, so it stays reachable here when everything else is locked.
+    pub camera: Option<Box<crate::camera_settings::CameraLiveSnapshot>>,
 }
 
 impl Default for RecordingPane {
@@ -236,6 +241,7 @@ impl Default for RecordingPane {
             settings: RecordingSettings::shipped(),
             capabilities: EngineCapabilities::default(),
             active: false,
+            camera: None,
         }
     }
 }
@@ -382,7 +388,7 @@ impl SettingsWindow {
                 build,
                 shortcuts,
                 after_capture,
-                recording_pane,
+                recording_pane.clone(),
                 recent_captures_overlay,
                 platform,
                 &mut self.pane,
@@ -599,7 +605,7 @@ fn draw_settings(
                 build,
                 shortcuts,
                 after_capture,
-                recording_pane,
+                recording_pane.clone(),
                 recent_captures_overlay,
                 platform,
                 pane,
@@ -641,7 +647,7 @@ fn draw_settings(
                 build,
                 shortcuts,
                 after_capture,
-                recording_pane,
+                recording_pane.clone(),
                 recent_captures_overlay,
                 platform,
                 pane,
@@ -857,10 +863,12 @@ fn draw_recording(
         .id_salt("settings-recording-pane")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            RecordingSettingsPanel::new(pane.settings, pane.capabilities, theme)
-                .with_active_recording(pane.active)
-                .show(ui)
-                .actions
+            let panel = RecordingSettingsPanel::new(pane.settings, pane.capabilities, theme)
+                .with_active_recording(pane.active);
+            match pane.camera.as_deref() {
+                Some(camera) => panel.with_camera(camera.model()).show(ui).actions,
+                None => panel.show(ui).actions,
+            }
         })
         .inner
 }

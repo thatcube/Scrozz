@@ -83,6 +83,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod camera_settings;
 pub mod card;
 pub mod editor;
 pub mod harness;
@@ -102,6 +103,13 @@ pub mod theme;
 pub mod vibrancy;
 pub mod video_editor;
 
+pub use camera_settings::{
+    CAMERA_SETTINGS_WINDOW_TITLE, CameraLiveModel, CameraLiveSnapshot, CameraSettingsAction,
+    CameraSettingsModel, CameraSettingsPanel, CameraSettingsResponse, CameraSettingsSnapshot,
+    show_window as show_camera_settings_window,
+    viewport_builder as camera_settings_viewport_builder,
+    viewport_id as camera_settings_viewport_id,
+};
 pub use card::{CardAction, CardChrome, CardContent, CardMedia, CardResponse};
 pub use history::{
     DateFilter, HistoryAction, HistoryEntry, HistoryFilters, HistoryPage, HistoryThumbnail,

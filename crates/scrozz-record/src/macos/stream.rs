@@ -15,6 +15,7 @@ use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
 use objc2_av_foundation::{
     AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureConnection, AVCaptureOutput,
+    AVCaptureVideoDataOutputSampleBufferDelegate,
 };
 use objc2_core_foundation::{CFRetained, Type};
 use objc2_core_graphics::kCGColorSpaceSRGB;
@@ -27,13 +28,17 @@ use objc2_screen_capture_kit::{
 use scrozz_core::{CaptureTarget, Error, PhysicalSize, Result};
 
 use crate::{
-    OverlaySource, Quality, Recording, RecordingMetadata, RecordingRequest, RecordingResolution,
-    RecordingSession, RecordingSettings, RecordingState, VideoCodec,
+    CameraFeed, CameraRecordingMetadata, CameraRequest, CameraRuntimeStatus, OverlaySource,
+    Quality, Recording, RecordingMetadata, RecordingRequest, RecordingResolution, RecordingSession,
+    RecordingSettings, RecordingState, VideoCodec,
+    camera::CameraCompositor,
     interaction::{InteractionMapper, InteractionRecording, PrivateRecordingSource},
     interaction_render::InteractionOverlaySource,
+    settings::CameraSettings,
 };
 
 use super::audio::MicrophoneCapture;
+use super::camera::CameraCapture;
 use super::compositor::Compositor;
 use super::content::{CaptureContent, CaptureSource};
 use super::plan::{CapturePixelFormat, RecordingPlan};
@@ -41,6 +46,7 @@ use super::timeline::SessionTimeline;
 use super::writer::{AudioTrack, Writer};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const CAMERA_RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const PIXEL_FORMAT_420_VIDEO_RANGE: u32 = u32::from_be_bytes(*b"420v");
 const PIXEL_FORMAT_BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
@@ -83,7 +89,8 @@ pub(crate) fn start(
             settings.after_capture.open_editor,
         )));
     }
-    let has_overlays = overlays.is_some();
+    let camera_feed = request.camera.as_ref().map(CameraFeed::new).transpose()?;
+    let has_overlays = overlays.is_some() || camera_feed.is_some();
     let retains_interactions = overlays
         .as_ref()
         .is_some_and(|source| source.retains_interactions());
@@ -127,6 +134,9 @@ pub(crate) fn start(
         .transpose()?;
     let output_width = plan.size.width.round() as u32;
     let output_height = plan.size.height.round() as u32;
+    if let Some(camera) = &camera_feed {
+        camera.set_output_size(output_width, output_height)?;
+    }
     let compositor = if content.requires_composition() || has_overlays {
         Some(Compositor::new(
             output_width,
@@ -148,6 +158,9 @@ pub(crate) fn start(
         direct_frame: Mutex::new(None),
         clock: Mutex::new(SessionTimeline::new(Duration::ZERO)),
         overlays: Mutex::new(overlays),
+        camera: camera_feed.clone(),
+        camera_compositor: Mutex::new(CameraCompositor::default()),
+        camera_warning: Mutex::new(None),
         failure: Mutex::new(None),
         warnings: Mutex::new(VecDeque::new()),
         raw_complete: AtomicBool::new(true),
@@ -157,6 +170,10 @@ pub(crate) fn start(
         epoch: std::time::Instant::now(),
         size: plan.size,
     });
+    let camera_delegate = request
+        .camera
+        .as_ref()
+        .map(|_| CameraDelegate::new(Arc::clone(&shared)));
     let window_id = match &request.target {
         CaptureTarget::Window(id) => id.0.parse::<u32>().ok(),
         _ => None,
@@ -221,6 +238,20 @@ pub(crate) fn start(
         delegates.push(delegate);
     }
 
+    let camera = match (&request.camera, camera_delegate.as_ref()) {
+        (Some(camera_request), Some(delegate)) => {
+            let delegate_protocol: &ProtocolObject<
+                dyn AVCaptureVideoDataOutputSampleBufferDelegate,
+            > = ProtocolObject::from_ref(&**delegate);
+            let capture = CameraCapture::start(camera_request, delegate_protocol, &queue)?;
+            if let Some(feed) = &camera_feed {
+                feed.activate();
+            }
+            Some(capture)
+        }
+        _ => None,
+    };
+
     *lock(&shared.clock) = SessionTimeline::new(shared.now());
     shared.accepting.store(true, Ordering::Release);
     for (started_streams, stream) in streams.iter().enumerate() {
@@ -233,6 +264,12 @@ pub(crate) fn start(
         }) {
             shared.accepting.store(false, Ordering::Release);
             stop_started(&streams[..started_streams]);
+            if let Some(camera) = &camera {
+                camera.stop();
+            }
+            if let Some(feed) = &camera_feed {
+                feed.stop();
+            }
             return Err(failure);
         }
     }
@@ -240,6 +277,12 @@ pub(crate) fn start(
     if let Some(reason) = startup_failure {
         shared.accepting.store(false, Ordering::Release);
         stop_started(&streams);
+        if let Some(camera) = &camera {
+            camera.stop();
+        }
+        if let Some(feed) = &camera_feed {
+            feed.stop();
+        }
         return Err(Error::Platform(reason));
     }
 
@@ -261,6 +304,9 @@ pub(crate) fn start(
     Ok(Box::new(MacRecordingSession {
         streams,
         microphone,
+        camera,
+        camera_request: request.camera.clone(),
+        camera_delegate,
         shared,
         target: request.target.clone(),
         quality: request.quality,
@@ -270,6 +316,7 @@ pub(crate) fn start(
         queue,
         window_id,
         next_window_check: Cell::new(std::time::Instant::now()),
+        next_camera_check: std::time::Instant::now() + CAMERA_RECONNECT_INTERVAL,
         first_frame_emitted: false,
         finalized: false,
     }))
@@ -283,6 +330,9 @@ struct Shared {
     direct_frame: Mutex<Option<DirectFrame>>,
     clock: Mutex<SessionTimeline>,
     overlays: Mutex<Option<Box<dyn OverlaySource>>>,
+    camera: Option<CameraFeed>,
+    camera_compositor: Mutex<CameraCompositor>,
+    camera_warning: Mutex<Option<String>>,
     failure: Mutex<Option<String>>,
     warnings: Mutex<VecDeque<String>>,
     raw_complete: AtomicBool,
@@ -448,6 +498,18 @@ impl Shared {
 
     fn append_video_with_overlays(&self, sample: &CMSampleBuffer) -> Result<bool> {
         let elapsed = self.elapsed();
+        // The camera is part of the base composition, not a toggleable overlay,
+        // so it lands on the sample before the private editable source is
+        // cloned. Toggling interactions in the editor must not remove it.
+        if let Some(camera) = &self.camera {
+            let frame = camera.frame_for(elapsed);
+            super::camera::composite(
+                sample,
+                frame.as_ref(),
+                camera.settings(),
+                &mut lock(&self.camera_compositor),
+            )?;
+        }
         let layers = {
             let mut overlays = lock(&self.overlays);
             let layers = overlays
@@ -512,6 +574,28 @@ impl Shared {
         } else {
             *failure = Some(reason);
         }
+    }
+
+    fn append_camera(&self, sample: &CMSampleBuffer) -> Result<()> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.state() != RecordingState::Recording {
+            return Ok(());
+        }
+        let Some(camera) = &self.camera else {
+            return Ok(());
+        };
+        let frame = super::camera::copy_frame(sample, self.elapsed())?;
+        camera.push(frame).map(|_| ())
+    }
+
+    fn warn_camera(&self, warning: impl Into<String>) {
+        let warning = warning.into();
+        if let Some(camera) = &self.camera {
+            camera.warn(warning.clone());
+        }
+        *lock(&self.camera_warning) = Some(warning);
     }
 }
 
@@ -623,6 +707,51 @@ define_class!(
     }
 );
 
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[ivars = CameraDelegateIvars]
+    struct CameraDelegate;
+
+    unsafe impl NSObjectProtocol for CameraDelegate {}
+
+    unsafe impl AVCaptureVideoDataOutputSampleBufferDelegate for CameraDelegate {
+        #[unsafe(method(captureOutput:didOutputSampleBuffer:fromConnection:))]
+        unsafe fn captureOutput_didOutputSampleBuffer_fromConnection(
+            &self,
+            _output: &AVCaptureOutput,
+            sample_buffer: &CMSampleBuffer,
+            _connection: &AVCaptureConnection,
+        ) {
+            if let Err(failure) = self.ivars().shared.append_camera(sample_buffer) {
+                self.ivars().shared.warn_camera(failure.to_string());
+            }
+        }
+
+        #[unsafe(method(captureOutput:didDropSampleBuffer:fromConnection:))]
+        unsafe fn captureOutput_didDropSampleBuffer_fromConnection(
+            &self,
+            _output: &AVCaptureOutput,
+            _sample_buffer: &CMSampleBuffer,
+            _connection: &AVCaptureConnection,
+        ) {
+            if let Some(camera) = &self.ivars().shared.camera {
+                camera.note_drop();
+            }
+        }
+    }
+);
+
+struct CameraDelegateIvars {
+    shared: Arc<Shared>,
+}
+
+impl CameraDelegate {
+    fn new(shared: Arc<Shared>) -> Retained<Self> {
+        let allocated = Self::alloc().set_ivars(CameraDelegateIvars { shared });
+        unsafe { msg_send![super(allocated), init] }
+    }
+}
+
 struct StreamDelegateIvars {
     shared: Arc<Shared>,
     source_index: usize,
@@ -655,6 +784,9 @@ impl StreamDelegate {
 struct MacRecordingSession {
     streams: Vec<Retained<SCStream>>,
     microphone: Option<MicrophoneCapture>,
+    camera: Option<CameraCapture>,
+    camera_request: Option<CameraRequest>,
+    camera_delegate: Option<Retained<CameraDelegate>>,
     shared: Arc<Shared>,
     target: CaptureTarget,
     quality: Quality,
@@ -664,6 +796,7 @@ struct MacRecordingSession {
     queue: DispatchRetained<DispatchQueue>,
     window_id: Option<u32>,
     next_window_check: Cell<std::time::Instant>,
+    next_camera_check: std::time::Instant,
     first_frame_emitted: bool,
     finalized: bool,
 }
@@ -716,6 +849,9 @@ impl RecordingSession for MacRecordingSession {
                 "private editable source could not pause; the final recording is intact: {failure}"
             ));
         }
+        if let Some(camera) = &self.shared.camera {
+            camera.clear_frames();
+        }
         Ok(())
     }
 
@@ -733,6 +869,9 @@ impl RecordingSession for MacRecordingSession {
         if let Some(overlays) = lock(&self.shared.overlays).as_mut() {
             overlays.resume();
         }
+        if let Some(camera) = &self.shared.camera {
+            camera.clear_frames();
+        }
         if let Err(failure) = self.shared.emit_direct_frame() {
             self.shared.fail(failure.to_string());
             return Err(failure);
@@ -741,7 +880,10 @@ impl RecordingSession for MacRecordingSession {
     }
 
     fn poll(&mut self) -> Option<crate::SessionEvent> {
-        if let Some(warning) = lock(&self.shared.warnings).pop_front() {
+        self.refresh_camera();
+        if let Some(warning) = lock(&self.shared.camera_warning).take() {
+            Some(crate::SessionEvent::Warning(warning))
+        } else if let Some(warning) = lock(&self.shared.warnings).pop_front() {
             Some(crate::SessionEvent::Warning(warning))
         } else if !self.first_frame_emitted && self.shared.first_frame.load(Ordering::Acquire) {
             self.first_frame_emitted = true;
@@ -755,6 +897,29 @@ impl RecordingSession for MacRecordingSession {
         Some(self.shared.elapsed().as_secs_f64())
     }
 
+    fn camera_status(&self) -> Option<CameraRuntimeStatus> {
+        self.shared.camera.as_ref().map(CameraFeed::status)
+    }
+
+    fn camera_preview(&self) -> Option<crate::CameraPreview> {
+        self.shared
+            .camera
+            .as_ref()
+            .and_then(|camera| camera.preview(self.shared.elapsed()))
+    }
+
+    fn update_camera(&mut self, settings: CameraSettings) -> Result<()> {
+        self.shared
+            .camera
+            .as_ref()
+            .ok_or_else(|| Error::InvalidRequest("this recording has no active camera".to_owned()))?
+            .update_settings(settings)?;
+        if let Some(request) = &mut self.camera_request {
+            request.settings = settings;
+        }
+        Ok(())
+    }
+
     fn stop(mut self: Box<Self>) -> Result<Recording> {
         self.queue.exec_sync(|| {});
         self.shared.stop_requested.store(true, Ordering::Release);
@@ -763,6 +928,13 @@ impl RecordingSession for MacRecordingSession {
             .take()
             .and_then(|mut source| source.finish());
         lock(&self.shared.clock).stop(self.shared.now());
+        if let Some(camera) = self.camera.take() {
+            camera.stop();
+            drop(camera);
+        }
+        if let Some(feed) = &self.shared.camera {
+            feed.stop();
+        }
         for stream in &self.streams {
             if let Err(failure) = wait_operation("stopping screen capture", |handler| {
                 // SAFETY: valid stream and completion block.
@@ -804,6 +976,12 @@ impl RecordingSession for MacRecordingSession {
             quality: Some(self.quality),
             resolution: Some(self.resolution),
             interaction_editable: None,
+            camera: self.shared.camera.as_ref().map(|camera| {
+                Box::new(CameraRecordingMetadata::from_runtime(
+                    camera.settings(),
+                    &camera.status(),
+                ))
+            }),
         };
         let mut recording = Recording::native(
             summary.path,
@@ -861,6 +1039,13 @@ impl Drop for MacRecordingSession {
         self.shared.stop_requested.store(true, Ordering::Release);
         self.shared.accepting.store(false, Ordering::Release);
         lock(&self.shared.overlays).take();
+        if let Some(camera) = self.camera.take() {
+            camera.stop();
+            drop(camera);
+        }
+        if let Some(feed) = &self.shared.camera {
+            feed.stop();
+        }
         // SAFETY: best-effort asynchronous shutdown during an abandoned session.
         for stream in &self.streams {
             unsafe {
@@ -881,6 +1066,57 @@ impl Drop for MacRecordingSession {
         }
         lock(&self.shared.raw_source).take();
         self.finalized = true;
+    }
+}
+
+impl MacRecordingSession {
+    fn refresh_camera(&mut self) {
+        let Some(request) = self.camera_request.clone() else {
+            return;
+        };
+        if std::time::Instant::now() < self.next_camera_check {
+            return;
+        }
+        self.next_camera_check = std::time::Instant::now() + CAMERA_RECONNECT_INTERVAL;
+        let disconnected = self
+            .camera
+            .as_ref()
+            .is_some_and(|camera| !camera.is_connected() || !camera.is_running());
+        if disconnected {
+            self.camera.take();
+            if let Some(feed) = &self.shared.camera {
+                feed.disconnected("camera disconnected; screen recording continues");
+            }
+            self.shared
+                .warn_camera("camera disconnected; reconnecting to the selected device");
+        }
+        if self.camera.is_some() {
+            return;
+        }
+        let Some(delegate) = &self.camera_delegate else {
+            return;
+        };
+        let protocol: &ProtocolObject<dyn AVCaptureVideoDataOutputSampleBufferDelegate> =
+            ProtocolObject::from_ref(&**delegate);
+        match CameraCapture::start(&request, protocol, &self.queue) {
+            Ok(camera) => {
+                if let Some(feed) = &self.shared.camera {
+                    feed.reconnected();
+                }
+                self.camera = Some(camera);
+                self.shared.warn_camera("camera reconnected");
+            }
+            Err(error) => {
+                if let Some(feed) = &self.shared.camera {
+                    let message = format!("camera unavailable: {error}");
+                    if matches!(error, Error::PermissionDenied { .. }) {
+                        feed.permission_denied(message);
+                    } else {
+                        feed.disconnected(message);
+                    }
+                }
+            }
+        }
     }
 }
 

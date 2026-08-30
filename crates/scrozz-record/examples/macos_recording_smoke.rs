@@ -27,8 +27,10 @@ use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NS
 use scrozz_core::{CaptureTarget, WindowId};
 #[cfg(target_os = "macos")]
 use scrozz_record::{
-    RecordingRequest, RecordingSettings, RecordingState, active_input_monitors,
-    edit::VideoDocument, settings::KeystrokeScope,
+    CameraDeviceId, CameraRequest, RecordingRequest, RecordingSettings, RecordingState,
+    active_input_monitors,
+    edit::VideoDocument,
+    settings::{CameraSettings, CameraShape, KeystrokeScope, OverlayAnchor},
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -52,8 +54,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("window-disappearance") => smoke_window_disappearance(),
         Some("microphone") => smoke_microphone(),
         Some("interactions") => smoke_interactions(),
+        Some("camera") => smoke_camera(),
+        Some("camera-preview") => smoke_camera_preview(),
         _ => Err(invalid(
-            "usage: macos_recording_smoke <window-disappearance|microphone|interactions>",
+            "usage: macos_recording_smoke <window-disappearance|microphone|interactions|camera|camera-preview>",
         )),
     }
 }
@@ -278,6 +282,7 @@ fn smoke_microphone() -> Result<(), Box<dyn Error>> {
             "microphone smoke completed without an encoded audio track",
         ));
     }
+
     if let Some(reason) = recording.partial_reason() {
         return Err(invalid(&format!(
             "microphone smoke returned only partial output: {reason}"
@@ -288,6 +293,120 @@ fn smoke_microphone() -> Result<(), Box<dyn Error>> {
         recording.metadata.frames.unwrap_or(0),
         recording.path.display()
     );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn smoke_camera() -> Result<(), Box<dyn Error>> {
+    require_opt_in("SCROZZ_RECORD_CAMERA_SMOKE", "camera smoke")?;
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| invalid("camera smoke must start on the process main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    app.finishLaunching();
+    app.activate();
+
+    let backend = scrozz_capture::backend()?;
+    let display = backend
+        .displays()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid("camera smoke requires one attached display"))?;
+    let output = TempRecording::new("scrozz-camera-smoke");
+    let mut request = RecordingRequest::new(CaptureTarget::Display(display.id));
+    request.destination = Some(output.path.clone());
+    let settings = CameraSettings {
+        enabled: true,
+        position: OverlayAnchor::BottomRight,
+        shape: CameraShape::Circle,
+        ..CameraSettings::default()
+    };
+    let mut camera = CameraRequest::new(settings);
+    if let Ok(device) = std::env::var("SCROZZ_CAMERA_DEVICE") {
+        camera = camera.with_device(CameraDeviceId::new(device)?);
+    }
+
+    request.camera = Some(camera);
+
+    let mut session = scrozz_record::start(&request)?;
+    std::thread::sleep(Duration::from_secs(2));
+    let status = session
+        .camera_status()
+        .ok_or_else(|| invalid("camera smoke exposed no runtime status"))?;
+    if !status.active || !status.privacy_indicator_visible || status.frames_received == 0 {
+        return Err(invalid(&format!(
+            "camera smoke was not visibly active: {status:?}"
+        )));
+    }
+    session.update_camera(CameraSettings {
+        presenter: true,
+        presenter_screen: true,
+        ..settings
+    })?;
+    std::thread::sleep(Duration::from_secs(2));
+    let recording = session.stop()?;
+    let metadata = recording
+        .metadata
+        .camera
+        .as_deref()
+        .ok_or_else(|| invalid("camera smoke output omitted camera metadata"))?;
+    if !metadata.presenter || recording.metadata.frames.unwrap_or(0) == 0 {
+        return Err(invalid(
+            "camera smoke did not preserve the live presenter transition",
+        ));
+    }
+    if let Some(reason) = recording.partial_reason() {
+        return Err(invalid(&format!(
+            "camera smoke returned only partial output: {reason}"
+        )));
+    }
+    println!(
+        "camera smoke encoded {} frames with {} dropped camera frames at {}",
+        recording.metadata.frames.unwrap_or(0),
+        metadata.dropped_frames,
+        recording.path.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn smoke_camera_preview() -> Result<(), Box<dyn Error>> {
+    require_opt_in("SCROZZ_CAMERA_PREVIEW_SMOKE", "camera preview smoke")?;
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| invalid("camera preview smoke must start on the process main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    app.finishLaunching();
+    app.activate();
+
+    let settings = CameraSettings {
+        enabled: true,
+        ..CameraSettings::default()
+    };
+    let mut request = CameraRequest::new(settings);
+    if let Ok(device) = std::env::var("SCROZZ_CAMERA_DEVICE") {
+        request = request.with_device(CameraDeviceId::new(device)?);
+    }
+    let mut preview = scrozz_record::start_camera_preview(&request)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let frame = loop {
+        pump_app_events(&app, Duration::from_millis(20));
+        if let Some(frame) = preview.poll() {
+            break frame;
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(
+                "camera preview produced no frame within 10 seconds",
+            ));
+        }
+    };
+    if !frame.status.active || !frame.status.privacy_indicator_visible {
+        return Err(invalid("camera preview privacy indicator was not active"));
+    }
+    let width = frame.frame.pixels.width();
+    let height = frame.frame.pixels.height();
+    preview.stop();
+    println!("camera preview smoke captured {width}x{height}");
     Ok(())
 }
 

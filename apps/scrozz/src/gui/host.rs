@@ -22,12 +22,14 @@ use scrozz_shell::{
     native_surface_for_window,
 };
 use scrozz_ui::{
-    RecentCapturesOverlayHandle,
+    CameraSettingsAction, RecentCapturesOverlayHandle, Theme, camera_settings_viewport_builder,
+    camera_settings_viewport_id,
     history::{WINDOW_TITLE as HISTORY_WINDOW_TITLE, viewport_builder, viewport_id},
     recent_captures_overlay::{
         PinSupport, PinTopology, RecentCapturesOverlayApp, RecentCapturesOverlayGeometry,
         RecentCapturesOverlayOptions,
     },
+    show_camera_settings_window,
 };
 
 use crate::{
@@ -407,6 +409,8 @@ impl Host for Windowed {
                     editor: scrozz_ui::editor::EditorWindow::new(),
                     video_editor: VideoEditorWindow::default(),
                     video_editor_actions: Arc::new(Mutex::new(Vec::new())),
+                    camera_settings_actions: Arc::new(Mutex::new(Vec::new())),
+                    camera_settings_was_open: false,
                     editing: None,
                     color_picker: scrozz_shell::SystemColorPicker::default(),
                     color_picker_generation: None,
@@ -621,6 +625,10 @@ struct Driver {
     /// Actions emitted by the deferred video viewport and drained by the next
     /// root logic pass.
     video_editor_actions: Arc<Mutex<Vec<scrozz_ui::VideoEditorAction>>>,
+    /// Actions emitted by the deferred camera-settings viewport, drained on the
+    /// next root pass so the camera is only ever touched from the app thread.
+    camera_settings_actions: Arc<Mutex<Vec<CameraSettingsAction>>>,
+    camera_settings_was_open: bool,
     color_picker: scrozz_shell::SystemColorPicker,
     /// Editor generation that opened the modeless system colour panel.
     color_picker_generation: Option<u64>,
@@ -1044,6 +1052,7 @@ impl Driver {
             || self.editor.is_open()
             || self.app.video_editor_is_open()
             || self.video_editor.is_open()
+            || self.camera_settings_was_open
             || self.app.permission_prompt().is_some()
             || history_open;
         let mode = root_surface_mode(
@@ -1139,6 +1148,69 @@ impl Driver {
         self.app.edit_recording_settings(&edits.recording);
         if let Some(settings) = edits.recent_captures_overlay {
             self.app.edit_recent_captures_overlay(settings);
+        }
+    }
+
+    fn show_camera_settings(&mut self, ctx: &egui::Context) {
+        let queued: Vec<_> = self
+            .camera_settings_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for action in queued {
+            self.app.handle_camera_settings_action(action);
+        }
+
+        let Some(snapshot) = self.app.camera_settings_snapshot() else {
+            if self.camera_settings_was_open {
+                ctx.send_viewport_cmd_to(
+                    camera_settings_viewport_id(),
+                    egui::ViewportCommand::Close,
+                );
+            }
+            self.camera_settings_was_open = false;
+            return;
+        };
+        let first_frame = !self.camera_settings_was_open;
+        self.camera_settings_was_open = true;
+        let actions = Arc::clone(&self.camera_settings_actions);
+        let viewport = camera_settings_viewport_id();
+        ctx.request_repaint_of(viewport);
+        ctx.show_viewport_deferred(
+            viewport,
+            camera_settings_viewport_builder(),
+            move |ui, _class| {
+                let theme = if ui.ctx().system_theme().unwrap_or_else(|| ui.ctx().theme())
+                    == egui::Theme::Dark
+                {
+                    Theme::dark()
+                } else {
+                    Theme::light()
+                };
+                let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+                let response = show_camera_settings_window(ui, &snapshot, &theme);
+                let mut emitted = response.actions;
+                if close_requested {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    if !emitted
+                        .iter()
+                        .any(|action| matches!(action, CameraSettingsAction::Close))
+                    {
+                        emitted.push(CameraSettingsAction::Close);
+                    }
+                }
+                actions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(emitted);
+                ui.ctx().request_repaint_after(IDLE);
+            },
+        );
+        if first_frame {
+            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Focus);
         }
     }
 }
@@ -1683,6 +1755,7 @@ impl eframe::App for Driver {
         self.show_settings(ui.ctx());
         self.show_editor(ui.ctx());
         self.show_video_editor(ui.ctx());
+        self.show_camera_settings(ui.ctx());
         self.show_history(ui.ctx());
         self.service_history_drag(ui.ctx());
 

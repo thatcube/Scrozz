@@ -139,6 +139,12 @@ expose typed content and is presented with an explicit privacy warning. Scrozz
 retains only display-ready labels in memory for an open editor session, never in
 history, logs, or event sidecars.
 
+The camera is opt-in in the same way. `record.camera` is off by default, device
+enumeration never opens a camera, and the camera is only started by an explicit
+Preview in Settings or by a recording that asked for one. Composition — anchor,
+size, shape, mirror, border, shadow, and the presenter switch — stays adjustable
+while a recording runs, and is the only recording preference that does.
+
 ### From the command line
 
 The CLI is not a wrapper around the app; it is the same capability, headless, and
@@ -148,8 +154,11 @@ hotkeys on compositors that refuse to provide them.
 ```bash
 tools/dev.sh run -- list displays
 tools/dev.sh run -- list windows
+tools/dev.sh run -- list cameras
 tools/dev.sh run -- capture --display primary -o shot.png
 tools/dev.sh run -- capture --region 0,0,1200,800 --json
+tools/dev.sh run -- record --camera --camera-shape circle
+tools/dev.sh run -- record --camera --presenter
 tools/dev.sh run -- ocr shot.png
 tools/dev.sh run -- settings get
 tools/dev.sh run -- --help
@@ -164,6 +173,12 @@ Capture from the development binary may be refused on macOS because its grant
 belongs to the terminal rather than to Scrozz. That refusal is deliberate and
 tells you exactly which setting to change; the packaged app owns the just-in-time
 permission and Apple-picker flow described above.
+
+Camera access is likewise requested only after an explicit **Preview camera** or
+recording action. Scrozz remembers the stable device identifier and composition
+preferences, never a native device handle. The recording HUD keeps an in-app
+privacy indicator visible while the camera is active and releases the device as
+soon as preview or recording stops.
 
 ## Contributing & development
 

@@ -37,6 +37,8 @@ PACKAGES=(
   # compiler is mandatory, not optional.
   pkg-config
   build-essential
+  clang
+  libclang-dev
 
   # GTK 3 — pulled in by `tray-icon` via gtk-sys/atk-sys/gdk-sys/pango-sys.
   # This one package drags in most of the transitive -dev set.
