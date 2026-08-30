@@ -27,33 +27,39 @@
 //! between servicing the tray and the hotkey queue, and a blocking `accept()`
 //! there would freeze the menu bar until someone happened to run a command.
 
-use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::{
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use scrozz_core::Capture;
 
 use crate::{
     cli::{Cli, Command},
     commands,
     fault::{CliError, CliResult},
-    gui::card::SurfaceWaker,
+    gui::{action::CaptureKind, card::SurfaceWaker},
     ipc::{self, Response, StreamKind},
     report::{error_envelope, success_envelope},
 };
 
-#[cfg(unix)]
-const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
-#[cfg(unix)]
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(unix)]
 const REQUEST_READ_POLL: Duration = Duration::from_millis(100);
+const REQUEST_QUEUE_DEPTH: usize = 1;
+const WORKER_POLL: Duration = Duration::from_millis(8);
+
+/// The one full-resolution capture a forwarded command may produce.
+#[derive(Debug)]
+pub(crate) struct ForwardedCapture {
+    pub(crate) kind: CaptureKind,
+    pub(crate) capture: Capture,
+}
 
 /// A request from another process, waiting for its answer.
 pub struct Request {
@@ -62,8 +68,7 @@ pub struct Request {
     /// The caller's working directory, so relative `--output` paths resolve
     /// against *their* directory rather than the daemon's.
     pub cwd: Option<PathBuf>,
-    #[cfg(unix)]
-    stream: std::os::unix::net::UnixStream,
+    reply: SyncSender<Response>,
 }
 
 impl std::fmt::Debug for Request {
@@ -76,44 +81,41 @@ impl std::fmt::Debug for Request {
 }
 
 impl Request {
-    /// Runs the command and answers the caller.
-    ///
-    /// Consumes the request, because the socket must be closed either way: a
-    /// branch that forgot to reply would leave the terminal hanging on a read
-    /// that never returns.
-    ///
-    /// Returns a successfully completed command, so the app can decide whether
-    /// it also has local work to do. Failed commands have already been answered
-    /// and must not mutate the live UI.
-    pub fn serve(self) -> Option<Command> {
-        self.serve_with(&mut |_, _| {}, |_| Ok(()))
-    }
-
     /// Runs a command, then completes required in-process work before replying.
     ///
     /// The hook exists for operations such as terminal unpinning whose durable
     /// worker write must be ordered after older queued writes. A hook failure
     /// replaces the otherwise successful command response.
     ///
-    /// `observed` receives the pixels of any capture the command took, so a
-    /// `scrozz capture` typed at a terminal joins the stack the user is looking
-    /// at rather than only landing in a file. It is separate from
-    /// `after_success` because both want `&mut` access to the same application:
-    /// the observer collects, and the caller acts once this returns.
+    /// `after_success` receives ownership of the command's optional capture.
+    /// There can be at most one, which bounds retention per request and lets the
+    /// app move the frame directly into its capture pipeline before success is
+    /// visible to the client.
     pub fn serve_with(
         self,
-        observed: crate::commands::CaptureSink<'_>,
-        after_success: impl FnOnce(&Command) -> CliResult<()>,
+        after_success: impl FnOnce(&Command, Option<ForwardedCapture>) -> CliResult<()>,
     ) -> Option<Command> {
-        let (command, mut response) = run(&self.argv, self.cwd.as_deref(), observed);
+        let (command, response, captured) = run(&self.argv, self.cwd.as_deref());
+        self.finish(command, response, captured, after_success)
+    }
+
+    fn finish(
+        self,
+        command: Option<Command>,
+        mut response: Response,
+        captured: Option<ForwardedCapture>,
+        after_success: impl FnOnce(&Command, Option<ForwardedCapture>) -> CliResult<()>,
+    ) -> Option<Command> {
         if response.code == 0
             && let Some(command) = command.as_ref()
-            && let Err(error) = after_success(command)
+            && let Err(error) = after_success(command, captured)
         {
             response = Self::command_error_response(&self.argv, command, &error);
         }
         let succeeded = response.code == 0;
-        self.reply(&response);
+        if self.reply.send(response).is_err() {
+            tracing::debug!("forwarded command client disconnected before the reply");
+        }
         command.filter(|_| succeeded)
     }
 
@@ -134,23 +136,6 @@ impl Request {
             text(error.exit().code(), error.to_string())
         }
     }
-
-    #[cfg(unix)]
-    fn reply(self, response: &Response) {
-        use std::{io::Write, net::Shutdown};
-
-        let mut stream = self.stream;
-        let bytes = ipc::encode_response(response);
-        if let Err(err) = stream.write_all(&bytes) {
-            tracing::warn!("could not answer a forwarded command: {err}");
-        }
-        let _ = stream.flush();
-        // The client reads to EOF, so it only sees the answer once we close.
-        let _ = stream.shutdown(Shutdown::Both);
-    }
-
-    #[cfg(not(unix))]
-    fn reply(self, _response: &Response) {}
 }
 
 /// Executes a forwarded argument vector, exactly as a local run would.
@@ -161,8 +146,7 @@ impl Request {
 fn run(
     argv: &[String],
     cwd: Option<&Path>,
-    observed: crate::commands::CaptureSink<'_>,
-) -> (Option<Command>, Response) {
+) -> (Option<Command>, Response, Option<ForwardedCapture>) {
     use clap::Parser as _;
 
     if argv.is_empty() {
@@ -171,6 +155,7 @@ fn run(
         return (
             None,
             text(2, "the forwarded command had no arguments".to_owned()),
+            None,
         );
     }
 
@@ -188,7 +173,7 @@ fn run(
         Ok(cli) => cli,
         // clap's own rejection. There is no slug to report it under, because we
         // never got as far as knowing which subcommand was meant.
-        Err(err) => return (None, text(2, err.to_string())),
+        Err(err) => return (None, text(2, err.to_string()), None),
     };
 
     let command = cli.command.clone().unwrap_or(Command::Gui);
@@ -198,11 +183,14 @@ fn run(
     // restore matters as much as the switch: this is the GUI's own process, and
     // every later capture would otherwise inherit whatever directory the last
     // forwarded command happened to run in.
-    let restore = enter(cwd);
-    let result = cli
-        .validate()
-        .and_then(|()| commands::dispatch_observed(&command, observed));
-    restore();
+    let mut captured = None;
+    let result = WorkingDirectory::enter(cwd).and_then(|_directory| {
+        cli.validate().and_then(|()| {
+            commands::dispatch_observed(&command, &mut |kind, capture| {
+                retain_capture(&mut captured, kind, capture)
+            })
+        })
+    });
 
     let response = match result {
         Ok(report) => {
@@ -230,20 +218,57 @@ fn run(
         }
     };
 
-    (Some(command), response)
+    if response.code != 0 {
+        captured = None;
+    }
+    (Some(command), response, captured)
 }
 
-/// Switches to `target`, returning how to switch back.
-fn enter(target: Option<&Path>) -> impl FnOnce() {
-    let previous = target.and_then(|dir| {
-        let here = std::env::current_dir().ok()?;
-        std::env::set_current_dir(dir).ok()?;
-        Some(here)
-    });
+fn retain_capture(
+    slot: &mut Option<ForwardedCapture>,
+    kind: CaptureKind,
+    capture: Capture,
+) -> CliResult<()> {
+    if slot.is_some() {
+        return Err(CliError::ipc(
+            "a forwarded command produced more than one full-resolution capture",
+        ));
+    }
+    *slot = Some(ForwardedCapture { kind, capture });
+    Ok(())
+}
 
-    move || {
-        if let Some(here) = previous {
-            let _ = std::env::set_current_dir(here);
+struct WorkingDirectory(Option<PathBuf>);
+
+impl WorkingDirectory {
+    fn enter(target: Option<&Path>) -> CliResult<Self> {
+        let Some(target) = target else {
+            return Ok(Self(None));
+        };
+        let previous = std::env::current_dir().map_err(|error| {
+            CliError::ipc(format!(
+                "could not preserve the running instance working directory: {error}"
+            ))
+        })?;
+        std::env::set_current_dir(target).map_err(|error| {
+            CliError::ipc(format!(
+                "could not enter the caller working directory {}: {error}",
+                target.display()
+            ))
+        })?;
+        Ok(Self(Some(previous)))
+    }
+}
+
+impl Drop for WorkingDirectory {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take()
+            && let Err(error) = std::env::set_current_dir(&previous)
+        {
+            tracing::error!(
+                path = %previous.display(),
+                "could not restore the GUI working directory: {error}"
+            );
         }
     }
 }
@@ -267,11 +292,8 @@ fn json(code: u8, body: String) -> Response {
 /// The listener a running GUI holds.
 pub struct Server {
     path: PathBuf,
-    #[cfg(unix)]
     requests: Receiver<Request>,
-    #[cfg(unix)]
     stop: Arc<AtomicBool>,
-    #[cfg(unix)]
     worker: Option<JoinHandle<()>>,
 }
 
@@ -326,81 +348,50 @@ impl Server {
             CliError::ipc(format!("could not make the instance socket pollable: {e}"))
         })?;
 
-        let (request_tx, requests) = channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
-        let worker = std::thread::Builder::new()
-            .name("scrozz-ipc-listener".into())
-            .spawn(move || {
-                while !worker_stop.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            if let Some(request) = read_request(stream) {
-                                if request_tx.send(request).is_err() {
-                                    break;
-                                }
-                                if let Some(waker) = &waker {
-                                    waker();
-                                }
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(8));
-                        }
-                        Err(error) => {
-                            tracing::warn!("could not accept a forwarded command: {error}");
-                            std::thread::sleep(Duration::from_millis(25));
-                        }
-                    }
-                }
-            })
-            .map_err(|error| {
-                CliError::ipc(format!(
-                    "could not start the instance listener for {}: {error}",
-                    path.display()
-                ))
-            })?;
-
-        tracing::debug!(path = %path.display(), "listening for forwarded commands");
-        Ok(Self {
-            path,
-            requests,
-            stop,
-            worker: Some(worker),
+        spawn(path, waker, move |requests, stop, waker| {
+            unix_worker(listener, &requests, &stop, waker.as_ref());
         })
     }
 
-    /// Named-pipe support is not built yet, so there is nothing to listen on.
-    ///
-    /// # Errors
-    ///
-    /// Never. The GUI runs without single-instance forwarding rather than
-    /// refusing to start over it.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     pub fn bind_at(path: PathBuf) -> CliResult<Self> {
         Self::bind_at_with_waker(path, None)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn bind_at_with_waker(path: PathBuf, waker: Option<SurfaceWaker>) -> CliResult<Self> {
+        let listener = ipc::windows_pipe::PipeListener::bind(&path)?;
+        spawn(path, waker, move |requests, stop, waker| {
+            windows_worker(listener, &requests, &stop, waker.as_ref());
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub fn bind_at(path: PathBuf) -> CliResult<Self> {
+        Self::bind_at_with_waker(path, None)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn bind_at_with_waker(path: PathBuf, _waker: Option<SurfaceWaker>) -> CliResult<Self> {
-        tracing::warn!(
-            "this build has no named-pipe listener, so `scrozz capture` from a \
-             terminal will run in its own process"
-        );
-        Ok(Self { path })
+        let (_sender, requests) = sync_channel(REQUEST_QUEUE_DEPTH);
+        Ok(Self {
+            path,
+            requests,
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        })
     }
 
     /// Takes one pending request, if there is one. Never blocks.
-    #[cfg(unix)]
     pub fn poll(&self) -> Option<Request> {
-        self.requests.try_recv().ok()
-    }
-
-    /// Nothing arrives without a listener.
-    #[cfg(not(unix))]
-    #[must_use]
-    pub const fn poll(&self) -> Option<Request> {
-        None
+        match self.requests.try_recv() {
+            Ok(request) => Some(request),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                tracing::warn!("the single-instance transport worker stopped");
+                None
+            }
+        }
     }
 
     /// Where this server is listening.
@@ -412,66 +403,205 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
         #[cfg(unix)]
         {
-            self.stop.store(true, Ordering::Release);
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
+            // Otherwise the next launch finds a socket file with nothing behind
+            // it and has to decide whether it is stale.
+            let _ = std::fs::remove_file(&self.path);
         }
-        // Otherwise the next launch finds a socket file with nothing behind it
-        // and has to decide whether it is stale — solvable, but this is free.
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
-#[cfg(unix)]
-fn read_request(mut stream: std::os::unix::net::UnixStream) -> Option<Request> {
-    use std::io::{ErrorKind, Read};
+fn spawn(
+    path: PathBuf,
+    waker: Option<SurfaceWaker>,
+    run_worker: impl FnOnce(SyncSender<Request>, Arc<AtomicBool>, Option<SurfaceWaker>) + Send + 'static,
+) -> CliResult<Server> {
+    let (request_tx, requests) = sync_channel(REQUEST_QUEUE_DEPTH);
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let worker = std::thread::Builder::new()
+        .name("scrozz-ipc-listener".into())
+        .spawn(move || run_worker(request_tx, worker_stop, waker))
+        .map_err(|error| {
+            CliError::ipc(format!(
+                "could not start the instance listener for {}: {error}",
+                path.display()
+            ))
+        })?;
 
-    if let Err(error) = stream.set_nonblocking(false) {
-        tracing::warn!("could not make an accepted command socket blocking: {error}");
-        return None;
-    }
-    if let Err(error) = stream.set_read_timeout(Some(REQUEST_READ_POLL)) {
-        tracing::warn!("could not bound a forwarded-command read: {error}");
-        return None;
-    }
-    let started = std::time::Instant::now();
-    let mut raw = Vec::new();
-    let mut chunk = [0u8; 8 * 1024];
-    loop {
-        if started.elapsed() >= REQUEST_READ_TIMEOUT {
-            tracing::warn!("forwarded command exceeded the one-second read deadline");
-            return None;
-        }
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => {
-                if raw.len() as u64 + read as u64 > MAX_REQUEST_BYTES {
-                    tracing::warn!(
-                        bytes = raw.len() + read,
-                        "forwarded command exceeded the one-megabyte request limit"
-                    );
-                    return None;
+    tracing::debug!(path = %path.display(), "listening for forwarded commands");
+    Ok(Server {
+        path,
+        requests,
+        stop,
+        worker: Some(worker),
+    })
+}
+
+#[cfg(unix)]
+fn unix_worker(
+    listener: std::os::unix::net::UnixListener,
+    requests: &SyncSender<Request>,
+    stop: &Arc<AtomicBool>,
+    waker: Option<&SurfaceWaker>,
+) {
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                if let Err(error) = stream.set_read_timeout(Some(REQUEST_READ_POLL)) {
+                    tracing::warn!("could not bound a forwarded-command read: {error}");
+                    continue;
                 }
-                raw.extend_from_slice(&chunk[..read]);
+                if let Err(error) = stream.set_write_timeout(Some(REQUEST_READ_POLL)) {
+                    tracing::warn!("could not bound a forwarded-command reply: {error}");
+                    continue;
+                }
+                serve_connection(&mut stream, requests, stop, waker);
             }
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
-                continue;
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(WORKER_POLL);
             }
             Err(error) => {
-                tracing::warn!("could not read a forwarded command: {error}");
-                return None;
+                tracing::warn!("could not accept a forwarded command: {error}");
+                std::thread::sleep(Duration::from_millis(25));
             }
         }
     }
+}
 
-    let line = String::from_utf8_lossy(&raw);
-    let argv = string_array(&line, "argv")?;
-    let cwd = string_field(&line, "cwd").map(PathBuf::from);
-    Some(Request { argv, cwd, stream })
+#[cfg(windows)]
+fn windows_worker(
+    mut listener: ipc::windows_pipe::PipeListener,
+    requests: &SyncSender<Request>,
+    stop: &Arc<AtomicBool>,
+    waker: Option<&SurfaceWaker>,
+) {
+    while !stop.load(Ordering::Acquire) {
+        if let Err(error) = listener.accept(stop) {
+            if !stop.load(Ordering::Acquire) {
+                tracing::warn!("{error}");
+            }
+            std::thread::sleep(WORKER_POLL);
+            continue;
+        }
+        serve_connection(&mut listener, requests, stop, waker);
+        listener.disconnect();
+    }
+}
+
+fn serve_connection(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    requests: &SyncSender<Request>,
+    stop: &Arc<AtomicBool>,
+    waker: Option<&SurfaceWaker>,
+) {
+    let Some((argv, cwd)) = read_request(stream, stop) else {
+        return;
+    };
+    let (reply, response) = sync_channel(1);
+    let request = Request { argv, cwd, reply };
+    if let Err(error) = requests.try_send(request) {
+        let message = match error {
+            TrySendError::Full(_) => "the running instance is busy",
+            TrySendError::Disconnected(_) => "the running instance is shutting down",
+        };
+        answer(stream, &protocol_error(message), stop);
+        return;
+    }
+    if let Some(waker) = waker {
+        waker();
+    }
+
+    let deadline = Instant::now() + ipc::COMMAND_TIMEOUT;
+    let response = loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break protocol_error("the forwarded command timed out");
+        }
+        match response.recv_timeout(remaining.min(REQUEST_READ_POLL)) {
+            Ok(response) => break response,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                break protocol_error("the forwarded command did not produce a response");
+            }
+        }
+    };
+    answer(stream, &response, stop);
+}
+
+fn protocol_error(message: &str) -> Response {
+    let error = CliError::ipc(message);
+    text(error.exit().code(), error.to_string())
+}
+
+fn answer(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    response: &Response,
+    stop: &AtomicBool,
+) {
+    if let Err(error) = ipc::send_response_frame(
+        stream,
+        response,
+        Instant::now() + ipc::TRANSFER_TIMEOUT,
+        stop,
+    ) {
+        tracing::debug!("could not answer a forwarded command: {error}");
+        return;
+    }
+    if let Err(error) = ipc::receive_ack(stream, Instant::now() + ipc::TRANSFER_TIMEOUT, stop) {
+        tracing::debug!("forwarded command response was not acknowledged: {error}");
+    }
+}
+
+fn read_request(
+    stream: &mut impl std::io::Read,
+    stop: &AtomicBool,
+) -> Option<(Vec<String>, Option<PathBuf>)> {
+    let raw = match ipc::receive_request_frame(stream, Instant::now() + REQUEST_READ_TIMEOUT, stop)
+    {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::debug!("discarding incomplete forwarded command: {error}");
+            return None;
+        }
+    };
+    let line = match std::str::from_utf8(&raw) {
+        Ok(line) if line.ends_with('\n') => &line[..line.len() - 1],
+        Ok(_) => {
+            tracing::warn!("forwarded command was not newline terminated");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!("forwarded command was not valid UTF-8: {error}");
+            return None;
+        }
+    };
+    if integer_field(line, "schema") != Some(ipc::REQUEST_SCHEMA) {
+        tracing::warn!("forwarded command used an unsupported request schema");
+        return None;
+    }
+    let argv = string_array(line, "argv")?;
+    if argv.len() > 4_096 || argv.iter().any(|argument| argument.contains('\0')) {
+        tracing::warn!("forwarded command arguments were malformed or excessive");
+        return None;
+    }
+    let cwd = string_field(line, "cwd").map(PathBuf::from);
+    if cwd.as_ref().is_some_and(|path| {
+        let raw = path.to_string_lossy();
+        raw.len() > 32 * 1024 || raw.contains('\0')
+    }) {
+        tracing::warn!("forwarded command working directory was malformed or excessive");
+        return None;
+    }
+    Some((argv, cwd))
 }
 
 /// Removes a socket file left behind by a crash.
@@ -494,6 +624,15 @@ fn clear_stale(path: &Path) -> CliResult<()> {
     }
     let _ = std::fs::remove_file(path);
     Ok(())
+}
+
+fn integer_field(line: &str, key: &str) -> Option<i64> {
+    let start = line.find(&format!("\"{key}\":"))? + key.len() + 3;
+    let bytes = line.as_bytes();
+    let end = (start..bytes.len())
+        .find(|index| !bytes[*index].is_ascii_digit() && bytes[*index] != b'-')
+        .unwrap_or(bytes.len());
+    line.get(start..end)?.parse().ok()
 }
 
 /// Pulls a JSON string array out of the request line.
@@ -576,9 +715,29 @@ fn read_string(line: &str, from: usize) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
+    use scrozz_core::{
+        ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor, WindowId,
+    };
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn large_capture(marker: u8) -> Capture {
+        let edge = 1_024;
+        Capture {
+            frame: Frame {
+                data: vec![marker; edge * edge * 4],
+                size: PhysicalSize::new(edge as f64, edge as f64),
+                stride: edge * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Window,
+            target: scrozz_core::CaptureTarget::Window(WindowId(format!("large-{marker}"))),
+        }
     }
 
     #[test]
@@ -647,38 +806,138 @@ mod tests {
     }
 
     #[test]
+    fn one_request_retains_at_most_one_owned_full_resolution_capture() {
+        let first = large_capture(1);
+        let first_pixels = first.frame.data.as_ptr();
+        let mut slot = None;
+        retain_capture(&mut slot, CaptureKind::Region, first).expect("first capture");
+        let retained = slot.as_ref().expect("capture retained");
+        assert_eq!(
+            retained.capture.frame.data.as_ptr(),
+            first_pixels,
+            "capture pixels must move into the request slot rather than clone"
+        );
+
+        let error = retain_capture(&mut slot, CaptureKind::Window, large_capture(2))
+            .expect_err("a second full-resolution frame in one request must be rejected");
+        assert!(error.to_string().contains("more than one"), "{error}");
+    }
+
+    #[test]
+    fn acceptance_completes_before_a_success_reply_and_runs_once() {
+        let command = Cli::try_parse_from([
+            "scrozz",
+            "capture",
+            "--region",
+            "0,0,10,10",
+            "--output",
+            "capture.png",
+        ])
+        .expect("valid command")
+        .command
+        .expect("capture command");
+        let (reply, response) = sync_channel(1);
+        let request = Request {
+            argv: argv(&["capture", "--region", "0,0,10,10"]),
+            cwd: None,
+            reply,
+        };
+        let accepted = std::cell::Cell::new(0_u8);
+        let result = request.finish(
+            Some(command),
+            text(0, "captured".to_owned()),
+            Some(ForwardedCapture {
+                kind: CaptureKind::Region,
+                capture: large_capture(3),
+            }),
+            |_, captured| {
+                assert!(matches!(
+                    response.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+                let captured = captured.expect("owned capture reaches acceptance");
+                assert_eq!(captured.kind, CaptureKind::Region);
+                accepted.set(accepted.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Some(Command::Capture(_))));
+        assert_eq!(accepted.get(), 1, "acceptance must be exactly once");
+        assert_eq!(response.recv().expect("success reply").code, 0);
+    }
+
+    #[test]
+    fn acceptance_failure_replaces_success_before_the_reply() {
+        let command = Cli::try_parse_from(["scrozz", "capture", "--window", "Editor"])
+            .expect("valid command")
+            .command
+            .expect("capture command");
+        let (reply, response) = sync_channel(1);
+        let request = Request {
+            argv: argv(&["capture", "--window", "Editor"]),
+            cwd: None,
+            reply,
+        };
+
+        let result = request.finish(
+            Some(command),
+            text(0, "captured".to_owned()),
+            Some(ForwardedCapture {
+                kind: CaptureKind::Window,
+                capture: large_capture(4),
+            }),
+            |_, captured| {
+                assert!(captured.is_some());
+                Err(CliError::ipc("capture admission was full"))
+            },
+        );
+
+        assert!(
+            result.is_none(),
+            "failed acceptance is not a successful command"
+        );
+        let response = response.recv().expect("failure reply");
+        assert_ne!(response.code, 0);
+        assert!(String::from_utf8_lossy(&response.payload).contains("capture admission was full"));
+    }
+
+    #[test]
     fn an_empty_argument_vector_is_answered_not_ignored() {
-        let (command, response) = run(&[], None, &mut |_, _| {});
+        let (command, response, captured) = run(&[], None);
         assert!(command.is_none());
         assert_eq!(response.code, 2);
         assert!(!response.payload.is_empty());
+        assert!(captured.is_none());
     }
 
     #[test]
     fn an_unparseable_command_answers_with_claps_own_message() {
-        let (command, response) = run(&argv(&["nonsuch"]), None, &mut |_, _| {});
+        let (command, response, captured) = run(&argv(&["nonsuch"]), None);
         assert!(command.is_none(), "there is no command to name");
         assert_eq!(response.code, 2);
         assert_eq!(response.stream, StreamKind::Text);
         let message = String::from_utf8_lossy(&response.payload);
         assert!(message.contains("nonsuch"), "{message}");
+        assert!(captured.is_none());
     }
 
     #[test]
     fn a_forwarded_failure_carries_the_same_exit_code_as_a_local_one() {
         // `list displays` needs a backend, which is guarded off by default, so
         // this is a stable failure that does not touch the screen.
-        let (command, response) = run(&argv(&["list", "displays"]), None, &mut |_, _| {});
+        let (command, response, captured) = run(&argv(&["list", "displays"]), None);
         assert!(matches!(command, Some(Command::List(_))));
         assert_ne!(
             response.code, 0,
             "a guarded backend must not report success"
         );
+        assert!(captured.is_none());
     }
 
     #[test]
     fn a_forwarded_json_failure_is_an_envelope_not_a_sentence() {
-        let (_, response) = run(&argv(&["--json", "list", "displays"]), None, &mut |_, _| {});
+        let (_, response, _) = run(&argv(&["--json", "list", "displays"]), None);
         assert_eq!(response.stream, StreamKind::Json);
         let body = String::from_utf8_lossy(&response.payload);
         assert!(body.starts_with('{'), "{body}");
@@ -689,7 +948,7 @@ mod tests {
     #[test]
     fn a_forwarded_success_is_reported_verbatim() {
         // `capture --dry-run` reaches no backend, so it succeeds anywhere.
-        let (_, response) = run(&argv(&["capture", "--dry-run"]), None, &mut |_, _| {});
+        let (_, response, captured) = run(&argv(&["capture", "--dry-run"]), None);
         assert_eq!(response.code, 0);
         assert_eq!(response.stream, StreamKind::Text);
         let body = String::from_utf8_lossy(&response.payload);
@@ -698,26 +957,19 @@ mod tests {
             !body.ends_with('\n'),
             "the trailing newline is the wire's job"
         );
+        assert!(captured.is_none());
     }
 
     #[test]
     fn a_quiet_forwarded_command_says_nothing() {
-        let (_, response) = run(
-            &argv(&["--quiet", "capture", "--dry-run"]),
-            None,
-            &mut |_, _| {},
-        );
+        let (_, response, _) = run(&argv(&["--quiet", "capture", "--dry-run"]), None);
         assert_eq!(response.code, 0);
         assert!(response.payload.is_empty());
     }
 
     #[test]
     fn a_json_forwarded_success_is_an_envelope() {
-        let (_, response) = run(
-            &argv(&["--json", "capture", "--dry-run"]),
-            None,
-            &mut |_, _| {},
-        );
+        let (_, response, _) = run(&argv(&["--json", "capture", "--dry-run"]), None);
         assert_eq!(response.stream, StreamKind::Json);
         let body = String::from_utf8_lossy(&response.payload);
         assert!(body.contains("\"ok\":true"), "{body}");
@@ -729,11 +981,7 @@ mod tests {
         // The real check: whatever we produce, `ipc::parse_response` must read
         // back unchanged, or the terminal shows something different from a
         // local run.
-        let (_, response) = run(
-            &argv(&["--json", "capture", "--dry-run"]),
-            None,
-            &mut |_, _| {},
-        );
+        let (_, response, _) = run(&argv(&["--json", "capture", "--dry-run"]), None);
         let wire = ipc::encode_response(&response);
         let parsed = ipc::parse_response(&wire).expect("our own wire format must parse");
         assert_eq!(parsed.code, response.code);
@@ -745,8 +993,7 @@ mod tests {
     fn the_working_directory_is_restored_afterwards() {
         let before = std::env::current_dir().expect("a working directory");
         let elsewhere = std::env::temp_dir();
-        let restore = enter(Some(&elsewhere));
-        restore();
+        drop(WorkingDirectory::enter(Some(&elsewhere)).expect("enter temporary directory"));
         assert_eq!(
             std::env::current_dir().expect("a working directory"),
             before
@@ -758,6 +1005,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("scrozz-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         dir
+    }
+
+    #[cfg(unix)]
+    fn endpoint_for(name: &str) -> (PathBuf, PathBuf) {
+        let directory = scratch(name);
+        let path = directory.join("instance.sock");
+        (directory, path)
+    }
+
+    #[cfg(windows)]
+    fn endpoint_for(name: &str) -> (PathBuf, PathBuf) {
+        (
+            PathBuf::new(),
+            PathBuf::from(format!(
+                r"\\.\pipe\scrozz-pinned-{name}-{}",
+                std::process::id()
+            )),
+        )
     }
 
     #[cfg(unix)]
@@ -828,29 +1093,35 @@ mod tests {
         use std::io::Write;
         use std::net::Shutdown;
 
-        let (mut writer, reader) =
+        let (mut writer, mut reader) =
             std::os::unix::net::UnixStream::pair().expect("local socket pair");
+        reader
+            .set_read_timeout(Some(REQUEST_READ_POLL))
+            .expect("read timeout");
         let sending = std::thread::spawn(move || {
-            let chunk = vec![b'x'; 64 * 1024];
-            let mut remaining = MAX_REQUEST_BYTES + 1;
-            while remaining > 0 {
-                let count = usize::try_from(remaining.min(chunk.len() as u64)).expect("bounded");
-                writer.write_all(&chunk[..count]).expect("write request");
-                remaining -= count as u64;
-            }
+            let announced = u32::try_from(ipc::MAX_REQUEST_BYTES + 1).expect("bounded");
+            writer
+                .write_all(&announced.to_le_bytes())
+                .expect("write oversized frame prefix");
             writer.shutdown(Shutdown::Write).expect("finish request");
         });
 
-        assert!(read_request(reader).is_none());
+        let stop = AtomicBool::new(false);
+        assert!(read_request(&mut reader, &stop).is_none());
         sending.join().expect("writer");
     }
 
     #[cfg(unix)]
     #[test]
     fn a_peer_that_never_finishes_is_bounded_by_the_read_timeout() {
-        let (_writer, reader) = std::os::unix::net::UnixStream::pair().expect("local socket pair");
+        let (_writer, mut reader) =
+            std::os::unix::net::UnixStream::pair().expect("local socket pair");
+        reader
+            .set_read_timeout(Some(REQUEST_READ_POLL))
+            .expect("read timeout");
         let started = std::time::Instant::now();
-        assert!(read_request(reader).is_none());
+        let stop = AtomicBool::new(false);
+        assert!(read_request(&mut reader, &stop).is_none());
         assert!(
             started.elapsed() < REQUEST_READ_TIMEOUT + Duration::from_secs(1),
             "socket read exceeded its configured timeout"
@@ -862,8 +1133,11 @@ mod tests {
     fn a_slow_drip_cannot_restart_the_wall_clock_deadline() {
         use std::io::Write;
 
-        let (mut writer, reader) =
+        let (mut writer, mut reader) =
             std::os::unix::net::UnixStream::pair().expect("local socket pair");
+        reader
+            .set_read_timeout(Some(REQUEST_READ_POLL))
+            .expect("read timeout");
         let sending = std::thread::spawn(move || {
             for _ in 0..20 {
                 if writer.write_all(b"x").is_err() {
@@ -874,7 +1148,8 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        assert!(read_request(reader).is_none());
+        let stop = AtomicBool::new(false);
+        assert!(read_request(&mut reader, &stop).is_none());
         assert!(
             started.elapsed() < REQUEST_READ_TIMEOUT + Duration::from_secs(1),
             "partial reads restarted the wall-clock deadline"
@@ -897,13 +1172,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn a_forwarded_command_reaches_the_server_and_is_answered() {
+        let _env = crate::test_env::lock();
         // The whole point, end to end: the client half in `ipc` talking to the
         // server half here, over a real socket.
-        let dir = scratch("round-trip");
-        let path = dir.join("live.sock");
+        let (dir, path) = endpoint_for("round-trip");
         let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = Arc::clone(&wakes);
         let waker: SurfaceWaker = Arc::new(move || {
@@ -914,15 +1189,8 @@ mod tests {
         // No program name: `try_forward` sends `env::args().skip(1)`, and the
         // server is the side that has to know that.
         let sent = argv(&["capture", "--dry-run"]);
-        let client = std::thread::spawn({
-            let path = path.clone();
-            move || {
-                // SAFETY-adjacent: the env var is process-global, but this test
-                // is the only one using this endpoint name.
-                unsafe { std::env::set_var(ipc::ENDPOINT_ENV, &path) };
-                ipc::forward(&sent)
-            }
-        });
+        crate::test_env::set(ipc::ENDPOINT_ENV, &path.to_string_lossy());
+        let client = std::thread::spawn(move || ipc::forward(&sent));
 
         let request = loop {
             if let Some(request) = server.poll() {
@@ -932,7 +1200,8 @@ mod tests {
         };
         assert_eq!(request.argv.first().map(String::as_str), Some("capture"));
         assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
-        let command = request.serve_with(&mut |_, _| {}, |_| {
+        let command = request.serve_with(|_, captured| {
+            assert!(captured.is_none(), "a dry run has no pixels");
             assert!(
                 !client.is_finished(),
                 "the caller must remain blocked until the success hook finishes"
@@ -952,14 +1221,40 @@ mod tests {
         );
 
         drop(server);
+        #[cfg(unix)]
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_probe_does_not_poison_the_following_command() {
+        let _env = crate::test_env::lock();
+        let (_, path) = endpoint_for("probe");
+        let server = Server::bind_at(path.clone()).expect("named-pipe listener");
+        crate::test_env::set(ipc::ENDPOINT_ENV, &path.to_string_lossy());
+        assert_eq!(ipc::probe(), ipc::Status::Running);
+
+        let client = std::thread::spawn(|| ipc::forward(&argv(&["capture", "--dry-run"])));
+        let request = loop {
+            if let Some(request) = server.poll() {
+                break request;
+            }
+            std::thread::sleep(WORKER_POLL);
+        };
+        assert!(matches!(
+            request.serve_with(|_, captured| {
+                assert!(captured.is_none());
+                Ok(())
+            }),
+            Some(Command::Capture(_))
+        ));
+        assert_eq!(client.join().expect("client").expect("response").code, 0);
     }
 
     #[cfg(unix)]
     #[test]
     fn a_client_may_pause_after_accept_before_sending_its_request() {
         use std::io::Write;
-        use std::net::Shutdown;
 
         let dir = scratch("delayed-write");
         let path = dir.join("delayed.sock");
@@ -969,10 +1264,15 @@ mod tests {
             move || {
                 let mut stream = std::os::unix::net::UnixStream::connect(path).expect("connect");
                 std::thread::sleep(Duration::from_millis(50));
+                let request = ipc::encode_request(&argv(&["capture", "--dry-run"]), None);
                 stream
-                    .write_all(br#"{"argv":["capture","--dry-run"],"cwd":null}"#)
-                    .expect("delayed write");
-                stream.shutdown(Shutdown::Write).expect("finish request");
+                    .write_all(
+                        &u32::try_from(request.len())
+                            .expect("request length")
+                            .to_le_bytes(),
+                    )
+                    .and_then(|()| stream.write_all(request.as_bytes()))
+                    .expect("delayed framed write");
             }
         });
 

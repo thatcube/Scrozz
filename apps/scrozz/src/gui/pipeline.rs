@@ -26,6 +26,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
@@ -53,9 +54,46 @@ use crate::{
     platform,
 };
 
+const MAX_QUEUED_CAPTURE_FRAMES: usize = 2;
+
+#[derive(Clone)]
+struct CaptureBudget {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl CaptureBudget {
+    fn new() -> Self {
+        Self {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<CapturePermit> {
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_QUEUED_CAPTURE_FRAMES).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| CapturePermit {
+                in_flight: Arc::clone(&self.in_flight),
+            })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CapturePermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for CapturePermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Work posted to the capture thread.
 #[derive(Debug)]
-pub enum Job {
+pub(crate) enum Job {
     /// Take a capture and turn it into a card.
     Capture {
         /// What to capture.
@@ -72,6 +110,9 @@ pub enum Job {
         card: CardId,
         /// Authoritative pixels and provenance returned by the selector backend.
         capture: Capture,
+        /// Admission token that strictly bounds full-resolution frames waiting
+        /// for or being processed by the worker.
+        _permit: CapturePermit,
     },
     /// Put a card's capture on the clipboard.
     Copy(CardId),
@@ -240,6 +281,7 @@ pub enum Outcome {
 /// A handle to the capture thread.
 pub struct Pipeline {
     jobs: Sender<Job>,
+    capture_budget: CaptureBudget,
     pending_pin_updates: Arc<PendingPinUpdates>,
     outcomes: Receiver<Outcome>,
     worker: Option<JoinHandle<()>>,
@@ -264,6 +306,7 @@ impl Pipeline {
         let (jobs, job_rx) = channel();
         let (outcome_tx, outcomes) = channel();
         let pending_pin_updates = Arc::new(PendingPinUpdates::default());
+        let capture_budget = CaptureBudget::new();
         let worker_pin_updates = Arc::clone(&pending_pin_updates);
 
         let worker = std::thread::Builder::new()
@@ -277,6 +320,7 @@ impl Pipeline {
 
         Ok(Self {
             jobs,
+            capture_budget,
             pending_pin_updates,
             outcomes,
             worker: Some(worker),
@@ -326,18 +370,25 @@ impl Pipeline {
         self.jobs.send(job).is_ok()
     }
 
-    /// Feed a completed selector capture into the ordinary durable card pipeline.
+    /// Feed completed external capture pixels into the durable card pipeline.
     ///
-    /// Region and window selectors own their platform-specific lifecycle, but
-    /// their output must still receive history identity, a bounded texture, and
-    /// the same Pin to Screen action as a fixed display capture.
+    /// Region/window selectors and forwarded CLI captures own their capture
+    /// lifecycle, but their output must still receive history identity, a
+    /// bounded texture, and the same Pin to Screen action as a display capture.
     pub fn accept_capture(&mut self, kind: CaptureKind, capture: Capture) -> CliResult<CardId> {
+        let permit = self.capture_budget.try_acquire().ok_or_else(|| {
+            CliError::Core(CoreError::Platform(format!(
+                "the capture worker already holds the maximum of \
+                 {MAX_QUEUED_CAPTURE_FRAMES} full-resolution forwarded captures"
+            )))
+        })?;
         let card = self.allocate();
         self.jobs
             .send(Job::Captured {
                 kind,
                 card,
                 capture,
+                _permit: permit,
             })
             .map_err(|_| {
                 CliError::Core(CoreError::Platform(
@@ -459,6 +510,7 @@ impl Worker {
                     kind,
                     card,
                     capture,
+                    _permit,
                 } => self.finish_capture(kind, card, capture),
                 Job::Copy(card) => self.copy(card),
                 Job::Save(card) => self.save(card),
@@ -908,6 +960,22 @@ mod tests {
         }
     }
 
+    fn large_capture(marker: u8) -> Capture {
+        let edge = 1_024;
+        Capture {
+            frame: Frame {
+                data: vec![marker; edge * edge * 4],
+                size: PhysicalSize::new(edge as f64, edge as f64),
+                stride: edge * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Window,
+            target: CaptureTarget::Window(WindowId(format!("large-{marker}"))),
+        }
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -929,6 +997,49 @@ mod tests {
     fn polling_an_idle_pipeline_does_not_block() {
         let pipeline = Pipeline::start().expect("the worker should start");
         assert!(pipeline.poll().is_none());
+    }
+
+    #[test]
+    fn full_resolution_capture_backpressure_is_strict_and_moves_pixels() {
+        let (jobs, job_rx) = channel();
+        let (_outcome_tx, outcomes) = channel();
+        let mut pipeline = Pipeline {
+            jobs,
+            capture_budget: CaptureBudget::new(),
+            pending_pin_updates: Arc::new(PendingPinUpdates::default()),
+            outcomes,
+            worker: None,
+            next_card: 1,
+        };
+
+        let first = large_capture(1);
+        let first_pixels = first.frame.data.as_ptr();
+        pipeline
+            .accept_capture(CaptureKind::Window, first)
+            .expect("first large frame");
+        pipeline
+            .accept_capture(CaptureKind::Region, large_capture(2))
+            .expect("second large frame");
+        let error = pipeline
+            .accept_capture(CaptureKind::Window, large_capture(3))
+            .expect_err("a burst beyond the strict frame budget must backpressure");
+        assert!(
+            error.to_string().contains("maximum"),
+            "backpressure should be explicit: {error}"
+        );
+        assert_eq!(
+            pipeline.capture_budget.in_flight.load(Ordering::Acquire),
+            MAX_QUEUED_CAPTURE_FRAMES
+        );
+
+        let Job::Captured { capture, .. } = job_rx.try_recv().expect("first queued capture") else {
+            panic!("capture admission queued the wrong job");
+        };
+        assert_eq!(
+            capture.frame.data.as_ptr(),
+            first_pixels,
+            "the full-resolution pixel allocation must move, not clone"
+        );
     }
 
     #[test]

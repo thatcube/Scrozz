@@ -114,11 +114,16 @@ impl SystemPermissions {
 
 impl Permissions for SystemPermissions {
     fn is_granted(&self, capability: Capability) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(test)]
+        {
+            let _ = capability;
+            true
+        }
+        #[cfg(all(not(test), target_os = "macos"))]
         {
             crate::macos::permissions::is_granted(capability)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(test), not(target_os = "macos")))]
         {
             // Windows and X11 gate none of these at the API level for the paths
             // Scrozz uses, and Wayland gates capture behind a portal that
@@ -131,11 +136,19 @@ impl Permissions for SystemPermissions {
     }
 
     fn request(&self, capability: Capability) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(test)]
+        {
+            tracing::debug!(
+                capability = capability_name(capability),
+                "permission requests are inert under cfg(test)"
+            );
+            Ok(())
+        }
+        #[cfg(all(not(test), target_os = "macos"))]
         {
             crate::macos::permissions::request(capability)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(test), not(target_os = "macos")))]
         {
             tracing::debug!(
                 capability = capability_name(capability),
@@ -157,15 +170,39 @@ impl Permissions for SystemPermissions {
 /// Returns [`Error::Platform`] if the URL could not be opened, and
 /// [`Error::Unsupported`] on platforms with no such scheme.
 pub fn open_settings(capability: Capability) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(test)]
+    {
+        Err(Error::Unsupported {
+            what: format!("opening settings for {}", capability_name(capability)),
+            why: "OS launchers are disabled under cfg(test)".to_owned(),
+        })
+    }
+    #[cfg(all(not(test), target_os = "macos"))]
     {
         crate::macos::permissions::open_settings_pane(capability)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(test), not(target_os = "macos")))]
     {
         Err(Error::Unsupported {
             what: format!("opening settings for {}", capability_name(capability)),
             why: "no settings-pane URL scheme is wired up for this platform yet".to_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn os_permission_and_settings_actions_are_inert_under_tests() {
+        let permissions = SystemPermissions::new();
+        assert!(permissions.is_granted(Capability::ScreenRecording));
+        permissions
+            .request(Capability::ScreenRecording)
+            .expect("test permission requests are inert");
+        let error = open_settings(Capability::ScreenRecording)
+            .expect_err("test settings launch must be refused");
+        assert!(error.to_string().contains("disabled under cfg(test)"));
     }
 }

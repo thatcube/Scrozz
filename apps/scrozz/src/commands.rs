@@ -50,7 +50,7 @@ use crate::{
 /// which quietly made pinning a fullscreen-only feature. Region and window
 /// captures had a working backend and durable storage, and no route to a pin,
 /// because the only producer that reached the card pipeline was the hotkey.
-pub type CaptureSink<'a> = &'a mut dyn FnMut(CaptureKind, &scrozz_core::Capture);
+pub type CaptureSink<'a> = &'a mut dyn FnMut(CaptureKind, scrozz_core::Capture) -> CliResult<()>;
 
 /// Runs a command locally.
 ///
@@ -59,7 +59,7 @@ pub type CaptureSink<'a> = &'a mut dyn FnMut(CaptureKind, &scrozz_core::Capture)
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
-    dispatch_observed(command, &mut |_, _| {})
+    dispatch_observed(command, &mut |_, _| Ok(()))
 }
 
 /// Runs a command locally, offering any capture it takes to `observed`.
@@ -69,8 +69,9 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
 ///
 /// # Errors
 ///
-/// Identical to [`dispatch`]. The observer runs only after the capture has
-/// already succeeded, so it can neither cause nor mask a failure.
+/// The observer runs only after capture and requested sinks succeed. Its own
+/// admission failure is propagated so an IPC caller is not acknowledged before
+/// the running app has accepted the pixels.
 pub fn dispatch_observed(command: &Command, observed: CaptureSink<'_>) -> CliResult<Report> {
     match command {
         Command::Capture(args) => capture(args, observed),
@@ -208,7 +209,7 @@ fn capture(args: &CaptureArgs, observed: CaptureSink<'_>) -> CliResult<Report> {
     // After the sinks, so a capture that could not be written never reaches the
     // stack claiming it was, and after the report is built, so the observer
     // cannot change what a script sees.
-    observed(capture_kind(&target), &capture);
+    observed(capture_kind(&target), capture)?;
 
     let mut report = Report::new(data, human);
     report.raw = raw;
@@ -836,8 +837,11 @@ mod tests {
             .expect("valid dry run");
         let command = cli.command.expect("a command");
         let mut seen = Vec::new();
-        let report = dispatch_observed(&command, &mut |kind, _| seen.push(kind))
-            .expect("a dry run always succeeds");
+        let report = dispatch_observed(&command, &mut |kind, _| {
+            seen.push(kind);
+            Ok(())
+        })
+        .expect("a dry run always succeeds");
         assert!(report.human.starts_with("Would capture"));
         assert!(seen.is_empty(), "a dry run took no pixels to hand over");
     }

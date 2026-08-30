@@ -47,7 +47,7 @@ use crate::{
         action::{Action, CaptureKind},
         card::{CardEvent, CardId, CardSurface, PinGeneration, SurfaceWaker},
         pipeline::{Job, Outcome, Pipeline},
-        server::Server,
+        server::{ForwardedCapture, Server},
     },
     json::Json,
     report::Report,
@@ -439,44 +439,23 @@ impl App {
     }
 
     fn drain_server(&mut self) -> Tick {
-        // Collected before any is served: serving needs `&mut self`, and the
-        // listener is borrowed for as long as it is being polled.
-        let mut pending = Vec::new();
-        if let Some(server) = &self.server {
-            while let Some(request) = server.poll() {
-                pending.push(request);
-            }
-        }
-
-        // Pixels taken by forwarded captures, collected rather than routed
-        // inline: the observer and the after-success hook would otherwise both
-        // want `&mut self` at once.
-        let mut captured: Vec<(CaptureKind, scrozz_core::Capture)> = Vec::new();
-
-        for request in pending {
+        loop {
+            // Keep the server borrow inside this expression. The request owns
+            // its response channel, so serving it can then borrow the whole app.
+            let request = self.server.as_ref().and_then(Server::poll);
+            let Some(request) = request else {
+                break;
+            };
             tracing::debug!(?request, "a forwarded command arrived");
-            let taken_before = captured.len();
             // The command runs to completion here, on the main thread, because
             // it must produce byte-identical output to a local run and the
             // command layer is synchronous. A capture is tens of milliseconds;
             // a recording returns as soon as it has started.
-            let command = request.serve_with(
-                &mut |kind, capture| captured.push((kind, capture.clone())),
-                |command| {
-                    if let Some(id) = forwarded_unpin(command) {
-                        let capture = CaptureId(id.to_owned());
-                        let generation = self.set_pin_intent(capture.clone(), false);
-                        self.surface.discard_pin(&capture);
-                        self.pipeline.terminal_unpin(capture, generation)?;
-                        self.note(format!("pinned capture {id} closed after forwarded unpin"));
-                    }
-                    if forwarded_unlock_pins(command) {
-                        self.unlock_all_pins()?;
-                        self.note("pinned captures unlocked from the command line");
-                    }
-                    Ok(())
-                },
-            );
+            let mut accepted_capture = false;
+            let command = request.serve_with(|command, captured| {
+                accepted_capture = captured.is_some();
+                self.accept_forwarded(command, captured)
+            });
             if let Some(command) = command {
                 // A capture whose pixels reached the observer is counted when
                 // its card arrives, like every other capture. Counting it here
@@ -484,8 +463,7 @@ impl App {
                 // this branch is the capture that produced no card at all — a
                 // dry run, or a plan that never opened a backend.
                 self.captures += u64::from(
-                    matches!(command, crate::cli::Command::Capture(_))
-                        && captured.len() == taken_before,
+                    matches!(command, crate::cli::Command::Capture(_)) && !accepted_capture,
                 );
                 if matches!(command, crate::cli::Command::Gui) {
                     // A second `scrozz gui` means "show yourself", not "start
@@ -496,26 +474,34 @@ impl App {
             }
         }
 
-        // A forwarded capture joins the stack the user is already looking at,
-        // and from here follows exactly the path a hotkey capture follows:
-        // durable history identity, a bounded texture, and Pin to Screen. This
-        // is what makes pinning a region or a window reachable at all — the
-        // selection overlay does not exist yet, so `--region` and `--window`
-        // are the routes those captures have.
-        for (kind, capture) in captured {
-            match self.accept_capture(kind, capture) {
-                Ok(card) => self.note(format!("{card} accepted from a forwarded capture")),
-                Err(error) => self.note(format!(
-                    "a forwarded capture could not join the capture stack: {error}"
-                )),
-            }
-        }
-
         // A forwarded command never ends this process. `scrozz quit` is not a
         // command; quitting is a menu entry, because the thing being quit is
         // the application the user can see, not a request that arrived on a
         // socket.
         Tick::Continue
+    }
+
+    fn accept_forwarded(
+        &mut self,
+        command: &crate::cli::Command,
+        captured: Option<ForwardedCapture>,
+    ) -> CliResult<()> {
+        if let Some(ForwardedCapture { kind, capture }) = captured {
+            let card = self.accept_capture(kind, capture)?;
+            self.note(format!("{card} accepted from a forwarded capture"));
+        }
+        if let Some(id) = forwarded_unpin(command) {
+            let capture = CaptureId(id.to_owned());
+            let generation = self.set_pin_intent(capture.clone(), false);
+            self.surface.discard_pin(&capture);
+            self.pipeline.terminal_unpin(capture, generation)?;
+            self.note(format!("pinned capture {id} closed after forwarded unpin"));
+        }
+        if forwarded_unlock_pins(command) {
+            self.unlock_all_pins()?;
+            self.note("pinned captures unlocked from the command line");
+        }
+        Ok(())
     }
 
     fn drain_pipeline(&mut self) {
@@ -980,12 +966,54 @@ mod tests {
     use super::*;
     use crate::gui::card::{Card, CardId, Recording};
     use clap::Parser as _;
+    use scrozz_core::{
+        Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
+        PhysicalSize, PixelFormat, Provenance, ScaleFactor, WindowId,
+    };
 
     fn app() -> (App, Recording) {
         let surface = Recording::new();
         let handle = surface.handle();
         let app = App::new(Config::sealed(), Box::new(surface)).expect("a sealed app must start");
         (app, handle)
+    }
+
+    fn forwarded_capture(kind: CaptureKind) -> ForwardedCapture {
+        let (provenance, target) = match kind {
+            CaptureKind::Fullscreen => (
+                Provenance::Display,
+                CaptureTarget::Region(LogicalRect::new(
+                    LogicalPoint::new(0.0, 0.0),
+                    LogicalSize::new(4.0, 4.0),
+                )),
+            ),
+            CaptureKind::Region => (
+                Provenance::Region,
+                CaptureTarget::Region(LogicalRect::new(
+                    LogicalPoint::new(0.0, 0.0),
+                    LogicalSize::new(4.0, 4.0),
+                )),
+            ),
+            CaptureKind::Window => (
+                Provenance::Window,
+                CaptureTarget::Window(WindowId("forwarded-window".into())),
+            ),
+        };
+        ForwardedCapture {
+            kind,
+            capture: Capture {
+                frame: Frame {
+                    data: vec![255; 4 * 4 * 4],
+                    size: PhysicalSize::new(4.0, 4.0),
+                    stride: 16,
+                    format: PixelFormat::Rgba8,
+                    color_space: ColorSpace::Srgb,
+                    scale: ScaleFactor::IDENTITY,
+                },
+                provenance,
+                target,
+            },
+        }
     }
 
     #[test]
@@ -998,6 +1026,47 @@ mod tests {
             app.pin_lock_escapes().is_empty(),
             "configured resources are not lock escapes until they exist"
         );
+    }
+
+    #[test]
+    fn forwarded_region_and_window_pixels_reach_the_live_card_stack() {
+        let (mut app, surface) = app();
+        for (arguments, kind) in [
+            (
+                vec!["scrozz", "capture", "--region", "0,0,4,4"],
+                CaptureKind::Region,
+            ),
+            (
+                vec!["scrozz", "capture", "--window", "forwarded-window"],
+                CaptureKind::Window,
+            ),
+        ] {
+            let command = Cli::try_parse_from(arguments)
+                .expect("valid forwarded capture")
+                .command
+                .expect("capture command");
+            app.accept_forwarded(&command, Some(forwarded_capture(kind)))
+                .expect("forwarded pixels accepted");
+        }
+
+        for _ in 0..200 {
+            app.drain_pipeline();
+            if surface.presented().len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cards = surface.presented();
+        assert_eq!(cards.len(), 2, "both forwarded captures need live cards");
+        assert_eq!(cards[0].kind, CaptureKind::Region);
+        assert_eq!(cards[1].kind, CaptureKind::Window);
+        assert!(
+            cards.iter().all(|card| card.thumbnail.is_some()),
+            "the forwarded path must carry real pixels, not placeholders"
+        );
+        // `pipeline::selector_outputs_receive_durable_identity_and_pin_ready_provenance`
+        // covers the durable Pin to Screen identity with an isolated store.
+        assert_eq!(app.captures, 2, "each capture is accounted exactly once");
     }
 
     #[test]

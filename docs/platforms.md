@@ -226,12 +226,15 @@ pin reappear. A deliberate new pin revives the identity.
 
 A capture reaches a pin from every source that can name a target. The fullscreen
 hotkey and tray entry go straight through the pipeline; a `scrozz capture` typed
-at a terminal while the app is running is executed *inside* it, and its pixels
-are handed to the same capture stack, so they receive history identity, a
-bounded texture, and Pin to Screen exactly as a hotkey capture does. Choosing a
-region or a window *on screen* still needs the selection overlay, which does not
-exist yet, so that one path refuses per D8 and names `--region` / `--window` as
-the route that works today.
+at a terminal while the app is running is executed *inside* it over a Unix
+socket or a current-user-only Windows named pipe. Its pixels are moved into the
+same capture stack before the caller receives success, so they receive history
+identity, a bounded texture, and Pin to Screen exactly as a hotkey capture does.
+The handoff admits one frame per request and at most two queued full-resolution
+frames; additional burst requests receive an explicit busy error instead of
+growing memory without limit. Choosing a region or a window *on screen* still
+needs the selection overlay, which does not exist yet, so that one path refuses
+per D8 and names `--region` / `--window` as the route that works today.
 
 Static pins do not drive a repaint clock. Capture completion, IPC, menu/hotkey
 input, viewport interaction, animation, geometry settlement, and explicit
