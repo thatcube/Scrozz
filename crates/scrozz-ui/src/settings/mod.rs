@@ -477,7 +477,7 @@ impl SettingsWindow {
     pub fn show(&mut self, ctx: &egui::Context, input: &SettingsInput<'_>) -> SettingsEdits {
         let mut edits = SettingsEdits::default();
         if !self.open {
-            self.recording = None;
+            self.forget_transient_edits();
             return edits;
         }
 
@@ -533,11 +533,33 @@ impl SettingsWindow {
             );
         });
 
+        self.set_open(open);
+        edits
+    }
+
+    /// Records whether the viewport survived the frame.
+    ///
+    /// The only place `open` changes on the way down, so it is also the only
+    /// place that has to hand the keyboard back.
+    fn set_open(&mut self, open: bool) {
         self.open = open;
         if !self.open {
-            self.recording = None;
+            self.forget_transient_edits();
         }
-        edits
+    }
+
+    /// Drops every half-finished edit the window was holding.
+    ///
+    /// Both kinds suspend the app's global shortcuts while they are live — a
+    /// shortcut recorder is waiting to swallow the next chord, and a rename
+    /// field owns the keyboard. Clearing only one on close leaves the other
+    /// asserting ownership of a keyboard that belongs to a window nobody can
+    /// see, so the app stays deaf to its own shortcuts until Settings is
+    /// reopened. Anything added here that captures typing must be cleared here
+    /// too.
+    fn forget_transient_edits(&mut self) {
+        self.recording = None;
+        self.scenes.cancel_rename();
     }
 
     fn resolve_appearance(&mut self, ctx: &egui::Context) -> Appearance {
@@ -1434,7 +1456,8 @@ fn draw_shortcut_row(
             } else {
                 row.symbols.as_str()
             };
-            let response = kit::key_cap(ui, theme, caption, armed || !row.symbols.is_empty());
+            let response =
+                kit::key_cap_button(ui, theme, caption, armed || !row.symbols.is_empty());
             let accessible = format!("{}: {caption}", row.label);
             response
                 .widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, accessible.clone()));
@@ -2336,17 +2359,49 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_window_forgets_that_it_was_recording() {
+    fn a_closed_window_forgets_every_half_finished_edit() {
         // Otherwise reopening Settings would silently eat the first chord the
-        // user typed into whatever row happened to be armed last time.
+        // user typed into whatever row happened to be armed last time — and a
+        // rename left armed keeps claiming the keyboard, so the app answers no
+        // global shortcut at all until Settings is opened and closed again.
         let mut window = SettingsWindow {
             recording: Some("capture.region".to_owned()),
             ..SettingsWindow::default()
         };
+        window.scenes.begin_rename_for_test("studio", "Studio");
+        assert!(window.is_editing_text());
+
         let ctx = egui::Context::default();
         let edits = window.show(&ctx, &SettingsInput::default());
+
         assert!(edits.is_empty());
         assert!(!window.is_recording());
+        assert!(
+            !window.is_editing_text(),
+            "a closed window must hand the keyboard back"
+        );
+    }
+
+    #[test]
+    fn closing_the_viewport_hands_the_keyboard_back() {
+        // The close-button path, rather than the already-closed early return:
+        // while a rename is live the host suspends global shortcuts, so a
+        // rename that survives the close makes the whole app deaf to them.
+        let mut window = SettingsWindow::default();
+        window.open();
+        window.scenes.begin_rename_for_test("studio", "Studio");
+        window.recording = Some("capture.region".to_owned());
+        assert!(window.is_editing_text());
+        assert!(window.is_recording());
+
+        window.set_open(false);
+
+        assert!(!window.is_open());
+        assert!(!window.is_recording());
+        assert!(
+            !window.is_editing_text(),
+            "global shortcuts must work again once Settings is gone"
+        );
     }
 
     #[test]

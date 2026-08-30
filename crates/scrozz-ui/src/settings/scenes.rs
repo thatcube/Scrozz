@@ -427,6 +427,13 @@ impl ScenesPane {
         self.renaming.is_some()
     }
 
+    /// Arms a rename the way clicking Rename would, for tests that need the
+    /// pane to be holding the keyboard.
+    #[cfg(test)]
+    pub fn begin_rename_for_test(&mut self, id: &str, draft: &str) {
+        self.renaming = Some((id.to_owned(), draft.to_owned()));
+    }
+
     /// Abandon an in-progress rename without committing it.
     ///
     /// Called when the user navigates away: a draft name left armed in a pane

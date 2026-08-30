@@ -1099,24 +1099,59 @@ pub fn trailing(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// A monospaced-feeling key cap, for accelerators and modifier hints.
+///
+/// Inert on purpose: use [`key_cap_button`] where the cap is the control that
+/// starts a reassignment, so it is reachable by keyboard as well as by pointer.
 pub fn key_cap(ui: &mut egui::Ui, theme: &Theme, text: &str, usable: bool) -> Response {
+    key_cap_impl(ui, theme, text, usable, false)
+}
+
+/// A key cap that is itself the button — used to arm shortcut reassignment.
+///
+/// Separate from [`key_cap`] because a focusable widget that does nothing is
+/// worse for keyboard users than no widget at all. The returned response is
+/// clicked by pointer, Space or Enter.
+pub fn key_cap_button(ui: &mut egui::Ui, theme: &Theme, text: &str, usable: bool) -> Response {
+    key_cap_impl(ui, theme, text, usable, true)
+}
+
+fn key_cap_impl(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    text: &str,
+    usable: bool,
+    interactive: bool,
+) -> Response {
     let ink = Ink::new(theme);
     let font = theme.font(Text::Shortcut);
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
-    let (rect, response) = ui.allocate_exact_size(
+    let (rect, mut response) = ui.allocate_exact_size(
         Vec2::new((galley.size().x + Space::SM * 2.0).max(22.0), 21.0),
-        Sense::hover(),
+        if interactive {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
     );
+    if interactive && keyboard_activated(ui, &response) {
+        response.flags |= egui::response::Flags::CLICKED;
+    }
+    let hovered = interactive && response.hovered();
+    let fill = if hovered {
+        ink.control_hover
+    } else {
+        ink.control
+    };
+    let stroke = if interactive && response.has_focus() {
+        Stroke::new(2.0, ink.accent)
+    } else {
+        Stroke::new(1.0, ink.control_stroke)
+    };
     let painter = ui.painter();
-    painter.rect_filled(rect, corner(5.0), ink.control);
-    painter.rect_stroke(
-        rect,
-        corner(5.0),
-        Stroke::new(1.0, ink.control_stroke),
-        StrokeKind::Inside,
-    );
+    painter.rect_filled(rect, corner(5.0), fill);
+    painter.rect_stroke(rect, corner(5.0), stroke, StrokeKind::Inside);
     painter.galley(
         egui::pos2(
             rect.center().x - galley.size().x / 2.0,
@@ -1155,6 +1190,113 @@ pub fn hairline(palette: &Palette) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A context whose custom families are bound, one warm-up pass done.
+    ///
+    /// `set_fonts` only lands on the *next* begin-pass, so a caller that draws
+    /// straight away panics on the unbound family.
+    fn context_with_fonts() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        ctx
+    }
+
+    fn run<R>(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        mut body: impl FnMut(&mut egui::Ui) -> R,
+    ) -> R {
+        let mut result = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            result = Some(body(ui));
+        });
+        output.textures_delta.clear();
+        result.expect("the ui ran")
+    }
+
+    fn click_at(position: egui::Pos2) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_key_cap_button_can_actually_be_clicked() {
+        // It senses hover only, so `clicked()` never fires and reassigning a
+        // shortcut is impossible with a mouse.
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let rect = run(&ctx, egui::RawInput::default(), |ui| {
+            key_cap_button(ui, &theme, "Cmd+7", true).rect
+        });
+
+        let clicked = run(&ctx, click_at(rect.center()), |ui| {
+            key_cap_button(ui, &theme, "Cmd+7", true).clicked()
+        });
+
+        assert!(clicked, "the cap is the control that arms reassignment");
+    }
+
+    #[test]
+    fn a_key_cap_button_can_be_reached_from_the_keyboard() {
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let id = run(&ctx, egui::RawInput::default(), |ui| {
+            key_cap_button(ui, &theme, "Cmd+7", true).id
+        });
+        ctx.memory_mut(|memory| memory.request_focus(id));
+
+        let clicked = run(
+            &ctx,
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| key_cap_button(ui, &theme, "Cmd+7", true).clicked(),
+        );
+
+        assert!(clicked, "Space must arm it as well as the pointer");
+    }
+
+    #[test]
+    fn a_plain_key_cap_stays_inert() {
+        // A hint that steals focus and does nothing is worse for keyboard users
+        // than no widget at all.
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let rect = run(&ctx, egui::RawInput::default(), |ui| {
+            key_cap(ui, &theme, "Option", true).rect
+        });
+
+        let clicked = run(&ctx, click_at(rect.center()), |ui| {
+            key_cap(ui, &theme, "Option", true).clicked()
+        });
+
+        assert!(!clicked);
+    }
 
     #[test]
     fn ink_derives_from_the_theme() {
