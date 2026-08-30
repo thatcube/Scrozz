@@ -575,17 +575,53 @@ pub(crate) fn activated(ui: &egui::Ui, response: &mut Response) -> bool {
         response.flags |= egui::response::Flags::FAKE_PRIMARY_CLICKED;
         return true;
     }
-    if response.has_focus() && chord_pressed(ui) && !ui.input(|input| input.pointer.any_click()) {
-        // egui has already faked a primary click for the Space or Return inside
-        // the chord. Take it back: the chord was aimed at the recorder.
+    if response
+        .flags
+        .contains(egui::response::Flags::FAKE_PRIMARY_CLICKED)
+        && !bare_activation_pressed(ui)
+        && !accessibility_activated(ui, response)
+    {
+        // egui faked a primary click for a Space or Return that was part of a
+        // chord. Take it back: the chord was aimed at the recorder.
+        //
+        // The test is the synthetic click itself, not `has_focus` — a click
+        // landing anywhere else in the same frame surrenders focus, so the flag
+        // outlives the focus that earned it. Only the synthetic click goes.
+        // Whether this control was *also* pressed for a real reason is then
+        // answered by `clicked`, which falls back to the pointer — and the
+        // pointer half is per-widget, so an unrelated click no longer rescues
+        // the chord's press here, while a press on this very control does.
         response.flags -= egui::response::Flags::FAKE_PRIMARY_CLICKED;
-        return false;
     }
     response.clicked()
 }
 
+/// Whether assistive technology asked for this control to be activated.
+///
+/// This is the other reason egui fakes a primary click, and it is a deliberate
+/// request aimed at this widget by id rather than a key that happened to be
+/// held down. It must survive a chord in the same frame.
+fn accessibility_activated(ui: &egui::Ui, response: &Response) -> bool {
+    ui.input(|input| {
+        input.has_accesskit_action_request(response.id, egui::accesskit::Action::Click)
+    })
+}
+
+/// Whether a Space or Return arrived this frame with nothing held down.
+///
+/// The keyboard press egui is entitled to fake, regardless of which control it
+/// landed on or whether focus survived the frame.
+fn bare_activation_pressed(ui: &egui::Ui) -> bool {
+    activation_pressed(ui, egui::Modifiers::is_none)
+}
+
 /// Whether a Space or Return arrived this frame as part of a chord.
 fn chord_pressed(ui: &egui::Ui) -> bool {
+    activation_pressed(ui, |modifiers| !modifiers.is_none())
+}
+
+/// Whether an activation key arrived this frame whose modifiers `wanted` accepts.
+fn activation_pressed(ui: &egui::Ui, wanted: impl Fn(&egui::Modifiers) -> bool) -> bool {
     ui.input(|input| {
         input.events.iter().any(|event| {
             matches!(
@@ -595,7 +631,7 @@ fn chord_pressed(ui: &egui::Ui) -> bool {
                     pressed: true,
                     modifiers,
                     ..
-                } if !modifiers.is_none()
+                } if wanted(modifiers)
             )
         })
     })
@@ -610,20 +646,7 @@ fn chord_pressed(ui: &egui::Ui) -> bool {
 /// key cap behind the recorder sees a Return, re-arms, and the shortcut can
 /// never be finished. Modified keys belong to whoever is reading chords.
 fn keyboard_activated(ui: &egui::Ui, response: &Response) -> bool {
-    response.has_focus()
-        && ui.input(|input| {
-            input.events.iter().any(|event| {
-                matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::Space | egui::Key::Enter,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.is_none()
-                )
-            })
-        })
+    response.has_focus() && bare_activation_pressed(ui)
 }
 
 /// A pill switch — the on/off control for a whole behaviour.
@@ -985,7 +1008,8 @@ pub fn menu_item(ui: &mut egui::Ui, theme: &Theme, selected: bool, label: &str) 
         .painter()
         .layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER);
     let width = ui.available_width().max(galley.size().x + Space::MD * 2.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click());
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click());
+    // A chord typed while a row holds focus must not choose that row.
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, label)
     });
@@ -1296,6 +1320,109 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    /// One frame's worth of `key` held down with `modifiers`.
+    fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Every modifier a chord can end in, paired with both activation keys.
+    fn chords() -> impl Iterator<Item = (egui::Key, egui::Modifiers)> {
+        [
+            egui::Modifiers::CTRL,
+            egui::Modifiers::COMMAND,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::ALT,
+        ]
+        .into_iter()
+        .flat_map(|modifiers| {
+            [egui::Key::Enter, egui::Key::Space]
+                .into_iter()
+                .map(move |key| (key, modifiers))
+        })
+    }
+
+    #[test]
+    fn a_click_somewhere_else_does_not_let_a_chord_press_a_focused_control() {
+        // The guard used to ask whether *any* pointer click happened this
+        // frame. Clicking anything at all — another pane, empty dialog
+        // background — while finishing a chord therefore left the synthetic
+        // press in place, and two controls answered one keystroke.
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let id = run(&ctx, egui::RawInput::default(), |ui| {
+            key_cap_button(ui, &theme, "Cmd+7", true).id
+        });
+        ctx.memory_mut(|memory| memory.request_focus(id));
+
+        for (key, modifiers) in chords() {
+            let mut input = key_press(key, modifiers);
+            // Somewhere far from the cap, which is drawn at the origin.
+            input
+                .events
+                .extend(click_at(egui::pos2(600.0, 400.0)).events);
+
+            let clicked = run(&ctx, input, |ui| {
+                key_cap_button(ui, &theme, "Cmd+7", true).clicked()
+            });
+            assert!(
+                !clicked,
+                "an unrelated click let {key:?} with {modifiers:?} press the cap"
+            );
+            ctx.memory_mut(|memory| memory.request_focus(id));
+        }
+    }
+
+    #[test]
+    fn a_click_on_the_control_itself_still_presses_it_during_a_chord() {
+        // The other half: refusing the chord must not refuse a real press.
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let response = run(&ctx, egui::RawInput::default(), |ui| {
+            let response = key_cap_button(ui, &theme, "Cmd+7", true);
+            (response.id, response.rect)
+        });
+        let (id, rect) = response;
+        ctx.memory_mut(|memory| memory.request_focus(id));
+
+        let mut input = click_at(rect.center());
+        input
+            .events
+            .extend(key_press(egui::Key::Enter, egui::Modifiers::CTRL).events);
+
+        let clicked = run(&ctx, input, |ui| {
+            key_cap_button(ui, &theme, "Cmd+7", true).clicked()
+        });
+        assert!(
+            clicked,
+            "the pointer pressed this control and the chord is irrelevant to that"
+        );
+
+        // And through a control that acts on the answer rather than on the
+        // response, so refusing the frame outright would show up here.
+        let theme = Theme::dark();
+        let ctx = context_with_fonts();
+        let mut on = false;
+        let rect = run(&ctx, egui::RawInput::default(), |ui| {
+            switch(ui, &theme, &mut on, true).rect
+        });
+
+        let mut input = click_at(rect.center());
+        input
+            .events
+            .extend(key_press(egui::Key::Enter, egui::Modifiers::CTRL).events);
+        run(&ctx, input, |ui| switch(ui, &theme, &mut on, true));
+        assert!(on, "the switch was clicked, chord or no chord");
     }
 
     #[test]
