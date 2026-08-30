@@ -62,10 +62,10 @@ const HOVER_SCRIM: f32 = 132.0;
 /// itself to fade out rather than being clipped.
 ///
 /// Two things reach past a card's own rectangle, and this clears the larger.
-/// The deepest shadow offsets 13 points and blurs 76 at a 1.4 lift, so its
-/// falloff runs about 71 points; the landing glow's halo reaches
-/// [`glow::HALO_OUT`] points beyond the thumbnail. Eighty points covers both
-/// with rounding tolerance.
+/// The deepest key shadow offsets 10 points and blurs 88 at a 1.4 lift, and
+/// `epaint` feathers a blur half its width either side, so its falloff runs
+/// about 76 points; the landing glow's halo reaches [`glow::HALO_OUT`] points
+/// beyond the thumbnail. Eighty points covers both with rounding tolerance.
 pub const SHADOW_BLEED: f32 = 80.0;
 /// Width below which primary actions collapse to icon-only controls.
 const COMPACT_CHROME_W: f32 = 154.0;

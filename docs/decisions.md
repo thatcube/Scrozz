@@ -1423,6 +1423,25 @@ missing line, and it is the kind of bug that only a token layer prevents
 structurally. Keyboard focus rides on the `active` state, so every stock control
 shows a focus ring without anyone remembering to add one (D13).
 
+**A popup is not a panel.** Scrozz's panels are transparent because its windows
+are: the desktop, or a captured image, is what sits behind a `CentralPanel`.
+egui builds every dropdown list, menu and tooltip from `Frame::popup`, which
+fills with `window_fill` — so leaving *that* transparent meant a combo box's
+options floated with the desktop showing straight through them, legible only on
+whichever row happened to be selected. `window_fill` is now an opaque raised
+surface with a hairline and a real popup shadow. Nothing in Scrozz uses
+`egui::Window`, so this reaches popups and only popups.
+
+**Shadows are wide and faint, and they follow the corner.** A short blur
+concentrates a shadow into a band directly under the object, which has a
+legible outer edge — and an edge is what reads as harsh. The ambient shadow now
+carries a spread and almost no offset: `Shadow::as_shape` grows the corner
+radius by the spread, so the contact shadow follows the object's own curve
+instead of cutting across it, and it surrounds the object rather than pooling
+below it. Without that, the top corners of a rounded card got almost no shadow
+at all — the offset had already moved the shape past them, and the corner curve
+pulled what was left further inward still.
+
 **One state per card.** A capture card whose editor is open offers exactly one
 control: the Editing/Continue pill. Copy, Save, Pin, Upload and Close are absent
 rather than disabled, because the card's pixels are frozen at their pre-edit

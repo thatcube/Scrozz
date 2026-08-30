@@ -199,21 +199,28 @@ impl Elevation {
 pub fn shadows_for_lift(lift: f32, palette: &Palette) -> (Shadow, Shadow) {
     let lift = lift.clamp(0.0, 4.0);
     // Wide and faint rather than tight and dark. A short blur concentrates the
-    // whole shadow into a band just under the card, which has a legible outer
-    // edge — and an edge is what reads as harsh. Spreading the same shadow
-    // over more than twice the distance, at well under half the opacity,
-    // gives the card the same weight with nothing in it for the eye to catch.
-    // The key light also sits a little higher: less drop, more diffusion,
-    // which is what an object resting near a surface actually does.
+    // whole shadow into a band just under the object, which has a legible
+    // outer edge — and an edge is what reads as harsh. Spreading the same
+    // shadow much further, at well under half the opacity, gives the object
+    // the same weight with nothing in it for the eye to catch.
+    //
+    // The ambient shadow carries a *spread* and almost no offset, and both are
+    // load-bearing. `Shadow::as_shape` grows the corner radius by the spread,
+    // so a spread contact shadow follows the object's own curve instead of
+    // cutting across it — and with the shape barely offset it surrounds the
+    // object rather than pooling below it. Without that, the top corners of a
+    // rounded card got almost no shadow at all: the offset had already moved
+    // the shape down past them, and the corner curve pulled what was left
+    // further inward still.
     let ambient = Shadow {
-        offset: [0, quantise_offset(2.0 * lift)],
-        blur: quantise_blur(24.0 * lift),
-        spread: 0,
+        offset: [0, quantise_offset(1.0 * lift)],
+        blur: quantise_blur(26.0 * lift),
+        spread: quantise_spread(2.0 * lift),
         color: palette.ambient_shadow,
     };
     let key = Shadow {
-        offset: [0, quantise_offset(13.0 * lift)],
-        blur: quantise_blur(76.0 * lift),
+        offset: [0, quantise_offset(10.0 * lift)],
+        blur: quantise_blur(88.0 * lift),
         spread: 0,
         color: palette.key_shadow,
     };
@@ -225,6 +232,10 @@ fn quantise_offset(v: f32) -> i8 {
 }
 
 fn quantise_blur(v: f32) -> u8 {
+    v.round().clamp(0.0, 255.0) as u8
+}
+
+fn quantise_spread(v: f32) -> u8 {
     v.round().clamp(0.0, 255.0) as u8
 }
 
@@ -480,8 +491,8 @@ impl Palette {
             warning: Color32::from_rgb(0xFF, 0xC4, 0x5C),
             success: Color32::from_rgb(0x63, 0xD6, 0x9A),
 
-            key_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 116),
-            ambient_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 62),
+            key_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 92),
+            ambient_shadow: Color32::from_rgba_unmultiplied_const(0, 0, 0, 44),
 
             thumb_border: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 30),
             chip_fill: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 22),
@@ -519,8 +530,8 @@ impl Palette {
             warning: Color32::from_rgb(0x8A, 0x51, 0x00),
             success: Color32::from_rgb(0x0E, 0x6B, 0x42),
 
-            key_shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x28, 60),
-            ambient_shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x28, 30),
+            key_shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x28, 46),
+            ambient_shadow: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x28, 22),
 
             thumb_border: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x24, 28),
             chip_fill: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x24, 16),
@@ -872,11 +883,24 @@ pub fn apply_style(style: &mut egui::Style, theme: &Theme) {
     visuals.override_text_color = None;
     visuals.weak_text_color = Some(palette.text_muted);
     visuals.widgets = widget_visuals(&palette);
+    // Panels stay transparent because Scrozz's windows are: the OS desktop, or
+    // a captured image, is what sits behind a `CentralPanel`.
+    //
+    // A *popup* is not a panel. egui builds every menu, dropdown list and
+    // tooltip from `Frame::popup`, which fills with `window_fill` — so leaving
+    // that transparent meant a combo box's options floated with the desktop
+    // showing straight through them, legible only where a row happened to be
+    // selected. Nothing in Scrozz uses `egui::Window`, so this affects popups
+    // and only popups.
     visuals.panel_fill = Color32::TRANSPARENT;
-    visuals.window_fill = Color32::TRANSPARENT;
-    visuals.window_stroke = egui::Stroke::NONE;
+    visuals.window_fill = palette.flatten(palette.card_fill_raised);
+    visuals.window_stroke = egui::Stroke::new(1.0, palette.hairline);
     visuals.window_shadow = Shadow::NONE;
-    visuals.popup_shadow = Shadow::NONE;
+    // A popup floats over content it must be readable against, so it gets the
+    // elevation its own token system says a floating surface has.
+    visuals.popup_shadow = Elevation::Lifted
+        .shadows(&palette)
+        .map_or(Shadow::NONE, |(_, key)| key);
     visuals.window_corner_radius = corner(Radius::CARD);
     visuals.menu_corner_radius = corner(Radius::BUTTON);
     // A translucent accent reads as a highlight over text; an opaque one reads

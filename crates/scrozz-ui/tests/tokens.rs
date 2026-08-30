@@ -1239,3 +1239,146 @@ fn control_state_defaults_to_enabled_and_quiet() {
     assert!(ControlState::on().selected);
     assert!(ControlState::new().selected(true).selected);
 }
+
+// ===========================================================================
+// Popups are surfaces, panels are not
+// ===========================================================================
+
+/// A dropdown's own background, in both appearances.
+///
+/// Scrozz's panels are transparent on purpose — the OS desktop or a captured
+/// image is what sits behind a `CentralPanel`. A popup is not a panel, and
+/// egui builds every menu, dropdown list and tooltip from `Frame::popup`,
+/// which fills with `window_fill`. Leaving that transparent left a combo
+/// box's options floating with the desktop showing straight through them,
+/// readable only on whichever row happened to be selected.
+#[test]
+fn every_popup_has_an_opaque_background_its_text_is_legible_on() {
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        let theme = Theme::for_appearance(appearance);
+        let mut style = egui::Style::default();
+        theme::apply_style(&mut style, &theme);
+
+        let fill = style.visuals.window_fill;
+        assert_eq!(
+            fill.a(),
+            255,
+            "{appearance:?}: a dropdown drawn over arbitrary desktop content \
+             cannot be translucent"
+        );
+        assert!(
+            theme::contrast_ratio(fill, style.visuals.widgets.inactive.fg_stroke.color)
+                >= Contrast::AA_TEXT,
+            "{appearance:?}: an option's label must clear AA against the \
+             popup it sits on"
+        );
+        assert!(
+            style.visuals.window_stroke.width > 0.0,
+            "{appearance:?}: the popup needs an edge, not just a fill"
+        );
+        assert!(
+            style.visuals.popup_shadow != egui::epaint::Shadow::NONE,
+            "{appearance:?}: a floating surface casts something"
+        );
+
+        // And the panel behind it stays transparent, which is the property
+        // this must not have broken.
+        assert_eq!(style.visuals.panel_fill, egui::Color32::TRANSPARENT);
+    }
+}
+
+/// The popup surface reaches the actual dropdown, not just the style struct.
+///
+/// Driven through a real `Context` because the failure this guards against was
+/// exactly a style that looked right in isolation: `ComboBox` opens its list in
+/// its own `Area`, and an `Area` reads the *context* style rather than the one
+/// a caller installed on some inner `Ui`.
+#[test]
+fn an_open_dropdown_paints_a_background_behind_its_options() {
+    use egui::{Event, PointerButton, RawInput, Rect, pos2, vec2};
+
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::install_style(&ctx, &Theme::for_appearance(appearance));
+        let expected = {
+            let mut style = egui::Style::default();
+            theme::apply_style(&mut style, &Theme::for_appearance(appearance));
+            style.visuals.window_fill
+        };
+
+        let mut selected = 0usize;
+        let at = pos2(60.0, 16.0);
+        let mut time = 0.0;
+        let mut opened = false;
+        let mut debug_rects: Vec<(egui::Color32, egui::Rect)> = Vec::new();
+
+        for pass in 0..4 {
+            time += 1.0 / 60.0;
+            let mut events = Vec::new();
+            if pass == 1 {
+                events.push(Event::PointerMoved(at));
+                for pressed in [true, false] {
+                    events.push(Event::PointerButton {
+                        pos: at,
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+            }
+            let mut output = ctx.run_ui(
+                RawInput {
+                    time: Some(time),
+                    predicted_dt: 1.0 / 60.0,
+                    focused: true,
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 220.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::ComboBox::from_id_salt("probe")
+                        .selected_text(["Save to export location", "Ask every time"][selected])
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut selected, 0, "Save to export location");
+                            ui.selectable_value(&mut selected, 1, "Ask every time");
+                        });
+                },
+            );
+            output.textures_delta.clear();
+            if pass < 2 {
+                continue;
+            }
+            // The popup's own frame: a filled rectangle below the closed
+            // control, in the colour the style promised.
+            // A frame with a shadow paints as a `Shape::Vec` of the shadow
+            // and the frame, so the background is one level down.
+            fn rects(shape: &egui::Shape, out: &mut Vec<(egui::Color32, egui::Rect)>) {
+                match shape {
+                    egui::Shape::Rect(rect) => out.push((rect.fill, rect.rect)),
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            rects(shape, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut found = Vec::new();
+            for clipped in &output.shapes {
+                rects(&clipped.shape, &mut found);
+            }
+            debug_rects.extend(found.iter().copied());
+            opened |= found
+                .iter()
+                .any(|(fill, rect)| *fill == expected && rect.top() > 30.0 && rect.height() > 20.0);
+        }
+        assert!(
+            opened,
+            "{appearance:?}: the open dropdown painted no background behind \
+             its options; expected {expected:?}, saw {:?}",
+            debug_rects
+        );
+    }
+}
