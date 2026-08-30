@@ -3617,8 +3617,10 @@ pub fn render_settings_golden(case: &SettingsGoldenCase) -> Result<Image> {
     };
     let icons = std::sync::Mutex::new(None);
     RasterJob {
-        width_px: if case.compact { 1200 } else { 1600 },
-        height_px: 1200,
+        // The dialog's own default and minimum sizes, at 2x: a Settings golden
+        // that is 200pt taller than the window can never show a real overflow.
+        width_px: if case.compact { 1280 } else { 1520 },
+        height_px: if case.compact { 940 } else { 1160 },
         pixels_per_point,
         theme: case.theme,
         background: Background::Solid([0, 0, 0, 0]),
@@ -3640,24 +3642,24 @@ pub fn render_settings_golden(case: &SettingsGoldenCase) -> Result<Image> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let empty = crate::icons::IconStore::empty();
-            if case.recent_captures_overlay {
-                crate::settings::render_recent_captures_preview(
-                    ui,
-                    case.platform,
-                    guard.as_ref().unwrap_or(&empty),
-                    crate::RecentCapturesOverlaySettings {
+            let shortcuts = crate::settings::preview_shortcuts(case.platform);
+            let after_capture = crate::settings::preview_after_capture_rows();
+            crate::settings::render_preview(
+                ui,
+                case.pane,
+                guard.as_ref().unwrap_or(&empty),
+                &crate::settings::SettingsInput {
+                    shortcuts: &shortcuts,
+                    after_capture: &after_capture,
+                    recent_captures_overlay: crate::RecentCapturesOverlaySettings {
                         auto_close_enabled: true,
                         ..crate::RecentCapturesOverlaySettings::default()
                     },
-                );
-            } else {
-                crate::settings::render_preview(
-                    ui,
-                    case.platform,
-                    guard.as_ref().unwrap_or(&empty),
-                    &crate::settings::preview_shortcuts(case.platform),
-                );
-            }
+                    scenes: crate::settings::ScenesModel::preview(),
+                    platform: case.platform,
+                    ..crate::settings::SettingsInput::default()
+                },
+            );
         },
     )
 }
@@ -4612,8 +4614,8 @@ pub struct SettingsGoldenCase {
     pub platform: crate::settings::SettingsPlatform,
     /// OS appearance to render.
     pub theme: egui::Theme,
-    /// Whether this case renders the Recent Captures Overlay pane.
-    pub recent_captures_overlay: bool,
+    /// Which pane the window is showing.
+    pub pane: crate::settings::Pane,
     /// Whether to render below the ordinary minimum width.
     pub compact: bool,
     /// What a reviewer should verify.
@@ -4623,37 +4625,40 @@ pub struct SettingsGoldenCase {
 /// Settings cases that cover native navigation and system appearance.
 #[must_use]
 pub fn settings_golden_plan() -> Vec<SettingsGoldenCase> {
-    use crate::settings::SettingsPlatform;
+    use crate::settings::{Pane, SettingsPlatform};
     vec![
         SettingsGoldenCase {
             name: "settings-macos--light",
             platform: SettingsPlatform::MacOs,
             theme: egui::Theme::Light,
-            recent_captures_overlay: false,
+            pane: Pane::Shortcuts,
             compact: false,
-            expectation: "macOS top category toolbar in system light appearance",
+            expectation: "macOS top category toolbar in system light appearance: dense rows, \
+                          one card per group, no full-page web spacing",
         },
         SettingsGoldenCase {
             name: "settings-macos--dark",
             platform: SettingsPlatform::MacOs,
             theme: egui::Theme::Dark,
-            recent_captures_overlay: false,
+            pane: Pane::Shortcuts,
             compact: false,
-            expectation: "macOS top category toolbar in system dark appearance",
+            expectation: "the same shortcut rows in dark appearance: key caps and quiet \
+                          Reset/Clear actions stay legible on the card fill",
         },
         SettingsGoldenCase {
             name: "settings-windows--light",
             platform: SettingsPlatform::Windows,
             theme: egui::Theme::Light,
-            recent_captures_overlay: false,
+            pane: Pane::Shortcuts,
             compact: false,
-            expectation: "Windows left navigation with the spacious Settings form",
+            expectation: "Windows left navigation: 28pt nav rows, selected row filled with \
+                          the accent, body padding matching the macOS toolbar layout",
         },
         SettingsGoldenCase {
             name: "settings-linux--dark",
             platform: SettingsPlatform::Linux,
             theme: egui::Theme::Dark,
-            recent_captures_overlay: false,
+            pane: Pane::Shortcuts,
             compact: false,
             expectation: "desktop-neutral Linux sidebar in system dark appearance",
         },
@@ -4661,23 +4666,78 @@ pub fn settings_golden_plan() -> Vec<SettingsGoldenCase> {
             name: "settings-linux--light",
             platform: SettingsPlatform::Linux,
             theme: egui::Theme::Light,
-            recent_captures_overlay: false,
+            pane: Pane::Shortcuts,
             compact: false,
             expectation: "desktop-neutral Linux sidebar in system light appearance",
+        },
+        SettingsGoldenCase {
+            name: "settings-scenes-macos--dark",
+            platform: SettingsPlatform::MacOs,
+            theme: egui::Theme::Dark,
+            pane: Pane::Scenes,
+            compact: false,
+            expectation: "Scenes: a Default row above all five capture types, then preset \
+                          tiles whose previews are fictional macOS windows — no badges, no \
+                          per-row descriptions, no user screenshots",
+        },
+        SettingsGoldenCase {
+            name: "settings-scenes-windows--light",
+            platform: SettingsPlatform::Windows,
+            theme: egui::Theme::Light,
+            pane: Pane::Scenes,
+            compact: false,
+            expectation: "the same Scenes pane with Windows-native preview chrome and light \
+                          control fills",
+        },
+        SettingsGoldenCase {
+            name: "settings-scenes-linux--compact",
+            platform: SettingsPlatform::Linux,
+            theme: egui::Theme::Dark,
+            pane: Pane::Scenes,
+            compact: true,
+            expectation: "Scenes at the minimum window width: rows fold to stacked labels and \
+                          the tile grid reflows without clipping a preset action",
+        },
+        SettingsGoldenCase {
+            name: "settings-after-capture-macos--light",
+            platform: SettingsPlatform::MacOs,
+            theme: egui::Theme::Light,
+            pane: Pane::AfterCapture,
+            compact: false,
+            expectation: "After Capture as a matrix of single-line rows with two checkbox \
+                          columns, and no Apply Smart Frame row",
+        },
+        SettingsGoldenCase {
+            name: "settings-capture-macos--light",
+            platform: SettingsPlatform::MacOs,
+            theme: egui::Theme::Light,
+            pane: Pane::Capture,
+            compact: false,
+            expectation: "window drop shadow as a switch with the one-shot Option hint, not \
+                          buried in an Advanced drawer",
+        },
+        SettingsGoldenCase {
+            name: "settings-about-macos--dark",
+            platform: SettingsPlatform::MacOs,
+            theme: egui::Theme::Dark,
+            pane: Pane::About,
+            compact: false,
+            expectation: "About sized for a dialog: an 84pt icon beside four lines of text",
         },
         SettingsGoldenCase {
             name: "settings-recent-captures-macos--light",
             platform: SettingsPlatform::MacOs,
             theme: egui::Theme::Light,
-            recent_captures_overlay: true,
+            pane: Pane::RecentCapturesOverlay,
             compact: false,
-            expectation: "Recent Captures Overlay pane with a restrained left-placement schematic",
+            expectation: "Recent Captures as labelled rows: segmented side control, sliders \
+                          with value chips, and a disabled upload checkbox that still reads",
         },
         SettingsGoldenCase {
             name: "settings-recent-captures-macos--dark",
             platform: SettingsPlatform::MacOs,
             theme: egui::Theme::Dark,
-            recent_captures_overlay: true,
+            pane: Pane::RecentCapturesOverlay,
             compact: false,
             expectation: "Recent Captures Overlay controls remain legible in system dark appearance",
         },
@@ -4685,7 +4745,7 @@ pub fn settings_golden_plan() -> Vec<SettingsGoldenCase> {
             name: "settings-recent-captures-linux--compact",
             platform: SettingsPlatform::Linux,
             theme: egui::Theme::Light,
-            recent_captures_overlay: true,
+            pane: Pane::RecentCapturesOverlay,
             compact: true,
             expectation: "compact sidebar layout wraps without clipping controls or unavailable reasons",
         },

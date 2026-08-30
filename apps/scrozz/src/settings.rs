@@ -48,8 +48,15 @@ use scrozz_record::{
 };
 use scrozz_shell::ScreenshotSound;
 
-/// Persisted opt-in transform resolved before screenshot consumers run.
+/// Legacy opt-in transform, superseded by `scenes.default`.
+///
+/// Retained only so an existing document can be migrated; nothing reads it to
+/// decide behaviour any more.
 pub const APPLY_SMART_FRAME_AFTER_CAPTURE_KEY: &str = "after-capture.apply-smart-frame";
+/// The Scene applied wherever a capture type does not name its own.
+pub const SCENES_DEFAULT_KEY: &str = "scenes.default";
+/// Window drop shadow fidelity for window captures.
+pub const WINDOW_SHADOW_KEY: &str = "capture.window-shadow";
 pub const RECENT_CAPTURES_OVERLAY_PLACEMENT_KEY: &str = "recent-captures-overlay.placement";
 pub const RECENT_CAPTURES_OVERLAY_FOLLOW_ACTIVE_DISPLAY_KEY: &str =
     "recent-captures-overlay.follow-active-display";
@@ -657,10 +664,52 @@ pub const SETTINGS: &[Setting] = &[
         key: APPLY_SMART_FRAME_AFTER_CAPTURE_KEY,
         kind: Kind::Bool,
         default: "false",
-        description: "Apply an adaptive Smart Frame before any enabled screenshot action runs.",
+        description: "Deprecated: superseded by `scenes.default`. Migrated on first load.",
+    },
+    // Scenes: `none`, `auto`, or `preset:<id>` naming a saved Smart Frame
+    // preset. Free text rather than a Choice because the set of presets is
+    // owned by the user, not by this table.
+    Setting {
+        key: SCENES_DEFAULT_KEY,
+        kind: Kind::Text { allow_empty: false },
+        default: "auto",
+        description: "Scene applied to captures that do not name their own: \
+                      `none`, `auto`, or `preset:<id>`.",
     },
     Setting {
-        key: "capture.window-shadow",
+        key: "scenes.region",
+        kind: Kind::Text { allow_empty: false },
+        default: "default",
+        description: "Scene for region captures: `default`, `none`, `auto`, or `preset:<id>`.",
+    },
+    Setting {
+        key: "scenes.window",
+        kind: Kind::Text { allow_empty: false },
+        default: "default",
+        description: "Scene for window captures: `default`, `none`, `auto`, or `preset:<id>`.",
+    },
+    Setting {
+        key: "scenes.full-screen",
+        kind: Kind::Text { allow_empty: false },
+        default: "default",
+        description: "Scene for full-screen captures: `default`, `none`, `auto`, or \
+                      `preset:<id>`.",
+    },
+    Setting {
+        key: "scenes.all-displays",
+        kind: Kind::Text { allow_empty: false },
+        default: "default",
+        description: "Scene for all-displays captures: `default`, `none`, `auto`, or \
+                      `preset:<id>`.",
+    },
+    Setting {
+        key: "scenes.scrolling",
+        kind: Kind::Text { allow_empty: false },
+        default: "default",
+        description: "Scene for scrolling captures: `default`, `none`, `auto`, or `preset:<id>`.",
+    },
+    Setting {
+        key: WINDOW_SHADOW_KEY,
         kind: Kind::Bool,
         default: "true",
         description: "Include the window's drop shadow in window captures.",
@@ -1179,6 +1228,9 @@ pub fn stored_shortcuts() -> Shortcuts {
 pub fn stored_settings() -> CliResult<(AfterCaptureSettings, AfterCaptureStore)> {
     let store = AfterCaptureStore::default_location().map_err(CliError::Core)?;
     let profile = store.inferred_profile();
+    // Schema migration, including folding the retired Smart Frame flag into
+    // Scenes, belongs to the store's versioned load. Doing it here would miss
+    // every other caller that loads the document directly, the GUI included.
     let settings = store.load(profile).map_err(CliError::Core)?;
     Ok((settings, store))
 }
@@ -1278,21 +1330,154 @@ pub fn retention_policy(
     })
 }
 
-/// Whether GUI screenshots should receive Smart Frame before any consumer runs.
-pub fn smart_frame_after_capture(persisted: &AfterCaptureSettings) -> CliResult<bool> {
+/// Whether window captures keep the window's own drop shadow.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] if the stored value is not a boolean.
+pub fn window_shadow(persisted: &AfterCaptureSettings) -> CliResult<bool> {
     let shortcuts = Shortcuts::default();
-    let value = resolve(
-        lookup(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)?,
-        &shortcuts,
-        persisted,
-    )
-    .0;
-    value.parse::<bool>().map_err(|_| {
-        CliError::usage(format!(
-            "{APPLY_SMART_FRAME_AFTER_CAPTURE_KEY} must be `true` or `false`"
-        ))
-    })
+    let value = resolve(lookup(WINDOW_SHADOW_KEY)?, &shortcuts, persisted).0;
+    value
+        .parse::<bool>()
+        .map_err(|_| CliError::usage(format!("{WINDOW_SHADOW_KEY} must be `true` or `false`")))
 }
+
+/// Folds the retired `after-capture.apply-smart-frame` flag into `scenes.default`.
+///
+/// Call this only for a document that predates Scenes — the settings store
+/// decides that from the document version, which is the one place that can tell
+/// an existing install from a new one.
+///
+/// The distinction matters because the two have opposite defaults. The retired
+/// flag defaulted to `false`, so an existing user who never touched it had
+/// framing off and must keep it off; a new install has no history to preserve
+/// and takes the schema default of `auto`. Folding forward therefore maps an
+/// explicit `true` to `auto`, and both an explicit `false` and an absent flag to
+/// `none`.
+///
+/// Returns whether anything changed, so the caller can skip a pointless write.
+pub fn migrate_scenes(persisted: &mut AfterCaptureSettings) -> bool {
+    if persisted.value(SCENES_DEFAULT_KEY).is_some() {
+        return false;
+    }
+    let legacy = persisted
+        .value(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)
+        .map(str::to_owned)
+        .or_else(|| {
+            persisted
+                .value_for_key(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)
+                .map(|value| value.to_string())
+        });
+    let resolved = if legacy.is_some_and(|value| value.trim() == "true") {
+        "auto"
+    } else {
+        "none"
+    };
+    persisted.set_value(SCENES_DEFAULT_KEY, resolved);
+    true
+}
+
+/// Deletes a Scene preset and every assignment that named it.
+///
+/// The one place a preset may be removed. A preset can be deleted from Settings
+/// or from the editor's preset list, and both leave the same wreckage if they
+/// only touch the preset store: `scenes.default` and the per-capture rows keep
+/// pointing at an id that no longer resolves, so the row still reads as
+/// configured while applying nothing. Deleting and re-pointing together — inside
+/// one store update — means no reader ever observes a dangling reference.
+///
+/// The default falls back to `auto` and per-capture rows to `default`, matching
+/// what the pane offers when nothing has been chosen.
+///
+/// # Errors
+///
+/// Returns whatever [`AfterCaptureSettings::delete_smart_frame_preset`] returns,
+/// leaving assignments untouched if the delete itself was refused.
+pub fn forget_scene_preset(
+    persisted: &mut AfterCaptureSettings,
+    id: &str,
+) -> scrozz_core::Result<()> {
+    persisted.delete_smart_frame_preset(id)?;
+    let token = format!("preset:{id}");
+    if persisted.value(SCENES_DEFAULT_KEY) == Some(token.as_str()) {
+        persisted.set_value(SCENES_DEFAULT_KEY, "auto");
+    }
+    for (_, key) in SCENE_CAPTURE_KEYS {
+        if persisted.value(key) == Some(token.as_str()) {
+            persisted.set_value(*key, "default");
+        }
+    }
+    Ok(())
+}
+
+/// Every Scene assignment in force, as raw tokens the UI layer parses.
+///
+/// Returned as `(slug, token)` pairs rather than a typed enum so this module
+/// keeps knowing only about strings; `scrozz_ui::settings` owns the grammar.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] if a Scenes key is missing from the schema.
+pub fn scene_assignments(
+    persisted: &AfterCaptureSettings,
+) -> CliResult<Vec<(&'static str, String)>> {
+    let shortcuts = Shortcuts::default();
+    SCENE_CAPTURE_KEYS
+        .iter()
+        .map(|(slug, key)| {
+            let value = resolve(lookup(key)?, &shortcuts, persisted).0;
+            Ok((*slug, value))
+        })
+        .collect()
+}
+
+/// The default Scene token.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] if the key is missing from the schema.
+pub fn scene_default(persisted: &AfterCaptureSettings) -> CliResult<String> {
+    let shortcuts = Shortcuts::default();
+    Ok(resolve(lookup(SCENES_DEFAULT_KEY)?, &shortcuts, persisted).0)
+}
+
+/// The Scene token in force for one capture type, with `default` resolved.
+///
+/// Returns `None` when no Scene applies, `Some("auto")` for the adaptive
+/// built-in, or `Some("preset:<id>")` for a saved preset.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] if `slug` is not a known capture type or a
+/// Scenes key is missing from the schema.
+pub fn scene_for_capture(
+    persisted: &AfterCaptureSettings,
+    slug: &str,
+) -> CliResult<Option<String>> {
+    let key = SCENE_CAPTURE_KEYS
+        .iter()
+        .find(|(candidate, _)| *candidate == slug)
+        .map(|(_, key)| *key)
+        .ok_or_else(|| CliError::usage(format!("unknown capture type {slug:?}")))?;
+    let shortcuts = Shortcuts::default();
+    let token = resolve(lookup(key)?, &shortcuts, persisted).0;
+    let resolved = if token == "default" {
+        scene_default(persisted)?
+    } else {
+        token
+    };
+    Ok((resolved != "none").then_some(resolved))
+}
+
+/// Capture-type slug to settings key, in the order the pane lists them.
+pub const SCENE_CAPTURE_KEYS: &[(&str, &str)] = &[
+    ("region", "scenes.region"),
+    ("window", "scenes.window"),
+    ("full-screen", "scenes.full-screen"),
+    ("all-displays", "scenes.all-displays"),
+    ("scrolling", "scenes.scrolling"),
+];
 
 /// Resolves the complete Recent Captures Overlay behavior contract.
 pub fn recent_captures_overlay_settings(
@@ -1938,13 +2123,64 @@ mod tests {
     }
 
     #[test]
-    fn after_capture_smart_frame_defaults_off() {
+    fn a_new_install_frames_captures_automatically() {
         let persisted = AfterCaptureSettings::fresh();
+        assert_eq!(lookup(SCENES_DEFAULT_KEY).unwrap().default, "auto");
+        assert_eq!(scene_default(&persisted).unwrap(), "auto");
+        for (slug, _) in SCENE_CAPTURE_KEYS {
+            assert_eq!(
+                scene_for_capture(&persisted, slug).unwrap(),
+                Some("auto".to_owned()),
+                "{slug} should follow the default"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_smart_frame_choice_survives_the_move_to_scenes() {
+        // The whole point of the migration: a user who turned Smart Frame on
+        // keeps framing, and a user who turned it off does not silently get it.
+        for (legacy, expected) in [("true", "auto"), ("false", "none")] {
+            let mut persisted = AfterCaptureSettings::fresh();
+            persisted.set_value(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY, legacy);
+            assert!(migrate_scenes(&mut persisted));
+            assert_eq!(scene_default(&persisted).unwrap(), expected);
+            // Idempotent: a second load must not re-derive anything.
+            assert!(!migrate_scenes(&mut persisted));
+        }
+    }
+
+    #[test]
+    fn an_existing_install_that_never_stored_the_legacy_flag_keeps_framing_off() {
+        // The retired flag defaulted to `false`, so silence in an existing
+        // document means the user had framing off — not that they want the new
+        // install default. Only the store decides a document is "existing";
+        // this asserts what happens once it has.
+        let mut persisted = AfterCaptureSettings::fresh();
+        assert!(migrate_scenes(&mut persisted));
+        assert_eq!(scene_default(&persisted).unwrap(), "none");
+        assert!(!migrate_scenes(&mut persisted));
+    }
+
+    #[test]
+    fn a_per_type_override_wins_over_the_default() {
+        let mut persisted = AfterCaptureSettings::fresh();
+        persisted.set_value(SCENES_DEFAULT_KEY, "none");
+        persisted.set_value("scenes.window", "preset:studio");
         assert_eq!(
-            lookup(APPLY_SMART_FRAME_AFTER_CAPTURE_KEY).unwrap().default,
-            "false"
+            scene_for_capture(&persisted, "window").unwrap(),
+            Some("preset:studio".to_owned())
         );
-        assert!(!smart_frame_after_capture(&persisted).unwrap());
+        assert_eq!(scene_for_capture(&persisted, "region").unwrap(), None);
+        assert!(scene_for_capture(&persisted, "nonsense").is_err());
+    }
+
+    #[test]
+    fn window_shadow_is_on_by_default_and_can_be_turned_off() {
+        let mut persisted = AfterCaptureSettings::fresh();
+        assert!(window_shadow(&persisted).unwrap());
+        persisted.set_value(WINDOW_SHADOW_KEY, "false");
+        assert!(!window_shadow(&persisted).unwrap());
     }
 
     #[test]

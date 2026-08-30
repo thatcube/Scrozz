@@ -88,8 +88,8 @@ use scrozz_ui::{ScrollHudAction, ScrollHudState, ScrollHudStatus};
 
 use crate::{
     after_capture::{
-        ActionEffect, AfterCaptureAction, AfterCaptureSettings, AfterCaptureStore, InstallProfile,
-        MediaKind, current_availability,
+        ActionEffect, AfterCaptureAction, AfterCaptureSettings, AfterCaptureStore, MediaKind,
+        current_availability,
     },
     cli::{Cli, InteractiveMode, SettingsCommand},
     commands::{ScrollingTarget, wayland_portal_picker_target},
@@ -268,10 +268,12 @@ impl Config {
                     config.after_capture_warning = Some(format!(
                         "After Capture settings could not be loaded; preserving the inferred profile defaults for this session: {error}"
                     ));
-                    config.after_capture = match profile {
-                        InstallProfile::Fresh => AfterCaptureSettings::fresh(),
-                        InstallProfile::Existing => AfterCaptureSettings::legacy(),
-                    };
+                    // The same defaults a first run would have written, Scenes
+                    // included: an existing install whose document cannot be
+                    // read must still not start framing captures. Nothing is
+                    // saved here — the unreadable file is left exactly as found
+                    // rather than overwritten with a guess.
+                    config.after_capture = profile.defaults();
                 }
             }
         }
@@ -1683,6 +1685,221 @@ impl App {
         &self,
     ) -> scrozz_ui::RecentCapturesOverlaySettings {
         self.config.recent_captures_overlay
+    }
+
+    /// Whether window captures currently keep the window's drop shadow.
+    #[must_use]
+    pub fn capture_settings(&self) -> scrozz_ui::settings::CaptureSettings {
+        scrozz_ui::settings::CaptureSettings {
+            window_shadow: crate::settings::window_shadow(&self.config.after_capture)
+                .unwrap_or(true),
+        }
+    }
+
+    /// Everything the Scenes pane draws, resolved from the persisted document.
+    ///
+    /// The preset library is the saved Smart Frame preset list: Scenes is a
+    /// presentation surface over the same store the editor writes to, so
+    /// "Save Scene as Preset" needs no second persistence path.
+    #[must_use]
+    pub fn scenes_model(&self) -> scrozz_ui::settings::ScenesModel {
+        use scrozz_ui::settings::{
+            SceneAssignment, SceneCapture, SceneChoice, ScenePreset, ScenePreviewStyle, ScenesModel,
+        };
+
+        let persisted = &self.config.after_capture;
+        let default = crate::settings::scene_default(persisted)
+            .map_or(SceneChoice::Auto, |token| SceneChoice::from_value(&token));
+        let assignments = crate::settings::scene_assignments(persisted)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(slug, token)| {
+                let kind = SceneCapture::from_slug(slug)?;
+                Some((kind, SceneAssignment::from_value(&token)))
+            })
+            .collect();
+        let mut presets = vec![ScenePreset::auto()];
+        presets.extend(
+            persisted
+                .smart_frame_presets()
+                .iter()
+                .map(|preset| ScenePreset {
+                    id: preset.id.clone(),
+                    name: preset.name.clone(),
+                    builtin: false,
+                    style: ScenePreviewStyle::from_preset(&preset.settings),
+                }),
+        );
+        ScenesModel {
+            default,
+            assignments,
+            presets,
+            has_recent_capture: self.newest_screenshot_capture().is_some(),
+        }
+    }
+
+    /// The most recent still capture, newest card first.
+    fn newest_screenshot_capture(&self) -> Option<scrozz_store::CaptureId> {
+        let mut candidates: Vec<_> = self.card_capture_ids.iter().collect();
+        candidates.sort_by_key(|(card, _)| std::cmp::Reverse(card.0));
+        candidates
+            .into_iter()
+            .map(|(_, capture)| capture)
+            .find(|capture| !self.history_entry_is_recording(capture))
+            .cloned()
+    }
+
+    /// Persists capture fidelity preferences.
+    pub fn edit_capture_settings(&mut self, settings: scrozz_ui::settings::CaptureSettings) {
+        if settings == self.capture_settings() {
+            return;
+        }
+        self.store_scene_value(
+            crate::settings::WINDOW_SHADOW_KEY,
+            &settings.window_shadow.to_string(),
+        );
+    }
+
+    /// Applies one Scenes request, persisting assignments and preset edits.
+    pub fn handle_scenes_event(&mut self, event: scrozz_ui::settings::ScenesEvent) {
+        use scrozz_ui::settings::ScenesEvent;
+
+        match event {
+            ScenesEvent::SetDefault(choice) => {
+                self.store_scene_value(crate::settings::SCENES_DEFAULT_KEY, &choice.to_value());
+            }
+            ScenesEvent::SetAssignment(kind, assignment) => {
+                let Some((_, key)) = crate::settings::SCENE_CAPTURE_KEYS
+                    .iter()
+                    .find(|(slug, _)| *slug == kind.slug())
+                else {
+                    return;
+                };
+                self.store_scene_value(key, &assignment.to_value());
+            }
+            ScenesEvent::CreateFromCapture => {
+                if let Some(capture) = self.newest_screenshot_capture() {
+                    let card = self.pipeline.allocate();
+                    if !self.pipeline.post(Job::OpenHistoryEditor { capture, card }) {
+                        self.note("the capture worker has gone");
+                    }
+                } else {
+                    self.begin_capture(CaptureOrigin::MenuBar, CaptureKind::Region);
+                }
+            }
+            ScenesEvent::RenamePreset { id, name } => self.edit_scene_preset(&id, Some(name)),
+            ScenesEvent::DuplicatePreset(id) => self.duplicate_scene_preset(&id),
+            ScenesEvent::DeletePreset(id) => self.edit_scene_preset(&id, None),
+        }
+    }
+
+    fn store_scene_value(&mut self, key: &str, value: &str) {
+        let Some(store) = self.config.after_capture_store.clone() else {
+            self.note("Scenes were not changed because no config directory is available");
+            return;
+        };
+        let key = key.to_owned();
+        let value = value.to_owned();
+        match store.update(store.inferred_profile(), |latest| {
+            latest.set_value(key.clone(), value.clone());
+            Ok(())
+        }) {
+            Ok(updated) => self.config.after_capture = updated,
+            Err(error) => self.note(format!("Scenes were not saved: {error}")),
+        }
+    }
+
+    /// Renames a preset, or deletes it when `name` is `None`.
+    ///
+    /// Assignments naming a deleted preset fall back to the default rather than
+    /// dangling: a row pointing at nothing would silently apply no Scene while
+    /// still reading as configured.
+    fn edit_scene_preset(&mut self, id: &str, name: Option<String>) {
+        let Some(store) = self.config.after_capture_store.clone() else {
+            self.note("Scenes were not changed because no config directory is available");
+            return;
+        };
+        let id = id.to_owned();
+        let token = format!("preset:{id}");
+        let outcome = store.update(store.inferred_profile(), |latest| {
+            match name.clone() {
+                Some(name) => {
+                    let Some(mut preset) = latest
+                        .smart_frame_presets()
+                        .iter()
+                        .find(|preset| preset.id == id)
+                        .cloned()
+                    else {
+                        return Ok(());
+                    };
+                    preset.name = name;
+                    latest.upsert_smart_frame_preset(preset)?;
+                }
+                None => crate::settings::forget_scene_preset(latest, &id)?,
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(updated) => self.config.after_capture = updated,
+            Err(error) => self.note(format!("Scenes were not saved: {error}")),
+        }
+    }
+
+    fn duplicate_scene_preset(&mut self, id: &str) {
+        let Some(store) = self.config.after_capture_store.clone() else {
+            self.note("Scenes were not changed because no config directory is available");
+            return;
+        };
+        let id = id.to_owned();
+        let source = self
+            .config
+            .after_capture
+            .smart_frame_presets()
+            .iter()
+            .find(|preset| preset.id == id)
+            .cloned();
+        let outcome = store.update(store.inferred_profile(), |latest| {
+            // Duplicating the immutable built-in has to synthesize one: `Auto`
+            // is not in the preset list, so there is nothing to clone from.
+            let mut preset = source.clone().unwrap_or_default();
+            if id == scrozz_ui::settings::AUTO_PRESET_ID {
+                preset.name = "Auto".to_owned();
+            }
+            let taken: Vec<_> = latest
+                .smart_frame_presets()
+                .iter()
+                .map(|preset| preset.name.clone())
+                .collect();
+            let base = format!("{} copy", preset.name);
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while taken.contains(&name) {
+                name = format!("{base} {suffix}");
+                suffix += 1;
+            }
+            preset.name = name;
+            // Lowest free ordinal rather than a random id: reproducible, and a
+            // settings file stays readable by a human debugging it.
+            let mut ordinal = 1;
+            loop {
+                let candidate = format!("scene-{ordinal}");
+                if !latest
+                    .smart_frame_presets()
+                    .iter()
+                    .any(|preset| preset.id == candidate)
+                {
+                    preset.id = candidate;
+                    break;
+                }
+                ordinal += 1;
+            }
+            latest.upsert_smart_frame_preset(preset)?;
+            Ok(())
+        });
+        match outcome {
+            Ok(updated) => self.config.after_capture = updated,
+            Err(error) => self.note(format!("Scenes were not saved: {error}")),
+        }
     }
 
     /// Services every source once. Never blocks.
@@ -4791,7 +5008,11 @@ impl App {
             PickerMode::Display => scrozz_capture::ApplePickerMode::Display,
             PickerMode::WindowOrDisplay => scrozz_capture::ApplePickerMode::WindowOrDisplay,
         };
-        match picker.present(native_mode) {
+        // The picker answers on its own callback, so the shadow preference is
+        // latched now rather than read when the selection arrives.
+        let include_window_shadow =
+            crate::settings::window_shadow(&self.config.after_capture).unwrap_or(true);
+        match picker.present(native_mode, include_window_shadow) {
             Ok(()) => {
                 self.apple_picker = Some(picker);
             }
@@ -5043,28 +5264,8 @@ impl App {
                 unavailable_reason: availability.reason.map(str::to_owned),
             }
         };
-        let mut rows = vec![AfterCaptureRow {
-            screenshot_id: crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY.to_owned(),
-            recording_id: None,
-            label: "Apply Smart Frame".to_owned(),
-            description:
-                "Create one adaptive presentation revision before any screenshot action runs."
-                    .to_owned(),
-            screenshot: AfterCaptureCell {
-                enabled: self
-                    .config
-                    .after_capture
-                    .value(crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)
-                    .is_some_and(|value| value == "true"),
-                available: true,
-                unavailable_reason: None,
-            },
-            recording: AfterCaptureCell {
-                enabled: false,
-                available: false,
-                unavailable_reason: Some("Smart Frame applies only to screenshots.".to_owned()),
-            },
-        }];
+        // Presentation lives in Scenes; this pane answers destinations only.
+        let mut rows: Vec<AfterCaptureRow> = Vec::new();
         rows.extend(AfterCaptureAction::UI_ORDER.into_iter().map(|action| {
             AfterCaptureRow {
                 screenshot_id: action.setting_key(MediaKind::Screenshot),
@@ -5087,19 +5288,7 @@ impl App {
         }
 
         let mut changes = Vec::new();
-        let mut apply_smart_frame = None;
         for edit in edits {
-            if edit.id == crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY {
-                if edit.media != AfterCaptureMedia::Screenshot {
-                    self.note(format!(
-                        "{} was not changed because it arrived from the wrong settings column",
-                        edit.id
-                    ));
-                    continue;
-                }
-                apply_smart_frame = Some(edit.enabled);
-                continue;
-            }
             let Some((media, action)) = AfterCaptureSettings::resolve_key(&edit.id) else {
                 self.note(format!(
                     "unknown After Capture setting {:?} was ignored",
@@ -5131,7 +5320,7 @@ impl App {
             }
             changes.push((media, action, edit.enabled));
         }
-        if changes.is_empty() && apply_smart_frame.is_none() {
+        if changes.is_empty() {
             return;
         }
         let Some(store) = self.config.after_capture_store.clone() else {
@@ -5143,12 +5332,6 @@ impl App {
         match store.update(store.inferred_profile(), |latest| {
             for &(media, action, enabled) in &changes {
                 latest.set(media, action, enabled);
-            }
-            if let Some(enabled) = apply_smart_frame {
-                latest.set_value(
-                    crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY,
-                    enabled.to_string(),
-                );
             }
             Ok(())
         }) {
@@ -5513,6 +5696,10 @@ impl App {
     }
 
     /// Removes one custom Smart Frame preset and updates the live policy snapshot.
+    ///
+    /// Shares [`crate::settings::forget_scene_preset`] with the Settings-side
+    /// delete so a preset can never be removed while Scene assignments still
+    /// name it, whichever list the user deleted it from.
     pub fn delete_smart_frame_preset(
         &mut self,
         preset_id: &str,
@@ -5524,7 +5711,7 @@ impl App {
         })?;
         let updated = store
             .update(store.inferred_profile(), |settings| {
-                settings.delete_smart_frame_preset(preset_id)
+                crate::settings::forget_scene_preset(settings, preset_id)
             })
             .map_err(CliError::Core)?;
         let presets = updated.smart_frame_presets().to_vec();
@@ -7941,6 +8128,7 @@ pub fn menu_actions() -> Vec<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::after_capture::InstallProfile;
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
     use scrozz_core::{
@@ -11193,7 +11381,7 @@ mod tests {
     fn after_capture_rows_expose_real_capabilities_not_inert_controls() {
         let (app, _) = app();
         let rows = app.after_capture_rows();
-        assert_eq!(rows.len(), AfterCaptureAction::UI_ORDER.len() + 1);
+        assert_eq!(rows.len(), AfterCaptureAction::UI_ORDER.len());
         assert!(
             rows.iter().all(|row| !row.label.contains("Quick Access")),
             "{rows:?}"
@@ -11215,13 +11403,13 @@ mod tests {
         assert!(pin.recording_id.is_none());
         assert!(pin.recording.unavailable_reason.is_some());
 
-        let smart_frame = rows
-            .iter()
-            .find(|row| row.screenshot_id == crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY)
-            .expect("Smart Frame row");
-        assert!(!smart_frame.screenshot.enabled);
-        assert!(smart_frame.screenshot.available);
-        assert!(smart_frame.recording_id.is_none());
+        // Presentation moved to Scenes: After Capture answers destinations only.
+        assert!(
+            rows.iter().all(|row| {
+                row.screenshot_id != crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY
+            }),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -11261,9 +11449,8 @@ mod tests {
     }
 
     #[test]
-    fn after_capture_smart_frame_is_opt_in_and_persists() {
-        let root =
-            std::env::temp_dir().join(format!("scrozz-app-smart-frame-{}", std::process::id()));
+    fn scene_assignments_persist_and_after_capture_no_longer_frames() {
+        let root = std::env::temp_dir().join(format!("scrozz-app-scenes-{}", std::process::id()));
         let store = AfterCaptureStore::new(root.join("settings.json"));
         let surface = Recording::new();
         let mut config = Config::sealed();
@@ -11277,16 +11464,104 @@ mod tests {
         )
         .expect("sealed app");
 
-        app.edit_after_capture(&[AfterCaptureEdit {
-            id: crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY.to_owned(),
-            media: AfterCaptureMedia::Screenshot,
-            enabled: true,
-        }]);
-        assert!(crate::settings::smart_frame_after_capture(&app.config.after_capture).unwrap());
+        // Presentation is not an After Capture action any more.
+        assert!(
+            app.after_capture_rows()
+                .iter()
+                .all(|row| !row.label.contains("Smart Frame")),
+        );
+
+        use scrozz_ui::settings::{SceneAssignment, SceneCapture, SceneChoice, ScenesEvent};
+        app.handle_scenes_event(ScenesEvent::SetDefault(SceneChoice::None));
+        app.handle_scenes_event(ScenesEvent::SetAssignment(
+            SceneCapture::Window,
+            SceneAssignment::Explicit(SceneChoice::Auto),
+        ));
+
+        // A window capture frames, everything else follows the `none` default.
+        assert_eq!(
+            crate::settings::scene_for_capture(&app.config.after_capture, "window").unwrap(),
+            Some("auto".to_owned())
+        );
+        assert_eq!(
+            crate::settings::scene_for_capture(&app.config.after_capture, "region").unwrap(),
+            None
+        );
         drop(app);
 
         let restarted = store.load(InstallProfile::Fresh).unwrap();
-        assert!(crate::settings::smart_frame_after_capture(&restarted).unwrap());
+        assert_eq!(
+            crate::settings::scene_for_capture(&restarted, "window").unwrap(),
+            Some("auto".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleting_a_preset_from_the_editor_takes_its_assignments_with_it() {
+        // The editor's preset list and the Scenes pane delete the same preset.
+        // If only one of them re-points the assignments, the rows that named it
+        // keep reading as configured while resolving to nothing at all.
+        use scrozz_ui::settings::{SceneAssignment, SceneCapture, SceneChoice, ScenesEvent};
+
+        let root =
+            std::env::temp_dir().join(format!("scrozz-app-preset-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let mut config = Config::sealed();
+        config.after_capture = AfterCaptureSettings::fresh();
+        store.save(&config.after_capture).unwrap();
+        config.after_capture_store = Some(store.clone());
+        let mut app = App::new(
+            config,
+            Box::new(Recording::new()),
+            Arc::new(UnsupportedSelector::headless()),
+            false,
+        )
+        .expect("sealed app");
+
+        let preset = SmartFramePreset::new(
+            "notes",
+            "Notes",
+            scrozz_annotate::SmartFramePresetSettings::default(),
+        )
+        .unwrap();
+        app.upsert_smart_frame_preset(preset).unwrap();
+        app.handle_scenes_event(ScenesEvent::SetDefault(SceneChoice::Preset(
+            "notes".to_owned(),
+        )));
+        app.handle_scenes_event(ScenesEvent::SetAssignment(
+            SceneCapture::Window,
+            SceneAssignment::Explicit(SceneChoice::Preset("notes".to_owned())),
+        ));
+        assert_eq!(
+            crate::settings::scene_for_capture(&app.config.after_capture, "window").unwrap(),
+            Some("preset:notes".to_owned())
+        );
+
+        // The editor-side entry point, not the Scenes pane's.
+        app.delete_smart_frame_preset("notes").unwrap();
+
+        assert_eq!(
+            crate::settings::scene_default(&app.config.after_capture).unwrap(),
+            "auto",
+            "the default must not name a preset that is gone"
+        );
+        assert_eq!(
+            crate::settings::scene_for_capture(&app.config.after_capture, "window").unwrap(),
+            Some("auto".to_owned()),
+            "an explicit row falls back to the default it was overriding"
+        );
+        drop(app);
+
+        let restarted = store.load(InstallProfile::Fresh).unwrap();
+        for (_, key) in crate::settings::SCENE_CAPTURE_KEYS {
+            assert_ne!(restarted.value(key), Some("preset:notes"));
+        }
+        assert_ne!(
+            restarted.value(crate::settings::SCENES_DEFAULT_KEY),
+            Some("preset:notes")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -55,8 +55,9 @@ use std::{
 };
 
 use scrozz_annotate::{
-    AnalysisCancellation, Document, DocumentData, Renderer, SkiaRenderer, SmartFrameAnalysis,
-    analyze_smart_frame,
+    AnalysisCancellation, Beautification, Document, DocumentData, GeneratedStyle, PresetBackground,
+    Renderer, SkiaRenderer, SmartFrameAnalysis, SmartFramePresetSettings, SourceInsets,
+    analyze_scene_with_style, analyze_smart_frame,
 };
 use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError,
@@ -73,6 +74,7 @@ use scrozz_store::{
 };
 use scrozz_ui::editor::RevisionedFrame;
 use scrozz_ui::history::{HistoryEntry, HistoryPage, HistoryThumbnail};
+use scrozz_ui::settings::SceneChoice;
 
 use crate::{
     after_capture::{
@@ -91,6 +93,33 @@ use crate::{
     },
     platform,
 };
+
+/// What a resolved Scene does to a freshly taken capture.
+///
+/// Scenes has three answers and they are not interchangeable: leave it alone,
+/// derive a treatment from the capture, or apply settings the user already
+/// chose. Collapsing them to "framed or not" loses the third and silently
+/// re-derives what a named preset had already decided.
+#[derive(Debug, Clone)]
+enum ScenePlan {
+    /// Keep the capture exactly as taken.
+    Untouched,
+    /// Derive the whole treatment from the capture itself.
+    Analyze,
+    /// Apply a named preset's stored settings.
+    Preset {
+        settings: Box<SmartFramePresetSettings>,
+        /// Generated direction to resolve from the capture, if any.
+        resolve_background: Option<GeneratedStyle>,
+    },
+}
+
+impl ScenePlan {
+    /// Whether applying this plan produces a frame different from the capture.
+    const fn alters_frame(&self) -> bool {
+        !matches!(self, Self::Untouched)
+    }
+}
 
 const MAX_ANALYSIS_CACHE_ENTRIES: usize = 32;
 
@@ -2322,7 +2351,10 @@ impl Worker {
             }
         };
 
-        let include_window_shadow = target.is_window();
+        // Only a window capture has a shadow to include, and Settings decides
+        // whether it is kept.
+        let include_window_shadow =
+            target.is_window() && crate::settings::window_shadow(policy).unwrap_or(true);
         let request = CaptureRequest {
             target,
             cursor: CursorMode::Hidden,
@@ -2356,15 +2388,19 @@ impl Worker {
         policy: &AfterCaptureSettings,
     ) -> CliResult<ReadyCapture> {
         let mut document = Document::new(capture);
-        let apply_smart_frame = crate::settings::smart_frame_after_capture(policy)?;
-        let editor_source = if apply_smart_frame {
+        // Presentation is a Scenes decision now, resolved per capture type with
+        // the pane's own `default` fallback.
+        let scene_slug = Self::scene_slug(kind, document.source().provenance);
+        let plan = Self::scene_plan(policy, scene_slug)?;
+        let alters_frame = plan.alters_frame();
+        let editor_source = if alters_frame {
             Some(Arc::new(
                 FrameEncoder::new().encode(&document.source().frame, ImageFormat::Png)?,
             ))
         } else {
             None
         };
-        let frame = Self::prepare_after_capture_revision(&mut document, apply_smart_frame)?;
+        let frame = Self::prepare_after_capture_revision(&mut document, plan)?;
         let bytes = Arc::new(FrameEncoder::new().encode(&frame, ImageFormat::Png)?);
 
         // Finalized bytes and metadata exist before any action runs. Copy is
@@ -2389,7 +2425,7 @@ impl Worker {
                 .and_then(|store| store.record(id).ok().flatten())
                 .is_some_and(|record| matches!(record.image, ImageState::Present { .. }))
         });
-        if apply_smart_frame {
+        if alters_frame {
             self.derived_documents.insert(card, document.data());
         }
         self.vault.store(
@@ -2465,21 +2501,129 @@ impl Worker {
         })
     }
 
+    /// Which Scenes row governs a capture.
+    ///
+    /// All-in-One is not a capture shape; it resolves to one during selection.
+    /// The capture's own provenance is the only record of what the user
+    /// actually committed to, so it — not the launching kind — picks the row.
+    fn scene_slug(kind: CaptureKind, provenance: Provenance) -> &'static str {
+        match kind {
+            CaptureKind::Window => "window",
+            CaptureKind::Fullscreen => "full-screen",
+            CaptureKind::AllDisplays => "all-displays",
+            CaptureKind::Scrolling => "scrolling",
+            CaptureKind::Region => "region",
+            CaptureKind::AllInOne => match provenance {
+                Provenance::Window => "window",
+                Provenance::Display => "full-screen",
+                Provenance::AllDisplays => "all-displays",
+                Provenance::Stitched => "scrolling",
+                Provenance::Region => "region",
+            },
+        }
+    }
+
+    /// Turns the stored Scene for a capture type into what to actually do.
+    ///
+    /// A named preset is stored settings, not a request to re-derive anything;
+    /// only `Auto` analyses the capture. A preset naming a background of
+    /// `Automatic` is the one case that needs both.
+    fn scene_plan(policy: &AfterCaptureSettings, slug: &str) -> CliResult<ScenePlan> {
+        let Some(value) = crate::settings::scene_for_capture(policy, slug)? else {
+            return Ok(ScenePlan::Untouched);
+        };
+        Ok(match SceneChoice::from_value(&value) {
+            SceneChoice::None => ScenePlan::Untouched,
+            SceneChoice::Auto => ScenePlan::Analyze,
+            SceneChoice::Preset(id) => policy
+                .smart_frame_presets()
+                .iter()
+                .find(|preset| preset.id == id)
+                .map_or_else(
+                    || {
+                        // A deleted preset must not silently restyle captures as
+                        // something else, and must not stop the capture either.
+                        tracing::warn!(preset = %id, capture = %slug, "the Scene names a preset that no longer exists; leaving the capture as taken");
+                        ScenePlan::Untouched
+                    },
+                    |preset| ScenePlan::Preset {
+                        settings: Box::new(preset.settings.clone()),
+                        resolve_background: match &preset.settings.background {
+                            PresetBackground::Automatic => Some(GeneratedStyle::Balanced),
+                            PresetBackground::Generated(style) => Some(*style),
+                            _ => None,
+                        },
+                    },
+                ),
+        })
+    }
+
     fn prepare_after_capture_revision(
         document: &mut Document,
-        apply_smart_frame: bool,
+        plan: ScenePlan,
     ) -> CliResult<scrozz_core::Frame> {
-        if !apply_smart_frame {
+        let beautification = match plan {
+            ScenePlan::Untouched => return Ok(document.source().frame.clone()),
+            ScenePlan::Analyze => {
+                Self::analyze_scene(document, GeneratedStyle::Balanced)?.beautification
+            }
+            ScenePlan::Preset {
+                settings,
+                resolve_background,
+            } => {
+                let mut beautification = settings.to_beautification();
+                if let Some(style) = resolve_background {
+                    // The background is the *only* thing `Automatic` defers to
+                    // the capture. Carrying the analysis metadata across too
+                    // would smuggle in its focus point, and with auto balance on
+                    // that silently repositions the subject — so a preset would
+                    // frame differently depending on what it was pointed at.
+                    // Placement stays the preset's own.
+                    let analysis = Self::analyze_scene(document, style)?;
+                    beautification.background = analysis.beautification.background;
+                }
+                Self::constrain_to_provenance(&mut beautification, document.source().provenance);
+                beautification
+            }
+        };
+        if let Err(error) = document.set_beautification(Some(beautification)) {
+            // A preset is cross-capture by design, so it can name framing this
+            // particular capture cannot take. Losing the capture over it would
+            // be far worse than delivering it unframed.
+            tracing::warn!(%error, "the Scene could not be applied to this capture; leaving it as taken");
             return Ok(document.source().frame.clone());
         }
+        Ok(SkiaRenderer.render(document)?)
+    }
+
+    /// Trims framing to what the capture's provenance allows.
+    ///
+    /// Decision D9 forbids inset, synthetic corners, shadow and border on a
+    /// window capture, because the compositor already supplied the subject's
+    /// true shape. A preset is reusable across capture types by design, so it
+    /// may legitimately name values a given capture cannot take; dropping just
+    /// those keeps the rest of the preset instead of losing all of it.
+    fn constrain_to_provenance(beautification: &mut Beautification, provenance: Provenance) {
+        if !provenance.forbids_compositing() {
+            return;
+        }
+        beautification.inset = SourceInsets::default();
+        beautification.corner_radius = 0.0;
+        beautification.shadow = 0.0;
+        beautification.border_width = 0.0;
+    }
+
+    fn analyze_scene(
+        document: &Document,
+        style: GeneratedStyle,
+    ) -> CliResult<SmartFrameAnalysis> {
         let current = SkiaRenderer.render(document)?;
-        let analysis = analyze_smart_frame(
+        Ok(analyze_scene_with_style(
             &current,
             document.source().provenance,
+            style,
             &AnalysisCancellation::default(),
-        )?;
-        document.set_beautification(Some(analysis.beautification))?;
-        Ok(SkiaRenderer.render(document)?)
+        )?)
     }
 
     fn options_for(kind: CaptureKind) -> SelectionOptions {
@@ -4304,7 +4448,7 @@ mod tests {
     use std::sync::Arc;
 
     use scrozz_store::test_support::{
-        ScratchDir, richly_annotated_document, sample_document, scratch_dir,
+        ScratchDir, richly_annotated_document, sample_display_capture, sample_document, scratch_dir,
     };
 
     use super::*;
@@ -4714,11 +4858,22 @@ mod tests {
             .expect("worker outcome")
     }
 
+    use scrozz_annotate::SmartFramePreset;
+
+    fn preset_policy(id: &str, settings: SmartFramePresetSettings) -> AfterCaptureSettings {
+        let mut policy = no_after_capture_actions();
+        policy
+            .upsert_smart_frame_preset(SmartFramePreset::new(id, "Studio", settings).unwrap())
+            .unwrap();
+        policy.set_value(crate::settings::SCENES_DEFAULT_KEY, format!("preset:{id}"));
+        policy
+    }
+
     #[test]
     fn after_capture_smart_frame_is_one_derived_revision_before_consumers() {
         let (_dir, mut worker, _outcomes) = worker_with_store("smart-frame-after-capture");
         let mut policy = no_after_capture_actions();
-        policy.set_value(crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY, "true");
+        policy.set_value(crate::settings::SCENES_DEFAULT_KEY, "auto");
         let source = sample_document(96, 60, 1, 0).source().clone();
         let source_pixels = source.frame.data.clone();
 
@@ -4747,7 +4902,8 @@ mod tests {
         let mut document = sample_document(32, 20, 1, 0);
         let source = document.source().frame.clone();
 
-        let output = Worker::prepare_after_capture_revision(&mut document, false).unwrap();
+        let output =
+            Worker::prepare_after_capture_revision(&mut document, ScenePlan::Untouched).unwrap();
 
         assert!(document.beautification().is_none());
         assert_eq!(output.data, source.data);
@@ -4756,6 +4912,262 @@ mod tests {
         assert_eq!(output.format, source.format);
         assert_eq!(output.color_space, source.color_space);
         assert_eq!(output.scale, source.scale);
+    }
+
+    #[test]
+    fn a_named_scene_applies_its_stored_settings_rather_than_reanalysing() {
+        // The whole point of naming a preset is that the user already decided.
+        // Re-deriving a treatment would silently overrule them.
+        let (_dir, mut worker, _outcomes) = worker_with_store("named-scene");
+        let policy = preset_policy(
+            "studio",
+            SmartFramePresetSettings {
+                padding: 48.0,
+                corner_radius: 3.0,
+                shadow: 0.0,
+                background: PresetBackground::Solid(scrozz_annotate::Color::rgba(
+                    0x20, 0x30, 0x40, 0xff,
+                )),
+                auto_balance: false,
+                ..SmartFramePresetSettings::default()
+            },
+        );
+        // A display capture, because decision D9 forbids most of this framing on
+        // a window capture; that clamp has its own test below.
+        let source = sample_display_capture(96, 60, 1);
+
+        let ready = worker
+            .finish_capture(CaptureKind::Region, CardId(21), source, &policy)
+            .unwrap();
+
+        let capture = ready.card.capture_id.expect("history identity");
+        let stored = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .document(&capture)
+            .unwrap()
+            .and_then(scrozz_store::DocumentState::complete)
+            .expect("complete derived document");
+        let beautification = stored.beautification().expect("the preset was applied");
+        assert!((beautification.padding - 48.0).abs() < f64::EPSILON);
+        assert!((beautification.corner_radius - 3.0).abs() < f64::EPSILON);
+        assert!(
+            !beautification.auto_balance,
+            "analysis must not overrule a stored preset"
+        );
+        assert!(
+            matches!(
+                beautification.background,
+                scrozz_annotate::Background::Solid(_)
+            ),
+            "the preset's own background survived: {:?}",
+            beautification.background
+        );
+    }
+
+    #[test]
+    fn a_named_scene_deferring_to_an_automatic_background_keeps_its_other_values() {
+        // `Automatic` is the one preset value that has to come from the capture.
+        // Everything else stays exactly as saved.
+        let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-automatic");
+        let policy = preset_policy(
+            "auto-bg",
+            SmartFramePresetSettings {
+                padding: 52.0,
+                corner_radius: 7.0,
+                background: PresetBackground::Automatic,
+                auto_balance: false,
+                ..SmartFramePresetSettings::default()
+            },
+        );
+        let source = sample_display_capture(96, 60, 1);
+
+        let ready = worker
+            .finish_capture(CaptureKind::Region, CardId(22), source, &policy)
+            .unwrap();
+
+        let capture = ready.card.capture_id.expect("history identity");
+        let stored = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .document(&capture)
+            .unwrap()
+            .and_then(scrozz_store::DocumentState::complete)
+            .expect("complete derived document");
+        let beautification = stored.beautification().expect("the preset was applied");
+        assert!((beautification.padding - 52.0).abs() < f64::EPSILON);
+        assert!((beautification.corner_radius - 7.0).abs() < f64::EPSILON);
+        assert!(!beautification.auto_balance);
+        assert!(matches!(
+            beautification.background,
+            scrozz_annotate::Background::Automatic(_)
+        ));
+    }
+
+    #[test]
+    fn a_generated_background_does_not_move_where_the_preset_puts_the_subject() {
+        // Resolving a generated direction runs analysis, and analysis knows where the
+        // capture's visual centre is. With auto balance on, letting that focus
+        // ride along would place the subject somewhere the preset never asked
+        // for — the same preset framing two captures differently. Only the
+        // generated background crosses over, using the preset's chosen direction.
+        let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-focus");
+        let policy = preset_policy(
+            "balanced",
+            SmartFramePresetSettings {
+                padding: 48.0,
+                background: PresetBackground::Generated(GeneratedStyle::Vibrant),
+                auto_balance: true,
+                ..SmartFramePresetSettings::default()
+            },
+        );
+        // Heavily lopsided pixels: everything bright is crammed into the left
+        // sixth, so an analysed focus sits far from centre and any leak shows up
+        // as a different placement.
+        let mut source = sample_display_capture(96, 60, 1);
+        let (width, height) = (source.frame.width(), source.frame.height());
+        let stride = source.frame.stride;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let offset = y * stride + x * 4;
+                let value = if x < width as usize / 6 { 0xff } else { 0x08 };
+                source.frame.data[offset] = value;
+                source.frame.data[offset + 1] = value;
+                source.frame.data[offset + 2] = value;
+                source.frame.data[offset + 3] = 0xff;
+            }
+        }
+
+        let ready = worker
+            .finish_capture(CaptureKind::Region, CardId(31), source, &policy)
+            .unwrap();
+
+        let capture = ready.card.capture_id.expect("history identity");
+        let stored = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .document(&capture)
+            .unwrap()
+            .and_then(scrozz_store::DocumentState::complete)
+            .expect("complete derived document");
+        let beautification = stored.beautification().expect("the preset was applied");
+        let scrozz_annotate::Background::Automatic(background) = &beautification.background else {
+            panic!("generated background was not resolved");
+        };
+        assert_eq!(background.style, GeneratedStyle::Vibrant);
+        assert!(
+            beautification.smart_frame.is_none(),
+            "analysis metadata must not ride along with the resolved background"
+        );
+
+        // Everything except the background is the preset's own, byte for byte.
+        let mut expected = SmartFramePresetSettings {
+            padding: 48.0,
+            background: PresetBackground::Generated(GeneratedStyle::Vibrant),
+            auto_balance: true,
+            ..SmartFramePresetSettings::default()
+        }
+        .to_beautification();
+        expected.background = beautification.background.clone();
+        assert_eq!(
+            *beautification, expected,
+            "only the background may come from the capture"
+        );
+    }
+
+    #[test]
+    fn a_named_scene_on_a_window_capture_drops_only_what_decision_d9_forbids() {
+        // A preset is reusable across capture types, so it will name corners and
+        // shadows a window capture cannot take. Failing the capture over that
+        // would lose the screenshot; dropping the whole preset would lose the
+        // user's choice. Only the forbidden fields go.
+        let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-window");
+        let policy = preset_policy(
+            "framed",
+            SmartFramePresetSettings {
+                padding: 40.0,
+                corner_radius: 12.0,
+                shadow: 9.0,
+                border_width: 2.0,
+                inset: scrozz_annotate::SourceInsets::uniform(3.0),
+                background: PresetBackground::Solid(scrozz_annotate::Color::rgba(
+                    0x10, 0x10, 0x10, 0xff,
+                )),
+                ..SmartFramePresetSettings::default()
+            },
+        );
+        // `sample_document` is a window capture.
+        let source = sample_document(96, 60, 1, 0).source().clone();
+        assert!(source.provenance.forbids_compositing());
+
+        let ready = worker
+            .finish_capture(CaptureKind::Window, CardId(23), source, &policy)
+            .unwrap();
+
+        let capture = ready.card.capture_id.expect("history identity");
+        let stored = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .document(&capture)
+            .unwrap()
+            .and_then(scrozz_store::DocumentState::complete)
+            .expect("complete derived document");
+        let beautification = stored.beautification().expect("the outer canvas survived");
+        assert!(
+            (beautification.padding - 40.0).abs() < f64::EPSILON,
+            "the outer canvas is still allowed"
+        );
+        assert!(beautification.preserves_subject_pixels());
+        assert!(beautification.corner_radius <= 0.0);
+        assert!(beautification.shadow <= 0.0);
+        assert!(beautification.border_width <= 0.0);
+        assert!(beautification.inset.is_zero());
+    }
+
+    #[test]
+    fn a_scene_naming_a_deleted_preset_leaves_the_capture_as_taken() {
+        // Falling back to analysis would restyle the capture as something the
+        // user never chose; refusing the capture would be worse still.
+        let mut policy = no_after_capture_actions();
+        policy.set_value(crate::settings::SCENES_DEFAULT_KEY, "preset:gone");
+
+        let plan = Worker::scene_plan(&policy, "region").unwrap();
+
+        assert!(matches!(plan, ScenePlan::Untouched));
+        assert!(!plan.alters_frame());
+    }
+
+    #[test]
+    fn scene_rows_follow_the_capture_all_in_one_actually_produced() {
+        // All-in-One is a launcher, not a shape. Hard-coding it to Region sent
+        // every window grabbed through it to the wrong Scenes row.
+        for (provenance, expected) in [
+            (Provenance::Window, "window"),
+            (Provenance::Display, "full-screen"),
+            (Provenance::AllDisplays, "all-displays"),
+            (Provenance::Stitched, "scrolling"),
+            (Provenance::Region, "region"),
+        ] {
+            assert_eq!(
+                Worker::scene_slug(CaptureKind::AllInOne, provenance),
+                expected,
+                "All-in-One that captured {provenance:?}"
+            );
+        }
+        // An explicitly launched kind still governs; provenance only breaks the
+        // tie All-in-One leaves behind.
+        assert_eq!(
+            Worker::scene_slug(CaptureKind::Region, Provenance::Window),
+            "region"
+        );
+        assert_eq!(
+            Worker::scene_slug(CaptureKind::Scrolling, Provenance::Display),
+            "scrolling"
+        );
     }
 
     #[test]
