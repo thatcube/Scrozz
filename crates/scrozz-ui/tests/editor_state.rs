@@ -91,6 +91,11 @@ fn every_tool_has_a_unique_accelerator() {
 }
 
 #[test]
+fn crop_is_first_in_the_document_palette() {
+    assert_eq!(Tool::ALL[0], Tool::Crop);
+}
+
+#[test]
 fn accelerators_round_trip_to_their_tool() {
     for tool in Tool::ALL {
         assert_eq!(Tool::from_accelerator(tool.accelerator()), Some(tool));

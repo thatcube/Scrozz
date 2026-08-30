@@ -117,6 +117,7 @@ pub enum Tool {
 impl Tool {
     /// Every tool, in palette order.
     pub const ALL: [Self; 11] = [
+        Self::Crop,
         Self::Select,
         Self::Arrow,
         Self::Line,
@@ -127,7 +128,6 @@ impl Tool {
         Self::Highlight,
         Self::Redact,
         Self::Counter,
-        Self::Crop,
     ];
 
     /// The tool's name, for tooltips and accessibility.
