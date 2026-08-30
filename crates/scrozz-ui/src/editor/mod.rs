@@ -666,6 +666,23 @@ impl EditorWindow {
         self.confirm_discard = false;
     }
 
+    /// Reopens the window immediately after [`Self::show`] returned
+    /// [`EditorWindowExit::Done`] but the caller could not actually commit
+    /// the render, so the window must not appear to have closed at all.
+    ///
+    /// `show` already closed the native viewport for this frame before
+    /// returning `Done` (its own doc comment says as much), so nothing here
+    /// undoes that first close -- it only asks the *next* frame's `show`
+    /// call to draw the same viewport again, which looks identical to the
+    /// window never having closed. Kept free of a title argument on
+    /// purpose: the caller only just learned the close needs to be undone,
+    /// not what the window used to be titled, and the title is unchanged.
+    pub fn reopen(&mut self) {
+        self.open = true;
+        self.focus_requested = true;
+        self.confirm_discard = false;
+    }
+
     /// Returns keyboard focus after a system picker closes.
     pub fn request_foreground(&mut self) {
         if self.open {
@@ -915,6 +932,27 @@ mod window_tests {
         let _ = window.open("card:1");
         assert!(std::mem::take(&mut window.focus_requested));
         assert!(!window.focus_requested);
+    }
+
+    #[test]
+    fn reopen_undoes_a_close_show_already_committed_for_this_frame() {
+        // `show` closes the viewport itself the instant it decides Done or
+        // Cancel, before the caller ever sees the exit value -- so this is
+        // the only lever a caller has to say "actually, keep going" when a
+        // Done's render turned out to fail. It must look exactly like the
+        // window never closed: open again, refocused, and with no stale
+        // discard prompt left over from whatever `show` was doing.
+        let mut window = EditorWindow::new(1);
+        let _ = window.open("card:1");
+        std::mem::take(&mut window.focus_requested);
+        window.confirm_discard = true;
+        window.close();
+        assert!(!window.is_open());
+
+        window.reopen();
+        assert!(window.is_open());
+        assert!(std::mem::take(&mut window.focus_requested));
+        assert!(!window.confirm_discard);
     }
 
     #[test]

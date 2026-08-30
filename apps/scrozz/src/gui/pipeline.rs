@@ -316,6 +316,14 @@ pub(crate) enum Job {
         generation: u64,
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
+        /// The same document the render came from.
+        ///
+        /// Kept alongside the pixels so the worker can also refresh its
+        /// in-memory reopen document in the same step -- [`Job::PersistDocument`]
+        /// writes the durable history copy separately and can fail or lag
+        /// independently, and a later [`Job::Open`] must never reconstruct an
+        /// older document than the one this job just committed here.
+        data: Box<DocumentData>,
     },
     /// Analyse one immutable editor revision without blocking capture work.
     AnalyzeSmartFrame {
@@ -1569,6 +1577,25 @@ impl CaptureVault {
     /// this. The now-superseded staged revision is cleared with it, since
     /// keeping it would let a stale `get_revision` answer outlive the commit
     /// it was staged for.
+    /// Replaces a card's own bytes with a committed editor revision.
+    ///
+    /// Unlike [`Self::store_rendered`], which stages a revision alongside the
+    /// untouched capture for a drag that might still be cancelled, this is
+    /// the one path that overwrites what a plain Copy, Save or Upload --
+    /// posted once no editor is open -- actually reads. Called only for a
+    /// committed (Done) edit, mirroring `App::refresh_card_thumbnail`'s
+    /// Done-only call site; a cancelled or discarded edit must never reach
+    /// this. The now-superseded staged revision is cleared with it, since
+    /// keeping it would let a stale `get_revision` answer outlive the commit
+    /// it was staged for.
+    ///
+    /// Backfills [`Cached::editor_source`] from the pre-commit bytes the
+    /// first time a card without one (Smart Frame was off at capture)
+    /// commits an edit. Once this returns, `bytes` is the flattened,
+    /// annotated revision and can no longer serve as a reconstruction base;
+    /// without this backfill a later reopen built from a freshly tracked
+    /// document (see `Worker::commit_card_output`) would draw that
+    /// document's own layer a second time over pixels that already show it.
     fn commit_rendered(&self, card: CardId, bytes: CaptureBytes) -> bool {
         let Ok(mut map) = self.inner.lock() else {
             return false;
@@ -1576,6 +1603,9 @@ impl CaptureVault {
         let Some(cached) = map.get_mut(&card) else {
             return false;
         };
+        if cached.editor_source.is_none() {
+            cached.editor_source = Some(Arc::clone(&cached.bytes.full));
+        }
         cached.bytes = bytes;
         cached.rendered = None;
         true
@@ -1779,7 +1809,8 @@ impl Worker {
                     card,
                     generation,
                     rendered,
-                } => self.commit_card_output(card, generation, &rendered),
+                    data,
+                } => self.commit_card_output(card, generation, &rendered, &data),
                 Job::AnalyzeSmartFrame {
                     card,
                     generation,
@@ -2334,10 +2365,23 @@ impl Worker {
     /// their edit committed -- but never silent about failing to file it,
     /// since a stale card output would otherwise resurrect pixels a
     /// destructive redaction was meant to remove.
-    fn commit_card_output(&mut self, card: CardId, generation: u64, rendered: &RevisionedFrame) {
+    ///
+    /// Also refreshes [`Self::derived_documents`] with `data` in the same
+    /// step as the bytes: `persist_document`'s history write can fail or
+    /// lag independently, and [`Self::open`] must never reconstruct a
+    /// document older than what was just committed here.
+    fn commit_card_output(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        data: &DocumentData,
+    ) {
         match CaptureBytes::from_rendered(generation, rendered) {
             Ok(bytes) => {
-                if !self.vault.commit_rendered(card, bytes) {
+                if self.vault.commit_rendered(card, bytes) {
+                    self.derived_documents.insert(card, data.clone());
+                } else {
                     tracing::warn!(
                         %card,
                         "a committed edit could not be filed: the card had already left the vault"
@@ -2384,20 +2428,33 @@ impl Worker {
     /// presentation canvas for window captures; the editor must know which kind
     /// it holds rather than guess.
     fn open(&mut self, card: CardId) {
-        let durable = self.vault.cached(card).and_then(|cached| cached.capture_id);
-        let document = match durable {
-            Some(capture) => match self.load_document(&capture) {
-                Ok(document) => Ok(document),
-                Err(error) => {
-                    tracing::warn!(
-                        %card,
-                        %error,
-                        "stored document could not be loaded; opening its flattened visible pixels"
-                    );
-                    self.open_cached_document(card)
-                }
-            },
-            None => self.open_cached_document(card),
+        // A committed edit refreshes this in the very same worker step that
+        // replaces the card's own bytes (see `Worker::commit_card_output`),
+        // so whenever an entry exists here it is always at least as fresh
+        // as anything durable history might return -- including when the
+        // history write posted alongside it (`Job::PersistDocument`) is
+        // still pending or has failed outright. Trusting history over this
+        // would risk resurrecting a stale, unredacted document even though
+        // the card's own bytes and thumbnail already show the redaction
+        // committed.
+        let document = if self.derived_documents.contains_key(&card) {
+            self.open_cached_document(card)
+        } else {
+            let durable = self.vault.cached(card).and_then(|cached| cached.capture_id);
+            match durable {
+                Some(capture) => match self.load_document(&capture) {
+                    Ok(document) => Ok(document),
+                    Err(error) => {
+                        tracing::warn!(
+                            %card,
+                            %error,
+                            "stored document could not be loaded; opening its flattened visible pixels"
+                        );
+                        self.open_cached_document(card)
+                    }
+                },
+                None => self.open_cached_document(card),
+            }
         };
         match document {
             Ok(document) => {
@@ -5019,7 +5076,7 @@ mod tests {
 
         let edited = richly_annotated_document(9);
         let rendered = RevisionedFrame::from_document(&edited, 3).expect("render edited revision");
-        worker.commit_card_output(card, 1, &rendered);
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
 
         let committed = worker.vault.get(card).expect("card remains in the vault");
         assert_eq!(
@@ -5061,9 +5118,116 @@ mod tests {
         // The card already left the vault (its editor-only release beat the
         // commit, or it was never captured through this worker) -- filing the
         // commit must not panic and must leave nothing behind.
-        worker.commit_card_output(card, 1, &rendered);
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
 
         assert!(worker.vault.get(card).is_none());
+    }
+
+    #[test]
+    fn a_first_commit_backfills_editor_source_from_the_pre_edit_pixels() {
+        // Finding #3 (round 4), the corruption this backfill exists to
+        // prevent: once a commit overwrites `bytes` with the flattened,
+        // annotated render, that render can no longer serve as the base a
+        // reopen rebuilds a document on top of -- doing so would draw the
+        // very same annotations a second time. `editor_source` is the base
+        // a reopen actually uses (see `capture_from_cache`); a card whose
+        // Smart Frame was off at capture never had one populated at all.
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-commit-backfill-source");
+        let card = CardId(23);
+        let original = richly_annotated_document(1);
+        worker
+            .vault
+            .store_test_capture(card, original.source())
+            .expect("seed the card's own capture");
+        let pre_commit_bytes = worker.vault.get(card).expect("seeded capture").full;
+        assert!(
+            worker
+                .vault
+                .cached(card)
+                .expect("seeded")
+                .editor_source
+                .is_none(),
+            "sanity: a card with Smart Frame off at capture starts without editor_source"
+        );
+
+        let edited = richly_annotated_document(9);
+        let rendered = RevisionedFrame::from_document(&edited, 1).expect("render edited revision");
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
+
+        let after = worker
+            .vault
+            .cached(card)
+            .expect("card remains in the vault");
+        assert_eq!(
+            after.editor_source,
+            Some(pre_commit_bytes),
+            "editor_source must be backfilled with the pre-commit pixels, not left empty or \
+             overwritten with the committed (already annotated) bytes"
+        );
+        assert_ne!(
+            after.bytes.full,
+            after.editor_source.expect("checked above"),
+            "the card's own bytes must still be the newly committed render, not the backfilled \
+             source"
+        );
+    }
+
+    #[test]
+    fn opening_a_committed_card_never_resurrects_a_stale_durable_document() {
+        // Finding #3 (round 4): `Job::PersistDocument` (durable history) and
+        // `Job::CommitCardOutput` (the vault's own bytes) are two
+        // independently-failable jobs posted from the same Done. If
+        // history's write lags or silently fails, `load_document` would
+        // otherwise keep handing back whatever it last held -- an older,
+        // possibly unredacted document -- even though the card's own bytes
+        // already show the edit committed. `derived_documents` is refreshed
+        // in the very same step that replaces those bytes, so `open` must
+        // prefer it whenever both an entry and durable history exist.
+        let (_dir, mut worker, receiver) = worker_with_store("worker-open-prefers-derived");
+        let stale = richly_annotated_document(1);
+        let capture_id = worker
+            .remember_document(&stale)
+            .expect("seed the stale durable history entry");
+
+        let card = CardId(30);
+        let seed_capture = stale.source();
+        let full = FrameEncoder::new()
+            .encode(&seed_capture.frame, ImageFormat::Png)
+            .map(Arc::new)
+            .expect("encode seed capture");
+        worker.vault.store(
+            card,
+            Cached {
+                bytes: CaptureBytes {
+                    generation: None,
+                    revision: 0,
+                    full,
+                    preview: None,
+                },
+                editor_source: None,
+                rendered: None,
+                provenance: seed_capture.provenance,
+                target: seed_capture.target.clone(),
+                scale: seed_capture.frame.scale,
+                color_space: seed_capture.frame.color_space,
+                capture_id: Some(capture_id),
+            },
+        );
+
+        let edited = richly_annotated_document(9);
+        let rendered = RevisionedFrame::from_document(&edited, 2).expect("render edited revision");
+        worker.commit_card_output(card, 1, &rendered, &edited.data());
+
+        worker.open(card);
+        let Outcome::Opened { document, .. } = received(&receiver) else {
+            panic!("opening a committed card should still produce a document");
+        };
+        assert_eq!(
+            document.data(),
+            edited.data(),
+            "a reopen must never be older than the bytes it just committed, even when \
+             durable history still holds a stale pre-edit document"
+        );
     }
 
     #[test]

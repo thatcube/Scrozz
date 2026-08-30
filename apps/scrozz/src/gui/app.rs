@@ -2373,8 +2373,16 @@ impl App {
                 CardEvent::Overflow(id) => {
                     // Releasing an editor's source would strand the window on
                     // pixels it can no longer re-read, so capacity retirement
-                    // waits and resumes against the revision the editor ends on.
-                    if editors.for_card(id).is_some() {
+                    // waits and resumes against the revision the editor ends
+                    // on. The same guard covers a card still being decoded
+                    // for one opened this very frame: `Outcome::Opened` has
+                    // not landed yet, so no live editor exists for the check
+                    // above to find, but retiring the card now would still
+                    // strand that in-flight open (and, per `Outcome::Refused`
+                    // above, the deferral this inserts resolves correctly
+                    // either way -- against the editor once it opens, or
+                    // against no editor at all if the open fails instead).
+                    if editors.for_card(id).is_some() || self.opening_cards.contains(&id) {
                         self.deferred_overflow.insert(id);
                         self.note(format!(
                             "{id} overflow cleanup was deferred while its editor is open"
@@ -4621,13 +4629,35 @@ impl App {
     /// actually reads. Called only for the Done exception D14 sanctions --
     /// never for Cancel or a clean close, both of which must leave a card's own
     /// bytes exactly as they were before the editor opened.
-    pub fn commit_card_output(&mut self, card: CardId, generation: u64, rendered: RevisionedFrame) {
+    ///
+    /// `data` travels alongside the render so the worker can keep its
+    /// in-memory reopen document in lock-step with the bytes it is about to
+    /// replace -- durable history persistence is a separate job posted right
+    /// after this one and can fail or lag independently, and a reopen must
+    /// never reconstruct a document older than what this call just committed.
+    pub fn commit_card_output(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: RevisionedFrame,
+        data: DocumentData,
+    ) {
         let job = Job::CommitCardOutput {
             card,
             generation,
             rendered: Box::new(rendered),
+            data: Box::new(data),
         };
-        if !self.pipeline.post(job) {
+        if self.pipeline.post(job) {
+            // Any retention recorded before now describes the pre-edit
+            // content, not the revision just filed above: trusting it would
+            // let a later overflow or auto-close treat this card as already
+            // durable-and-exported when the newly committed revision has
+            // not actually been saved or uploaded anywhere yet.
+            if self.card_retention.contains_key(&card) {
+                self.card_retention.insert(card, (false, false));
+            }
+        } else {
             self.note(format!(
                 "{card} editor {generation}'s committed edit could not be filed for export: \
                  the capture worker has gone"
@@ -7629,6 +7659,82 @@ mod tests {
 
         assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
         assert!(!app.deferred_auto_close.contains_key(&card));
+    }
+
+    #[test]
+    fn a_committed_done_resets_stale_retention_so_the_next_overflow_re_exports() {
+        // Finding #1 (round 4): `card_retention` is keyed per card, not per
+        // revision. If a card had already been saved and exported once
+        // before the user reopened it and made a destructive redaction, the
+        // recorded `(retained, exported)` describes the pre-edit content --
+        // trusting it after Done would let a later overflow dismiss the card
+        // as "already exported" without ever saving the redacted revision.
+        let (mut app, surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(73);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_capture_ids
+            .insert(card, CaptureId("committed-retention".into()));
+        app.card_retention.insert(card, (true, true));
+
+        let rendered =
+            RevisionedFrame::from_document(editor.document(), 2).expect("render edited revision");
+        app.commit_card_output(card, 1, rendered, editor.document().data());
+
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(false, false)),
+            "a committed edit must invalidate retention recorded for the pre-edit content"
+        );
+
+        // The editor has since closed (Done always closes shortly after
+        // committing); overflow now arrives with no live editor for the card.
+        surface.inject(CardEvent::Overflow(card));
+        app.drain_cards(EditorSnapshots::EMPTY);
+
+        assert!(
+            app.close_after_output.contains(&card),
+            "stale retention flags must not let overflow skip exporting the redacted \
+             revision Done just committed -- only a fresh save, not pre-edit export \
+             history, may let this card leave the display"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "the card must not be dismissed before the redacted revision is actually saved"
+        );
+    }
+
+    #[test]
+    fn an_overflow_racing_a_fresh_open_defers_instead_of_retiring_the_opening_card() {
+        // Finding #4 (round 4), the same deadline race as the sibling
+        // auto-close test above but for capacity retirement: `editors.for_card`
+        // cannot see a decode that only just got queued (it produces no live
+        // editor until the async round trip completes), so without also
+        // checking `opening_cards` overflow would retire the card -- and, per
+        // `handle_overflow`'s no-live-editor branches, potentially dismiss it
+        // outright -- while its editor is still being created.
+        let (mut app, surface) = app();
+        let card = CardId(74);
+        surface.inject(CardEvent::Open(card));
+        surface.inject(CardEvent::Overflow(card));
+
+        app.drain_cards(EditorSnapshots::EMPTY);
+
+        assert!(
+            app.opening_cards.contains(&card),
+            "the open must still proceed"
+        );
+        assert!(
+            app.deferred_overflow.contains(&card),
+            "the same-frame overflow must defer rather than race the open"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "a card must not be retired the same frame its editor starts opening"
+        );
     }
 
     #[test]

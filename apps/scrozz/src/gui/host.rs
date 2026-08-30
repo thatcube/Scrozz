@@ -1085,15 +1085,32 @@ impl Driver {
                             // Upload posted after this window closes reads
                             // the redaction the thumbnail just committed to,
                             // never the original pixels underneath it.
-                            self.app.commit_card_output(card, generation, rendered);
+                            self.app.commit_card_output(
+                                card,
+                                generation,
+                                rendered,
+                                editor.document().data(),
+                            );
+                            self.app
+                                .persist_editor(EditorSnapshot::new(card, generation, editor));
                         }
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "the annotated image could not be rendered for the card thumbnail"
-                        ),
+                        Err(error) => {
+                            // `show` already closed the native viewport for
+                            // this frame before returning `Done` -- nothing
+                            // was committed, so Done must not behave as if
+                            // it had: reopen for the next frame instead of
+                            // falling through to the close/persist/handoff
+                            // below, which would otherwise discard the
+                            // dirty document under the guise of a success.
+                            tracing::warn!(
+                                %error,
+                                "the annotated image could not be rendered for the card thumbnail; \
+                                 keeping the editor open"
+                            );
+                            window.reopen();
+                            continue;
+                        }
                     }
-                    self.app
-                        .persist_editor(EditorSnapshot::new(card, generation, editor));
                 }
                 // Only Done may hand the closing editor's live snapshot to
                 // deferred cleanup; Cancel and a clean close must resolve
@@ -2902,6 +2919,73 @@ mod tests {
         assert!(
             second_request_close.is_none() || second_request_close.unwrap() > fallthrough,
             "Intent::Close must have exactly one dirty-aware close path"
+        );
+    }
+
+    #[test]
+    fn a_failed_done_render_reopens_instead_of_closing() {
+        // Finding #2 (round 4): `show` has already closed the native
+        // viewport for this frame the moment it decided `Done` -- so a
+        // render failure here cannot un-close it, only ask the next frame
+        // to draw it again via `reopen`, and must `continue` past every
+        // step that would otherwise commit, persist or release a document
+        // that was never actually rendered.
+        let source = include_str!("host.rs");
+        let editor = source
+            .split("fn show_editor")
+            .nth(1)
+            .and_then(|body| body.split_once("fn announce_panel"))
+            .map(|(body, _)| body)
+            .expect("editor host");
+
+        let done_render = editor
+            .find("exit == EditorWindowExit::Done && editor.state().is_dirty()")
+            .expect("a dirty Done re-renders for the thumbnail and card cache");
+        let err_arm = editor[done_render..]
+            .find("Err(error) => {")
+            .map(|offset| done_render + offset)
+            .expect("the re-render's failure is handled");
+        let reopen = editor[err_arm..]
+            .find("window.reopen();")
+            .map(|offset| err_arm + offset)
+            .expect("a failed render reopens the window rather than closing it");
+        let continue_stmt = editor[err_arm..]
+            .find("continue;")
+            .map(|offset| err_arm + offset)
+            .expect("a failed render skips the rest of this iteration");
+        let editor_closed = editor
+            .find("self.app.editor_closed(")
+            .expect("Done/Cancel eventually release the editor");
+
+        assert!(
+            reopen < continue_stmt,
+            "reopen must run before the continue that skips commit/persist/close"
+        );
+        assert!(
+            continue_stmt < editor_closed,
+            "the continue must appear before editor_closed so a failed render \
+             never reaches commit_card_output, persist_editor, or editor_closed"
+        );
+
+        // The success arm alone may commit and persist; a failed render's
+        // `continue` must jump clean over both.
+        let ok_arm = editor[done_render..err_arm]
+            .find("Ok(rendered) => {")
+            .map(|offset| done_render + offset)
+            .expect("the successful re-render commits and persists");
+        let commit = editor[ok_arm..err_arm]
+            .find("self.app.commit_card_output(")
+            .map(|offset| ok_arm + offset);
+        let persist = editor[ok_arm..err_arm]
+            .find(".persist_editor(")
+            .map(|offset| ok_arm + offset);
+        assert!(
+            commit.is_some_and(|at| at > ok_arm && at < err_arm),
+            "commit_card_output must be reached only from the Ok arm"
+        );
+        assert!(
+            persist.is_some_and(|at| at > ok_arm && at < err_arm),
+            "persist_editor must be reached only from the Ok arm"
         );
     }
 
