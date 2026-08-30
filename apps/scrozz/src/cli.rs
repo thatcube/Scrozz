@@ -89,7 +89,7 @@ pub struct GlobalArgs {
     #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
 
-    /// Never hand the command to an already-running Scrozz instance.
+    /// Never hand live-state work to an already-running Scrozz instance.
     ///
     /// By default a capture taken while the menu-bar app is running is performed
     /// *by* that app while retaining explicit command-line destinations and
@@ -119,6 +119,9 @@ pub enum Command {
 
     /// Upload an image to storage you control and print a shareable link.
     Share(ShareArgs),
+
+    /// Decode QR codes and barcodes in a capture or image file.
+    Barcodes(BarcodesArgs),
 
     /// Read and write settings.
     Settings(SettingsArgs),
@@ -157,6 +160,7 @@ impl Command {
             },
             Self::Ocr(_) => "ocr".into(),
             Self::Share(_) => "share".into(),
+            Self::Barcodes(_) => "barcodes".into(),
             Self::Settings(args) => match args.command {
                 SettingsCommand::Get { .. } => "settings.get".into(),
                 SettingsCommand::Set { .. } => "settings.set".into(),
@@ -2108,20 +2112,135 @@ pub struct OcrArgs {
     ///
     /// Resolved as a file if a file exists at that path, otherwise as a capture
     /// id. Use `--capture` or `--file` when a script needs no guessing.
-    #[arg(value_name = "CAPTURE|FILE")]
+    #[arg(value_name = "CAPTURE|FILE", conflicts_with = "under_pointer")]
     pub subject: Option<String>,
 
     /// Recognise text in a stored capture.
-    #[arg(long, value_name = "ID", conflicts_with_all = ["subject", "file"])]
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with_all = ["subject", "file", "under_pointer"]
+    )]
     pub capture: Option<String>,
 
     /// Recognise text in an image file.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["subject", "capture"])]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["subject", "capture", "under_pointer"]
+    )]
     pub file: Option<PathBuf>,
+
+    /// Recognise the text currently beneath the global pointer.
+    #[arg(
+        long,
+        conflicts_with_all = ["subject", "capture", "file", "list_languages"]
+    )]
+    pub under_pointer: bool,
 
     /// Discard blocks the engine is less sure of than this.
     #[arg(long, value_name = "0.0-1.0")]
     pub min_confidence: Option<f32>,
+
+    /// Prefer a BCP-47 language tag. Repeat to provide fallbacks.
+    #[arg(long, value_name = "TAG", action = ArgAction::Append)]
+    pub language: Vec<String>,
+
+    /// Infer the language from image content when the backend supports it.
+    #[arg(long, conflicts_with = "language")]
+    pub auto_detect_language: bool,
+
+    /// Print the OCR languages available on this machine.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "subject",
+            "capture",
+            "file",
+            "under_pointer",
+            "min_confidence",
+            "detect_links"
+        ]
+    )]
+    pub list_languages: bool,
+
+    /// Quality versus latency.
+    #[arg(long, value_enum, default_value_t = OcrAccuracy::Accurate)]
+    pub accuracy: OcrAccuracy,
+
+    /// Apply the engine's prose-oriented language correction.
+    #[arg(long)]
+    pub language_correction: bool,
+
+    /// Do not enlarge small images before recognition.
+    #[arg(long)]
+    pub no_upscale: bool,
+
+    /// Preserve visual lines or collapse them into prose.
+    #[arg(long, value_enum, default_value_t = OcrLineBreaks::Preserve)]
+    pub line_breaks: OcrLineBreaks,
+
+    /// Classify URLs, email addresses, and telephone numbers.
+    #[arg(long)]
+    pub detect_links: bool,
+}
+
+/// OCR quality exposed by the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OcrAccuracy {
+    /// Best recognition quality.
+    Accurate,
+    /// Lower latency for live interactions.
+    Fast,
+}
+
+impl OcrAccuracy {
+    /// Converts to the library option.
+    #[must_use]
+    pub const fn to_ocr(self) -> scrozz_ocr::Accuracy {
+        match self {
+            Self::Accurate => scrozz_ocr::Accuracy::Accurate,
+            Self::Fast => scrozz_ocr::Accuracy::Fast,
+        }
+    }
+
+    /// Stable machine-readable token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Accurate => "accurate",
+            Self::Fast => "fast",
+        }
+    }
+}
+
+/// OCR line-break handling exposed by the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OcrLineBreaks {
+    /// Keep one newline per visual line.
+    Preserve,
+    /// Join visual lines with spaces.
+    Collapse,
+}
+
+impl OcrLineBreaks {
+    /// Converts to the library option.
+    #[must_use]
+    pub const fn to_ocr(self) -> scrozz_ocr::LineBreaks {
+        match self {
+            Self::Preserve => scrozz_ocr::LineBreaks::Preserve,
+            Self::Collapse => scrozz_ocr::LineBreaks::Collapse,
+        }
+    }
+
+    /// Stable machine-readable token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Collapse => "collapse",
+        }
+    }
 }
 
 /// What `scrozz ocr` should read.
@@ -2141,28 +2260,7 @@ impl OcrArgs {
     /// Returns [`CliError::Usage`] if nothing was named. `clap` already rejects
     /// naming more than one.
     pub fn resolve(&self) -> CliResult<OcrSubject> {
-        if let Some(id) = &self.capture {
-            return Ok(OcrSubject::Capture(id.clone()));
-        }
-        if let Some(path) = &self.file {
-            return Ok(OcrSubject::File(path.clone()));
-        }
-        match &self.subject {
-            None => Err(CliError::usage(
-                "scrozz ocr needs a capture id or an image file path",
-            )),
-            Some(subject) => Ok(Self::disambiguate(subject)),
-        }
-    }
-
-    /// A path that exists is a file; anything else is a capture id.
-    fn disambiguate(subject: &str) -> OcrSubject {
-        let path = PathBuf::from(subject);
-        if path.is_file() {
-            OcrSubject::File(path)
-        } else {
-            OcrSubject::Capture(subject.to_string())
-        }
+        resolve_image_subject("ocr", self.subject.as_deref(), &self.capture, &self.file)
     }
 
     /// Validates the confidence threshold.
@@ -2178,7 +2276,112 @@ impl OcrArgs {
                 "--min-confidence must be between 0.0 and 1.0, got {min}"
             )));
         }
-        self.resolve().map(|_| ())
+        if self.list_languages || self.under_pointer {
+            Ok(())
+        } else {
+            self.resolve().map(|_| ())
+        }
+    }
+
+    /// Converts command-line controls into the library options.
+    #[must_use]
+    pub fn options(&self) -> scrozz_ocr::Options {
+        scrozz_ocr::Options::new()
+            .with_languages(self.language.iter().cloned())
+            .with_automatic_language_detection(self.auto_detect_language)
+            .with_accuracy(if self.under_pointer {
+                scrozz_ocr::Accuracy::Fast
+            } else {
+                self.accuracy.to_ocr()
+            })
+            .with_language_correction(self.language_correction)
+            .with_upscale(if self.no_upscale {
+                scrozz_ocr::UpscalePolicy::Off
+            } else {
+                scrozz_ocr::UpscalePolicy::Automatic
+            })
+            .with_line_breaks(self.line_breaks.to_ocr())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// barcodes
+// ---------------------------------------------------------------------------
+
+/// Arguments to `scrozz barcodes`.
+#[derive(Debug, Clone, Args)]
+pub struct BarcodesArgs {
+    /// A capture id, or a path to an image file.
+    #[arg(value_name = "CAPTURE|FILE")]
+    pub subject: Option<String>,
+
+    /// Decode codes in a stored capture.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["subject", "file"])]
+    pub capture: Option<String>,
+
+    /// Decode codes in an image file.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["subject", "capture"])]
+    pub file: Option<PathBuf>,
+
+    /// Restrict detection to a stable symbology token such as `qr` or `code-128`.
+    #[arg(long, value_name = "NAME", action = ArgAction::Append)]
+    pub symbology: Vec<String>,
+
+    /// Do not enlarge small codes before detection.
+    #[arg(long)]
+    pub no_upscale: bool,
+}
+
+impl BarcodesArgs {
+    /// Resolves the input image.
+    pub fn resolve(&self) -> CliResult<OcrSubject> {
+        resolve_image_subject(
+            "barcodes",
+            self.subject.as_deref(),
+            &self.capture,
+            &self.file,
+        )
+    }
+
+    /// Converts command-line filters into detector options.
+    #[must_use]
+    pub fn options(&self) -> scrozz_ocr::BarcodeOptions {
+        scrozz_ocr::BarcodeOptions::new()
+            .with_symbologies(
+                self.symbology
+                    .iter()
+                    .map(|name| scrozz_ocr::Symbology::parse(name)),
+            )
+            .with_upscale(if self.no_upscale {
+                scrozz_ocr::UpscalePolicy::Off
+            } else {
+                scrozz_ocr::UpscalePolicy::Automatic
+            })
+    }
+}
+
+fn resolve_image_subject(
+    command: &str,
+    subject: Option<&str>,
+    capture: &Option<String>,
+    file: &Option<PathBuf>,
+) -> CliResult<OcrSubject> {
+    if let Some(id) = capture {
+        return Ok(OcrSubject::Capture(id.clone()));
+    }
+    if let Some(path) = file {
+        return Ok(OcrSubject::File(path.clone()));
+    }
+    let Some(subject) = subject else {
+        return Err(CliError::usage(format!(
+            "scrozz {command} needs a capture id or an image file path"
+        )));
+    };
+    let path = PathBuf::from(subject);
+    if path.is_file() {
+        Ok(OcrSubject::File(path))
+    } else {
+        Ok(OcrSubject::Capture(subject.to_string()))
     }
 }
 
@@ -3795,6 +3998,22 @@ mod tests {
     }
 
     #[test]
+    fn live_pointer_ocr_needs_no_subject_and_always_uses_fast_mode() {
+        let Some(Command::Ocr(args)) =
+            parse(&["scrozz", "ocr", "--under-pointer", "--detect-links"]).command
+        else {
+            panic!("expected ocr")
+        };
+        assert!(args.validate().is_ok());
+        assert_eq!(args.options().accuracy, scrozz_ocr::Accuracy::Fast);
+        assert!(args.detect_links);
+
+        reject(&["scrozz", "ocr", "image.png", "--under-pointer"]);
+        reject(&["scrozz", "ocr", "--capture", "a", "--under-pointer"]);
+        reject(&["scrozz", "ocr", "--list-languages", "--under-pointer"]);
+    }
+
+    #[test]
     fn ocr_needs_a_subject() {
         let Some(Command::Ocr(args)) = parse(&["scrozz", "ocr"]).command else {
             panic!("expected ocr")
@@ -3817,6 +4036,100 @@ mod tests {
             panic!("expected ocr")
         };
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn ocr_controls_map_to_library_options() {
+        let Some(Command::Ocr(args)) = parse(&[
+            "scrozz",
+            "ocr",
+            "a",
+            "--language",
+            "en-US",
+            "--language",
+            "de-DE",
+            "--accuracy",
+            "fast",
+            "--language-correction",
+            "--no-upscale",
+            "--line-breaks",
+            "collapse",
+            "--detect-links",
+        ])
+        .command
+        else {
+            panic!("expected ocr")
+        };
+        let options = args.options();
+        assert_eq!(options.languages, ["en-US", "de-DE"]);
+        assert_eq!(options.accuracy, scrozz_ocr::Accuracy::Fast);
+        assert_eq!(options.upscale, scrozz_ocr::UpscalePolicy::Off);
+        assert_eq!(options.line_breaks, scrozz_ocr::LineBreaks::Collapse);
+        assert!(options.language_correction);
+        assert!(args.detect_links);
+    }
+
+    #[test]
+    fn language_listing_needs_no_image_subject() {
+        let Some(Command::Ocr(args)) = parse(&["scrozz", "ocr", "--list-languages"]).command else {
+            panic!("expected ocr")
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn automatic_language_detection_conflicts_with_explicit_languages() {
+        reject(&[
+            "scrozz",
+            "ocr",
+            "a",
+            "--auto-detect-language",
+            "--language",
+            "en-US",
+        ]);
+    }
+
+    // -- barcodes ---------------------------------------------------------
+
+    #[test]
+    fn barcodes_accepts_file_and_symbology_controls() {
+        let Some(Command::Barcodes(args)) = parse(&[
+            "scrozz",
+            "barcodes",
+            "--file",
+            "fixture.png",
+            "--symbology",
+            "qr",
+            "--symbology",
+            "code-128",
+            "--no-upscale",
+        ])
+        .command
+        else {
+            panic!("expected barcodes")
+        };
+        assert_eq!(
+            args.resolve().unwrap(),
+            OcrSubject::File(PathBuf::from("fixture.png"))
+        );
+        let options = args.options();
+        assert_eq!(
+            options.symbologies,
+            [
+                scrozz_ocr::Symbology::QrCode,
+                scrozz_ocr::Symbology::Code128
+            ]
+        );
+        assert_eq!(options.upscale, scrozz_ocr::UpscalePolicy::Off);
+    }
+
+    #[test]
+    fn barcodes_needs_exactly_one_subject() {
+        let Some(Command::Barcodes(args)) = parse(&["scrozz", "barcodes"]).command else {
+            panic!("expected barcodes")
+        };
+        assert!(args.resolve().is_err());
+        reject(&["scrozz", "barcodes", "positional", "--capture", "stored"]);
     }
 
     // -- settings ---------------------------------------------------------

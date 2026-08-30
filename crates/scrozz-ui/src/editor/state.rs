@@ -1639,7 +1639,7 @@ impl EditorState {
     #[must_use]
     pub fn crop_pixel_sizes(&self) -> Option<((u32, u32), (u32, u32))> {
         let crop = self.crop?;
-        let scale = self.document.source.frame.scale.get();
+        let scale = self.document.source().frame.scale.get();
         let quantise = |value: f64| {
             value
                 .mul_add(scale, 0.0)
@@ -1652,8 +1652,8 @@ impl EditorState {
                 quantise(crop.rect.size.height),
             ),
             (
-                self.document.source.frame.width(),
-                self.document.source.frame.height(),
+                self.document.source().frame.width(),
+                self.document.source().frame.height(),
             ),
         ))
     }
@@ -2762,9 +2762,9 @@ impl EditorState {
         let cancellation = AnalysisCancellation::default();
         let provisional = provisional_smart_frame(
             self.document.logical_size(),
-            self.document.source.frame.scale.get(),
-            self.document.source.provenance,
-            self.document.source.frame.color_space,
+            self.document.source().frame.scale.get(),
+            self.document.source().provenance,
+            self.document.source().frame.color_space,
         );
         self.document
             .set_beautification(Some(provisional))
@@ -2831,9 +2831,9 @@ impl EditorState {
         let cancellation = AnalysisCancellation::default();
         let provisional = provisional_smart_frame(
             self.document.logical_size(),
-            self.document.source.frame.scale.get(),
-            self.document.source.provenance,
-            self.document.source.frame.color_space,
+            self.document.source().frame.scale.get(),
+            self.document.source().provenance,
+            self.document.source().frame.color_space,
         );
         self.document
             .set_beautification(Some(provisional))

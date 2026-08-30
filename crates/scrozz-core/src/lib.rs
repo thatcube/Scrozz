@@ -36,6 +36,7 @@ pub mod geometry;
 pub mod layout;
 pub mod pin;
 pub mod product_copy;
+pub mod revision;
 pub mod scroll;
 pub mod selection;
 pub mod target;
@@ -53,6 +54,7 @@ pub use pin::{
     MAX_OPACITY, MAX_PIN_PHYSICAL_EDGE, MAX_PIN_PHYSICAL_PIXELS, MIN_OPACITY, NudgeStep, Opacity,
     PinBorder, PinChrome, PinChromePolicy, PinId, PinScale, PinState, PinnedSurface,
 };
+pub use revision::ContentRevision;
 pub use scroll::{
     ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
     ScrollSynthesis,

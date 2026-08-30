@@ -251,7 +251,7 @@ fn undo_restores_crop() {
 #[test]
 fn undo_never_disturbs_the_source_image() {
     let (mut doc, mut history) = started();
-    let before = doc.source.frame.data.clone();
+    let before = doc.source().frame.data.clone();
     doc.add_default(Annotation::Redact {
         area: rect(0.0, 0.0, 50.0, 50.0),
         style: RedactStyle::Solid,
@@ -259,7 +259,8 @@ fn undo_never_disturbs_the_source_image() {
     history.commit(&doc);
     history.undo(&mut doc).unwrap();
     assert_eq!(
-        doc.source.frame.data, before,
+        doc.source().frame.data,
+        before,
         "the source is never part of a snapshot, so it can never be restored over"
     );
 }

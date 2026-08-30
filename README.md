@@ -75,7 +75,9 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Recent Captures Overlay | 🟡 | ⬜ | ⬜ | The macOS overlay has reviewed native lifecycle proof and an atomic first-card reveal barrier; the unified build still awaits final hands-on confirmation. GNOME/Wayland cannot position overlays at all — the adaptation is [D31](docs/decisions.md) |
 | Drag-out to another app | ✅ | 🟡 | ⬜ | Native macOS drag is hands-on verified; Windows delayed rendering is implemented but still needs native testing; Linux remains open |
 | Pinned captures | 🟡 | 🟡 | 🟠 | Pin, lock, opacity, zoom and persistence are implemented; native focus and window-manager behavior still need the full platform matrix |
-| Text recognition (OCR) | ✅ | 🟡 | 🚫 | On-device system engines: Vision · `Windows.Media.Ocr` · Linux ships none |
+| Text recognition (OCR) | ✅ | 🟡 | 🟡 | Local only: Vision · packaged `Windows.Media.Ocr` / portable Tesseract · Linux Tesseract. The portable Windows ZIP includes Tesseract, its runtime DLLs, and English data; Linux uses host packages. Missing requested language data produces an actionable error |
+| Barcode and QR reading | ✅ | ✅ | ✅ | A pure-Rust decoder on every platform, with Vision used for macOS symbologies it already covers. Payloads are returned verbatim and never followed |
+| Sensitive-information review | 🟡 | 🟡 | 🟡 | Deterministic local detectors identify possible emails, payment cards, network addresses, phone numbers, token-bearing URLs and likely keys. Findings contain no recognized text, stay unselected until review, and become ordinary secure Redact annotations only after explicit acceptance of the current image revision |
 | Capture history | 🟡 | 🟡 | 🟡 | Persistence, retention, restore/delete/filter UI and editable annotation documents are implemented; aggregate hands-on validation is in progress |
 | Private sharing | 🟡 | 🟡 | 🟡 | Optional BYO S3/R2/B2/MinIO upload; automated signing, encryption and loopback transport tests pass, but no provider has been confirmed by hand |
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
@@ -111,7 +113,8 @@ that step cleanly without it.
 ```bash
 git clone https://github.com/thatcube/scrozz.git
 cd scrozz
-tools/make-app-bundle.sh          # builds and installs /Applications/Scrozz.app
+SCROZZ_SIGNING_MODE=ad-hoc-dev tools/make-app-bundle.sh
+# builds and installs /Applications/Scrozz.app with an explicit local identity
 open /Applications/Scrozz.app
 ```
 
@@ -263,12 +266,13 @@ decision is wrong, say so and change it there first — that is what it is for.
 A screenshot tool sees your screen, including things you never meant to share.
 That earns a direct answer rather than a marketing adjective, so:
 
-**Scrozz contains no AI.** No language model, no inference, nothing generated.
-It has no telemetry, analytics, account, sign-in, or Scrozz server. Text
-recognition runs on device, using the recogniser already built into your
-operating system. A capture leaves the machine only when you explicitly use the
-optional sharing feature, and then it goes only to the S3-compatible storage you
-configured.
+**Scrozz contains no generative AI.** No language model, nothing generated: it
+does not describe or summarise what you capture. It has no telemetry, analytics,
+account, sign-in, or Scrozz server. Text recognition and sensitive-information
+suggestions run on device, through the recogniser built into your operating
+system or a Tesseract installation on your machine. A capture leaves the machine
+only when you explicitly use the optional sharing feature, and then it goes only
+to the S3-compatible storage you configured.
 
 You can check that rather than believe it: the source default build compiles no
 HTTP client. Distributed packages deliberately build with `--features cloud`,

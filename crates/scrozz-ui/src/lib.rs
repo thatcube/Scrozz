@@ -91,6 +91,7 @@ pub mod harness;
 pub mod history;
 pub mod icons;
 pub mod motion;
+pub mod onboarding;
 pub mod paint;
 pub mod permission;
 pub mod pinned;
@@ -99,6 +100,7 @@ mod recording_controls;
 pub mod recording_settings;
 pub mod scrolling;
 pub mod select;
+pub mod sensitive;
 pub mod settings;
 pub mod stack;
 pub mod theme;
@@ -123,6 +125,7 @@ pub use history::{
     HistoryViewModel,
 };
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
+pub use onboarding::{OcrOnboarding, OnboardingResponse};
 pub use recent_captures_overlay::{
     CaptureMedia, CaptureRequest, DismissReason, NativePassthrough, PanelHook, PanelReport,
     PanelSetup, Passthrough, PointerProbe, RecentCapturesOverlayApp, RecentCapturesOverlayEvent,
@@ -140,6 +143,9 @@ pub use select::{
     AxisDirection, DisplayLayout, DragModifiers, FrozenDesktop, FrozenDisplayFrame, FrozenPixel,
     HudEntry, HudModel, HudNav, MagnifierCell, MagnifierConfig, MagnifierGrid, ResizeHandle,
     SelectionAnnouncement, SelectionDecision, SelectionScene, SelectionState, SelectionUi,
+};
+pub use sensitive::{
+    FindingDecision, SensitiveReview, SensitiveReviewResponse, SensitiveReviewScene,
 };
 pub use theme::{Appearance, Elevation, Palette, Radius, Space, Text, Theme};
 pub use video_editor::{

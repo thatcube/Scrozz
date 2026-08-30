@@ -66,7 +66,7 @@ impl SkiaRenderer {
         scale: ScaleFactor,
         target_width: Option<u32>,
     ) -> Result<Frame> {
-        if document.source.provenance.forbids_compositing()
+        if document.source().provenance.forbids_compositing()
             && document
                 .beautification()
                 .is_some_and(|beautification| !beautification.preserves_subject_pixels())
@@ -88,21 +88,21 @@ impl SkiaRenderer {
             None => 0,
         };
         preflight_render(
-            &document.source.frame,
+            &document.source().frame,
             width,
             height,
             false,
             retained_background_bytes,
         )?;
 
-        let source = raster::to_pixmap(&document.source.frame)?;
+        let source = raster::to_pixmap(&document.source().frame)?;
         let bounds = document.logical_bounds();
         let content = document.content_bounds();
         let source_size = scaled_size(bounds, scale)?;
         let crop = crop_rect(bounds, content, scale, source_size)?;
 
         let mut canvas = new_pixmap(source_size.0, source_size.1, "source-sized output")?;
-        let into = ColorTransform::new(ColorSpace::Srgb, document.source.frame.color_space);
+        let into = ColorTransform::new(ColorSpace::Srgb, document.source().frame.color_space);
         let xf = Scaled::with_origin(scale.get(), bounds.origin);
         draw_source(&mut canvas, &source, bounds, xf);
 
@@ -117,7 +117,7 @@ impl SkiaRenderer {
             crop_canvas(canvas, crop)?
         };
         let retained_source_bytes =
-            u64::try_from(document.source.frame.data.len()).map_err(|_| {
+            u64::try_from(document.source().frame.data.len()).map_err(|_| {
                 Error::InvalidRequest("source buffer size is not addressable".to_owned())
             })?;
         let canvas = match document.beautification() {
@@ -127,9 +127,9 @@ impl SkiaRenderer {
                     beautification,
                     beautify::ApplyOptions {
                         scale: scale.get(),
-                        source_scale: document.source.frame.scale.get(),
-                        target_color_space: document.source.frame.color_space,
-                        preserve_source_pixels: document.source.provenance.forbids_compositing(),
+                        source_scale: document.source().frame.scale.get(),
+                        target_color_space: document.source().frame.color_space,
+                        preserve_source_pixels: document.source().provenance.forbids_compositing(),
                         retained_source_bytes,
                         target_width,
                     },
@@ -146,7 +146,7 @@ impl SkiaRenderer {
             )));
         }
 
-        let color_space = if document.source.frame.color_space == ColorSpace::Unknown
+        let color_space = if document.source().frame.color_space == ColorSpace::Unknown
             || document.beautification().is_some_and(|beautification| {
                 matches!(
                     &beautification.background,
@@ -156,7 +156,7 @@ impl SkiaRenderer {
             }) {
             ColorSpace::Unknown
         } else {
-            document.source.frame.color_space
+            document.source().frame.color_space
         };
 
         Ok(raster::from_pixmap(canvas, color_space, scale))
@@ -191,7 +191,7 @@ impl SkiaRenderer {
 impl Renderer for SkiaRenderer {
     /// Composites at the source's own scale, which is the lossless default.
     fn render(&self, document: &Document) -> Result<Frame> {
-        self.render_at(document, document.source.frame.scale)
+        self.render_at(document, document.source().frame.scale)
     }
 }
 

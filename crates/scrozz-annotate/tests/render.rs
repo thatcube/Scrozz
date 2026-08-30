@@ -69,13 +69,14 @@ fn rendering_never_mutates_the_source() {
         },
         Style::redaction(),
     );
-    let before = doc.source.frame.data.clone();
+    let before = doc.source().frame.data.clone();
 
     let _ = SkiaRenderer::new().render(&doc).unwrap();
     let _ = SkiaRenderer::new().render(&doc).unwrap();
 
     assert_eq!(
-        before, doc.source.frame.data,
+        before,
+        doc.source().frame.data,
         "a full-frame redaction must not have touched the document's own pixels"
     );
 }
@@ -87,7 +88,7 @@ fn output_is_premultiplied_and_well_formed() {
     assert_eq!(out.format, PixelFormat::RgbaPremultiplied8);
     assert!(out.is_well_formed());
     assert_eq!(out.stride, out.width() as usize * 4);
-    assert_eq!(out.color_space, doc.source.frame.color_space);
+    assert_eq!(out.color_space, doc.source().frame.color_space);
 }
 
 #[test]
@@ -285,13 +286,12 @@ fn subject_styling_is_refused_by_the_renderer_for_window_captures() {
         ..Default::default()
     };
 
-    // Build it against a permitted capture, then swap the source for a window.
+    // Build it against a permitted capture, then verify the safe replacement
+    // API refuses to create the invalid state the renderer also guards.
     let mut doc = Document::from_data(region_capture(60, 60), data).unwrap();
-    doc.source = window_capture(60, 60);
-
-    let err = SkiaRenderer::new()
-        .render(&doc)
-        .expect_err("a window capture must never be re-styled");
+    let err = doc
+        .replace_source(window_capture(60, 60))
+        .expect_err("a window capture must never be re-framed");
     assert!(format!("{err}").to_lowercase().contains("window"), "{err}");
 }
 

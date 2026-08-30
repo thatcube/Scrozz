@@ -2,14 +2,10 @@
 //!
 //! # The shape of the problem
 //!
-//! Two of Scrozz's three platforms ship a genuinely good text recogniser in the
-//! operating system — Vision on macOS, `Windows.Media.Ocr` on Windows. Using
-//! them instead of a bundled model is not a shortcut: they are better on the
-//! small, antialiased, light-on-dark UI text that screenshots are full of, they
-//! are already localised to whatever languages the user has installed, and they
-//! add nothing to the download. Linux ships no such engine, so per decision D8
-//! that gap is reported honestly rather than papered over with a silent empty
-//! result.
+//! macOS and packaged Windows builds use the operating system's recogniser:
+//! Vision and `Windows.Media.Ocr`, respectively. The portable Windows ZIP has no
+//! package identity and therefore uses the same timeout-bounded local Tesseract
+//! subprocess as Linux. None of these paths sends image content off the machine.
 //!
 //! # What is actually hard
 //!
@@ -44,20 +40,56 @@
 // dependency graph forbids unsafe outright.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use scrozz_core::{Frame, LogicalRect, Result};
+use scrozz_core::{Error, Frame, LogicalRect, Result};
 
+pub mod barcode;
+mod config;
 pub mod layout;
+pub mod links;
+mod live;
 pub mod prepare;
+pub mod sensitive;
 
-pub use layout::plain_text;
+pub use barcode::{
+    Barcode, BarcodeDetector, BarcodeOptions, PortableBarcodes, Symbology, SystemBarcodes,
+};
+pub use config::{
+    AUTO_DETECT_LANGUAGE_KEY, DETECT_LINKS_KEY, KEEP_LINE_BREAKS_KEY, LANGUAGES_KEY, LanguageMode,
+    RuntimeConfig,
+};
+pub use layout::{LineBreaks, plain_text, text};
+pub use links::{Link, LinkKind, links};
+pub use live::{LiveOcr, block_at_point, frame_local_point};
 pub use prepare::UpscalePolicy;
+pub use sensitive::{
+    CancellationToken, FindingConfidence, FindingId, FindingReason, LocalSensitiveDetector,
+    SensitiveCategory, SensitiveFinding, SensitiveScan, SensitiveScanCache, SensitiveScanOptions,
+    SensitiveSource,
+};
+
+/// Optional absolute directory containing a local Tesseract installation.
+///
+/// Portable Windows expects `tesseract.exe` and `tessdata/*.traineddata` below
+/// this directory. Linux expects `tesseract` with the same `tessdata` layout.
+/// When unset, portable Windows uses `tesseract/` beside `scrozz.exe`; Linux
+/// resolves `tesseract` through `PATH`.
+pub const TESSERACT_DIRECTORY_ENV: &str = "SCROZZ_TESSERACT_DIR";
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows", test),
+    feature = "tesseract"
+))]
+mod tesseract;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", feature = "tesseract")
+)))]
 mod unsupported;
 
 /// One recognised span of text.
@@ -73,11 +105,8 @@ pub struct TextBlock {
 
 /// Extracts text from images.
 ///
-/// Every platform ships a competent engine — Vision on macOS, Windows OCR on
-/// Windows — and both are far better than a bundled model at the sizes and
-/// fonts screenshots actually contain. Linux has no system engine, so it needs
-/// Tesseract or an ONNX model; per decision D8 that gap is stated plainly rather
-/// than hidden.
+/// Vision runs on macOS, Windows OCR runs when the process has package identity,
+/// and Tesseract runs on Linux and in the unpackaged Windows artifact.
 pub trait Ocr {
     /// Recognises text in a frame.
     ///
@@ -105,15 +134,18 @@ pub enum Accuracy {
 pub struct Options {
     /// BCP-47 tags in priority order, e.g. `["en-US", "de-DE"]`.
     ///
-    /// Empty means "use the languages the user has configured", which is the
-    /// right default on both platforms.
+    /// Empty means "resolve the languages the user has configured".
     ///
     /// A tag with no installed recogniser is skipped. If *none* of the requested
-    /// languages is available, macOS falls back to automatic language detection
-    /// and Windows returns [`Error::Unsupported`] naming what is installed —
-    /// Windows has no detection mode, and recognising text with the wrong
-    /// recogniser yields plausible nonsense rather than a visible failure.
+    /// languages is available, the backend returns
+    /// [`Error::Unsupported`] naming what is installed. Recognising text with
+    /// the wrong model yields plausible nonsense rather than a visible failure.
     pub languages: Vec<String>,
+    /// Ask a capable backend to infer the language from the image.
+    ///
+    /// This differs from an empty [`Self::languages`] list, which means to use
+    /// the person's configured system languages.
+    pub automatic_language_detection: bool,
     /// Quality/latency trade-off.
     pub accuracy: Accuracy,
     /// Whether to enlarge small images before recognition. Leave on unless the
@@ -126,6 +158,8 @@ pub struct Options {
     /// numbers, and "correcting" `libssl.so.1.1` into English is worse than the
     /// raw read. Turn it on for recognising a photographed document.
     pub language_correction: bool,
+    /// How visual OCR lines are joined for plain-text output.
+    pub line_breaks: LineBreaks,
 }
 
 impl Options {
@@ -143,6 +177,13 @@ impl Options {
         S: Into<String>,
     {
         self.languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Enables or disables explicit automatic language detection.
+    #[must_use]
+    pub const fn with_automatic_language_detection(mut self, enabled: bool) -> Self {
+        self.automatic_language_detection = enabled;
         self
     }
 
@@ -166,22 +207,23 @@ impl Options {
         self.language_correction = enabled;
         self
     }
+
+    /// Sets how visual lines become plain text.
+    #[must_use]
+    pub const fn with_line_breaks(mut self, line_breaks: LineBreaks) -> Self {
+        self.line_breaks = line_breaks;
+        self
+    }
 }
 
 /// The operating system's text recogniser.
 ///
-/// Vision on macOS, `Windows.Media.Ocr` on Windows, and an honest
-/// [`scrozz_core::Error::Unsupported`] elsewhere.
-///
-/// # Extending to Linux
-///
-/// [`Ocr`] is a trait precisely so this type is not the only answer. A Tesseract
-/// or ONNX backend belongs behind an optional Cargo feature in this crate,
-/// implementing [`Ocr`] and reusing [`prepare`] and [`layout`] verbatim — those
-/// two modules are the majority of the work and are already platform-independent
-/// and tested. Nothing is bundled by default: a screenshot tool that silently
-/// grows by an 80 MB language model has made a decision on the user's behalf
-/// that it had no right to make.
+/// Vision on macOS, `Windows.Media.Ocr` in a packaged Windows process, and the
+/// locally installed `tesseract` executable on Linux or portable Windows when
+/// the default `tesseract` feature is enabled. The subprocess integration links
+/// no native library; artifact packaging decides whether to bundle its executable
+/// and models. A missing executable or language package is returned as an
+/// actionable [`scrozz_core::Error::Unsupported`].
 #[derive(Debug, Clone, Default)]
 pub struct SystemOcr {
     options: Options,
@@ -206,13 +248,139 @@ impl SystemOcr {
         &self.options
     }
 
-    /// Whether this build has a working engine.
+    /// Replaces the options used by subsequent recognition calls.
+    pub fn set_options(&mut self, options: Options) {
+        self.options = options;
+    }
+
+    /// Whether this build contains an OCR engine integration.
     ///
-    /// Lets a UI hide or disable the command up front instead of offering
-    /// something that can only fail.
+    /// This is the original const capability API. Call
+    /// [`Self::is_runtime_available`] when installed language models and the
+    /// selected Tesseract runtime must be checked.
     #[must_use]
     pub const fn is_available() -> bool {
-        cfg!(any(target_os = "macos", target_os = "windows"))
+        cfg!(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", feature = "tesseract")
+        ))
+    }
+
+    /// Whether the engine selected for this process is currently usable.
+    ///
+    /// Linux and portable Windows probe the exact Tesseract runtime selected by
+    /// `PATH` or [`TESSERACT_DIRECTORY_ENV`] on every call, so an environment or
+    /// installation change cannot leave a stale positive answer.
+    #[must_use]
+    pub fn is_runtime_available() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            true
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::engine_name().is_ok_and(|engine| match engine {
+                "windows-media-ocr" => {
+                    windows::available_languages().is_ok_and(|languages| !languages.is_empty())
+                }
+                "tesseract" => {
+                    #[cfg(feature = "tesseract")]
+                    {
+                        tesseract::is_available()
+                    }
+                    #[cfg(not(feature = "tesseract"))]
+                    {
+                        false
+                    }
+                }
+                _ => false,
+            })
+        }
+        #[cfg(all(target_os = "linux", feature = "tesseract"))]
+        {
+            tesseract::is_available()
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", feature = "tesseract")
+        )))]
+        {
+            false
+        }
+    }
+
+    /// Backend name suitable for diagnostics and machine output.
+    ///
+    /// # Errors
+    ///
+    /// On Windows, returns a platform error if package identity cannot be
+    /// determined. The packaged artifact selects Windows Media OCR; the portable
+    /// artifact selects the local Tesseract subprocess integration.
+    pub fn engine_name() -> Result<&'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok("vision")
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::engine_name()
+        }
+        #[cfg(all(target_os = "linux", feature = "tesseract"))]
+        {
+            Ok("tesseract")
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", feature = "tesseract")
+        )))]
+        {
+            Ok("unavailable")
+        }
+    }
+
+    /// Whether this backend can infer language from arbitrary image content.
+    #[must_use]
+    pub fn supports_automatic_language_detection() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            macos::supports_automatic_language_detection()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Lists language tags accepted by this backend on this machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when no engine is installed and
+    /// [`Error::Platform`] when a native query fails.
+    pub fn available_languages(&self) -> Result<Vec<String>> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::available_languages(self.options.accuracy)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows::available_languages()
+        }
+        #[cfg(all(target_os = "linux", feature = "tesseract"))]
+        {
+            tesseract::available_languages()
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", feature = "tesseract")
+        )))]
+        {
+            unsupported::available_languages()
+        }
     }
 
     /// Recognises text and returns it as lines, ready to copy.
@@ -221,12 +389,18 @@ impl SystemOcr {
     ///
     /// As [`Ocr::recognize`].
     pub fn recognize_text(&self, frame: &Frame) -> Result<String> {
-        Ok(plain_text(&self.recognize(frame)?))
+        Ok(text(&self.recognize(frame)?, self.options.line_breaks))
     }
 }
 
 impl Ocr for SystemOcr {
     fn recognize(&self, frame: &Frame) -> Result<Vec<TextBlock>> {
+        if self.options.automatic_language_detection && !self.options.languages.is_empty() {
+            return Err(Error::InvalidRequest(
+                "automatic language detection cannot be combined with preferred languages"
+                    .to_string(),
+            ));
+        }
         #[cfg(target_os = "macos")]
         {
             macos::recognize(frame, &self.options)
@@ -235,7 +409,15 @@ impl Ocr for SystemOcr {
         {
             windows::recognize(frame, &self.options)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(all(target_os = "linux", feature = "tesseract"))]
+        {
+            tesseract::recognize(frame, &self.options)
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", feature = "tesseract")
+        )))]
         {
             unsupported::recognize(frame, &self.options)
         }

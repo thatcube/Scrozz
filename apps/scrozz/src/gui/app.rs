@@ -7170,7 +7170,7 @@ mod tests {
         let card = CardId(49);
         app.pipeline
             .captures()
-            .store_test_capture(card, &editor.document().source)
+            .store_test_capture(card, editor.document().source())
             .expect("editor source");
         app.card_retention.insert(card, (true, false));
         app.card_capture_ids
@@ -7278,7 +7278,7 @@ mod tests {
         let card = CardId(55);
         app.pipeline
             .captures()
-            .store_test_capture(card, &editor.document().source)
+            .store_test_capture(card, editor.document().source())
             .expect("source");
         app.card_retention.insert(card, (true, false));
         app.close_after_output.insert(card);
@@ -7638,7 +7638,7 @@ mod tests {
     #[test]
     fn automatic_editor_requests_queue_without_discarding_active_work() {
         let (mut app, _) = app();
-        let capture = redacted_editor().document().source.clone();
+        let capture = redacted_editor().document().source().clone();
         app.editor_requests.push_back(EditorRequest {
             card: CardId(1),
             generation: 1,
@@ -9129,7 +9129,7 @@ mod tests {
             );
             assert_ne!(
                 rendered.frame().data,
-                editor.document().source.frame.data,
+                editor.document().source().frame.data,
                 "the destructive redaction was bypassed with the original pixels"
             );
         }
@@ -9142,7 +9142,7 @@ mod tests {
         let card = CardId(7);
         app.pipeline
             .captures()
-            .store_test_capture(card, &editor.document().source)
+            .store_test_capture(card, editor.document().source())
             .expect("the original capture encodes");
         let original = app
             .pipeline
@@ -9183,7 +9183,7 @@ mod tests {
         assert_eq!(bytes.revision(), editor.state().revision());
         assert_ne!(
             decoded.data,
-            editor.document().source.frame.data,
+            editor.document().source().frame.data,
             "drag exposed the original pixels under a destructive redaction"
         );
         let after = app
@@ -9212,7 +9212,7 @@ mod tests {
         let generation = 3;
         app.pipeline
             .captures()
-            .store_test_capture(card, &editor.document().source)
+            .store_test_capture(card, editor.document().source())
             .expect("the original capture encodes");
         let version = (card, generation, editor.state().revision());
         app.editor_render_failed = Some(version);

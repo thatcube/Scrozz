@@ -22,6 +22,7 @@ pub mod macos;
 pub mod overlay;
 pub mod permissions;
 pub mod pin;
+pub mod pointer;
 pub mod selection;
 pub mod sound;
 pub mod tray;
@@ -47,6 +48,7 @@ pub use overlay::{
     StackLayout, anchor_bottom_left, appkit_to_logical, logical_to_appkit,
 };
 pub use permissions::SystemPermissions;
+pub use pointer::pointer_location;
 pub use selection::{SelectionIntegration, SelectionPlan, resolve_selection};
 pub use sound::{ScreenshotSound, play_screenshot_sound};
 pub use tray::{Tray, TrayAction, TrayEntry};

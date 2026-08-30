@@ -511,6 +511,11 @@ impl Host for Windowed {
                     }
                 };
                 let overlay = RecentCapturesOverlayApp::new(cc, handle, options);
+                // Gated on the GUI workflow existing at all: introducing a
+                // feature that region selection cannot yet perform would be a
+                // promise the app does not keep.
+                let ocr_onboarding_memory = crate::gui::onboarding::OcrOnboardingMemory::system();
+                let ocr_onboarding_visible = crate::gui::onboarding::workflow_available();
                 native.set_frame(logical_frame(geometry));
                 let (color_swatch_store, custom_swatches) =
                     match crate::color_swatches::CustomSwatchStore::default_location() {
@@ -534,6 +539,10 @@ impl Host for Windowed {
                     handle: reporting,
                     selection,
                     settings: scrozz_ui::settings::SettingsWindow::default(),
+                    ocr_onboarding: scrozz_ui::OcrOnboarding,
+                    ocr_onboarding_visible: ocr_onboarding_visible
+                        && !ocr_onboarding_memory.has_seen(),
+                    ocr_onboarding_memory,
                     permission: scrozz_ui::permission::PermissionWindow::default(),
                     permission_resume_armed: false,
                     editor: scrozz_ui::editor::EditorWindow::new(),
@@ -756,6 +765,11 @@ struct Driver {
     handle: RecentCapturesOverlayHandle,
     selection: ClientOverlayController,
     settings: scrozz_ui::settings::SettingsWindow,
+    /// The one-time text-recognition introduction, and the durable marker that
+    /// decides whether it appears without being asked for.
+    ocr_onboarding: scrozz_ui::OcrOnboarding,
+    ocr_onboarding_visible: bool,
+    ocr_onboarding_memory: crate::gui::onboarding::OcrOnboardingMemory,
     permission: scrozz_ui::permission::PermissionWindow,
     permission_resume_armed: bool,
     editor: scrozz_ui::editor::EditorWindow,
@@ -1444,8 +1458,49 @@ impl Driver {
         if let Some(settings) = edits.recent_captures_overlay {
             self.app.edit_recent_captures_overlay(settings);
         }
+        if edits.replay_ocr_onboarding {
+            self.ocr_onboarding_visible = true;
+        }
         if edits.open_sharing {
             self.app.request_sharing_settings();
+        }
+    }
+
+    /// Draws the one-time text-recognition introduction.
+    ///
+    /// A short-lived sheet, gated on the GUI workflow actually existing, and
+    /// never a second Settings surface: replaying it is a request raised by the
+    /// ordinary Settings window's Text Recognition pane.
+    fn show_ocr_onboarding(&mut self, ctx: &egui::Context) {
+        if !self.ocr_onboarding_visible {
+            return;
+        }
+        let viewport = egui::ViewportId::from_hash_of("scrozz-ocr-onboarding");
+        let mut close = false;
+        let mut completed = false;
+        ctx.show_viewport_immediate(
+            viewport,
+            egui::ViewportBuilder::default()
+                .with_title("Text recognition")
+                .with_inner_size([760.0, 500.0])
+                .with_min_inner_size([760.0, 500.0])
+                .with_resizable(false),
+            |ui, _class| {
+                close = ui.ctx().input(|input| input.viewport().close_requested());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    completed = self.ocr_onboarding.ui(ui).completed;
+                });
+            },
+        );
+
+        if close || completed {
+            if let Err(error) = self.ocr_onboarding_memory.mark_seen() {
+                tracing::warn!(%error, "OCR onboarding completion could not be saved");
+            }
+            self.ocr_onboarding_visible = false;
+            if completed {
+                ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -2116,6 +2171,7 @@ impl eframe::App for Driver {
         }
 
         self.show_settings(ui.ctx());
+        self.show_ocr_onboarding(ui.ctx());
         self.show_cloud_settings(ui.ctx());
         self.show_editor(ui.ctx());
         self.show_video_editor(ui.ctx());

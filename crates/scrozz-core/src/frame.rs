@@ -149,6 +149,13 @@ mod tests {
     }
 
     #[test]
+    fn malformed_stride_overflow_is_rejected_without_panicking() {
+        assert!(
+            !frame(PhysicalSize::new(1.0, 2.0), usize::MAX / 2 + 1, Vec::new()).is_well_formed()
+        );
+    }
+
+    #[test]
     fn impossible_buffer_arithmetic_is_rejected() {
         let impossible = frame(
             PhysicalSize::new(1.0, f64::from(u32::MAX)),

@@ -15,24 +15,19 @@
 //!   detector/recogniser pair is far more. Multiplying a screenshot tool's
 //!   download for a feature most users never open is a decision to make loudly,
 //!   if at all — not quietly in a dependency list.
-//! - **Shell out to `tesseract` if it happens to exist.** Unpredictable: results
-//!   depend on which language packs are installed and which of two very
-//!   different engine versions is present, and the failure mode is bad text
-//!   rather than a clear message.
+//! - **Silently shell out to `tesseract` if it happens to exist.** Unpredictable
+//!   unless it is an explicit build capability with discoverable language packs
+//!   and package-aware errors. The default `tesseract` feature provides exactly
+//!   that contract on Linux.
 //! - **Return an empty `Vec`.** The worst option. Indistinguishable from "this
 //!   image contains no text", so the user concludes the feature is broken and
 //!   has no idea why.
 //!
 //! # The recommended path
 //!
-//! Add an optional `tesseract` feature to this crate gated on the `leptonica-
-//! plumbing`/`tesseract` bindings, implementing [`Ocr`](crate::Ocr) exactly as
-//! the other backends do. It needs no new abstraction: [`crate::prepare`] hands
-//! it a tightly packed RGBA8 buffer that maps straight onto a Leptonica `PIX`,
-//! and [`crate::layout`] already turns top-left pixel rectangles into logical
-//! ones with [`pixels_to_physical`](crate::layout::pixels_to_physical). The
-//! platform-specific part is a few dozen lines; everything expensive is shared
-//! and already tested on every target.
+//! Build Linux with the default `tesseract` feature and install the distro's
+//! Tesseract executable plus language data. Scrozz streams a portable image to
+//! the subprocess, so the Rust build remains free of C libraries and bindgen.
 
 use scrozz_core::{Error, Frame, Result};
 
@@ -54,6 +49,16 @@ pub fn recognize(_frame: &Frame, _options: &Options) -> Result<Vec<TextBlock>> {
               with `--features tesseract`. Scrozz does not bundle a language \
               model, so the download stays small for the majority who never \
               use this feature"
+            .to_string(),
+    })
+}
+
+/// Reports that this build has no OCR engine capable of listing languages.
+pub fn available_languages() -> Result<Vec<String>> {
+    Err(Error::Unsupported {
+        what: "OCR language listing".to_string(),
+        why: "this build has no OCR engine. On Linux, install Tesseract and use \
+              Scrozz's default `tesseract` feature"
             .to_string(),
     })
 }

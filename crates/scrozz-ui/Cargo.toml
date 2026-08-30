@@ -15,6 +15,7 @@ scrozz-store.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scrozz-annotate.workspace = true
+scrozz-ocr.workspace = true
 egui.workspace = true
 eframe.workspace = true
 image.workspace = true
@@ -23,6 +24,9 @@ zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dark-light.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

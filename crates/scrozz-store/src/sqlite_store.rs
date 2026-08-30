@@ -1029,7 +1029,7 @@ impl Store for SqliteStore {
 
 impl History for SqliteStore {
     fn insert(&mut self, capture: NewCapture<'_>) -> Result<CaptureId> {
-        let frame = &capture.document.source.frame;
+        let frame = &capture.document.source().frame;
         if !frame.is_well_formed() {
             return Err(Error::InvalidRequest(format!(
                 "frame declares {}×{} at stride {} but holds {} bytes",
@@ -1053,8 +1053,8 @@ impl History for SqliteStore {
             capture.pinned,
             capture.app_name,
             capture.window_title,
-            capture.document.source.provenance,
-            &capture.document.source.target,
+            capture.document.source().provenance,
+            &capture.document.source().target,
             FrameHeader::of(frame),
             Some(digest.clone()),
             byte_len,

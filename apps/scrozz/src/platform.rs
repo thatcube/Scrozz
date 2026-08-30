@@ -219,8 +219,14 @@ pub fn store() -> CliResult<scrozz_store::SqliteStore> {
 /// turns a path into a [`scrozz_core::Frame`]. What remains is the call that
 /// joins them, which lives in `commands::ocr`.
 #[must_use]
-pub fn ocr_engine() -> scrozz_ocr::SystemOcr {
-    scrozz_ocr::SystemOcr::new()
+pub const fn ocr_engine(options: scrozz_ocr::Options) -> scrozz_ocr::SystemOcr {
+    scrozz_ocr::SystemOcr::with_options(options)
+}
+
+/// The best barcode detector for this platform.
+#[must_use]
+pub const fn barcode_engine(options: scrozz_ocr::BarcodeOptions) -> scrozz_ocr::SystemBarcodes {
+    scrozz_ocr::SystemBarcodes::with_options(options)
 }
 
 /// Whether this build has a working OCR engine.
@@ -228,8 +234,8 @@ pub fn ocr_engine() -> scrozz_ocr::SystemOcr {
 /// Lets `scrozz ocr` fail with a platform explanation before doing any work,
 /// rather than after reading a file.
 #[must_use]
-pub const fn ocr_available() -> bool {
-    scrozz_ocr::SystemOcr::is_available()
+pub fn ocr_available() -> bool {
+    scrozz_ocr::SystemOcr::is_runtime_available()
 }
 
 /// Decodes an image file into a frame.
@@ -529,10 +535,10 @@ mod tests {
     }
 
     #[test]
-    fn ocr_availability_matches_the_platforms_that_have_an_engine() {
+    fn ocr_availability_matches_the_selected_runtime() {
         assert_eq!(
             ocr_available(),
-            cfg!(any(target_os = "macos", target_os = "windows"))
+            scrozz_ocr::SystemOcr::is_runtime_available()
         );
     }
 

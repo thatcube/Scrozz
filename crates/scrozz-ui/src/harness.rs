@@ -332,6 +332,8 @@ pub enum Scenario {
     CameraSettings,
     /// The scrolling HUD choosing an axis and reporting stitched progress.
     ScrollingCapture,
+    /// Possible sensitive information shown for explicit review before redaction.
+    SensitiveReview,
 }
 
 impl Scenario {
@@ -378,6 +380,7 @@ impl Scenario {
         Self::RecordingPresenter,
         Self::CameraSettings,
         Self::ScrollingCapture,
+        Self::SensitiveReview,
     ];
 
     /// Every scenario, in stable declaration order.
@@ -434,6 +437,7 @@ impl Scenario {
             Self::SmartFrameUntouched => "smart-frame-untouched",
             Self::SmartFrameOneClick => "smart-frame-one-click",
             Self::SmartFrameExpanded => "smart-frame-expanded",
+            Self::SensitiveReview => "sensitive-review",
         }
     }
 
@@ -1333,8 +1337,20 @@ impl Fixture {
                     None,
                     None,
                 ),
+                Scenario::SensitiveReview => (
+                    Self::cards(seed, 1),
+                    Gesture::None,
+                    false,
+                    true,
+                    "Review before redacting",
+                    "Possible sensitive information is outlined on the source and listed by category. Nothing is selected or changed automatically.",
+                    instants::REST,
+                    None,
+                    None,
+                ),
             };
         let size_pt = match scenario {
+            Scenario::SensitiveReview => (1080.0, 680.0),
             Scenario::ScrollingCapture => (640.0, 260.0),
             Scenario::EditorAnnotating
             | Scenario::EditorColorPopover
@@ -2733,6 +2749,10 @@ impl SceneRegistry {
         me.register(
             Scenario::HistoryEmpty,
             Box::new(crate::history::HistoryScene),
+        );
+        me.register(
+            Scenario::SensitiveReview,
+            Box::new(crate::sensitive::SensitiveReviewScene),
         );
         me
     }
@@ -4730,6 +4750,7 @@ pub fn golden_plan() -> Vec<GoldenCase> {
         Scenario::RecordingCamera,
         Scenario::RecordingPresenter,
         Scenario::CameraSettings,
+        Scenario::SensitiveReview,
     ] {
         cases.push(GoldenCase {
             name: format!("{}--light", scenario.slug()),

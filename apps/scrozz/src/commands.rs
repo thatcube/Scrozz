@@ -28,7 +28,7 @@ use scrozz_core::{
     Provenance, ScrollAxis, SelectionOptions, SelectionOutcome,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, to_straight_rgba8};
-use scrozz_ocr::Ocr as _;
+use scrozz_ocr::{BarcodeDetector as _, Ocr as _};
 use scrozz_record::{
     RecordingMachine, RecordingPhase, RecordingRequest, RecordingSettings,
     edit::{EditOutput, EditPlan, VideoDocument},
@@ -42,9 +42,9 @@ use scrozz_store::{
 use crate::{
     after_capture::{AfterCaptureSettings, current_availability},
     cli::{
-        BeautifyBackground, CaptureArgs, Command, Compositor, DisplaySelector, HistoryCommand,
-        HotkeyCommand, InteractiveMode, ListWhat, OcrSubject, RecordArgs, SettingsCommand,
-        ShareArgs, Sink, TargetSpec,
+        BarcodesArgs, BeautifyBackground, CaptureArgs, Command, Compositor, DisplaySelector,
+        HistoryCommand, HotkeyCommand, InteractiveMode, ListWhat, OcrSubject, RecordArgs,
+        SettingsCommand, ShareArgs, Sink, TargetSpec,
     },
     fault::{CliError, CliResult},
     gui::action::CaptureKind,
@@ -148,6 +148,7 @@ fn dispatch_inner(
         Command::History(args) => history(&args.command),
         Command::Ocr(args) => ocr(args),
         Command::Share(args) => share(args),
+        Command::Barcodes(args) => barcodes(args),
         Command::Settings(args) => settings_command(&args.command),
         Command::Hotkey(args) => hotkey(&args.command),
         Command::Gui => gui(),
@@ -2003,22 +2004,59 @@ fn history_image_evicted(id: &str) -> CliError {
 
 fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
     args.validate()?;
-    let subject = args.resolve()?;
-
-    // Check the platform before the subject: on Linux there is no engine at all,
-    // and reading a file first only to say so afterwards wastes the user's time
-    // and makes the failure look conditional when it is not.
     if !platform::ocr_available() {
         return Err(CliError::Core(CoreError::Unsupported {
             what: "recognising text".to_string(),
-            why: "this build has no OCR engine. macOS uses Vision and Windows \
-                  uses Windows.Media.Ocr, both supplied by the system; Linux has \
-                  no system recogniser, and bundling one would add tens of \
-                  megabytes of language model to every install."
+            why: "this build has no OCR engine. macOS uses Vision, packaged Windows uses \
+                  Windows.Media.Ocr, and Linux plus portable Windows use the default \
+                  `tesseract` subprocess integration without linking C libraries."
                 .to_string(),
         }));
     }
 
+    let engine = platform::ocr_engine(args.options());
+    let engine_name = scrozz_ocr::SystemOcr::engine_name()?;
+    if args.list_languages {
+        let languages = engine.available_languages()?;
+        let data = Json::obj([
+            ("engine", Json::str(engine_name)),
+            (
+                "automatic_language_detection",
+                Json::Bool(scrozz_ocr::SystemOcr::supports_automatic_language_detection()),
+            ),
+            (
+                "languages",
+                Json::arr(
+                    languages
+                        .iter()
+                        .map(|language| Json::str(language.as_str())),
+                ),
+            ),
+        ]);
+        return Ok(Report::new(data, languages.join("\n")));
+    }
+
+    if args.under_pointer {
+        let capture = platform::capture_backend()?;
+        let display = capture.active_display()?;
+        let captured = capture.capture(&CaptureRequest {
+            target: CaptureTarget::Display(display.id),
+            cursor: CursorMode::Hidden,
+            include_window_shadow: false,
+        })?;
+        let pointer = scrozz_shell::pointer_location()?;
+        let live = scrozz_ocr::LiveOcr::with_options(args.options());
+        let mut blocks: Vec<_> = live
+            .recognize_global_at(&captured.frame, display.bounds, pointer)?
+            .into_iter()
+            .collect();
+        if let Some(minimum) = args.min_confidence {
+            blocks.retain(|block| block.confidence >= minimum);
+        }
+        return Ok(ocr_report(&blocks, "pointer", args, engine_name));
+    }
+
+    let subject = args.resolve()?;
     match subject {
         OcrSubject::File(path) => {
             if !path.exists() {
@@ -2028,20 +2066,17 @@ fn ocr(args: &crate::cli::OcrArgs) -> CliResult<Report> {
                 ))));
             }
             let frame = platform::decode_image_file(&path)?;
-            let blocks = confident_blocks(
-                platform::ocr_engine().recognize(&frame)?,
-                args.min_confidence,
-            );
-            Ok(ocr_report(&blocks, &path.display().to_string()))
+            let blocks = confident_blocks(engine.recognize(&frame)?, args.min_confidence);
+            Ok(ocr_report(
+                &blocks,
+                &path.display().to_string(),
+                args,
+                engine_name,
+            ))
         }
         OcrSubject::Capture(id) => {
             let mut store = platform::store()?;
-            ocr_stored_capture(
-                &mut store,
-                &platform::ocr_engine(),
-                &id,
-                args.min_confidence,
-            )
+            ocr_stored_capture(&mut store, &engine, &id, args, engine_name)
         }
     }
 }
@@ -2050,7 +2085,8 @@ fn ocr_stored_capture(
     store: &mut SqliteStore,
     engine: &impl scrozz_ocr::Ocr,
     id: &str,
-    min_confidence: Option<f32>,
+    args: &crate::cli::OcrArgs,
+    engine_name: &str,
 ) -> CliResult<Report> {
     let capture_id = CaptureId(id.to_owned());
     let document = match store.document(&capture_id)? {
@@ -2058,10 +2094,15 @@ fn ocr_stored_capture(
         Some(DocumentState::ImageEvicted(_)) => return Err(history_image_evicted(id)),
         None => return Err(history_not_found(id)),
     };
-    let blocks = confident_blocks(engine.recognize(&document.source.frame)?, min_confidence);
+    let blocks = confident_blocks(
+        engine.recognize(&document.source().frame)?,
+        args.min_confidence,
+    );
+    // The stored index stays plain text: it is a search key, not a rendering,
+    // and must not change shape with the caller's line-break preference.
     let text = scrozz_ocr::plain_text(&blocks);
     store.set_ocr_text(&capture_id, Some(&text))?;
-    Ok(ocr_report(&blocks, id))
+    Ok(ocr_report(&blocks, id, args, engine_name))
 }
 
 fn confident_blocks(
@@ -2084,8 +2125,18 @@ fn confident_blocks(
 /// belong in `--json`, where a consumer asked for structure; printing them in
 /// the human path would corrupt the far more common case of piping the text
 /// somewhere.
-fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
-    let text = scrozz_ocr::plain_text(blocks);
+fn ocr_report(
+    blocks: &[scrozz_ocr::TextBlock],
+    source: &str,
+    args: &crate::cli::OcrArgs,
+    engine_name: &str,
+) -> Report {
+    let text = scrozz_ocr::text(blocks, args.line_breaks.to_ocr());
+    let links = if args.detect_links {
+        scrozz_ocr::links(blocks)
+    } else {
+        Vec::new()
+    };
 
     let data = Json::obj([
         ("source", Json::str(source)),
@@ -2104,9 +2155,133 @@ fn ocr_report(blocks: &[scrozz_ocr::TextBlock], source: &str) -> Report {
                 ])
             })),
         ),
+        (
+            "links",
+            Json::arr(links.iter().map(|link| {
+                Json::obj([
+                    ("kind", Json::str(link.kind.token())),
+                    ("text", Json::str(link.text.as_str())),
+                    ("target", Json::str(link.target.as_str())),
+                    (
+                        "block",
+                        Json::opt(link.block, |index| Json::Int(index as i64)),
+                    ),
+                    ("x", Json::Float(link.bounds.origin.x)),
+                    ("y", Json::Float(link.bounds.origin.y)),
+                    ("width", Json::Float(link.bounds.size.width)),
+                    ("height", Json::Float(link.bounds.size.height)),
+                ])
+            })),
+        ),
+        ("engine", Json::str(engine_name)),
+        (
+            "accuracy",
+            Json::str(if args.under_pointer {
+                "fast"
+            } else {
+                args.accuracy.token()
+            }),
+        ),
+        ("line_breaks", Json::str(args.line_breaks.token())),
+        (
+            "language_mode",
+            Json::str(if args.auto_detect_language {
+                "automatic"
+            } else if args.language.is_empty() {
+                "system"
+            } else {
+                "preferred"
+            }),
+        ),
+        (
+            "languages",
+            Json::arr(
+                args.language
+                    .iter()
+                    .map(|language| Json::str(language.as_str())),
+            ),
+        ),
+        (
+            "min_confidence",
+            Json::opt(args.min_confidence, |value| Json::Float(f64::from(value))),
+        ),
     ]);
 
     Report::new(data, text)
+}
+
+// ---------------------------------------------------------------------------
+// barcodes
+// ---------------------------------------------------------------------------
+
+fn barcodes(args: &BarcodesArgs) -> CliResult<Report> {
+    match args.resolve()? {
+        OcrSubject::File(path) => {
+            if !path.exists() {
+                return Err(CliError::Core(CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{} does not exist", path.display()),
+                ))));
+            }
+            let frame = platform::decode_image_file(&path)?;
+            let detector = platform::barcode_engine(args.options());
+            let found = detector.detect(&frame)?;
+            Ok(barcode_report(&found, &path.display().to_string()))
+        }
+        OcrSubject::Capture(_) => {
+            let _store = platform::store()?;
+            Err(CliError::not_implemented(
+                "decoding barcodes in a stored capture",
+                "scrozz-store",
+            ))
+        }
+    }
+}
+
+fn barcode_report(barcodes: &[scrozz_ocr::Barcode], source: &str) -> Report {
+    let data = Json::obj([
+        ("source", Json::str(source)),
+        ("count", Json::Int(barcodes.len() as i64)),
+        (
+            "barcodes",
+            Json::arr(barcodes.iter().map(|barcode| {
+                Json::obj([
+                    ("payload", Json::str(barcode.payload.as_str())),
+                    ("symbology", Json::str(barcode.symbology.token())),
+                    ("confidence", Json::Float(f64::from(barcode.confidence))),
+                    ("x", Json::Float(barcode.bounds.origin.x)),
+                    ("y", Json::Float(barcode.bounds.origin.y)),
+                    ("width", Json::Float(barcode.bounds.size.width)),
+                    ("height", Json::Float(barcode.bounds.size.height)),
+                    (
+                        "corners",
+                        Json::arr(barcode.corners.iter().map(|corner| {
+                            Json::obj([("x", Json::Float(corner.x)), ("y", Json::Float(corner.y))])
+                        })),
+                    ),
+                    (
+                        "link",
+                        Json::opt(barcode.link(), |link| {
+                            Json::obj([
+                                ("kind", Json::str(link.kind.token())),
+                                ("target", Json::str(link.target)),
+                            ])
+                        }),
+                    ),
+                ])
+            })),
+        ),
+        (
+            "engine",
+            Json::str(scrozz_ocr::SystemBarcodes::engine_name()),
+        ),
+    ]);
+    let human = barcodes
+        .iter()
+        .map(|barcode| barcode.payload.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Report::new(data, human)
 }
 
 // ---------------------------------------------------------------------------
@@ -2680,6 +2855,83 @@ mod tests {
             )
             .expect("insert video");
         (dir, store, first, second)
+    }
+
+    #[test]
+    fn ocr_json_shape_and_key_order_are_stable() {
+        let cli = Cli::try_parse_from([
+            "scrozz",
+            "ocr",
+            "fixture.png",
+            "--min-confidence",
+            "0.5",
+            "--detect-links",
+        ])
+        .unwrap();
+        let Some(Command::Ocr(args)) = cli.command else {
+            panic!("expected OCR command")
+        };
+        let blocks = [scrozz_ocr::TextBlock {
+            text: "https://example.org".to_string(),
+            bounds: LogicalRect::new(LogicalPoint::new(1.0, 2.0), LogicalSize::new(3.0, 4.0)),
+            confidence: 0.5,
+        }];
+        let suffix = format!(
+            r#""engine":"{}","accuracy":"accurate","line_breaks":"preserve","language_mode":"system","languages":[],"min_confidence":0.5}}"#,
+            scrozz_ocr::SystemOcr::engine_name().unwrap()
+        );
+        let expected = [
+            r#"{"source":"fixture.png","block_count":1,"text":"https://example.org","#,
+            r#""blocks":[{"text":"https://example.org","confidence":0.5,"x":1.0,"y":2.0,"width":3.0,"height":4.0}],"#,
+            r#""links":[{"kind":"url","text":"https://example.org","target":"https://example.org","block":0,"x":1.0,"y":2.0,"width":3.0,"height":4.0}],"#,
+            &suffix,
+        ]
+        .concat();
+
+        assert_eq!(
+            ocr_report(
+                &blocks,
+                "fixture.png",
+                &args,
+                scrozz_ocr::SystemOcr::engine_name().unwrap(),
+            )
+            .data
+            .to_compact_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn barcode_json_shape_and_key_order_are_stable() {
+        let barcodes = [scrozz_ocr::Barcode {
+            payload: "mailto:person@example.org".to_string(),
+            symbology: scrozz_ocr::Symbology::QrCode,
+            bounds: LogicalRect::new(LogicalPoint::new(1.0, 2.0), LogicalSize::new(3.0, 4.0)),
+            corners: vec![
+                LogicalPoint::new(1.0, 2.0),
+                LogicalPoint::new(4.0, 2.0),
+                LogicalPoint::new(4.0, 6.0),
+                LogicalPoint::new(1.0, 6.0),
+            ],
+            confidence: 1.0,
+        }];
+        let suffix = format!(
+            r#""link":{{"kind":"email","target":"mailto:person@example.org"}}}}],"engine":"{}"}}"#,
+            scrozz_ocr::SystemBarcodes::engine_name()
+        );
+        let expected = [
+            r#"{"source":"fixture.png","count":1,"barcodes":[{"payload":"mailto:person@example.org","symbology":"qr","confidence":1.0,"#,
+            r#""x":1.0,"y":2.0,"width":3.0,"height":4.0,"corners":[{"x":1.0,"y":2.0},{"x":4.0,"y":2.0},{"x":4.0,"y":6.0},{"x":1.0,"y":6.0}],"#,
+            &suffix,
+        ]
+        .concat();
+
+        assert_eq!(
+            barcode_report(&barcodes, "fixture.png")
+                .data
+                .to_compact_string(),
+            expected
+        );
     }
 
     // -- dry-run capture ---------------------------------------------------
@@ -3277,7 +3529,9 @@ mod tests {
         }
         let err = run(&["scrozz", "ocr", "--capture", "abc"]).unwrap_err();
         assert_eq!(err.exit(), Exit::Unsupported);
-        assert!(err.to_string().contains("no system recogniser"), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("no OCR engine"), "{message}");
+        assert!(message.contains("tesseract"), "{message}");
     }
 
     #[test]
@@ -3321,7 +3575,12 @@ mod tests {
     #[test]
     fn ocr_on_a_stored_capture_filters_and_persists_searchable_text() {
         let (_dir, mut store, first, _) = history_fixture();
-        let report = ocr_stored_capture(&mut store, &StubOcr, &first.0, Some(0.8))
+        let cli = Cli::try_parse_from(["scrozz", "ocr", "--min-confidence", "0.8", &first.0])
+            .expect("valid OCR arguments");
+        let Some(Command::Ocr(args)) = cli.command else {
+            panic!("expected OCR command")
+        };
+        let report = ocr_stored_capture(&mut store, &StubOcr, &first.0, &args, "stub")
             .expect("recognise stored capture");
         assert_eq!(report.human, "keep me");
         assert_eq!(

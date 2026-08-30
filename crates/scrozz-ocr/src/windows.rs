@@ -1,6 +1,12 @@
-//! Windows text recognition via `Windows.Media.Ocr`.
+//! Dual Windows OCR for packaged and portable Scrozz artifacts.
 //!
-//! # Why the OS engine
+//! A process with package identity uses `Windows.Media.Ocr`. The portable ZIP
+//! intentionally remains an unpackaged executable, where that API cannot be
+//! activated reliably, so it uses the same local Tesseract subprocess backend as
+//! Linux. Backend selection happens once from package identity; a real native OCR
+//! failure is never hidden by silently retrying with Tesseract.
+//!
+//! # Why the native engine
 //!
 //! Same reasoning as macOS: it ships with Windows, it is already localised to
 //! the languages the user installed, it costs nothing in binary size, and it is
@@ -37,7 +43,13 @@ use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
-use windows::core::HSTRING;
+use windows::Win32::{
+    Foundation::{
+        APPMODEL_ERROR_NO_PACKAGE, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, WIN32_ERROR,
+    },
+    Storage::Packaging::Appx::GetCurrentPackageFullName,
+};
+use windows::core::{HSTRING, PWSTR};
 
 use crate::layout;
 use crate::prepare::{self, Prepared, Rgba8Image};
@@ -57,6 +69,73 @@ const ASYNC_CANCELED: i32 = 2;
 /// so a wedged engine surfaces as an error instead of a hung UI thread.
 const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    WindowsMediaOcr,
+    Tesseract,
+}
+
+const fn backend_for_package_identity(has_identity: bool) -> Backend {
+    if has_identity {
+        Backend::WindowsMediaOcr
+    } else {
+        Backend::Tesseract
+    }
+}
+
+fn active_backend() -> Result<Backend> {
+    let backend = backend_for_package_identity(has_package_identity()?);
+    if backend == Backend::Tesseract && !cfg!(feature = "tesseract") {
+        return Err(Error::Unsupported {
+            what: "text recognition from the portable Windows artifact".to_string(),
+            why: "this unpackaged process cannot use Windows.Media.Ocr and this build disabled \
+                  the unpackaged-safe `tesseract` feature"
+                .to_string(),
+        });
+    }
+    Ok(backend)
+}
+
+/// Name of the backend selected for this process artifact.
+pub fn engine_name() -> Result<&'static str> {
+    Ok(match active_backend()? {
+        Backend::WindowsMediaOcr => "windows-media-ocr",
+        Backend::Tesseract => "tesseract",
+    })
+}
+
+fn has_package_identity() -> Result<bool> {
+    let mut length = 0u32;
+    let status = unsafe { GetCurrentPackageFullName(&raw mut length, None) };
+    if status == APPMODEL_ERROR_NO_PACKAGE {
+        return Ok(false);
+    }
+    if status == ERROR_SUCCESS {
+        return Ok(true);
+    }
+    if status != ERROR_INSUFFICIENT_BUFFER {
+        return Err(package_identity_error(status));
+    }
+
+    let mut name = vec![0u16; length as usize];
+    let status =
+        unsafe { GetCurrentPackageFullName(&raw mut length, Some(PWSTR(name.as_mut_ptr()))) };
+    if status == ERROR_SUCCESS {
+        Ok(true)
+    } else if status == APPMODEL_ERROR_NO_PACKAGE {
+        Ok(false)
+    } else {
+        Err(package_identity_error(status))
+    }
+}
+
+fn package_identity_error(status: WIN32_ERROR) -> Error {
+    Error::Platform(format!(
+        "GetCurrentPackageFullName failed with Win32 error {}",
+        status.0
+    ))
+}
+
 /// Recognises text in a frame using the Windows OCR engine.
 ///
 /// # Errors
@@ -65,6 +144,32 @@ const RECOGNITION_TIMEOUT: Duration = Duration::from_secs(20);
 /// the machine has no OCR language pack installed, [`Error::Platform`] for any
 /// other WinRT failure.
 pub fn recognize(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
+    match active_backend()? {
+        Backend::WindowsMediaOcr => recognize_native(frame, options),
+        Backend::Tesseract => {
+            #[cfg(feature = "tesseract")]
+            {
+                crate::tesseract::recognize(frame, options)
+            }
+            #[cfg(not(feature = "tesseract"))]
+            {
+                let _ = (frame, options);
+                unreachable!("active_backend rejects this configuration")
+            }
+        }
+    }
+}
+
+fn recognize_native(frame: &Frame, options: &Options) -> Result<Vec<TextBlock>> {
+    if options.automatic_language_detection {
+        return Err(Error::Unsupported {
+            what: "automatic OCR language detection".to_string(),
+            why: "Windows.Media.Ocr requires an installed language pack selected explicitly or \
+                  through the user's profile; it cannot infer language from image content"
+                .to_string(),
+        });
+    }
+
     // Ask the engine for its ceiling first: the answer feeds the upscale
     // decision, so an image is never enlarged past what the engine will accept
     // and an already-oversized capture is shrunk rather than rejected.
@@ -232,19 +337,47 @@ fn engine_for(languages: &[String]) -> Result<OcrEngine> {
 
 /// The recognizer languages this machine has installed, for error messages.
 fn installed_languages() -> String {
-    let Ok(available) = OcrEngine::AvailableRecognizerLanguages() else {
+    let Ok(tags) = available_native_languages() else {
         return "unknown".to_string();
     };
-    let tags: Vec<String> = (0..available.Size().unwrap_or(0))
-        .filter_map(|i| available.GetAt(i).ok())
-        .filter_map(|language| language.LanguageTag().ok())
-        .map(|tag| tag.to_string_lossy())
-        .collect();
     if tags.is_empty() {
         "none".to_string()
     } else {
         tags.join(", ")
     }
+}
+
+/// Lists OCR recognizer languages installed in Windows.
+pub fn available_languages() -> Result<Vec<String>> {
+    match active_backend()? {
+        Backend::WindowsMediaOcr => available_native_languages(),
+        Backend::Tesseract => {
+            #[cfg(feature = "tesseract")]
+            {
+                crate::tesseract::available_languages()
+            }
+            #[cfg(not(feature = "tesseract"))]
+            {
+                unreachable!("active_backend rejects this configuration")
+            }
+        }
+    }
+}
+
+fn available_native_languages() -> Result<Vec<String>> {
+    let available = OcrEngine::AvailableRecognizerLanguages().map_err(|error| {
+        Error::Platform(format!(
+            "OcrEngine::AvailableRecognizerLanguages failed: {error}"
+        ))
+    })?;
+    let mut tags: Vec<String> = (0..available.Size().unwrap_or(0))
+        .filter_map(|index| available.GetAt(index).ok())
+        .filter_map(|language| language.LanguageTag().ok())
+        .map(|tag| tag.to_string_lossy())
+        .collect();
+    tags.sort_unstable();
+    tags.dedup();
+    Ok(tags)
 }
 
 /// Copies a prepared image into a `SoftwareBitmap` the engine can consume.
@@ -259,7 +392,7 @@ fn software_bitmap(prepared: &Prepared) -> Result<SoftwareBitmap> {
     let writer =
         DataWriter::new().map_err(|e| Error::Platform(format!("DataWriter::new failed: {e}")))?;
     writer
-        .WriteBytes(&bgra_premultiplied(&prepared.image))
+        .WriteBytes(&bgra_on_white(&prepared.image))
         .map_err(|e| Error::Platform(format!("DataWriter::WriteBytes failed: {e}")))?;
     let buffer = writer
         .DetachBuffer()
@@ -267,15 +400,14 @@ fn software_bitmap(prepared: &Prepared) -> Result<SoftwareBitmap> {
 
     // `CreateCopyFromBuffer` assumes rows are tightly packed at `width * 4`,
     // which is exactly what `Rgba8Image` guarantees, so there is no stride to
-    // reconcile. It also yields a premultiplied bitmap, which is why the bytes
-    // are premultiplied on the way in.
+    // reconcile. This overload does not declare an alpha mode, so the upload is
+    // deliberately opaque after compositing transparency onto white.
     SoftwareBitmap::CreateCopyFromBuffer(&buffer, BitmapPixelFormat::Bgra8, width, height)
         .map_err(|e| Error::Platform(format!("SoftwareBitmap::CreateCopyFromBuffer failed: {e}")))
 }
 
-/// Converts straight-alpha RGBA into the premultiplied BGRA `SoftwareBitmap`
-/// expects, in one pass.
-fn bgra_premultiplied(image: &Rgba8Image) -> Vec<u8> {
+/// Converts straight-alpha RGBA into opaque BGRA composited on white.
+fn bgra_on_white(image: &Rgba8Image) -> Vec<u8> {
     let mut out = vec![0u8; image.data.len()];
     for (s, d) in image
         .data
@@ -285,19 +417,54 @@ fn bgra_premultiplied(image: &Rgba8Image) -> Vec<u8> {
         .zip(out.as_chunks_mut::<4>().0.iter_mut())
     {
         let a = s[3];
-        d[0] = premultiply(s[2], a);
-        d[1] = premultiply(s[1], a);
-        d[2] = premultiply(s[0], a);
-        d[3] = a;
+        d[0] = composite_on_white(s[2], a);
+        d[1] = composite_on_white(s[1], a);
+        d[2] = composite_on_white(s[0], a);
+        d[3] = 255;
     }
     out
 }
 
-/// Scales a straight-alpha channel by its alpha.
-fn premultiply(channel: u8, alpha: u8) -> u8 {
-    match alpha {
-        255 => channel,
-        0 => 0,
-        a => ((u32::from(channel) * u32::from(a) + 127) / 255) as u8,
+fn composite_on_white(channel: u8, alpha: u8) -> u8 {
+    let foreground = u32::from(channel) * u32::from(alpha);
+    let background = 255 * u32::from(255 - alpha);
+    ((foreground + background + 127) / 255) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_artifacts_choose_the_unpackaged_safe_backend() {
+        assert_eq!(backend_for_package_identity(false), Backend::Tesseract);
+    }
+
+    #[test]
+    fn packaged_artifacts_choose_the_native_backend() {
+        assert_eq!(backend_for_package_identity(true), Backend::WindowsMediaOcr);
+    }
+
+    #[test]
+    fn bitmap_upload_composites_transparency_onto_white() {
+        let image = Rgba8Image::new(
+            3,
+            1,
+            vec![
+                0, 0, 0, 0, // transparent black
+                0, 0, 0, 128, // half-transparent black
+                1, 2, 3, 255, // opaque RGB
+            ],
+        )
+        .expect("fixture");
+
+        assert_eq!(
+            bgra_on_white(&image),
+            [
+                255, 255, 255, 255, //
+                127, 127, 127, 255, //
+                3, 2, 1, 255,
+            ]
+        );
     }
 }

@@ -412,7 +412,9 @@ fn secure_redact_is_safe_at_tiny_edges_and_in_wide_gamut_spaces() {
 
     for space in [ColorSpace::DisplayP3, ColorSpace::Rec2020] {
         let mut doc = checkered(80, 80);
-        doc.source.frame.color_space = space;
+        let mut recoloured = doc.source().clone();
+        recoloured.frame.color_space = space;
+        doc.replace_source(recoloured).expect("a region capture");
         doc.add(
             Annotation::Redact {
                 area: rect(0.0, 0.0, 80.0, 80.0),
@@ -577,7 +579,7 @@ fn redaction_survives_a_downscaled_export() {
 fn the_source_frame_is_untouched_by_every_redaction_style() {
     for style in [RedactStyle::Blur, RedactStyle::Pixelate, RedactStyle::Solid] {
         let mut doc = checkered(80, 80);
-        let before = doc.source.frame.data.clone();
+        let before = doc.source().frame.data.clone();
         doc.add(
             Annotation::Redact {
                 area: rect(0.0, 0.0, 80.0, 80.0),
@@ -587,7 +589,8 @@ fn the_source_frame_is_untouched_by_every_redaction_style() {
         );
         let _ = SkiaRenderer::new().render(&doc).unwrap();
         assert_eq!(
-            before, doc.source.frame.data,
+            before,
+            doc.source().frame.data,
             "{style:?} mutated the document's source; D14 requires it stay editable"
         );
     }

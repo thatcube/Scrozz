@@ -431,7 +431,7 @@ pub enum Intent {
 ///
 /// Each direction carries its own numbers because the directions differ in what
 /// they cost. Collapse is free to undo, so it commits sooner; dismiss and
-/// drag-out both remove a capture from the pile and ask for more conviction.
+/// drag-out both leave the pointer surface and ask for more conviction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GestureConfig {
     /// Travel that commits a leftward dismiss, in points.

@@ -1028,7 +1028,7 @@ fn a_crop_shrinks_the_content_without_touching_the_source() {
     assert!(cropped.width < full.width);
     assert!(cropped.height < full.height);
     assert_eq!(
-        state.document().source.frame.width(),
+        state.document().source().frame.width(),
         capture().frame.width(),
         "cropping resized the source pixels"
     );
@@ -1678,7 +1678,7 @@ fn nothing_the_editor_does_touches_the_source_pixels() {
     }
     state.command(Command::ApplyCrop).ok();
 
-    let source = &state.document().source.frame;
+    let source = &state.document().source().frame;
     assert_eq!(source.width(), original.frame.width());
     assert_eq!(source.height(), original.frame.height());
     assert_eq!(

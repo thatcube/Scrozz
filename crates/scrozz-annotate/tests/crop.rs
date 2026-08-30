@@ -83,10 +83,11 @@ fn crop_moves_annotations_with_the_image() {
 #[test]
 fn crop_is_non_destructive() {
     let mut doc = coded();
-    let original = doc.source.frame.data.clone();
+    let original = doc.source().frame.data.clone();
     doc.set_crop(Some(rect(10.0, 10.0, 20.0, 20.0))).unwrap();
     assert_eq!(
-        doc.source.frame.data, original,
+        doc.source().frame.data,
+        original,
         "the source keeps every pixel: a crop is a view, not an edit"
     );
 
@@ -164,7 +165,7 @@ fn crop_survives_a_round_trip_through_persistence() {
     doc.set_crop(Some(rect(12.0, 34.0, 40.0, 25.0))).unwrap();
     let json = serde_json::to_string(&doc.data()).unwrap();
     let data: DocumentData = serde_json::from_str(&json).unwrap();
-    let restored = Document::from_data(doc.source.clone(), data).unwrap();
+    let restored = Document::from_data(doc.source().clone(), data).unwrap();
     assert_eq!(restored.crop(), Some(rect(12.0, 34.0, 40.0, 25.0)));
 }
 
@@ -176,7 +177,7 @@ fn documents_saved_before_crop_existed_still_load() {
     let legacy = r#"{"version":1,"annotations":[],"beautification":null,"next_id":1}"#;
     let data: DocumentData = serde_json::from_str(legacy).unwrap();
     assert_eq!(data.crop, None);
-    let doc = Document::from_data(coded().source, data).unwrap();
+    let doc = Document::from_data(coded().source().clone(), data).unwrap();
     assert_eq!(doc.crop(), None);
 }
 
@@ -330,7 +331,7 @@ fn a_tiny_crop_cannot_shrink_a_redaction_into_a_no_op() {
             common::checkerboard(100, 100, 2),
             Provenance::Region,
         ));
-        let original = pixel(&doc.source.frame, 25, 25);
+        let original = pixel(&doc.source().frame, 25, 25);
         doc.add_default(Annotation::Redact {
             area: rect(20.0, 20.0, 20.0, 20.0),
             style,

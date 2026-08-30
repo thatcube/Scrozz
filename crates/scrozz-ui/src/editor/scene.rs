@@ -115,8 +115,8 @@ fn prime(fixture: &Fixture, editor: &mut EditorUi) {
         } = intent
         {
             let result = scrozz_annotate::analyze_smart_frame(
-                &editor.state().document().source.frame,
-                editor.state().document().source.provenance,
+                &editor.state().document().source().frame,
+                editor.state().document().source().provenance,
                 &cancellation,
             )
             .map_err(|e| e.to_string());

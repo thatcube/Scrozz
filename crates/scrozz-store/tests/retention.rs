@@ -626,7 +626,7 @@ fn expiring_one_capture_never_removes_a_blob_shared_with_a_recent_capture() {
     assert!(store.image(&old).expect("old image").is_none());
     assert_eq!(
         store.image(&recent).expect("recent image"),
-        Some(document.source.frame.data),
+        Some(document.source().frame.data.clone()),
         "the shared bytes must remain readable through the recent capture"
     );
 }

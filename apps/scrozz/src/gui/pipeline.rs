@@ -2050,7 +2050,7 @@ impl Worker {
         let apply_smart_frame = crate::settings::smart_frame_after_capture(policy)?;
         let editor_source = if apply_smart_frame {
             Some(Arc::new(
-                FrameEncoder::new().encode(&document.source.frame, ImageFormat::Png)?,
+                FrameEncoder::new().encode(&document.source().frame, ImageFormat::Png)?,
             ))
         } else {
             None
@@ -2094,8 +2094,8 @@ impl Worker {
                 },
                 editor_source,
                 rendered: None,
-                provenance: document.source.provenance,
-                target: document.source.target.clone(),
+                provenance: document.source().provenance,
+                target: document.source().target.clone(),
                 scale: frame.scale,
                 color_space: frame.color_space,
                 capture_id: capture_id.clone(),
@@ -2137,7 +2137,7 @@ impl Worker {
                 media: scrozz_ui::card::CardMedia::Image,
                 capture_id,
                 kind,
-                provenance: document.source.provenance,
+                provenance: document.source().provenance,
                 source_width: frame.width(),
                 source_height: frame.height(),
                 scale: frame.scale.get(),
@@ -2161,12 +2161,12 @@ impl Worker {
         apply_smart_frame: bool,
     ) -> CliResult<scrozz_core::Frame> {
         if !apply_smart_frame {
-            return Ok(document.source.frame.clone());
+            return Ok(document.source().frame.clone());
         }
         let current = SkiaRenderer.render(document)?;
         let analysis = analyze_smart_frame(
             &current,
-            document.source.provenance,
+            document.source().provenance,
             &AnalysisCancellation::default(),
         )?;
         document.set_beautification(Some(analysis.beautification))?;
@@ -2401,7 +2401,7 @@ impl Worker {
         let spawn = std::thread::Builder::new()
             .name(format!("scrozz-smart-frame-{}", card.0))
             .spawn(move || {
-                let provenance = document.source.provenance;
+                let provenance = document.source().provenance;
                 let result = SkiaRenderer
                     .render(&document)
                     .and_then(|frame| analyze_smart_frame(&frame, provenance, &cancellation))
@@ -2926,7 +2926,7 @@ impl Worker {
         let document = self.load_document(capture)?;
         let frame = SkiaRenderer::new().render(&document)?;
         let source_bytes =
-            Arc::new(FrameEncoder::new().encode(&document.source.frame, ImageFormat::Png)?);
+            Arc::new(FrameEncoder::new().encode(&document.source().frame, ImageFormat::Png)?);
         let bytes = Arc::new(FrameEncoder::new().encode(&frame, ImageFormat::Png)?);
         Ok(RenderedStored {
             record,
@@ -3449,7 +3449,7 @@ fn history_entry(
         Ok(Some(DocumentState::ImageEvicted(_))) => (false, None, None),
         Ok(Some(DocumentState::Complete(document))) => {
             let rendered = (|| {
-                let preview = history_thumbnail(&document, document.source.frame.scale)?;
+                let preview = history_thumbnail(&document, document.source().frame.scale)?;
                 let rgba = scrozz_export::to_straight_rgba8(&preview)?;
                 HistoryThumbnail::from_rgba(rgba.width, rgba.height, rgba.data).ok_or_else(|| {
                     CliError::Core(CoreError::Codec(format!(
@@ -3905,11 +3905,11 @@ mod tests {
             panic!("opening a cached card should produce a capture");
         };
         assert!(
-            (document.source.frame.scale.get() - 2.0).abs() < f64::EPSILON,
+            (document.source().frame.scale.get() - 2.0).abs() < f64::EPSILON,
             "the capture's own scale should survive the cache, not decode's identity"
         );
         assert_eq!(
-            document.source.frame.color_space,
+            document.source().frame.color_space,
             ColorSpace::DisplayP3,
             "a wide-gamut capture must not become unlabelled on the way to the editor"
         );
@@ -3944,7 +3944,8 @@ mod tests {
         let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
-        let logical = f64::from(document.source.frame.width()) / document.source.frame.scale.get();
+        let logical =
+            f64::from(document.source().frame.width()) / document.source().frame.scale.get();
         assert!(
             (logical - 1.0).abs() < f64::EPSILON,
             "a 2x2 physical capture at 2.0 scale is 1x1 logical, not 2x2"
@@ -3979,7 +3980,7 @@ mod tests {
         let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
-        assert_eq!(document.source.frame.color_space, ColorSpace::Unknown);
+        assert_eq!(document.source().frame.color_space, ColorSpace::Unknown);
     }
 
     #[test]
@@ -4011,7 +4012,7 @@ mod tests {
         let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
-        assert_eq!(document.source.provenance, Provenance::Window);
+        assert_eq!(document.source().provenance, Provenance::Window);
         assert!(document.may_beautify());
         assert!(!document.may_style_subject());
     }
@@ -4046,7 +4047,7 @@ mod tests {
         let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("opening a cached card should produce a capture");
         };
-        assert_eq!(document.source.provenance, Provenance::Region);
+        assert_eq!(document.source().provenance, Provenance::Region);
         assert!(document.may_beautify());
     }
 
@@ -4104,8 +4105,8 @@ mod tests {
         let Some(Outcome::Opened { document, .. }) = inbox.try_iter().next() else {
             panic!("flattened fallback should remain editable");
         };
-        assert_eq!(document.source.frame.width(), 2);
-        assert_eq!(document.source.frame.height(), 2);
+        assert_eq!(document.source().frame.width(), 2);
+        assert_eq!(document.source().frame.height(), 2);
     }
 
     fn sample_capture(provenance: Provenance) -> Capture {
@@ -4189,7 +4190,7 @@ mod tests {
         let (_dir, mut worker, _outcomes) = worker_with_store("smart-frame-after-capture");
         let mut policy = no_after_capture_actions();
         policy.set_value(crate::settings::APPLY_SMART_FRAME_AFTER_CAPTURE_KEY, "true");
-        let source = sample_document(96, 60, 1, 0).source;
+        let source = sample_document(96, 60, 1, 0).source().clone();
         let source_pixels = source.frame.data.clone();
 
         let ready = worker
@@ -4209,13 +4210,13 @@ mod tests {
             .expect("complete derived document");
         assert!(stored.beautification().is_some());
         assert!(stored.beautification().unwrap().auto_balance);
-        assert_eq!(stored.source.frame.data, source_pixels);
+        assert_eq!(stored.source().frame.data, source_pixels);
     }
 
     #[test]
     fn disabled_after_capture_smart_frame_is_a_byte_stable_noop() {
         let mut document = sample_document(32, 20, 1, 0);
-        let source = document.source.frame.clone();
+        let source = document.source().frame.clone();
 
         let output = Worker::prepare_after_capture_revision(&mut document, false).unwrap();
 
@@ -4231,7 +4232,7 @@ mod tests {
     #[test]
     fn after_capture_smart_frame_reopens_as_editable_without_history() {
         let card = CardId(12);
-        let source = sample_document(96, 60, 1, 0).source;
+        let source = sample_document(96, 60, 1, 0).source().clone();
         let seed_png = FrameEncoder::new()
             .encode(&source.frame, ImageFormat::Png)
             .unwrap();
@@ -4264,7 +4265,7 @@ mod tests {
             panic!("derived document should reopen");
         };
         assert!(document.beautification().is_some());
-        assert_eq!(document.source.frame.width(), 96);
+        assert_eq!(document.source().frame.width(), 96);
         assert!(
             document
                 .beautification()
@@ -4275,7 +4276,7 @@ mod tests {
     #[test]
     fn asynchronous_smart_frame_analysis_is_revision_bound_and_cached() {
         let card = CardId(7);
-        let capture = sample_document(80, 50, 1, 0).source;
+        let capture = sample_document(80, 50, 1, 0).source().clone();
         let (mut worker, outcomes) = worker_holding(
             card,
             Cached {
@@ -4337,7 +4338,7 @@ mod tests {
     #[test]
     fn cancelled_smart_frame_analysis_is_not_cached() {
         let card = CardId(8);
-        let capture = sample_document(80, 50, 1, 0).source;
+        let capture = sample_document(80, 50, 1, 0).source().clone();
         let (mut worker, outcomes) = worker_holding(
             card,
             Cached {
@@ -4396,7 +4397,7 @@ mod tests {
     fn a_live_policy_update_evicts_existing_images_and_governs_future_captures() {
         let (_dir, mut worker, outcomes) = worker_with_store("pipeline-retention-update");
         let first = worker
-            .remember(&sample_document(8, 8, 1, 0).source)
+            .remember(sample_document(8, 8, 1, 0).source())
             .expect("store existing capture");
         assert!(
             worker
@@ -4432,7 +4433,7 @@ mod tests {
         ));
 
         let future = worker
-            .remember(&sample_document(8, 8, 2, 0).source)
+            .remember(sample_document(8, 8, 2, 0).source())
             .expect("store future capture");
         let store = worker.store.as_mut().unwrap();
         assert!(store.image(&future).unwrap().is_none());
@@ -5005,7 +5006,7 @@ mod tests {
             .expect("render saved edits");
         let expected =
             Thumbnail::from_frame(&rendered, PIN_TEXTURE_MAX_EDGE).expect("expected texture");
-        let raw = Thumbnail::from_frame(&document.source.frame, PIN_TEXTURE_MAX_EDGE)
+        let raw = Thumbnail::from_frame(&document.source().frame, PIN_TEXTURE_MAX_EDGE)
             .expect("raw source texture");
 
         assert_eq!(actual.pixels(), expected.pixels());

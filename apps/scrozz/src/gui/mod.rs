@@ -65,12 +65,14 @@ pub mod app;
 pub mod card;
 pub mod drag;
 pub mod host;
+pub mod onboarding;
 pub mod panel;
 pub mod permission;
 pub mod pipeline;
 pub mod recent_captures_overlay;
 pub mod recording;
 pub mod selection;
+pub mod sensitive;
 pub mod server;
 
 // Re-exported so the rest of the binary — and anything that later lifts this

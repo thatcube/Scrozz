@@ -164,6 +164,11 @@ jobs:
         with:
           key: test-${{ matrix.os }}
 
+      - name: Test portable ZIP and MSIX artifacts
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: tools/test-windows-packaging.ps1
+
       # Clippy first. It type-checks every target including tests, so a plain
       # mistake surfaces here in a fraction of the time a full codegen build
       # takes — and clippy's own artefacts are not reusable by `cargo test`

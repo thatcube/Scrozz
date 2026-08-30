@@ -10,8 +10,8 @@ use scrozz_core::{
 };
 use scrozz_ocr::TextBlock;
 use scrozz_ocr::layout::{
-    NormalizedRect, bottom_left_normalized_to_physical, group_lines, pixels_to_physical,
-    plain_text, sort_reading_order, union,
+    LineBreaks, NormalizedRect, bottom_left_normalized_to_physical, group_lines,
+    pixels_to_physical, plain_text, sort_reading_order, text, union,
 };
 
 fn image(width: f64, height: f64) -> PhysicalSize {
@@ -237,6 +237,16 @@ fn plain_text_preserves_lines_and_spacing() {
         block("Ready.", 0.0, 30.0, 60.0, 12.0),
     ];
     assert_eq!(plain_text(&blocks), "Save Cancel\nReady.");
+}
+
+#[test]
+fn collapsed_text_joins_visual_lines_as_prose() {
+    let blocks = vec![
+        block("Save", 0.0, 0.0, 40.0, 12.0),
+        block("Cancel", 50.0, 0.0, 40.0, 12.0),
+        block("Ready.", 0.0, 30.0, 60.0, 12.0),
+    ];
+    assert_eq!(text(&blocks, LineBreaks::Collapse), "Save Cancel Ready.");
 }
 
 #[test]

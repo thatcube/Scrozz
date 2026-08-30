@@ -24,6 +24,16 @@ use scrozz_core::{LogicalRect, PhysicalPoint, PhysicalRect, PhysicalSize, ScaleF
 
 use crate::TextBlock;
 
+/// How recognized visual lines become plain text.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LineBreaks {
+    /// Keep one newline for each visual line returned by the OCR engine.
+    #[default]
+    Preserve,
+    /// Join visual lines with spaces for prose-oriented output.
+    Collapse,
+}
+
 /// Fraction of the shorter height two boxes must share vertically to count as
 /// the same line.
 ///
@@ -250,11 +260,21 @@ pub fn sort_reading_order(blocks: Vec<TextBlock>) -> Vec<TextBlock> {
 /// getting right.
 #[must_use]
 pub fn plain_text(blocks: &[TextBlock]) -> String {
+    text(blocks, LineBreaks::Preserve)
+}
+
+/// Joins blocks in reading order using the requested line-break policy.
+#[must_use]
+pub fn text(blocks: &[TextBlock], line_breaks: LineBreaks) -> String {
     let lines = group_lines(blocks.to_vec());
+    let line_separator = match line_breaks {
+        LineBreaks::Preserve => '\n',
+        LineBreaks::Collapse => ' ',
+    };
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate() {
         if i > 0 {
-            out.push('\n');
+            out.push(line_separator);
         }
         for (j, block) in line.iter().enumerate() {
             // Do not manufacture a double space when a block already ends in one.

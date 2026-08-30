@@ -13,6 +13,9 @@
 # an ad-hoc signature, whose effective identity is the binary's changing cdhash
 # and therefore requires Screen Recording approval after changed builds. Public
 # releases still need Developer ID signing and notarisation — see release.yml.
+# Set SCROZZ_SIGNING_MODE (ad-hoc-dev, developer-id-release, external-release)
+# to require one exact signing outcome instead of the automatic choice below;
+# release.yml does, so a release can never silently fall back to ad-hoc.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
@@ -57,6 +60,12 @@ case "$APP" in
     exit 1
     ;;
 esac
+case "/$APP/" in
+  */../* | */./*)
+    echo "make-app-bundle: destination must not contain '.' or '..' path components." >&2
+    exit 1
+    ;;
+esac
 if [[ "$APP" != *.app ]]; then
   echo "make-app-bundle: destination must end in .app, got '$APP'." >&2
   echo "make-app-bundle: this path is deleted before assembly, so it is not" >&2
@@ -70,9 +79,33 @@ if [[ ! -d "$APP_PARENT" ]]; then
   echo "                 path it is also about to rm -rf." >&2
   exit 1
 fi
+if [[ -L "$APP" ]]; then
+  echo "make-app-bundle: refusing to replace symlink '$APP'." >&2
+  exit 1
+fi
 if [[ -e "$APP" && ! -d "$APP" ]]; then
   echo "make-app-bundle: '$APP' exists and is not a directory." >&2
   exit 1
+fi
+if [[ -d "$APP" ]]; then
+  EXISTING_PLIST="$APP/Contents/Info.plist"
+  if [[ ! -f "$EXISTING_PLIST" ]]; then
+    echo "make-app-bundle: refusing to replace unrecognized bundle '$APP'." >&2
+    exit 1
+  fi
+  if command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
+    EXISTING_BUNDLE_ID="$(
+      /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+        "$EXISTING_PLIST" 2>/dev/null || true
+    )"
+    if [[ "$EXISTING_BUNDLE_ID" != "com.thatcube.Scrozz" ]]; then
+      echo "make-app-bundle: refusing to replace foreign bundle '$APP'." >&2
+      exit 1
+    fi
+  elif ! grep -q '<string>com\.thatcube\.Scrozz</string>' "$EXISTING_PLIST"; then
+    echo "make-app-bundle: refusing to replace foreign bundle '$APP'." >&2
+    exit 1
+  fi
 fi
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
@@ -113,17 +146,92 @@ else
   BUILD_SOURCE="fallback"
 fi
 
-VERSION_PATTERN='^[0-9]+(\.[0-9]+){1,2}$'
 BUILD_PATTERN='^[0-9]+(\.[0-9]+){0,2}$'
-if [[ ! "$APP_VERSION" =~ $VERSION_PATTERN ]]; then
+BASE_APP_VERSION="${APP_VERSION%%-*}"
+PRERELEASE=""
+if [[ "$APP_VERSION" == *-* ]]; then
+  PRERELEASE="${APP_VERSION#*-}"
+fi
+if [[ ! "$BASE_APP_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+  [[ "$APP_VERSION" == *- && -z "$PRERELEASE" ]] ||
+  { [[ -n "$PRERELEASE" ]] &&
+    [[ ! "$PRERELEASE" =~ ^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$ ]]; }; then
   echo "make-app-bundle: invalid app version '$APP_VERSION'." >&2
-  echo "                 Expected a dotted numeric version such as 2026.8.27." >&2
+  echo "                 Expected a version such as 2026.8.27 or 2026.8.27-rc.1." >&2
   exit 1
+fi
+if [[ -n "$PRERELEASE" ]]; then
+  IFS='.' read -r -a PRERELEASE_PARTS <<<"$PRERELEASE"
+  for PART in "${PRERELEASE_PARTS[@]}"; do
+    if [[ "$PART" =~ ^[0-9]+$ && ! "$PART" =~ ^(0|[1-9][0-9]*)$ ]]; then
+      echo "make-app-bundle: invalid app version '$APP_VERSION'." >&2
+      echo "                 Numeric prerelease components cannot have leading zeroes." >&2
+      exit 1
+    fi
+  done
 fi
 if [[ ! "$BUILD_NUMBER" =~ $BUILD_PATTERN ]]; then
   echo "make-app-bundle: invalid build number '$BUILD_NUMBER'." >&2
   echo "                 Expected one to three numeric components." >&2
   exit 1
+fi
+
+# --- deployment floor -------------------------------------------------------
+#
+# ScreenCaptureKit, the Vision recogniser and the overlay behaviours all assume
+# this floor. Declaring it in the bundle makes an older macOS refuse to launch
+# rather than fail at the first unavailable symbol.
+MINIMUM_MACOS_VERSION="12.3"
+DEPLOYMENT_TARGET="${SCROZZ_MACOS_DEPLOYMENT_TARGET:-$MINIMUM_MACOS_VERSION}"
+if [[ ! "$DEPLOYMENT_TARGET" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?$ ]]; then
+  echo "make-app-bundle: invalid macOS deployment target '$DEPLOYMENT_TARGET'" >&2
+  exit 1
+fi
+TARGET_MAJOR="${BASH_REMATCH[1]}"
+TARGET_MINOR="${BASH_REMATCH[2]}"
+if ((10#$TARGET_MAJOR < 12)) ||
+  ((10#$TARGET_MAJOR == 12 && 10#$TARGET_MINOR < 3)); then
+  echo "make-app-bundle: macOS deployment target '$DEPLOYMENT_TARGET' is below the true minimum $MINIMUM_MACOS_VERSION" >&2
+  exit 1
+fi
+
+# --- signing mode -----------------------------------------------------------
+#
+# Optional. Unset keeps the developer default further down, which picks the
+# best identity present. A release sets it so the outcome is a checked promise
+# rather than whatever the machine happened to have in its keychain.
+SIGNING_MODE="${SCROZZ_SIGNING_MODE:-}"
+SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}"
+case "$SIGNING_MODE" in
+  "" | ad-hoc-dev) ;;
+  developer-id-release)
+    if [[ "$SIGN_IDENTITY" != "Developer ID Application:"* ]]; then
+      echo "make-app-bundle: developer-id-release requires" >&2
+      echo "  SCROZZ_SIGN_IDENTITY='Developer ID Application: ...'" >&2
+      exit 1
+    fi
+    ;;
+  external-release)
+    if [[ "${SCROZZ_ALLOW_EXTERNAL_SIGNING:-0}" != "1" ]]; then
+      echo "make-app-bundle: external-release requires SCROZZ_ALLOW_EXTERNAL_SIGNING=1" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "make-app-bundle: unknown SCROZZ_SIGNING_MODE '$SIGNING_MODE'" >&2
+    echo "  expected ad-hoc-dev, developer-id-release, or external-release" >&2
+    exit 1
+    ;;
+esac
+
+# A dry contract check for callers that only want the arguments validated.
+if [[ "${SCROZZ_BUNDLE_VALIDATE_ONLY:-0}" == "1" ]]; then
+  if [[ -z "$SIGNING_MODE" ]]; then
+    echo "make-app-bundle: validation requires an explicit SCROZZ_SIGNING_MODE." >&2
+    exit 1
+  fi
+  echo "validated: $APP"
+  exit 0
 fi
 
 # --- where the executable comes from ---------------------------------------
@@ -178,7 +286,7 @@ if [[ -d assets/icons/Scrozz.icon && -x "$ICON_DEVELOPER_DIR/usr/bin/actool" ]];
     --platform macosx \
     --enable-icon-stack-fallback-generation=disabled \
     --include-all-app-icons \
-    --minimum-deployment-target 12.3 \
+    --minimum-deployment-target "$DEPLOYMENT_TARGET" \
     --output-partial-info-plist /dev/null
 fi
 
@@ -230,7 +338,13 @@ PLIST
 # pass the same value explicitly so bundle metadata, filenames and `--version`
 # cannot disagree.
 /usr/libexec/PlistBuddy \
-  -c "Set :CFBundleShortVersionString $APP_VERSION" \
+  -c "Set :CFBundleShortVersionString $BASE_APP_VERSION" \
+  "$APP/Contents/Info.plist"
+
+# The floor the capture and OCR stacks actually require. Stated in the bundle
+# so an older macOS refuses to launch rather than failing at the first API.
+/usr/libexec/PlistBuddy \
+  -c "Set :LSMinimumSystemVersion $DEPLOYMENT_TARGET" \
   "$APP/Contents/Info.plist"
 
 # Diagnostic/legacy escape hatch only. On macOS 26 this opts back into the
@@ -240,26 +354,54 @@ if [[ "${SCROZZ_INCLUDE_LEGACY_ICON:-0}" == "1" ]]; then
     "$APP/Contents/Info.plist"
 fi
 
-if [[ "${SCROZZ_SKIP_SIGN:-0}" == "1" ]]; then
-  echo "==> signing skipped (SCROZZ_SKIP_SIGN=1); caller owns the signature"
-else
-  SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}"
-  if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
-    SIGN_IDENTITY="$(
-      security find-identity -v -p codesigning 2>/dev/null |
-        awk '/"Apple Development:/ { print $2; exit }'
-    )"
-  fi
-
-  if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
-    echo "==> signing with a stable Apple Development identity"
-    codesign --force --sign "$SIGN_IDENTITY" --identifier com.thatcube.Scrozz \
-      --timestamp=none "$APP"
-  else
-    echo "==> signing ad-hoc (Screen Recording approval will not survive changed builds)"
+# An explicit mode is a promise about the outcome, so it is checked rather than
+# approximated. Without one the developer path picks the best identity it can
+# find, which is what makes a local rebuild keep its Screen Recording grant.
+case "$SIGNING_MODE" in
+  ad-hoc-dev)
+    echo "==> signing with an ad-hoc development identity"
+    echo "    Screen Recording consent may be requested again after bytes change."
     codesign --force --sign - --identifier com.thatcube.Scrozz "$APP"
-  fi
-fi
+    codesign --verify --strict --verbose=2 "$APP"
+    ;;
+  developer-id-release)
+    echo "==> signing with Developer ID release identity '$SIGN_IDENTITY'"
+    codesign --force --options runtime --timestamp \
+      --sign "$SIGN_IDENTITY" "$APP"
+    codesign --verify --strict --verbose=2 "$APP"
+    ;;
+  external-release)
+    echo "==> leaving bundle unsigned for the caller's immediate release-signing step"
+    ;;
+  "")
+    if [[ "${SCROZZ_SKIP_SIGN:-0}" == "1" ]]; then
+      echo "==> signing skipped (SCROZZ_SKIP_SIGN=1); caller owns the signature"
+    else
+      SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}"
+      if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
+        SIGN_IDENTITY="$(
+          security find-identity -v -p codesigning 2>/dev/null |
+            awk '/"Apple Development:/ { print $2; exit }'
+        )"
+      fi
+
+      if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
+        echo "==> signing with a stable Apple Development identity"
+        codesign --force --sign "$SIGN_IDENTITY" --identifier com.thatcube.Scrozz \
+          --timestamp=none "$APP"
+      else
+        echo "==> signing ad-hoc (Screen Recording approval will not survive changed builds)"
+        codesign --force --sign - --identifier com.thatcube.Scrozz "$APP"
+      fi
+    fi
+    ;;
+  *)
+    echo "make-app-bundle: unknown SCROZZ_SIGNING_MODE '$SIGNING_MODE'" >&2
+    echo "  expected ad-hoc-dev, developer-id-release, or external-release" >&2
+    exit 1
+    ;;
+esac
+
 
 echo
 echo "built: $APP"

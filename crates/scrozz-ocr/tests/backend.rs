@@ -20,9 +20,114 @@ fn blank(width: u32, height: u32, scale: f64) -> Frame {
 }
 
 #[test]
-fn availability_matches_the_platform() {
-    let expected = cfg!(any(target_os = "macos", target_os = "windows"));
-    assert_eq!(SystemOcr::is_available(), expected);
+fn availability_matches_the_runtime_that_will_be_used() {
+    #[cfg(target_os = "macos")]
+    assert!(SystemOcr::is_runtime_available());
+
+    #[cfg(all(target_os = "linux", feature = "tesseract"))]
+    assert_eq!(
+        SystemOcr::is_runtime_available(),
+        SystemOcr::new()
+            .available_languages()
+            .is_ok_and(|languages| !languages.is_empty())
+    );
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", feature = "tesseract")
+    )))]
+    assert!(!SystemOcr::is_runtime_available());
+}
+
+#[test]
+fn build_capability_remains_const_compatible() {
+    const BUILT_WITH_OCR: bool = SystemOcr::is_available();
+    assert_eq!(
+        BUILT_WITH_OCR,
+        cfg!(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", feature = "tesseract")
+        ))
+    );
+}
+
+#[cfg(all(target_os = "linux", feature = "tesseract"))]
+#[test]
+fn public_availability_reacts_to_same_process_runtime_changes() {
+    use std::{os::unix::fs::PermissionsExt as _, process::Command};
+
+    let root = std::env::temp_dir().join(format!(
+        "scrozz-public-ocr-availability-{}",
+        std::process::id()
+    ));
+    let available = root.join("available");
+    let missing = root.join("missing");
+    let _ = std::fs::remove_dir_all(&root);
+    for directory in [&available, &missing] {
+        std::fs::create_dir_all(directory.join("tessdata")).expect("tessdata directory");
+    }
+    let executable = available.join("tesseract");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf 'List of available languages (1):\\neng\\n'\n",
+    )
+    .expect("fake Tesseract");
+    let mut permissions = std::fs::metadata(&executable)
+        .expect("fixture metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&executable, permissions).expect("executable fixture");
+
+    let status = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--ignored", "--exact", "public_availability_probe_child"])
+        .env("SCROZZ_AVAILABLE_TESSERACT", &available)
+        .env("SCROZZ_MISSING_TESSERACT", &missing)
+        .status()
+        .expect("availability child");
+    assert!(status.success());
+    std::fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[cfg(all(target_os = "linux", feature = "tesseract"))]
+#[test]
+#[ignore = "launched in isolation by public_availability_reacts_to_same_process_runtime_changes"]
+fn public_availability_probe_child() {
+    let available = std::env::var_os("SCROZZ_AVAILABLE_TESSERACT").expect("available runtime");
+    let missing = std::env::var_os("SCROZZ_MISSING_TESSERACT").expect("missing runtime");
+
+    // SAFETY: this ignored probe runs as the only test in a dedicated child
+    // process, so no other thread can read or write the process environment.
+    unsafe { std::env::set_var(scrozz_ocr::TESSERACT_DIRECTORY_ENV, &available) };
+    assert!(SystemOcr::is_runtime_available());
+    // SAFETY: same isolated child-process guarantee as above.
+    unsafe { std::env::set_var(scrozz_ocr::TESSERACT_DIRECTORY_ENV, &missing) };
+    assert!(!SystemOcr::is_runtime_available());
+    // SAFETY: same isolated child-process guarantee as above.
+    unsafe { std::env::set_var(scrozz_ocr::TESSERACT_DIRECTORY_ENV, &available) };
+    assert!(SystemOcr::is_runtime_available());
+
+    std::fs::remove_file(std::path::Path::new(&available).join("tesseract"))
+        .expect("remove runtime");
+    assert!(
+        !SystemOcr::is_runtime_available(),
+        "removing the selected executable must invalidate a prior positive probe"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_availability_matches_the_selected_artifact_backend() {
+    match SystemOcr::engine_name().expect("package identity query") {
+        "windows-media-ocr" | "tesseract" => assert_eq!(
+            SystemOcr::is_runtime_available(),
+            SystemOcr::new()
+                .available_languages()
+                .is_ok_and(|languages| !languages.is_empty())
+        ),
+        other => panic!("unexpected Windows OCR backend {other}"),
+    }
 }
 
 #[test]
@@ -35,6 +140,8 @@ fn options_default_to_accurate_and_no_language_correction() {
     );
     assert_eq!(options.upscale, UpscalePolicy::Automatic);
     assert!(options.languages.is_empty());
+    assert!(!options.automatic_language_detection);
+    assert_eq!(options.line_breaks, scrozz_ocr::LineBreaks::Preserve);
 }
 
 #[test]
@@ -43,11 +150,14 @@ fn options_builders_compose() {
         .with_languages(["en-US".to_string(), "de-DE".to_string()])
         .with_accuracy(scrozz_ocr::Accuracy::Fast)
         .with_upscale(UpscalePolicy::Off)
-        .with_language_correction(true);
+        .with_language_correction(true)
+        .with_automatic_language_detection(false)
+        .with_line_breaks(scrozz_ocr::LineBreaks::Collapse);
     assert_eq!(options.languages, ["en-US", "de-DE"]);
     assert_eq!(options.accuracy, scrozz_ocr::Accuracy::Fast);
     assert_eq!(options.upscale, UpscalePolicy::Off);
     assert!(options.language_correction);
+    assert_eq!(options.line_breaks, scrozz_ocr::LineBreaks::Collapse);
 }
 
 /// A malformed frame must be rejected the same way everywhere, before any
@@ -69,7 +179,11 @@ fn a_zero_sized_frame_never_panics() {
     assert!(SystemOcr::new().recognize(&frame).is_err());
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", feature = "tesseract")
+)))]
 mod no_system_engine {
     use super::{Ocr, SystemOcr, blank};
     use scrozz_core::Error;

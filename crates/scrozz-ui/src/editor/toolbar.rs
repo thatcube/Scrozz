@@ -724,7 +724,7 @@ fn draw_crop_controls(ui: &Ui, surface: &Surface<'_>, state: &mut EditorState, c
                     if let Some(((width_px, height_px), (source_width, source_height))) =
                         state.crop_pixel_sizes()
                     {
-                        let scale = state.document().source.frame.scale.get();
+                        let scale = state.document().source().frame.scale.get();
                         let mut width_px = width_px;
                         let mut height_px = height_px;
                         let width_response = ui.add(

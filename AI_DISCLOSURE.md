@@ -58,9 +58,10 @@ result.
 
 These are properties of the shipped application, not promises about intent.
 
-- **No generative AI at runtime.** Scrozz contains no language model, no
-  diffusion model, and no inference of any kind. Nothing you capture is
-  interpreted, described, summarised, or generated.
+- **No generative AI at runtime.** Scrozz contains no large language model and
+  no diffusion model. Nothing you capture is described, summarised, or
+  generated. An explicit OCR command does interpret image pixels as text
+  locally; that narrow recognition step is the only model-backed processing.
 - **Your captures are never uploaded to an AI service or a Scrozz service.**
   There is no such integration, and none is planned. If the optional `cloud`
   feature is built and the user presses Upload or runs `scrozz share`, that
@@ -69,12 +70,19 @@ These are properties of the shipped application, not promises about intent.
 - **No account, no sign-in, no server.** There is no Scrozz backend to talk to.
 - **Your data is not monetised.** Scrozz receives none of it. A capture leaves
   the machine only when the user explicitly shares it to storage they control.
-- **Text recognition is local.** Optical character recognition uses the
-  recogniser already built into your operating system — Vision on macOS,
-  `Windows.Media.Ocr` on Windows — running on device. Linux ships no comparable
-  system engine, and per [D8](docs/decisions.md) Scrozz reports that honestly
-  rather than quietly returning an empty result. OCR sends nothing off the
-  machine in any case.
+- **Text recognition is local.** Optical character recognition uses Vision on
+  macOS, `Windows.Media.Ocr` when the Windows process has package identity, and
+  Tesseract on Linux and in the portable Windows ZIP. That ZIP includes the
+  Tesseract executable, its runtime DLLs, and English recognition data; Linux
+  uses the executable and language data installed by the user. Scrozz always
+  passes an explicit language model and returns an actionable error when a
+  requested model is absent. Nothing is sent off the machine.
+- **Sensitive-information suggestions are local and deterministic.** Scrozz can
+  classify OCR geometry as possible email addresses, payment cards, network
+  addresses, phone numbers, token-bearing URLs, or likely keys using ordinary
+  parsing, checksums, entropy and nearby context. Findings retain no recognized
+  value, are never selected automatically, and become redactions only after the
+  user reviews and accepts them.
 
 ### How you can verify that
 

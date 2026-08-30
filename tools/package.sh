@@ -54,6 +54,20 @@ Environment:
   SCROZZ_STAMP      identifier baked into the archive name, normally the short
                     commit sha (default: the current git short sha, else "dev")
 
+Windows packaged identity (all optional; set any one to take the MSIX path in
+tools/package-windows.ps1 instead of the plain portable zip):
+  SCROZZ_MSIX_IDENTITY_NAME           Partner Center package identity
+  SCROZZ_MSIX_PUBLISHER               certificate/Store publisher DN
+  SCROZZ_MSIX_PUBLISHER_DISPLAY_NAME  Store-facing publisher name
+  SCROZZ_MSIX_VERSION                 four-part package version override
+  SCROZZ_TESSERACT_DIR                absolute portable OCR payload directory
+                                      holding tesseract.exe and
+                                      tessdata/eng.traineddata
+  SCROZZ_MSIX_SIGN_PFX                external package-signing certificate
+  SCROZZ_MSIX_SIGN_PFX_PASSWORD       PFX password
+  SCROZZ_MSIX_SIGN_CERT_SHA1          certificate-store thumbprint
+  SCROZZ_WINDOWS_VERIFY_DETERMINISM   rebuild and compare both artifacts
+
 Exit status:
   0   an archive was produced
   1   packaging failed
@@ -100,9 +114,13 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 STAMP="${SCROZZ_STAMP:-$(git rev-parse --short HEAD 2>/dev/null || echo dev)}"
-VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' apps/scrozz/Cargo.toml | head -1)"
-[[ -n "$VERSION" ]] || VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+VERSION="${SCROZZ_APP_VERSION:-}"
+[[ -n "$VERSION" ]] ||
+  VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' apps/scrozz/Cargo.toml | head -1)"
+[[ -n "$VERSION" ]] ||
+  VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 [[ -n "$VERSION" ]] || VERSION="0.0.0"
+NATIVE_PACKAGE_VERSION="${VERSION%%-*}"
 
 NAME="scrozz-${VERSION}-${STAMP}-${OS}-${ARCH}"
 
@@ -160,6 +178,35 @@ case "$OS" in
     ;;
 
   windows)
+    # Packaged identity is what lets Windows.Media.Ocr activate at all, and the
+    # MSIX path also stages the artifact-local Tesseract payload that the
+    # portable build falls back to. It is opt-in because it needs the Windows
+    # SDK, and this per-commit path must keep working on a bare runner.
+    if [[ -n "${SCROZZ_MSIX_IDENTITY_NAME:-}${SCROZZ_MSIX_PUBLISHER:-}${SCROZZ_TESSERACT_DIR:-}" ]]; then
+      if command -v powershell.exe >/dev/null 2>&1; then
+        POWERSHELL="powershell.exe"
+      elif command -v powershell >/dev/null 2>&1; then
+        POWERSHELL="powershell"
+      else
+        echo "package: PowerShell is required for deterministic ZIP and MSIX output" >&2
+        exit 1
+      fi
+      # `package-windows.ps1` names its own artifacts and writes their
+      # checksums and metadata, so this path ends here rather than falling
+      # through to the portable-zip summary below.
+      "$POWERSHELL" \
+        -NoLogo \
+        -NoProfile \
+        -NonInteractive \
+        -ExecutionPolicy Bypass \
+        -File tools/package-windows.ps1 \
+        -OutputDirectory "$DIST" \
+        -Binary "$BIN" \
+        -Version "$VERSION" \
+        -Stamp "$STAMP" \
+        -Architecture "$([[ "$ARCH" == "arm64" ]] && echo aarch64 || echo "$ARCH")"
+      exit
+    fi
     STAGE="$DIST/$NAME"
     mkdir -p "$STAGE"
     cp "$BIN" "$STAGE/scrozz.exe"
@@ -253,6 +300,44 @@ fi
 [[ -n "$SUM" ]] && echo "$SUM  $(basename "$ARCHIVE")" >"$ARCHIVE.sha256"
 
 SIZE="$(wc -c <"$ARCHIVE" | tr -d ' ')"
+
+# --- artifact metadata ------------------------------------------------------
+#
+# Unsigned facts about what was produced: never an update manifest and never
+# installation authority. `signed_manifest` is hard-coded false so nothing
+# downstream can mistake this file for something a private key vouched for —
+# signing a release remains a separate, human-gated step.
+PACKAGE_KIND="portable-archive"
+PACKAGE_IDENTITY=""
+IDENTITY_MODE="${SCROZZ_SIGNING_MODE:-none}"
+PAYLOAD_SIGNED=false
+if [[ "$OS" == "macos" ]]; then
+  PACKAGE_KIND="app-bundle-archive"
+  PACKAGE_IDENTITY="com.thatcube.Scrozz"
+  # The bundler always leaves a signature on macOS unless a caller explicitly
+  # took ownership of that step.
+  [[ "${SCROZZ_SKIP_SIGN:-0}" == "1" || "${SCROZZ_SIGNING_MODE:-}" == "external-release" ]] ||
+    PAYLOAD_SIGNED=true
+fi
+cat >"$ARCHIVE.artifact.json" <<JSON
+{
+  "schema": 1,
+  "platform": "$OS-$ARCH",
+  "version": "$VERSION",
+  "file": "$(basename "$ARCHIVE")",
+  "sha256": "${SUM:-}",
+  "size": $SIZE,
+  "package_kind": "$PACKAGE_KIND",
+  "native_package_version": "$NATIVE_PACKAGE_VERSION",
+  "package_identity": "$PACKAGE_IDENTITY",
+  "identity_mode": "$IDENTITY_MODE",
+  "preview": $([[ "$PREVIEW" -eq 1 ]] && echo true || echo false),
+  "signed": false,
+  "payload_signed": $PAYLOAD_SIGNED,
+  "notarized": false,
+  "signed_manifest": false
+}
+JSON
 
 echo
 echo "built: $ARCHIVE"

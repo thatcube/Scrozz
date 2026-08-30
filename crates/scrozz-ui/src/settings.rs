@@ -9,6 +9,7 @@ use scrozz_record::{EngineCapabilities, RecordingSettings};
 
 use crate::{
     icons::{Icon, IconStore},
+    onboarding::OcrSettings,
     recent_captures_overlay::{
         RecentCapturesAutoCloseAction, RecentCapturesOverlaySettings, RecentCapturesPlacement,
         RecentCapturesSaveBehavior,
@@ -94,6 +95,8 @@ pub struct SettingsEdits {
     pub recording: Vec<RecordingSettingsAction>,
     /// Complete Recent Captures Overlay configuration after an accepted edit.
     pub recent_captures_overlay: Option<RecentCapturesOverlaySettings>,
+    /// The user asked to see the one-time text-recognition introduction again.
+    pub replay_ocr_onboarding: bool,
     /// The user asked to configure private sharing.
     ///
     /// Sharing has a viewport of its own rather than a pane here, because it
@@ -110,6 +113,7 @@ impl SettingsEdits {
             && self.after_capture.is_empty()
             && self.recording.is_empty()
             && self.recent_captures_overlay.is_none()
+            && !self.replay_ocr_onboarding
             && !self.open_sharing
     }
 }
@@ -260,6 +264,7 @@ enum Pane {
     AfterCapture,
     Recording,
     RecentCapturesOverlay,
+    TextRecognition,
     Shortcuts,
     About,
 }
@@ -735,7 +740,7 @@ fn draw_sidebar_navigation(
     }
 }
 
-fn navigation_items() -> [(Pane, &'static str, Icon); 5] {
+fn navigation_items() -> [(Pane, &'static str, Icon); 6] {
     [
         (Pane::AfterCapture, "After Capture", Icon::Copy),
         (Pane::Recording, "Recording", Icon::Video),
@@ -744,6 +749,7 @@ fn navigation_items() -> [(Pane, &'static str, Icon); 5] {
             "Recent Captures",
             Icon::LayoutGrid,
         ),
+        (Pane::TextRecognition, "Text Recognition", Icon::Scan),
         (Pane::Shortcuts, "Shortcuts", Icon::Settings),
         (Pane::About, "About", Icon::AppWindow),
     ]
@@ -847,6 +853,13 @@ fn draw_body(
                 Pane::RecentCapturesOverlay => {
                     edits.recent_captures_overlay =
                         draw_recent_captures_overlay(ui, theme, recent_captures_overlay, platform);
+                }
+                // OCR gets an ordinary pane here rather than a settings window
+                // of its own: a second settings surface is a second place to
+                // look, and the two would immediately disagree about theme,
+                // focus, and which one the tray item opens.
+                Pane::TextRecognition => {
+                    edits.replay_ocr_onboarding = OcrSettings.body(ui, theme).show_onboarding;
                 }
                 Pane::Shortcuts => {
                     edits.shortcuts = draw_shortcuts(ui, theme, icons, shortcuts, recording);
