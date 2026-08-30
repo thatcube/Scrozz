@@ -243,6 +243,20 @@ struct PickerObserverIvars {
     include_window_shadow: bool,
 }
 
+// A platform limitation this cannot close, recorded so nobody re-opens it as a
+// bug: `SCContentSharingPicker` broadcasts to every observer registered at the
+// moment it fires, and the callback carries nothing naming the presentation it
+// answers. So a callback from a presentation we have already abandoned can
+// still arrive while a newer one is registered.
+//
+// What is done about it: one observer per presentation, each frozen to the
+// generation and the shadow preference it was born with, and an inbox that
+// refuses anything not quoting the live generation. A late callback therefore
+// cannot capture under the wrong preference, cannot cancel a newer picker, and
+// cannot fail one. That is the whole window the API leaves; the residue is a
+// stale callback arriving inside its own generation, which no heuristic here
+// could distinguish from a real one, and guessing would break the honest case.
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[ivars = PickerObserverIvars]
