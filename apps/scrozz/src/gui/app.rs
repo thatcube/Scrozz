@@ -2045,6 +2045,18 @@ impl App {
                 Outcome::Refused { card, error } => {
                     if self.opening_cards.remove(&card) {
                         self.surface.set_editing(card, false);
+                        // The open that a deferred auto-close or overflow was
+                        // waiting on never produced an editor to close later,
+                        // so nothing will ever call `editor_closed` for it.
+                        // Resolve deferred cleanup now, against no editor, so
+                        // a card cannot stay pinned open forever behind a
+                        // decode failure.
+                        if let Some(action) = self.deferred_auto_close.remove(&card) {
+                            self.handle_auto_close(card, action, EditorSnapshots::EMPTY);
+                        }
+                        if self.deferred_overflow.remove(&card) {
+                            self.handle_overflow(card, EditorSnapshots::EMPTY);
+                        }
                     }
                     self.surface
                         .set_status(card, Some(format!("Action failed: {error}")));
@@ -2313,7 +2325,14 @@ impl App {
                         ));
                         continue;
                     }
-                    if editors.for_card(id).is_some() {
+                    if editors.for_card(id).is_some() || self.opening_cards.contains(&id) {
+                        // An editor is open, or is still being decoded for
+                        // one opened this very frame: `entry.editing` cannot
+                        // yet be true for either case (it only flips on the
+                        // async `Command::SetEditing` round trip), so the
+                        // overlay's own same-frame exclusion cannot see it.
+                        // Defer here instead of auto-closing out from under
+                        // an editor that exists, or is about to.
                         self.deferred_auto_close.insert(id, action);
                         self.note(format!("{id} stayed visible while its editor is open"));
                         continue;
@@ -2369,15 +2388,23 @@ impl App {
                         // Already open, or already being decoded for one:
                         // raise the one editor instead of starting a second.
                         self.focus_editor_requests.push_back(id);
-                    } else {
+                    } else if self.pipeline.post(Job::Open(id)) {
                         // Decoding happens on the worker, so the click that
                         // opens the editor never inflates a 6K PNG on the UI
                         // thread. The card's timer pauses optimistically here,
                         // before the decode even finishes, so a slow decode
                         // can never let the card auto-close out from under it.
+                        // Bookkeeping only follows a successful post: marking
+                        // the card as opening/editing first would leave it
+                        // stuck that way forever if the worker had already
+                        // gone, with its timer paused and Continue routing to
+                        // an editor that will never exist.
                         self.opening_cards.insert(id);
                         self.surface.set_editing(id, true);
-                        self.pipeline.post(Job::Open(id));
+                    } else {
+                        self.note(format!(
+                            "{id} could not be queued for Open Editor: the capture worker has gone"
+                        ));
                     }
                 }
                 CardEvent::Drag { card, at } => {
@@ -4558,13 +4585,21 @@ impl App {
     /// Releases an artifact retained only for its editor, then resumes deferred cleanup.
     ///
     /// Cleanup that expired while the window was open runs here with the
-    /// editor's final snapshot, so any recovery export is rendered from the
-    /// revision the user actually finished with. Resuming before the
-    /// editor-only release means a card the deferred work retires still hands
-    /// its live bytes back in the same pass.
-    pub fn editor_closed(&mut self, editor: EditorSnapshot<'_>) {
+    /// editor's final snapshot -- but only when `committed` says the editor
+    /// closed through Done. Any recovery export that fires for a card whose
+    /// editor merely closed (Cancel, or a clean window close) must instead
+    /// see no live editor at all, so it falls back to the card's own,
+    /// unmodified bytes rather than rendering and possibly saving or
+    /// uploading annotations the user just discarded. Resuming before the
+    /// editor-only release means a card the deferred work retires still
+    /// hands its live bytes back in the same pass.
+    pub fn editor_closed(&mut self, editor: EditorSnapshot<'_>, committed: bool) {
         let card = editor.card;
-        let editors = EditorSnapshots::new(std::slice::from_ref(&editor));
+        let editors = if committed {
+            EditorSnapshots::new(std::slice::from_ref(&editor))
+        } else {
+            EditorSnapshots::EMPTY
+        };
         if let Some(action) = self.deferred_auto_close.remove(&card) {
             self.handle_auto_close(card, action, editors);
         }
@@ -4576,6 +4611,28 @@ impl App {
         }
         self.opening_cards.remove(&card);
         self.surface.set_editing(card, false);
+    }
+
+    /// Files a Done-committed editor revision into the card's own exportable bytes.
+    ///
+    /// Companion to [`Self::persist_editor`] and [`Self::refresh_card_thumbnail`]:
+    /// those update the durable history record and the visible thumbnail, this
+    /// updates what a plain Copy, Save or Upload posted once the editor is gone
+    /// actually reads. Called only for the Done exception D14 sanctions --
+    /// never for Cancel or a clean close, both of which must leave a card's own
+    /// bytes exactly as they were before the editor opened.
+    pub fn commit_card_output(&mut self, card: CardId, generation: u64, rendered: RevisionedFrame) {
+        let job = Job::CommitCardOutput {
+            card,
+            generation,
+            rendered: Box::new(rendered),
+        };
+        if !self.pipeline.post(job) {
+            self.note(format!(
+                "{card} editor {generation}'s committed edit could not be filed for export: \
+                 the capture worker has gone"
+            ));
+        }
     }
 
     /// Asks the worker to prepare the latest settled editor revision for drag.
@@ -7243,7 +7300,7 @@ mod tests {
             Some(&RecentCapturesAutoCloseAction::SaveThenHide)
         );
 
-        app.editor_closed(EditorSnapshot::new(card, 1, &editor));
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), true);
 
         assert!(!app.deferred_auto_close.contains_key(&card));
         assert!(
@@ -7253,6 +7310,45 @@ mod tests {
         assert!(
             app.close_after_output.contains(&card),
             "the revision the editor ended on must be exported before the card closes"
+        );
+    }
+
+    #[test]
+    fn opening_a_card_and_its_expiry_landing_the_same_frame_defers_to_the_open() {
+        let (mut app, surface) = app();
+        let card = CardId(69);
+
+        // Deadline race: the dwell timer expires in the exact same batch as
+        // the click that opens the card. `entry.editing` cannot yet be true
+        // for a decode that only just got queued (it flips on the async
+        // `Command::SetEditing` round trip), so the overlay's own same-frame
+        // exclusion can't see it either. Without deferring on
+        // `opening_cards` this would auto-close (and, for `SaveThenHide`,
+        // export) the card the same frame its editor is starting.
+        surface.inject(CardEvent::Open(card));
+        surface.inject(CardEvent::AutoClose(
+            card,
+            RecentCapturesAutoCloseAction::SaveThenHide,
+        ));
+
+        app.drain_cards(EditorSnapshots::EMPTY);
+
+        assert!(
+            app.opening_cards.contains(&card),
+            "the open must still proceed"
+        );
+        assert_eq!(
+            app.deferred_auto_close.get(&card),
+            Some(&RecentCapturesAutoCloseAction::SaveThenHide),
+            "the same-frame expiry must defer rather than race the open"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "a card must not be dismissed the same frame its editor starts opening"
+        );
+        assert!(
+            !app.close_after_output.contains(&card),
+            "a deferred expiry must not export before the editor the user just opened exists"
         );
     }
 
@@ -7347,6 +7443,39 @@ mod tests {
                 editing: true
             }),
             "the timer is already paused for an open editor; opening it again must not re-pause it"
+        );
+    }
+
+    #[test]
+    fn a_refused_open_enqueue_leaves_the_card_closed_instead_of_stuck_editing() {
+        let (mut app, surface) = app();
+        let card = CardId(73);
+
+        // Simulate "the capture worker has gone": stop the pipeline first, so
+        // its `post` can no longer reach a receiver and every subsequent
+        // enqueue is refused, exactly like a worker that has already exited.
+        app.pipeline.stop();
+
+        surface.inject(CardEvent::Open(card));
+        app.drain_cards(EditorSnapshots::EMPTY);
+
+        assert!(
+            !app.opening_cards.contains(&card),
+            "a refused enqueue must not leave the card marked as opening forever"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::SetEditing {
+                id: card,
+                editing: true
+            }),
+            "a refused enqueue must not pause the card's auto-close timer with no editor to show for it"
+        );
+        assert!(
+            app.notes()
+                .iter()
+                .any(|note| note.contains("could not be queued for Open Editor")),
+            "the failure must be surfaced, not silently swallowed: {:?}",
+            app.notes()
         );
     }
 
@@ -7447,7 +7576,7 @@ mod tests {
 
         // Closing `a`'s editor must resolve only `a`'s deferred state, resume
         // only `a`'s timer, and leave `b` -- still open -- completely alone.
-        app.editor_closed(EditorSnapshot::new(a, 1, &editor_a));
+        app.editor_closed(EditorSnapshot::new(a, 1, &editor_a), true);
 
         assert!(!app.deferred_auto_close.contains_key(&a));
         assert!(
@@ -7496,7 +7625,7 @@ mod tests {
             Some(&RecentCapturesAutoCloseAction::Hide)
         );
 
-        app.editor_closed(EditorSnapshot::new(card, 1, &editor));
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), true);
 
         assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
         assert!(!app.deferred_auto_close.contains_key(&card));
@@ -7528,7 +7657,7 @@ mod tests {
         assert!(!app.pending_retention_overflow.contains(&card));
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
 
-        app.editor_closed(EditorSnapshot::new(card, 1, &editor));
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), true);
 
         assert!(!app.deferred_overflow.contains(&card));
         assert!(
@@ -7537,6 +7666,46 @@ mod tests {
             "the exact edited revision must be saved even when history retains only the original"
         );
         assert!(!app.pending_retention_overflow.contains(&card));
+    }
+
+    #[test]
+    fn a_cancelled_editor_resolves_deferred_overflow_without_exporting_discarded_edits() {
+        let (mut app, surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(55);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_retention.insert(card, (true, false));
+        app.card_capture_ids
+            .insert(card, CaptureId("editor-cancel-overflow".into()));
+        surface.inject(CardEvent::Overflow(card));
+
+        app.tick_with_editor(EditorSnapshots::new(std::slice::from_ref(
+            &EditorSnapshot::new(card, 1, &editor),
+        )));
+
+        assert!(app.deferred_overflow.contains(&card));
+
+        // Cancel: `committed` is false, so deferred overflow recovery must
+        // resolve as though no editor were open at all -- never rendering,
+        // and certainly never exporting, the discarded annotations.
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), false);
+
+        assert!(!app.deferred_overflow.contains(&card));
+        assert!(
+            !app.close_after_output.contains(&card)
+                && !app.overflow_recovery_in_flight.contains(&card),
+            "a cancelled edit must not be routed through the live-revision export path"
+        );
+        match app.pending_overflow_recovery.get(&card) {
+            Some(Job::Save(got)) => assert_eq!(*got, card),
+            other => panic!(
+                "a cancelled edit's overflow recovery must fall back to the card's own bytes, \
+                 not {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -7556,7 +7725,7 @@ mod tests {
         assert!(app.deferred_overflow.contains(&card));
         assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
 
-        app.editor_closed(EditorSnapshot::new(card, 1, &editor));
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), true);
 
         assert!(!app.deferred_overflow.contains(&card));
         assert!(
@@ -7583,7 +7752,7 @@ mod tests {
         app.drain_cards(EditorSnapshots::new(std::slice::from_ref(
             &EditorSnapshot::new(card, 1, &editor),
         )));
-        app.editor_closed(EditorSnapshot::new(card, 1, &editor));
+        app.editor_closed(EditorSnapshot::new(card, 1, &editor), true);
 
         assert!(!app.deferred_overflow.contains(&card));
         assert!(app.overflow_recovery_in_flight.contains(&card));
@@ -9529,6 +9698,29 @@ mod tests {
                 editor.document().source().frame.data,
                 "the destructive redaction was bypassed with the original pixels"
             );
+        }
+    }
+
+    #[test]
+    fn card_copy_save_and_upload_fall_back_to_the_card_s_own_bytes_once_no_editor_owns_it() {
+        // No editor owns the card -- exactly the state a Cancel, a clean
+        // close, or a plain post-close Copy/Save/Upload sees. These must
+        // route through the card's own committed bytes (updated only by a
+        // prior Done, never by a live in-progress edit) rather than
+        // rendering any editor's document.
+        let card = CardId(43);
+
+        for output in [CardOutput::Copy, CardOutput::Save(None), CardOutput::Upload] {
+            let job = App::card_output_job(card, output.clone(), EditorSnapshots::EMPTY)
+                .expect("no editor to render means this never fails");
+            match (output, job) {
+                (CardOutput::Copy, Job::Copy(got)) => assert_eq!(got, card),
+                (CardOutput::Save(None), Job::Save(got)) => assert_eq!(got, card),
+                (CardOutput::Upload, Job::Upload(got)) => assert_eq!(got, card),
+                (_, other) => panic!(
+                    "with no editor open, output must use the card's own bytes, not {other:?}"
+                ),
+            }
         }
     }
 

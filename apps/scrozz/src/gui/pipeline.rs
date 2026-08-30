@@ -300,6 +300,23 @@ pub(crate) enum Job {
         /// Editable scene graph; source pixels remain in the existing record.
         data: Box<DocumentData>,
     },
+    /// File a committed editor revision into the card's own exportable bytes.
+    ///
+    /// Posted once, alongside [`Job::PersistDocument`], when Done commits a
+    /// dirty document — never for a cancelled or discarded one. After this a
+    /// plain [`Job::Copy`], [`Job::Save`] or [`Job::Upload`] — posted once no
+    /// editor is open — reads this exact committed revision instead of the
+    /// pre-edit original, so a destructive redaction the card's thumbnail
+    /// already shows committed cannot resurface through a card output that
+    /// outlives the editor that applied it.
+    CommitCardOutput {
+        /// Which card's own bytes to replace.
+        card: CardId,
+        /// Editor lifetime that produced the render.
+        generation: u64,
+        /// The flattened image and the exact document revision it represents.
+        rendered: Box<RevisionedFrame>,
+    },
     /// Analyse one immutable editor revision without blocking capture work.
     AnalyzeSmartFrame {
         /// Which card owns the editor.
@@ -1305,8 +1322,16 @@ impl Drop for Pipeline {
 /// What the worker remembers about a card it produced.
 #[derive(Clone)]
 struct Cached {
-    /// The untouched card capture. This remains the default after the editor
-    /// closes, per D14.
+    /// The card's own exportable capture — what a plain Copy, Save or Upload
+    /// reads once no editor is open.
+    ///
+    /// Stays the untouched original through Cancel and a clean close. Per
+    /// D14 that only changes on an explicit save, and Done is that explicit
+    /// action ([`Worker::commit_card_output`] mirrors
+    /// `App::refresh_card_thumbnail`'s Done-only call site exactly): a
+    /// destructive redaction the card's thumbnail now shows committed must
+    /// never be reachable through a card output that still hands back these
+    /// pre-edit pixels.
     bytes: CaptureBytes,
     /// Original source pixels for rebuilding an editable history document.
     ///
@@ -1533,6 +1558,29 @@ impl CaptureVault {
         true
     }
 
+    /// Replaces a card's own bytes with a committed editor revision.
+    ///
+    /// Unlike [`Self::store_rendered`], which stages a revision alongside the
+    /// untouched capture for a drag that might still be cancelled, this is
+    /// the one path that overwrites what a plain Copy, Save or Upload --
+    /// posted once no editor is open -- actually reads. Called only for a
+    /// committed (Done) edit, mirroring `App::refresh_card_thumbnail`'s
+    /// Done-only call site; a cancelled or discarded edit must never reach
+    /// this. The now-superseded staged revision is cleared with it, since
+    /// keeping it would let a stale `get_revision` answer outlive the commit
+    /// it was staged for.
+    fn commit_rendered(&self, card: CardId, bytes: CaptureBytes) -> bool {
+        let Ok(mut map) = self.inner.lock() else {
+            return false;
+        };
+        let Some(cached) = map.get_mut(&card) else {
+            return false;
+        };
+        cached.bytes = bytes;
+        cached.rendered = None;
+        true
+    }
+
     /// The full cached entry, including metadata needed to reopen the editor.
     fn cached(&self, card: CardId) -> Option<Cached> {
         self.inner.lock().ok()?.get(&card).cloned()
@@ -1727,6 +1775,11 @@ impl Worker {
                     revision,
                     data,
                 } => self.persist_document(card, generation, revision, &data),
+                Job::CommitCardOutput {
+                    card,
+                    generation,
+                    rendered,
+                } => self.commit_card_output(card, generation, &rendered),
                 Job::AnalyzeSmartFrame {
                     card,
                     generation,
@@ -2269,6 +2322,33 @@ impl Worker {
                 format!("{card} editor {generation} revision {revision} saved to capture history"),
             ),
             Err(error) => self.emit(Outcome::Refused { card, error }),
+        }
+    }
+
+    /// Files a Done-committed editor revision into the card's own bytes.
+    ///
+    /// Companion to [`Self::persist_document`], posted for the same commit:
+    /// that call persists the editable scene to history, this one replaces
+    /// what a plain Copy, Save or Upload actually reads once the editor is
+    /// gone. Silent on success -- the card's thumbnail already told the user
+    /// their edit committed -- but never silent about failing to file it,
+    /// since a stale card output would otherwise resurrect pixels a
+    /// destructive redaction was meant to remove.
+    fn commit_card_output(&mut self, card: CardId, generation: u64, rendered: &RevisionedFrame) {
+        match CaptureBytes::from_rendered(generation, rendered) {
+            Ok(bytes) => {
+                if !self.vault.commit_rendered(card, bytes) {
+                    tracing::warn!(
+                        %card,
+                        "a committed edit could not be filed: the card had already left the vault"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                %card,
+                %error,
+                "a committed edit could not be encoded for the card's own bytes"
+            ),
         }
     }
 
@@ -4924,6 +5004,66 @@ mod tests {
         assert_eq!(card.capture_id.as_ref(), Some(&id));
         assert_eq!(card.source_px(), (128, 112));
         assert!(worker.vault.get(CardId(9)).is_some());
+    }
+
+    #[test]
+    fn committing_a_card_output_replaces_its_exportable_bytes_with_the_edited_revision() {
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-commit-output");
+        let original = richly_annotated_document(1);
+        let card = CardId(21);
+        worker
+            .vault
+            .store_test_capture(card, original.source())
+            .expect("seed the card's own capture");
+        let original_bytes = worker.vault.get(card).expect("seeded capture").full;
+
+        let edited = richly_annotated_document(9);
+        let rendered = RevisionedFrame::from_document(&edited, 3).expect("render edited revision");
+        worker.commit_card_output(card, 1, &rendered);
+
+        let committed = worker.vault.get(card).expect("card remains in the vault");
+        assert_eq!(
+            committed.revision(),
+            3,
+            "the committed revision must be recorded"
+        );
+        assert_eq!(
+            committed.generation(),
+            Some(1),
+            "the committed bytes must be attributed to the editor that produced them"
+        );
+        assert_ne!(
+            committed.full, original_bytes,
+            "a plain Copy, Save or Upload posted after Done must not fall back to the pre-edit \
+             capture -- exactly the pixels a destructive redaction was meant to remove"
+        );
+        let decoded = scrozz_export::decode(&committed.full).expect("decode committed bytes");
+        let expected = SkiaRenderer::new()
+            .render(&edited)
+            .expect("reference render");
+        assert_eq!(
+            decoded.data, expected.data,
+            "the committed bytes must be the exact edited revision, not a different render"
+        );
+        assert!(
+            worker.vault.get_revision(card, 1, 3).is_none(),
+            "the staged revision is superseded by the commit and must not linger"
+        );
+    }
+
+    #[test]
+    fn a_committed_card_output_for_a_vault_entry_that_has_left_is_a_harmless_no_op() {
+        let (_dir, mut worker, _receiver) = worker_with_store("worker-commit-output-gone");
+        let card = CardId(22);
+        let edited = richly_annotated_document(2);
+        let rendered = RevisionedFrame::from_document(&edited, 1).expect("render edited revision");
+
+        // The card already left the vault (its editor-only release beat the
+        // commit, or it was never captured through this worker) -- filing the
+        // commit must not panic and must leave nothing behind.
+        worker.commit_card_output(card, 1, &rendered);
+
+        assert!(worker.vault.get(card).is_none());
     }
 
     #[test]

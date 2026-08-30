@@ -2903,7 +2903,6 @@ impl eframe::App for RecentCapturesOverlayApp {
         self.reconcile(&ctx);
         self.draw_pins(&ctx);
         self.stack.advance(&m);
-        self.emit_due_auto_close(&ctx, ctx.input(|input| input.time));
 
         let was_empty = self.stack.is_empty();
         let dock_was = self.stack.dock().is_collapsed();
@@ -3058,6 +3057,15 @@ impl eframe::App for RecentCapturesOverlayApp {
         if let Some((id, a)) = action {
             self.handle_action(id, a, ctx.input(|input| input.modifiers.alt), &m);
         }
+
+        // Emitted after this frame's own card interactions (drag settle and
+        // `handle_action`) so a same-frame open/annotate/edit/continue click
+        // is queued to the app *before* a same-frame expiry. `entry.editing`
+        // cannot yet reflect a click made this very frame (it only flips on
+        // the async `Command::SetEditing` round trip), so ordering, not
+        // state, is what keeps auto-close from racing and dismissing a card
+        // the same frame its editor is opening.
+        self.emit_due_auto_close(&ctx, ctx.input(|input| input.time));
 
         let dock_now = self.stack.dock().is_collapsed();
         if dock_now != dock_was {

@@ -1078,7 +1078,15 @@ impl Driver {
                 // when the document actually changed.
                 if exit == EditorWindowExit::Done && editor.state().is_dirty() {
                     match editor.render() {
-                        Ok(rendered) => self.app.refresh_card_thumbnail(card, rendered.frame()),
+                        Ok(rendered) => {
+                            self.app.refresh_card_thumbnail(card, rendered.frame());
+                            // Files the same committed frame into the card's
+                            // own exportable bytes, so a plain Copy, Save or
+                            // Upload posted after this window closes reads
+                            // the redaction the thumbnail just committed to,
+                            // never the original pixels underneath it.
+                            self.app.commit_card_output(card, generation, rendered);
+                        }
                         Err(error) => tracing::warn!(
                             %error,
                             "the annotated image could not be rendered for the card thumbnail"
@@ -1087,8 +1095,14 @@ impl Driver {
                     self.app
                         .persist_editor(EditorSnapshot::new(card, generation, editor));
                 }
-                self.app
-                    .editor_closed(EditorSnapshot::new(card, generation, editor));
+                // Only Done may hand the closing editor's live snapshot to
+                // deferred cleanup; Cancel and a clean close must resolve
+                // against the card's own untouched bytes, never the
+                // discarded (or, for a clean close, merely unsaved) revision.
+                self.app.editor_closed(
+                    EditorSnapshot::new(card, generation, editor),
+                    exit == EditorWindowExit::Done,
+                );
                 if self.color_picker_generation == Some(generation) {
                     if let Err(error) = self.color_picker.close() {
                         tracing::warn!(%error, "the system colour picker could not close");
