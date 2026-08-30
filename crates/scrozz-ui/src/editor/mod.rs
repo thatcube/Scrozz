@@ -151,6 +151,12 @@ impl EditorUi {
         self.state.document()
     }
 
+    /// Starts or updates a Scene draft with a host-selected image background.
+    pub fn set_scene_background_image(&mut self, image: scrozz_annotate::BackgroundImage) {
+        self.state.set_scene_background_image(image, false);
+        self.show_smart_frame = true;
+    }
+
     /// Flattens the document to a full-resolution image.
     ///
     /// This is the *only* place an annotated image is produced, so copy, save

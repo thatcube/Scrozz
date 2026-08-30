@@ -4,8 +4,8 @@ mod common;
 
 use common::{document, frame_with, near, pixel, rect};
 use scrozz_annotate::{
-    Annotation, CropExpansion, Document, DocumentData, ImageOrientation, Renderer, SkiaRenderer,
-    Style, document::Background,
+    Annotation, Beautification, CropExpansion, Document, DocumentData, ImageOrientation, Renderer,
+    ResolvedFocus, SkiaRenderer, SmartFrameMetadata, Style, document::Background,
 };
 use scrozz_core::{
     Capture, CaptureTarget, LogicalPoint, LogicalSize, Provenance, ScaleFactor, WindowId,
@@ -35,6 +35,66 @@ fn crop_changes_the_rendered_size() {
     doc.set_crop(Some(rect(10.0, 20.0, 40.0, 30.0))).unwrap();
     let frame = SkiaRenderer::new().render(&doc).unwrap();
     assert_eq!((frame.width(), frame.height()), (40, 30));
+}
+
+#[test]
+fn source_geometry_changes_invalidate_resolved_scene_focus_but_noops_do_not() {
+    let mut doc = coded();
+    let mut scene = Beautification {
+        auto_balance: true,
+        smart_frame: Some(SmartFrameMetadata {
+            focus: ResolvedFocus {
+                x: 8_000,
+                y: 2_000,
+                confidence: 90,
+            },
+            ..SmartFrameMetadata::default()
+        }),
+        ..Beautification::default()
+    };
+    doc.set_scene(Some(scene.clone())).unwrap();
+
+    let crop = rect(10.0, 20.0, 40.0, 30.0);
+    doc.set_crop(Some(crop)).unwrap();
+    assert_eq!(
+        doc.scene()
+            .unwrap()
+            .smart_frame
+            .as_ref()
+            .unwrap()
+            .focus
+            .confidence,
+        0
+    );
+
+    scene.smart_frame.as_mut().unwrap().focus.confidence = 90;
+    doc.set_scene(Some(scene.clone())).unwrap();
+    let revision = doc.revision();
+    doc.set_crop(Some(crop)).unwrap();
+    assert_eq!(doc.revision(), revision);
+    assert_eq!(
+        doc.scene()
+            .unwrap()
+            .smart_frame
+            .as_ref()
+            .unwrap()
+            .focus
+            .confidence,
+        90,
+        "an unchanged crop must not invalidate metadata or spend a revision"
+    );
+
+    doc.set_orientation(ImageOrientation::RotateRight);
+    assert_eq!(
+        doc.scene()
+            .unwrap()
+            .smart_frame
+            .as_ref()
+            .unwrap()
+            .focus
+            .confidence,
+        0
+    );
 }
 
 #[test]

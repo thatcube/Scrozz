@@ -6,6 +6,11 @@ pixels and annotations stay in source coordinates. Rendering composites the
 source and annotations, applies the source crop, then applies the persisted
 90-degree rotation or reflection before Scene framing.
 
+Resolved Scene focus is tied to the geometry that was analyzed. Applying or
+reverting Crop therefore invalidates that focus across the current Scene and its
+undo/redo lane; the Scene background remains intact and placement falls back to
+geometric center until a new analysis resolves the transformed image.
+
 Snap to Edges preprocesses each source image asynchronously into an immutable
 index of long, axis-aligned structural boundaries. Pointer movement only queries
 that index. A boundary attracts within 6 screen points and remains locked until

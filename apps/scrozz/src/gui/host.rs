@@ -12,10 +12,13 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write as _,
-    path::PathBuf,
 };
 use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex, mpsc::channel},
+    task::{Context as TaskContext, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -72,6 +75,51 @@ const RECORDING_TICK: Duration = Duration::from_millis(50);
 const DISPLAY_REFRESH: Duration = Duration::from_millis(250);
 #[cfg(target_os = "macos")]
 const APPKIT_BOOTSTRAP_SETTLE: Duration = Duration::from_millis(250);
+
+type SceneImageDialog = Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>;
+
+#[cfg(not(test))]
+fn scene_image_dialog() -> SceneImageDialog {
+    Box::pin(
+        rfd::AsyncFileDialog::new()
+            .set_title("Add Image to Scene")
+            .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif"])
+            .pick_file(),
+    )
+}
+
+#[cfg(test)]
+fn scene_image_dialog() -> SceneImageDialog {
+    Box::pin(std::future::ready(None))
+}
+
+fn decode_scene_image(path: &Path) -> CliResult<scrozz_annotate::BackgroundImage> {
+    let encoded_bytes = std::fs::metadata(path).map_err(CoreError::from)?.len();
+    if encoded_bytes > scrozz_annotate::BackgroundImage::MAX_INPUT_BYTES {
+        return Err(CoreError::InvalidRequest(format!(
+            "Scene image is {encoded_bytes} encoded bytes; the limit is {}",
+            scrozz_annotate::BackgroundImage::MAX_INPUT_BYTES
+        ))
+        .into());
+    }
+    let reader = image::ImageReader::open(path)
+        .map_err(CoreError::from)?
+        .with_guessed_format()
+        .map_err(CoreError::from)?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|error| CoreError::Codec(format!("could not inspect Scene image: {error}")))?;
+    scrozz_annotate::BackgroundImage::validate_dimensions(width, height)?;
+
+    let frame = scrozz_export::decode_file(path)?;
+    let image = scrozz_export::to_straight_rgba8(&frame)?;
+    Ok(scrozz_annotate::BackgroundImage::new(
+        image.width,
+        image.height,
+        image.data,
+        frame.color_space,
+    )?)
+}
 
 type SharedGeometry = Arc<Mutex<RecentCapturesOverlayGeometry>>;
 const PARKED_ROOT_ORIGIN: f32 = -100_000.0;
@@ -546,6 +594,8 @@ impl Host for Windowed {
                     permission: scrozz_ui::permission::PermissionWindow::default(),
                     permission_resume_armed: false,
                     editors: std::collections::HashMap::new(),
+                    scene_image_dialogs: std::collections::HashMap::new(),
+                    scene_image_results: Arc::new(Mutex::new(Vec::new())),
                     video_editor: VideoEditorWindow::default(),
                     video_editor_actions: Arc::new(Mutex::new(Vec::new())),
                     camera_settings_actions: Arc::new(Mutex::new(Vec::new())),
@@ -759,6 +809,26 @@ struct Editing {
     window: scrozz_ui::editor::EditorWindow,
 }
 
+struct PendingSceneImageDialog {
+    generation: u64,
+    revision: u64,
+    future: SceneImageDialog,
+    loading: bool,
+}
+
+impl PendingSceneImageDialog {
+    fn answers(&self, generation: u64, revision: u64) -> bool {
+        self.loading && self.generation == generation && self.revision == revision
+    }
+}
+
+struct LoadedSceneImage {
+    card: crate::gui::card::CardId,
+    generation: u64,
+    revision: u64,
+    result: CliResult<scrozz_annotate::BackgroundImage>,
+}
+
 struct Driver {
     app: App,
     overlay: RecentCapturesOverlayApp,
@@ -783,6 +853,11 @@ struct Driver {
     /// (via [`Self::editor_snapshots`]) before it ever decides to start a
     /// new one, routing the request to raise the existing window instead.
     editors: std::collections::HashMap<crate::gui::card::CardId, Editing>,
+    /// Modeless native image choosers, independently bound to editor generations.
+    scene_image_dialogs:
+        std::collections::HashMap<crate::gui::card::CardId, PendingSceneImageDialog>,
+    /// Decode results produced off the UI thread and drained by the owning editor.
+    scene_image_results: Arc<Mutex<Vec<LoadedSceneImage>>>,
     /// The ordinary opaque recording-editor window.
     video_editor: VideoEditorWindow,
     /// Actions emitted by the deferred video viewport and drained by the next
@@ -898,6 +973,124 @@ impl Driver {
             .collect()
     }
 
+    fn poll_scene_image_dialogs(&mut self, ctx: &egui::Context) {
+        self.scene_image_dialogs.retain(|card, pending| {
+            self.editors
+                .get(card)
+                .is_some_and(|editing| editing.generation == pending.generation)
+        });
+        let cards: Vec<_> = self
+            .scene_image_dialogs
+            .iter()
+            .filter_map(|(card, pending)| (!pending.loading).then_some(*card))
+            .collect();
+        for card in cards {
+            let ready = {
+                let Some(pending) = self.scene_image_dialogs.get_mut(&card) else {
+                    continue;
+                };
+                let waker = Waker::noop();
+                let mut context = TaskContext::from_waker(waker);
+                match pending.future.as_mut().poll(&mut context) {
+                    Poll::Ready(file) => Some((pending.generation, pending.revision, file)),
+                    Poll::Pending => None,
+                }
+            };
+            let Some((generation, revision, file)) = ready else {
+                continue;
+            };
+            let Some(file) = file else {
+                self.scene_image_dialogs.remove(&card);
+                continue;
+            };
+            if let Some(pending) = self.scene_image_dialogs.get_mut(&card) {
+                pending.loading = true;
+                pending.future = Box::pin(std::future::pending());
+            }
+
+            let path = file.path().to_path_buf();
+            let results = Arc::clone(&self.scene_image_results);
+            let repaint = ctx.clone();
+            let worker = std::thread::Builder::new()
+                .name(format!("scrozz-scene-image-{card}"))
+                .spawn(move || {
+                    let loaded = LoadedSceneImage {
+                        card,
+                        generation,
+                        revision,
+                        result: decode_scene_image(&path),
+                    };
+                    match results.lock() {
+                        Ok(mut results) => results.push(loaded),
+                        Err(_) => {
+                            tracing::error!("Scene image result lock was poisoned");
+                        }
+                    }
+                    repaint.request_repaint();
+                });
+            if let Err(error) = worker {
+                let loaded = LoadedSceneImage {
+                    card,
+                    generation,
+                    revision,
+                    result: Err(CoreError::Platform(format!(
+                        "could not start the Scene image decoder: {error}"
+                    ))
+                    .into()),
+                };
+                match self.scene_image_results.lock() {
+                    Ok(mut results) => results.push(loaded),
+                    Err(_) => tracing::error!("Scene image result lock was poisoned"),
+                }
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn apply_loaded_scene_images(&mut self) {
+        let loaded = match self.scene_image_results.lock() {
+            Ok(mut loaded) => std::mem::take(&mut *loaded),
+            Err(_) => {
+                tracing::error!("Scene image result lock was poisoned");
+                return;
+            }
+        };
+        for loaded in loaded {
+            if self
+                .scene_image_dialogs
+                .get(&loaded.card)
+                .is_some_and(|pending| pending.answers(loaded.generation, loaded.revision))
+            {
+                self.scene_image_dialogs.remove(&loaded.card);
+            }
+            if self.app.editor_close_frozen(loaded.card) {
+                tracing::warn!(
+                    card = %loaded.card,
+                    "discarded a Scene image selected while the editor was closing"
+                );
+                continue;
+            }
+            let Some(editing) = self.editors.get_mut(&loaded.card) else {
+                continue;
+            };
+            if editing.generation != loaded.generation
+                || editing.editor.state().revision() != loaded.revision
+            {
+                tracing::warn!(
+                    card = %loaded.card,
+                    generation = loaded.generation,
+                    revision = loaded.revision,
+                    "discarded a stale Scene image selection"
+                );
+                continue;
+            }
+            match loaded.result {
+                Ok(image) => editing.editor.set_scene_background_image(image),
+                Err(error) => tracing::warn!(%error, "the Scene image could not be opened"),
+            }
+        }
+    }
+
     /// Draws every open annotation editor window.
     ///
     /// Copy and save go back through the worker rather than being written
@@ -923,6 +1116,8 @@ impl Driver {
         // no matter which card it was.
         self.app
             .set_keyboard_owner(KeyboardOwner::Editor, !self.editors.is_empty());
+        self.poll_scene_image_dialogs(ctx);
+        self.apply_loaded_scene_images();
 
         let picker_event = match self.color_picker.poll() {
             Ok(event) => event,
@@ -1042,6 +1237,16 @@ impl Driver {
                             editor.open_custom_color_fallback();
                         }
                     }
+                }
+                Intent::AddImage => {
+                    self.scene_image_dialogs.entry(card).or_insert_with(|| {
+                        PendingSceneImageDialog {
+                            generation,
+                            revision: editor.state().revision(),
+                            future: scene_image_dialog(),
+                            loading: false,
+                        }
+                    });
                 }
                 Intent::AnalyzeSmartFrame {
                     revision,
@@ -1219,7 +1424,12 @@ impl Driver {
             }
         }
 
-        if self.color_picker.is_open() {
+        if self.color_picker.is_open()
+            || self
+                .scene_image_dialogs
+                .values()
+                .any(|pending| !pending.loading)
+        {
             ctx.request_repaint_after(IDLE);
         }
     }
@@ -1339,6 +1549,11 @@ impl Driver {
             return;
         }
         self.native_teardown_prepared = true;
+        self.scene_image_dialogs.clear();
+        match self.scene_image_results.lock() {
+            Ok(mut results) => results.clear(),
+            Err(_) => tracing::error!("Scene image result lock was poisoned during teardown"),
+        }
         if let Err(error) = self.color_picker.close() {
             tracing::warn!(%error, "the system colour picker could not be ordered out");
         }
@@ -2791,6 +3006,44 @@ mod tests {
     use super::*;
     use crate::gui::panel::RecordedNativeAction;
     use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Provenance, ScaleFactor};
+
+    #[test]
+    fn scene_image_picker_is_inert_in_tests() {
+        let mut dialog = scene_image_dialog();
+        let waker = Waker::noop();
+        let mut context = TaskContext::from_waker(waker);
+        assert!(matches!(
+            dialog.as_mut().poll(&mut context),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn stale_scene_image_results_cannot_retire_a_newer_dialog() {
+        let pending = PendingSceneImageDialog {
+            generation: 2,
+            revision: 9,
+            future: scene_image_dialog(),
+            loading: true,
+        };
+        assert!(!pending.answers(1, 9));
+        assert!(!pending.answers(2, 8));
+        assert!(pending.answers(2, 9));
+    }
+
+    #[test]
+    fn scene_image_import_rejects_encoded_size_before_decoding() {
+        let path =
+            std::env::temp_dir().join(format!("scrozz-scene-image-limit-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(scrozz_annotate::BackgroundImage::MAX_INPUT_BYTES + 1)
+            .unwrap();
+        drop(file);
+
+        let error = decode_scene_image(&path).unwrap_err();
+        let _ = std::fs::remove_file(path);
+        assert!(error.to_string().contains("encoded bytes"));
+    }
 
     fn card_target(scale: f64, origin: egui::Pos2) -> CardSurfaceTarget {
         let base = RecentCapturesOverlayGeometry::with_viewport(

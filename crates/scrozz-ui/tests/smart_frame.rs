@@ -1,9 +1,9 @@
 //! Smart Frame behavior contracts ported from the reviewed monolithic editor.
 
 use scrozz_annotate::{
-    AspectPreset, Background, Beautification, BeautificationPreset, CanvasInsets, Color, Document,
-    GeneratedStyle, SceneAutomatic, SmartFrameAnalysis, SmartFramePreset, SmartFramePresetSettings,
-    SourceInsets, SubjectAppearance,
+    AspectPreset, Background, BackgroundImage, Beautification, BeautificationPreset, CanvasInsets,
+    Color, Document, GeneratedStyle, SceneAutomatic, SmartFrameAnalysis, SmartFramePreset,
+    SmartFramePresetSettings, SourceInsets, SubjectAppearance,
 };
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
@@ -34,6 +34,23 @@ fn drag(state: &mut EditorState, from: LogicalPoint, to: LogicalPoint) {
     state.pointer_pressed(from);
     state.pointer_dragged(to, false);
     state.pointer_released();
+}
+
+#[test]
+fn add_image_opens_a_transactional_scene_draft() {
+    let mut editor = EditorUi::new(document(Provenance::Region));
+    let before = editor.document().data();
+    let image = BackgroundImage::new(1, 1, vec![20, 40, 60, 255], ColorSpace::Srgb).unwrap();
+
+    editor.set_scene_background_image(image);
+
+    assert!(editor.state().has_scene_draft());
+    assert!(matches!(
+        editor.document().scene().map(|scene| &scene.background),
+        Some(Background::Image(_))
+    ));
+    editor.state_mut().cancel_scene();
+    assert_eq!(editor.document().data(), before);
 }
 
 #[test]

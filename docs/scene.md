@@ -45,8 +45,11 @@ color space, so reopening a document reproduces the same pixels.
 
 Reliable local treatments are smooth gradients, soft meshes, tonal studio
 fields, and blurred source. Image and Desktop backgrounds use explicit pixels
-supplied by the host. No generated treatment uses network access, ML, or
-unconstrained randomness.
+supplied by the host. **Add Image** chooses and decodes that background off the
+UI thread, applies it only to the editor generation and revision that requested
+it, and rejects files outside the Scene raster limits before allocating their
+pixels. No generated treatment uses network access, ML, or unconstrained
+randomness.
 
 ## Native window appearance
 

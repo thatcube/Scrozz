@@ -171,6 +171,19 @@ pub struct BackgroundImage {
 }
 
 impl BackgroundImage {
+    /// Largest accepted encoded source file for a Scene image.
+    pub const MAX_INPUT_BYTES: u64 = MAX_ENCODED_BACKGROUND_BYTES;
+
+    /// Validates image dimensions before a decoder allocates the raster.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] when an edge or pixel count exceeds the
+    /// Scene background limits.
+    pub fn validate_dimensions(width: u32, height: u32) -> Result<()> {
+        validate_background_area(width, height).map(|_| ())
+    }
+
     /// Wraps a tightly packed RGBA8 image.
     ///
     /// # Errors
@@ -1249,6 +1262,13 @@ impl Beautification {
             && self.border_width <= 0.0
     }
 
+    /// Stops resolved visual focus from being reused after source geometry changes.
+    pub fn invalidate_resolved_focus(&mut self) {
+        if let Some(metadata) = &mut self.smart_frame {
+            metadata.focus.confidence = 0;
+        }
+    }
+
     /// Logical output size before rasterisation.
     ///
     /// Aspect presets only add canvas; they never crop or scale the capture.
@@ -1814,6 +1834,9 @@ impl Document {
         let crop = normalize_crop(capture_bounds(&source), self.crop)?;
         self.source = source;
         self.crop = crop;
+        if let Some(beautification) = &mut self.beautification {
+            beautification.invalidate_resolved_focus();
+        }
         self.touch();
         Ok(())
     }
@@ -1834,6 +1857,9 @@ impl Document {
     pub fn set_orientation(&mut self, orientation: ImageOrientation) {
         if self.orientation != orientation {
             self.orientation = orientation;
+            if let Some(beautification) = &mut self.beautification {
+                beautification.invalidate_resolved_focus();
+            }
             self.touch();
         }
     }
@@ -1890,6 +1916,9 @@ impl Document {
         let crop = normalize_crop(self.logical_bounds(), area)?;
         if self.crop != crop {
             self.crop = crop;
+            if let Some(beautification) = &mut self.beautification {
+                beautification.invalidate_resolved_focus();
+            }
             self.touch();
         }
         Ok(())

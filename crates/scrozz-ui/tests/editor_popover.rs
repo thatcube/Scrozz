@@ -124,6 +124,32 @@ fn set_numeric(tree: TreeId, node: NodeId, value: f64) -> Event {
 }
 
 #[test]
+fn toolbar_leads_with_crop_scene_and_add_image_before_annotations() {
+    let mut driver = Driver::new(false, 1.0);
+    let mut editor = editor();
+    let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+    let update = output.platform_output.accesskit_update.as_ref().unwrap();
+    let labels: Vec<_> = update
+        .nodes
+        .iter()
+        .filter_map(|(_, node)| node.label().map(str::to_owned))
+        .collect();
+    let position = |label: &str| {
+        labels
+            .iter()
+            .position(|candidate| candidate == label)
+            .unwrap_or_else(|| panic!("{label} is exposed to accessibility"))
+    };
+    assert!(position("Crop") < position("Scene"));
+    assert!(position("Scene") < position("Add Image"));
+    assert!(position("Add Image") < position("Select"));
+
+    let (tree, add_image, _) = access_node(&output, |label| label == "Add Image");
+    let (intent, _) = driver.frame(&mut editor, SIZE, vec![activate(tree, add_image)]);
+    assert_eq!(intent, Intent::AddImage);
+}
+
+#[test]
 fn disclosure_keyboard_activation_does_not_apply_the_editors_enter_command() {
     let mut driver = Driver::new(true, 1.0);
     let mut editor = editor();

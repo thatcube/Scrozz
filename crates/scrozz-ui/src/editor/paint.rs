@@ -719,8 +719,11 @@ fn draw_selection(
     if arrow {
         let r = HANDLE_RADIUS as f32;
         for (_, position) in handles {
-            let at =
-                super::to_screen(state.source_to_display(position), view.subject, view.content);
+            let at = super::to_screen(
+                state.source_to_display(position),
+                view.subject,
+                view.content,
+            );
             // Dark under-ring + white keyline + accent centre: three contrasts,
             // so the endpoint stays visible over any captured pixel.
             painter.circle_filled(at, r + 2.0, Color32::from_black_alpha(100));
@@ -729,8 +732,11 @@ fn draw_selection(
             painter.circle_stroke(at, r - 0.5, Stroke::new(1.0, palette.accent_press));
         }
         if let Some(position) = state.arrow_bend_handle() {
-            let at =
-                super::to_screen(state.source_to_display(position), view.subject, view.content);
+            let at = super::to_screen(
+                state.source_to_display(position),
+                view.subject,
+                view.content,
+            );
             let near = painter
                 .ctx()
                 .pointer_hover_pos()
@@ -787,7 +793,11 @@ fn draw_selection(
 
     let r = HANDLE_RADIUS as f32;
     for (handle, position) in handles {
-        let at = super::to_screen(state.source_to_display(position), view.subject, view.content);
+        let at = super::to_screen(
+            state.source_to_display(position),
+            view.subject,
+            view.content,
+        );
         let at = pos2(
             at.x + handle_bias(handle.moves_left(), handle.moves_right()) * 2.0,
             at.y + handle_bias(handle.moves_top(), handle.moves_bottom()) * 2.0,
@@ -1017,5 +1027,93 @@ mod tests {
             to_document(subject.max, subject, state.document().content_bounds()),
             LogicalPoint::new(8.0, 8.0)
         );
+    }
+
+    #[test]
+    fn crop_rotation_preserves_scene_canvas_and_reports_the_oriented_subject() {
+        let source_size = LogicalSize::new(8.0, 4.0);
+        let capture = Capture {
+            frame: Frame {
+                data: vec![255; 8 * 4 * 4],
+                size: PhysicalSize::new(8.0, 4.0),
+                stride: 8 * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Region,
+            target: CaptureTarget::Region(LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                source_size,
+            )),
+        };
+        let mut document = Document::new(capture);
+        document
+            .set_scene(Some(Beautification {
+                output_size: Some(scrozz_annotate::ExactOutputSize {
+                    width: 16,
+                    height: 8,
+                }),
+                background: scrozz_annotate::Background::Transparent,
+                ..Beautification::default()
+            }))
+            .unwrap();
+        let mut state = EditorState::new(document);
+        state.set_tool(Tool::Crop);
+        state.rotate_crop_right();
+
+        let preview = render(&state, 160, true).unwrap();
+        assert_eq!(preview.image.size, [160, 80]);
+        let subject = preview.subject.expect("oriented Scene subject mapping");
+        let subject_aspect = (subject.width() * preview.image.size[0] as f32)
+            / (subject.height() * preview.image.size[1] as f32);
+        assert!((subject_aspect - 0.5).abs() < 0.01);
+        assert_eq!(
+            state.display_content_bounds().size,
+            LogicalSize::new(4.0, 8.0)
+        );
+    }
+
+    #[test]
+    fn reopening_crop_grows_an_exact_scene_to_fit_the_full_source() {
+        let source_size = LogicalSize::new(16.0, 8.0);
+        let capture = Capture {
+            frame: Frame {
+                data: vec![255; 16 * 8 * 4],
+                size: PhysicalSize::new(16.0, 8.0),
+                stride: 16 * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Region,
+            target: CaptureTarget::Region(LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                source_size,
+            )),
+        };
+        let mut document = Document::new(capture);
+        document
+            .set_crop(Some(LogicalRect::new(
+                LogicalPoint::new(4.0, 2.0),
+                LogicalSize::new(4.0, 4.0),
+            )))
+            .unwrap();
+        document
+            .set_scene(Some(Beautification {
+                output_size: Some(scrozz_annotate::ExactOutputSize {
+                    width: 8,
+                    height: 8,
+                }),
+                background: scrozz_annotate::Background::Transparent,
+                ..Beautification::default()
+            }))
+            .unwrap();
+        let mut state = EditorState::new(document);
+        state.set_tool(Tool::Crop);
+
+        let preview = render(&state, 160, true).unwrap();
+        assert_eq!(preview.image.size, [160, 160]);
+        assert!(preview.subject.is_some());
     }
 }

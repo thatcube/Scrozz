@@ -66,8 +66,21 @@ const POPOVER_MAX_HEIGHT: f32 = 560.0;
 const STROKE: f32 = 104.0;
 const REDACT_INTENSITY: f32 = 212.0;
 
-/// The width the tool palette occupies, including its trailing gap.
-const TOOLS_W: f32 = Tool::ALL.len() as f32 * (BUTTON + Space::HAIR);
+const ANNOTATION_TOOLS: [Tool; 10] = [
+    Tool::Select,
+    Tool::Arrow,
+    Tool::Line,
+    Tool::Rectangle,
+    Tool::Ellipse,
+    Tool::Pen,
+    Tool::Text,
+    Tool::Highlight,
+    Tool::Redact,
+    Tool::Counter,
+];
+
+/// The width of Crop, Scene, Add Image, the composition divider, and annotations.
+const TOOLS_W: f32 = (ANNOTATION_TOOLS.len() as f32 + 3.0) * (BUTTON + Space::HAIR) + DIVIDER_W;
 
 /// The width the compact colour control occupies.
 const COLOR_W: f32 = COLOR_CONTROL;
@@ -78,8 +91,8 @@ const DIVIDER_W: f32 = Space::SM + Space::SM + Space::XS;
 
 /// The width of the right-hand action group, at its widest.
 ///
-/// Five right-aligned document actions.
-const ACTIONS_W: f32 = 5.0f32.mul_add(BUTTON, 4.0 * Space::HAIR);
+/// Four right-aligned document actions.
+const ACTIONS_W: f32 = 4.0f32.mul_add(BUTTON, 3.0 * Space::HAIR);
 
 /// The width the whole toolbar needs to sit on a single row.
 ///
@@ -361,11 +374,73 @@ pub fn draw(
     let (tools_y, cy) = rows(bar);
     let wrapped = tools_y < cy;
     let mut x = bar.left() + Space::MD;
+    let mut intent = None;
 
-    // Tools. On a narrow window they get a row to themselves rather than being
-    // squeezed, dropped behind an overflow menu, or run under the actions.
+    // Composition comes first: these controls change the capture or its canvas,
+    // while everything after the divider is an annotation layered on the source.
+    let crop_rect = Rect::from_center_size(pos2(x + BUTTON / 2.0, tools_y), vec2(BUTTON, BUTTON));
+    let crop = icon_button(
+        ui,
+        surface,
+        crop_rect,
+        ui.id().with(("editor-tool", Tool::Crop)),
+        Icon::Crop,
+        "Crop",
+        ControlState::new().selected(state.tool() == Tool::Crop),
+        Reveal::SHOWN,
+    );
+    if crop.clicked() && !input_blocked {
+        state.set_tool(Tool::Crop);
+    }
+    crop.on_hover_text("Crop  (C)");
+    x += BUTTON + Space::HAIR;
+
+    let scene_rect = Rect::from_center_size(pos2(x + BUTTON / 2.0, tools_y), vec2(BUTTON, BUTTON));
+    let scene = icon_button(
+        ui,
+        surface,
+        scene_rect,
+        ui.id().with("editor-scene"),
+        Icon::LayoutGrid,
+        "Scene",
+        ControlState::new().selected(state.has_smart_frame_draft()),
+        Reveal::SHOWN,
+    );
+    if scene.clicked() && !input_blocked {
+        intent = Some(Intent::ToggleSmartFrame);
+    }
+    scene.on_hover_text("Scene");
+    x += BUTTON + Space::HAIR;
+
+    let image_rect = Rect::from_center_size(pos2(x + BUTTON / 2.0, tools_y), vec2(BUTTON, BUTTON));
+    let image = icon_button(
+        ui,
+        surface,
+        image_rect,
+        ui.id().with("editor-add-image"),
+        Icon::DeviceDesktop,
+        "Add Image",
+        ControlState::new(),
+        Reveal::SHOWN,
+    );
+    if image.clicked() && !input_blocked {
+        intent = Some(Intent::AddImage);
+    }
+    image.on_hover_text("Add Image");
+    x += BUTTON + Space::HAIR + Space::SM;
+    divider_v(
+        ui.painter(),
+        x,
+        row_top(tools_y),
+        row_bottom(tools_y),
+        palette,
+    );
+    x += Space::SM + Space::XS;
+
+    // Annotation tools. On a narrow window this whole composition-and-tools
+    // group gets its own row rather than being squeezed or dropped.
     let mut picked = None;
-    for tool in Tool::ALL {
+    for tool in ANNOTATION_TOOLS {
         let rect = Rect::from_center_size(pos2(x + BUTTON / 2.0, tools_y), vec2(BUTTON, BUTTON));
         let state_flags = ControlState::new().selected(state.tool() == tool);
         let response = icon_button(
@@ -548,7 +623,6 @@ pub fn draw(
         "the toolbar overlapped itself at {}pt",
         bar.width()
     );
-    let mut intent = None;
     for (icon, label, action) in [
         (
             Icon::DeviceFloppy,
@@ -558,11 +632,6 @@ pub fn draw(
         (Icon::Copy, "Copy", Action::Intent(Box::new(Intent::Copy))),
         (Icon::ArrowForwardUp, "Redo", Action::Redo),
         (Icon::ArrowBackUp, "Undo", Action::Undo),
-        (
-            Icon::LayoutGrid,
-            "Scene",
-            Action::Intent(Box::new(Intent::ToggleSmartFrame)),
-        ),
     ] {
         let rect = Rect::from_center_size(pos2(rx + BUTTON / 2.0, cy), vec2(BUTTON, BUTTON));
         let enabled = match action {
@@ -570,12 +639,8 @@ pub fn draw(
             Action::Redo => state.can_redo(),
             Action::Intent(_) => true,
         };
-        let selected = matches!(
-            &action,
-            Action::Intent(intent) if **intent == Intent::ToggleSmartFrame
-        ) && state.has_smart_frame_draft();
         let flags = if enabled {
-            ControlState::new().selected(selected)
+            ControlState::new()
         } else {
             ControlState::disabled()
         };

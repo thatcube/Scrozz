@@ -2613,10 +2613,7 @@ impl Worker {
         beautification.border_width = 0.0;
     }
 
-    fn analyze_scene(
-        document: &Document,
-        style: GeneratedStyle,
-    ) -> CliResult<SmartFrameAnalysis> {
+    fn analyze_scene(document: &Document, style: GeneratedStyle) -> CliResult<SmartFrameAnalysis> {
         let current = SkiaRenderer.render(document)?;
         Ok(analyze_scene_with_style(
             &current,

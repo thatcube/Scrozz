@@ -637,6 +637,8 @@ pub enum Intent {
     Save,
     /// Open the platform's custom colour picker.
     CustomColor,
+    /// Choose an image for the Scene canvas.
+    AddImage,
     /// Toggle the Smart Frame side panel.
     ToggleSmartFrame,
     /// Request asynchronous Smart Frame analysis.
@@ -675,6 +677,7 @@ impl PartialEq for Intent {
             | (Self::Copy, Self::Copy)
             | (Self::Save, Self::Save)
             | (Self::CustomColor, Self::CustomColor)
+            | (Self::AddImage, Self::AddImage)
             | (Self::ToggleSmartFrame, Self::ToggleSmartFrame) => true,
             (
                 Self::AnalyzeSmartFrame { revision: a, .. },
@@ -2602,6 +2605,7 @@ impl EditorState {
                     if self.document.crop() != before
                         || self.document.orientation() != before_orientation
                     {
+                        self.invalidate_framing_focus();
                         self.commit();
                         self.touch();
                     } else {
@@ -2624,6 +2628,7 @@ impl EditorState {
                 self.tool = Tool::Select;
                 if self.document.crop().is_some() {
                     let _ = self.document.set_crop(None);
+                    self.invalidate_framing_focus();
                     self.commit();
                     self.touch();
                 } else {
@@ -2992,6 +2997,24 @@ impl EditorState {
     fn synchronize_scene_history(&mut self) {
         self.history
             .synchronize_beautification(self.document.beautification());
+    }
+
+    fn invalidate_framing_focus(&mut self) {
+        let invalidate = |scene: &mut Option<Beautification>| {
+            if let Some(scene) = scene {
+                scene.invalidate_resolved_focus();
+            }
+        };
+        for scene in &mut self.framing_undo {
+            invalidate(scene);
+        }
+        for scene in &mut self.framing_redo {
+            invalidate(scene);
+        }
+        if let Some(draft) = &mut self.smart_frame {
+            invalidate(&mut draft.before);
+        }
+        self.synchronize_scene_history();
     }
 
     /// Takes the pending instruction to interrupt the platform's composition.

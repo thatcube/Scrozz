@@ -75,8 +75,8 @@ pub mod style;
 pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject, RedactStyle};
 pub use document::{
     Alignment, AnnotationMut, AspectPreset, AutomaticBackground, Background, BackgroundImage,
-    Beautification, BeautificationPreset, BuiltInBackground, CanvasInsets, Document, DocumentData,
-    CropExpansion, CropResolution, ExactOutputSize, GeneratedStyle, GeneratedTemplate,
+    Beautification, BeautificationPreset, BuiltInBackground, CanvasInsets, CropExpansion,
+    CropResolution, Document, DocumentData, ExactOutputSize, GeneratedStyle, GeneratedTemplate,
     ImageOrientation, Scene, SceneAutomatic, ScenePreset, SceneProperty, SourceInsets,
     SubjectAppearance, Watermark,
 };

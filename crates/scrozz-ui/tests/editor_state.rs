@@ -11,8 +11,8 @@ use std::sync::Arc;
 use egui::CursorIcon;
 use scrozz_annotate::{
     AnalysisCancellation, Annotation, AnnotationKind, ArrowStyle, Beautification,
-    BeautificationPreset, Color, Document, ImageOrientation, RedactStyle, Renderer, SkiaRenderer,
-    Style,
+    BeautificationPreset, Color, Document, ImageOrientation, RedactStyle, Renderer, ResolvedFocus,
+    SkiaRenderer, SmartFrameMetadata, Style,
 };
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
@@ -1492,6 +1492,72 @@ fn crop_history_is_orthogonal_to_applied_smart_frame_history() {
 
     state.undo_framing();
     assert_eq!(state.document().beautification(), None);
+}
+
+#[test]
+fn crop_invalidates_focus_in_scene_undo_and_redo_lanes() {
+    let focused = |color| Beautification {
+        background: scrozz_annotate::Background::Solid(color),
+        auto_balance: true,
+        smart_frame: Some(SmartFrameMetadata {
+            focus: ResolvedFocus {
+                x: 8_000,
+                y: 2_000,
+                confidence: 90,
+            },
+            ..SmartFrameMetadata::default()
+        }),
+        ..Beautification::default()
+    };
+    let mut state = state();
+    state.begin_with(focused(Color::rgb(10, 20, 30)));
+    state.apply_scene();
+    state.begin_with(focused(Color::rgb(40, 50, 60)));
+    state.apply_scene();
+
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(100.0);
+    state.set_crop_height(80.0);
+    state.command(Command::ApplyCrop).unwrap();
+    assert_eq!(
+        state
+            .document()
+            .scene()
+            .unwrap()
+            .smart_frame
+            .as_ref()
+            .unwrap()
+            .focus
+            .confidence,
+        0
+    );
+
+    state.undo_framing();
+    assert_eq!(
+        state
+            .document()
+            .scene()
+            .unwrap()
+            .smart_frame
+            .as_ref()
+            .unwrap()
+            .focus
+            .confidence,
+        0
+    );
+    state.redo_framing();
+    assert_eq!(
+        state
+            .document()
+            .scene()
+            .unwrap()
+            .smart_frame
+            .as_ref()
+            .unwrap()
+            .focus
+            .confidence,
+        0
+    );
 }
 
 #[test]
