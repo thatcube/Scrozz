@@ -6,8 +6,12 @@
 //! those three in sequence is testing the real path a mouse takes, not a
 //! parallel one written for the test's convenience.
 
+use std::sync::Arc;
+
+use egui::CursorIcon;
 use scrozz_annotate::{
-    Annotation, AnnotationKind, ArrowStyle, Color, Document, RedactStyle, Style,
+    AnalysisCancellation, Annotation, AnnotationKind, ArrowStyle, Color, Document,
+    ImageOrientation, RedactStyle, Style,
 };
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
@@ -15,7 +19,7 @@ use scrozz_core::{
 };
 use scrozz_ui::editor::{
     Caret, Command, CropAspect, EditorState, Handle, Intent, MAX_ZOOM, MIN_DRAG, MIN_SIZE,
-    MIN_ZOOM, TextEdit, Tool,
+    MIN_ZOOM, TextEdit, Tool, crop::StructuralBoundaryIndex, paint::crop_cursor,
 };
 
 /// A flat capture, 400x300 logical at 2x, big enough that the minimum-size
@@ -1103,6 +1107,44 @@ fn crop_edges_corners_and_inside_move_the_draft_directly() {
 }
 
 #[test]
+fn crop_hit_testing_covers_complete_edges_with_corner_priority() {
+    let mut state = state();
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    let crop = state.pending_crop().unwrap();
+    let tolerance = state.handle_tolerance();
+
+    assert_eq!(state.crop_handle_at(at(150.0, 30.0)), Some(Handle::Top));
+    assert_eq!(state.crop_handle_at(at(260.0, 120.0)), Some(Handle::Right));
+    assert_eq!(state.crop_handle_at(at(150.0, 210.0)), Some(Handle::Bottom));
+    assert_eq!(state.crop_handle_at(at(40.0, 120.0)), Some(Handle::Left));
+    assert_eq!(
+        state.crop_handle_at(at(crop.origin.x + 2.0, crop.origin.y + 2.0)),
+        Some(Handle::TopLeft)
+    );
+    assert_eq!(state.crop_handle_at(at(150.0, 120.0)), None);
+    assert_eq!(
+        state.crop_handle_at(at(150.0, crop.origin.y + tolerance + 0.5)),
+        None
+    );
+}
+
+#[test]
+fn crop_resize_cursors_match_each_edge_and_corner() {
+    for handle in [Handle::Left, Handle::Right] {
+        assert_eq!(crop_cursor(handle), CursorIcon::ResizeHorizontal);
+    }
+    for handle in [Handle::Top, Handle::Bottom] {
+        assert_eq!(crop_cursor(handle), CursorIcon::ResizeVertical);
+    }
+    for handle in [Handle::TopLeft, Handle::BottomRight] {
+        assert_eq!(crop_cursor(handle), CursorIcon::ResizeNwSe);
+    }
+    for handle in [Handle::TopRight, Handle::BottomLeft] {
+        assert_eq!(crop_cursor(handle), CursorIcon::ResizeNeSw);
+    }
+}
+
+#[test]
 fn crop_aspect_dimensions_and_swap_stay_bounded_in_source_space() {
     let mut state = state();
     state.set_tool(Tool::Crop);
@@ -1183,6 +1225,113 @@ fn crop_snap_can_be_temporarily_disabled_without_leaving_source_bounds() {
     state.pointer_dragged_with_snap(at(centre.x + 3.0, centre.y), false, true);
     state.pointer_released();
     assert_eq!(state.pending_crop().unwrap().origin.x, 3.0);
+}
+
+#[test]
+fn structural_snap_has_zoom_independent_entry_release_hysteresis_and_modifier_bypass() {
+    let mut capture = capture();
+    for y in 0..capture.frame.height() as usize {
+        for x in 0..capture.frame.width() as usize {
+            let value = if x < 400 { 32 } else { 224 };
+            let offset = y * capture.frame.stride + x * 4;
+            capture.frame.data[offset..offset + 4].copy_from_slice(&[value, value, value, 255]);
+        }
+    }
+    let index =
+        StructuralBoundaryIndex::analyze(&capture.frame, &AnalysisCancellation::default()).unwrap();
+    assert!(
+        index
+            .segments()
+            .iter()
+            .any(|segment| (segment.position - 200.0).abs() <= 1.0)
+    );
+
+    let mut state = EditorState::new(Document::new(capture));
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(100.0);
+    state.set_crop_height(80.0);
+    state.set_crop_boundaries(Arc::new(index));
+    let crop = state.pending_crop().unwrap();
+    let right = Handle::Right.position(&crop);
+    state.pointer_pressed(right);
+
+    state.pointer_dragged_with_snap(at(204.0, right.y), false, false);
+    assert_eq!(
+        state.pending_crop().unwrap().origin.x + state.pending_crop().unwrap().size.width,
+        200.0
+    );
+    assert_eq!(state.active_crop_snap_segments().len(), 1);
+
+    state.pointer_dragged_with_snap(at(210.0, right.y), false, false);
+    assert_eq!(
+        state.pending_crop().unwrap().origin.x + state.pending_crop().unwrap().size.width,
+        200.0,
+        "the 12-point release radius must hold after the 6-point entry"
+    );
+
+    state.pointer_dragged_with_snap(at(213.0, right.y), false, false);
+    assert_eq!(
+        state.pending_crop().unwrap().origin.x + state.pending_crop().unwrap().size.width,
+        213.0
+    );
+
+    state.pointer_dragged_with_snap(at(202.0, right.y), false, true);
+    assert_eq!(
+        state.pending_crop().unwrap().origin.x + state.pending_crop().unwrap().size.width,
+        202.0
+    );
+    assert!(state.active_crop_snap_segments().is_empty());
+    state.pointer_released();
+}
+
+#[test]
+fn crop_rotation_and_flip_are_transactional_and_share_one_undo_step() {
+    let mut state = state();
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    state.command(Command::RotateCropRight).unwrap();
+    assert_eq!(state.display_orientation(), ImageOrientation::RotateRight);
+    assert_eq!(state.document().orientation(), ImageOrientation::Identity);
+    assert_eq!(state.visual_crop_handle(Handle::Right), Handle::Bottom);
+    assert_eq!(
+        state.display_to_source(state.source_to_display(at(73.0, 91.0))),
+        at(73.0, 91.0)
+    );
+
+    state.command(Command::CancelCrop).unwrap();
+    assert_eq!(state.document().orientation(), ImageOrientation::Identity);
+    assert_eq!(state.document().crop(), None);
+    assert!(!state.can_undo());
+
+    draft_crop(&mut state, 40.0, 30.0, 260.0, 210.0);
+    state.command(Command::RotateCropRight).unwrap();
+    state.command(Command::FlipCropHorizontal).unwrap();
+    let expected = ImageOrientation::RotateRight.then(ImageOrientation::FlipHorizontal);
+    state.command(Command::ApplyCrop).unwrap();
+    assert_eq!(state.document().orientation(), expected);
+    assert!(state.document().crop().is_some());
+    assert_eq!(state.undo_depth(), 1);
+
+    state.command(Command::Undo).unwrap();
+    assert_eq!(state.document().orientation(), ImageOrientation::Identity);
+    assert_eq!(state.document().crop(), None);
+}
+
+#[test]
+fn manual_crop_is_available_for_native_window_captures() {
+    let mut capture = capture();
+    capture.provenance = Provenance::Window;
+    capture.target = CaptureTarget::Window(scrozz_core::WindowId("native".to_owned()));
+    let mut state = EditorState::new(Document::new(capture));
+
+    state.set_tool(Tool::Crop);
+    state.set_crop_width(120.0);
+    state.set_crop_height(90.0);
+    state.command(Command::ApplyCrop).unwrap();
+
+    assert_eq!(
+        state.document().crop().unwrap().size,
+        LogicalSize::new(120.0, 90.0)
+    );
 }
 
 #[test]

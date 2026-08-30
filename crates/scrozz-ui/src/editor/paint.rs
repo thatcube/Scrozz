@@ -65,6 +65,18 @@ impl std::fmt::Debug for Preview {
     }
 }
 
+/// Resize cursor for a crop handle in displayed orientation.
+#[must_use]
+pub const fn crop_cursor(handle: Handle) -> CursorIcon {
+    match handle {
+        Handle::Left | Handle::Right => CursorIcon::ResizeHorizontal,
+        Handle::Top | Handle::Bottom => CursorIcon::ResizeVertical,
+        Handle::TopLeft | Handle::BottomRight => CursorIcon::ResizeNwSe,
+        Handle::TopRight | Handle::BottomLeft => CursorIcon::ResizeNeSw,
+        Handle::ArrowStart | Handle::ArrowEnd => CursorIcon::Default,
+    }
+}
+
 impl Preview {
     /// Forgets the cached texture, forcing a re-render.
     pub fn invalidate(&mut self) {
@@ -137,11 +149,12 @@ fn render(
     target_px: u32,
     full_document: bool,
 ) -> scrozz_core::Result<egui::ColorImage> {
-    let mut uncropped;
-    let document = if full_document && state.document().crop().is_some() {
-        uncropped = state.document().clone();
-        uncropped.set_crop(None)?;
-        &uncropped
+    let mut crop_preview;
+    let document = if full_document {
+        crop_preview = state.document().clone();
+        crop_preview.set_crop(None)?;
+        crop_preview.set_orientation(state.display_orientation());
+        &crop_preview
     } else {
         state.document()
     };
@@ -266,11 +279,7 @@ pub fn draw_canvas(
     let painter = ui.painter_at(area);
     checkerboard(&painter, area, palette);
 
-    let content = if state.crop_mode() {
-        state.document().logical_bounds()
-    } else {
-        state.document().content_bounds()
-    };
+    let content = state.display_content_bounds();
     let fit_area = area.shrink(Space::LG);
     let image = if state.is_fit_zoom() {
         super::fit(content, fit_area, 1.0, state.pan())
@@ -342,7 +351,7 @@ pub fn draw_canvas(
     let interrupt = state.take_ime_interrupt();
     draw_caret(ui, &chrome, state, &view, palette, interrupt);
     if interactive {
-        cursor(ui, state, &response);
+        cursor(ui, state, &response, &view);
     }
     view
 }
@@ -377,8 +386,16 @@ fn draw_caret(
     // multiple of the advance; no shaping pass is needed to place it.
     let x = at.x + column as f64 * font::ADVANCE * size;
     let y = at.y + row as f64 * font::LINE_HEIGHT * size;
-    let top = super::to_screen(LogicalPoint::new(x, y), view.image, view.content);
-    let bottom = super::to_screen(LogicalPoint::new(x, y + size), view.image, view.content);
+    let top = super::to_screen(
+        state.source_to_display(LogicalPoint::new(x, y)),
+        view.image,
+        view.content,
+    );
+    let bottom = super::to_screen(
+        state.source_to_display(LogicalPoint::new(x, y + size)),
+        view.image,
+        view.content,
+    );
     let caret = Rect::from_min_max(top, bottom);
 
     // Blink on the same cadence as the rest of the system, and keep the frame
@@ -461,7 +478,7 @@ fn gestures(ui: &Ui, state: &mut EditorState, response: &egui::Response, view: &
         }
         return;
     };
-    let point = to_document(screen, view.image, view.content);
+    let point = state.display_to_source(to_document(screen, view.image, view.content));
     let (middle_pressed, middle_down, middle_released) = ui.ctx().input(|input| {
         (
             input.pointer.button_pressed(egui::PointerButton::Middle),
@@ -483,7 +500,7 @@ fn gestures(ui: &Ui, state: &mut EditorState, response: &egui::Response, view: &
 
     if response.drag_started() {
         let press_screen = screen - response.drag_delta();
-        let press = to_document(press_screen, view.image, view.content);
+        let press = state.display_to_source(to_document(press_screen, view.image, view.content));
         if pan_gesture {
             state.begin_pan((press_screen.x, press_screen.y));
             state.pan_to((screen.x, screen.y));
@@ -552,11 +569,11 @@ fn draw_crop_scrim(
     view: &CanvasView,
     palette: &Palette,
 ) {
-    let Some(rect) = state.pending_crop() else {
+    let Some(rect) = state.pending_crop_display() else {
         return;
     };
     let keep = rect_to_screen(rect, view.image, view.content);
-    if rect != state.document().logical_bounds() {
+    if rect != state.display_bounds() {
         let scrim = Color32::from_black_alpha(120);
         for band in [
             Rect::from_min_max(view.image.min, pos2(view.image.right(), keep.top())),
@@ -583,7 +600,11 @@ fn draw_crop_scrim(
     );
     thirds(painter, keep);
     for handle in Handle::ALL {
-        let at = super::to_screen(handle.position(&rect), view.image, view.content);
+        let source = state
+            .pending_crop()
+            .map(|crop| handle.position(&crop))
+            .unwrap_or_else(|| handle.position(&rect));
+        let at = super::to_screen(state.source_to_display(source), view.image, view.content);
         let radius = HANDLE_RADIUS as f32;
         let handle_rect = Rect::from_center_size(at, vec2(radius * 2.0, radius * 2.0));
         painter.rect_filled(
@@ -597,6 +618,25 @@ fn draw_crop_scrim(
             corner(1.5),
             Stroke::new(1.0, palette.accent),
             StrokeKind::Inside,
+        );
+    }
+    for segment in state.active_crop_snap_segments() {
+        let (from, to) = match segment.axis {
+            super::crop::BoundaryAxis::Horizontal => (
+                LogicalPoint::new(segment.start, segment.position),
+                LogicalPoint::new(segment.end, segment.position),
+            ),
+            super::crop::BoundaryAxis::Vertical => (
+                LogicalPoint::new(segment.position, segment.start),
+                LogicalPoint::new(segment.position, segment.end),
+            ),
+        };
+        painter.line_segment(
+            [
+                super::to_screen(state.source_to_display(from), view.image, view.content),
+                super::to_screen(state.source_to_display(to), view.image, view.content),
+            ],
+            Stroke::new(2.0, palette.accent),
         );
     }
 }
@@ -630,7 +670,7 @@ fn draw_selection(
     if arrow {
         let r = HANDLE_RADIUS as f32;
         for (_, position) in handles {
-            let at = super::to_screen(position, view.image, view.content);
+            let at = super::to_screen(state.source_to_display(position), view.image, view.content);
             // Dark under-ring + white keyline + accent centre: three contrasts,
             // so the endpoint stays visible over any captured pixel.
             painter.circle_filled(at, r + 2.0, Color32::from_black_alpha(100));
@@ -639,7 +679,7 @@ fn draw_selection(
             painter.circle_stroke(at, r - 0.5, Stroke::new(1.0, palette.accent_press));
         }
         if let Some(position) = state.arrow_bend_handle() {
-            let at = super::to_screen(position, view.image, view.content);
+            let at = super::to_screen(state.source_to_display(position), view.image, view.content);
             let near = painter
                 .ctx()
                 .pointer_hover_pos()
@@ -672,7 +712,12 @@ fn draw_selection(
         }
         return;
     }
-    let rect = rect_to_screen(bounds, view.image, view.content).expand(2.0);
+    let rect = rect_to_screen(
+        state.source_rect_to_display(bounds),
+        view.image,
+        view.content,
+    )
+    .expand(2.0);
     // A dark under-stroke keeps the selection visible over a light capture, and
     // the accent over a dark one; a single colour disappears against one or the
     // other every time.
@@ -691,7 +736,7 @@ fn draw_selection(
 
     let r = HANDLE_RADIUS as f32;
     for (handle, position) in handles {
-        let at = super::to_screen(position, view.image, view.content);
+        let at = super::to_screen(state.source_to_display(position), view.image, view.content);
         let at = pos2(
             at.x + handle_bias(handle.moves_left(), handle.moves_right()) * 2.0,
             at.y + handle_bias(handle.moves_top(), handle.moves_bottom()) * 2.0,
@@ -713,14 +758,22 @@ const fn handle_bias(low: bool, high: bool) -> f32 {
 }
 
 /// Sets the pointer cursor to match what a click would do.
-fn cursor(ui: &Ui, state: &EditorState, response: &egui::Response) {
+fn cursor(ui: &Ui, state: &EditorState, response: &egui::Response, view: &CanvasView) {
     if !response.hovered() {
         return;
     }
+    let crop_handle = state.active_crop_handle().or_else(|| {
+        response.hover_pos().and_then(|screen| {
+            let display = to_document(screen, view.image, view.content);
+            state.crop_handle_at(state.display_to_source(display))
+        })
+    });
     let icon = match state.tool() {
         Tool::Select => CursorIcon::Default,
         Tool::Text => CursorIcon::Text,
-        Tool::Crop => CursorIcon::Crosshair,
+        Tool::Crop => crop_handle.map_or(CursorIcon::Default, |handle| {
+            crop_cursor(state.visual_crop_handle(handle))
+        }),
         _ => CursorIcon::Crosshair,
     };
     ui.ctx().set_cursor_icon(icon);

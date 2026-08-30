@@ -77,7 +77,7 @@ impl SkiaRenderer {
             ));
         }
 
-        let logical = document.logical_size();
+        let logical = document.display_size();
         let width = checked_render_dimension(logical.width * scale.get(), "width")?;
         let height = checked_render_dimension(logical.height * scale.get(), "height")?;
         let retained_background_bytes = match document.beautification() {
@@ -116,6 +116,7 @@ impl SkiaRenderer {
         } else {
             crop_canvas(canvas, crop)?
         };
+        let canvas = orient_canvas(canvas, document.orientation())?;
         let retained_source_bytes =
             u64::try_from(document.source().frame.data.len()).map_err(|_| {
                 Error::InvalidRequest("source buffer size is not addressable".to_owned())
@@ -318,6 +319,40 @@ fn crop_canvas(canvas: Pixmap, rect: IntRect) -> Result<Pixmap> {
             .copy_from_slice(&canvas.data()[source..source + count]);
     }
     Ok(cropped)
+}
+
+fn orient_canvas(canvas: Pixmap, orientation: crate::ImageOrientation) -> Result<Pixmap> {
+    use crate::ImageOrientation;
+
+    if orientation == ImageOrientation::Identity {
+        return Ok(canvas);
+    }
+    let (source_width, source_height) = (canvas.width(), canvas.height());
+    let (width, height) = if orientation.swaps_axes() {
+        (source_height, source_width)
+    } else {
+        (source_width, source_height)
+    };
+    let mut oriented = new_pixmap(width, height, "oriented output")?;
+    for y in 0..source_height {
+        for x in 0..source_width {
+            let (dx, dy) = match orientation {
+                ImageOrientation::Identity => (x, y),
+                ImageOrientation::RotateRight => (source_height - 1 - y, x),
+                ImageOrientation::Rotate180 => (source_width - 1 - x, source_height - 1 - y),
+                ImageOrientation::RotateLeft => (y, source_width - 1 - x),
+                ImageOrientation::FlipHorizontal => (source_width - 1 - x, y),
+                ImageOrientation::FlipVertical => (x, source_height - 1 - y),
+                ImageOrientation::Transpose => (y, x),
+                ImageOrientation::Transverse => (source_height - 1 - y, source_width - 1 - x),
+            };
+            let source = (y as usize * source_width as usize + x as usize) * 4;
+            let destination = (dy as usize * width as usize + dx as usize) * 4;
+            oriented.data_mut()[destination..destination + 4]
+                .copy_from_slice(&canvas.data()[source..source + 4]);
+        }
+    }
+    Ok(oriented)
 }
 
 fn new_pixmap(width: u32, height: u32, label: &str) -> Result<Pixmap> {

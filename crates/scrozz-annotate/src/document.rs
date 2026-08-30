@@ -921,6 +921,224 @@ impl Beautification {
     }
 }
 
+/// Non-destructive orientation of source pixels after crop and before framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageOrientation {
+    /// Source pixels appear unchanged.
+    #[default]
+    Identity,
+    /// A clockwise quarter turn.
+    RotateRight,
+    /// A half turn.
+    Rotate180,
+    /// A counter-clockwise quarter turn.
+    RotateLeft,
+    /// Reflection across the vertical axis.
+    FlipHorizontal,
+    /// Reflection across the horizontal axis.
+    FlipVertical,
+    /// Reflection across the top-left to bottom-right diagonal.
+    Transpose,
+    /// Reflection across the top-right to bottom-left diagonal.
+    Transverse,
+}
+
+impl ImageOrientation {
+    /// Applies `operation` in the currently displayed coordinate system.
+    #[must_use]
+    pub fn then(self, operation: Self) -> Self {
+        let left = operation.matrix();
+        let right = self.matrix();
+        Self::from_matrix([
+            left[0] * right[0] + left[1] * right[2],
+            left[0] * right[1] + left[1] * right[3],
+            left[2] * right[0] + left[3] * right[2],
+            left[2] * right[1] + left[3] * right[3],
+        ])
+    }
+
+    /// Whether width and height exchange places.
+    #[must_use]
+    pub const fn swaps_axes(self) -> bool {
+        matches!(
+            self,
+            Self::RotateRight | Self::RotateLeft | Self::Transpose | Self::Transverse
+        )
+    }
+
+    /// Size after applying this orientation.
+    #[must_use]
+    pub fn apply_size(self, size: LogicalSize) -> LogicalSize {
+        if self.swaps_axes() {
+            LogicalSize::new(size.height, size.width)
+        } else {
+            size
+        }
+    }
+
+    /// Maps a source-space point into displayed full-image coordinates.
+    #[must_use]
+    pub fn apply_point(self, point: LogicalPoint, source: LogicalSize) -> LogicalPoint {
+        match self {
+            Self::Identity => point,
+            Self::RotateRight => LogicalPoint::new(source.height - point.y, point.x),
+            Self::Rotate180 => LogicalPoint::new(source.width - point.x, source.height - point.y),
+            Self::RotateLeft => LogicalPoint::new(point.y, source.width - point.x),
+            Self::FlipHorizontal => LogicalPoint::new(source.width - point.x, point.y),
+            Self::FlipVertical => LogicalPoint::new(point.x, source.height - point.y),
+            Self::Transpose => LogicalPoint::new(point.y, point.x),
+            Self::Transverse => LogicalPoint::new(source.height - point.y, source.width - point.x),
+        }
+    }
+
+    /// Maps a displayed full-image point back to source space.
+    #[must_use]
+    pub fn invert_point(self, point: LogicalPoint, source: LogicalSize) -> LogicalPoint {
+        self.inverse().apply_point(point, self.apply_size(source))
+    }
+
+    /// Maps a source-space axis-aligned rectangle into displayed coordinates.
+    #[must_use]
+    pub fn apply_rect(self, rect: LogicalRect, source: LogicalSize) -> LogicalRect {
+        let right = geom::max_x(&rect);
+        let bottom = geom::max_y(&rect);
+        let points = [
+            rect.origin,
+            LogicalPoint::new(right, rect.origin.y),
+            LogicalPoint::new(rect.origin.x, bottom),
+            LogicalPoint::new(right, bottom),
+        ]
+        .map(|point| self.apply_point(point, source));
+        let left = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f64::INFINITY, f64::min);
+        let top = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::INFINITY, f64::min);
+        let right = points
+            .iter()
+            .map(|point| point.x)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let bottom = points
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::NEG_INFINITY, f64::max);
+        geom::from_edges(left, top, right, bottom)
+    }
+
+    /// Maps a displayed axis-aligned rectangle back to source space.
+    #[must_use]
+    pub fn invert_rect(self, rect: LogicalRect, source: LogicalSize) -> LogicalRect {
+        self.inverse().apply_rect(rect, self.apply_size(source))
+    }
+
+    /// Maps an axis-aligned direction through this orientation.
+    #[must_use]
+    pub const fn apply_vector(self, vector: (i8, i8)) -> (i8, i8) {
+        let matrix = self.matrix();
+        (
+            matrix[0] * vector.0 + matrix[1] * vector.1,
+            matrix[2] * vector.0 + matrix[3] * vector.1,
+        )
+    }
+
+    const fn inverse(self) -> Self {
+        match self {
+            Self::RotateRight => Self::RotateLeft,
+            Self::RotateLeft => Self::RotateRight,
+            other => other,
+        }
+    }
+
+    const fn matrix(self) -> [i8; 4] {
+        match self {
+            Self::Identity => [1, 0, 0, 1],
+            Self::RotateRight => [0, -1, 1, 0],
+            Self::Rotate180 => [-1, 0, 0, -1],
+            Self::RotateLeft => [0, 1, -1, 0],
+            Self::FlipHorizontal => [-1, 0, 0, 1],
+            Self::FlipVertical => [1, 0, 0, -1],
+            Self::Transpose => [0, 1, 1, 0],
+            Self::Transverse => [0, -1, -1, 0],
+        }
+    }
+
+    const fn from_matrix(matrix: [i8; 4]) -> Self {
+        match matrix {
+            [1, 0, 0, 1] => Self::Identity,
+            [0, -1, 1, 0] => Self::RotateRight,
+            [-1, 0, 0, -1] => Self::Rotate180,
+            [0, 1, -1, 0] => Self::RotateLeft,
+            [-1, 0, 0, 1] => Self::FlipHorizontal,
+            [1, 0, 0, -1] => Self::FlipVertical,
+            [0, 1, 1, 0] => Self::Transpose,
+            [0, -1, -1, 0] => Self::Transverse,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Margin requested outside the captured source.
+///
+/// Crop itself deliberately owns no fill. A non-zero value is a hand-off to
+/// Scene, which can expand its existing canvas/background model and then apply
+/// `source_crop`; introducing a second crop-only background would make export
+/// semantics depend on which surface created the margin.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CropExpansion {
+    /// Requested margin left of the source.
+    pub left: f64,
+    /// Requested margin above the source.
+    pub top: f64,
+    /// Requested margin right of the source.
+    pub right: f64,
+    /// Requested margin below the source.
+    pub bottom: f64,
+}
+
+impl CropExpansion {
+    /// Whether Scene must provide any canvas.
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        [self.left, self.top, self.right, self.bottom]
+            .into_iter()
+            .all(|value| value <= 0.0)
+    }
+
+    /// Maps source-side margins into their displayed sides.
+    #[must_use]
+    pub const fn apply_orientation(self, orientation: ImageOrientation) -> Self {
+        let [left, top, right, bottom] = match orientation {
+            ImageOrientation::Identity => [self.left, self.top, self.right, self.bottom],
+            ImageOrientation::RotateRight => [self.bottom, self.left, self.top, self.right],
+            ImageOrientation::Rotate180 => [self.right, self.bottom, self.left, self.top],
+            ImageOrientation::RotateLeft => [self.top, self.right, self.bottom, self.left],
+            ImageOrientation::FlipHorizontal => [self.right, self.top, self.left, self.bottom],
+            ImageOrientation::FlipVertical => [self.left, self.bottom, self.right, self.top],
+            ImageOrientation::Transpose => [self.top, self.left, self.bottom, self.right],
+            ImageOrientation::Transverse => [self.bottom, self.right, self.top, self.left],
+        };
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+}
+
+/// Validated split between source trimming and Scene-owned outward canvas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CropResolution {
+    /// Source-space crop after intersecting the request with the capture.
+    pub source_crop: Option<LogicalRect>,
+    /// Asymmetric canvas Scene must add around that source result.
+    pub expansion: CropExpansion,
+}
+
 /// The editable part of a document: everything except the pixels.
 ///
 /// Per decision D14 this is persisted invisibly alongside the capture rather
@@ -944,6 +1162,9 @@ pub struct DocumentData {
     /// kept too, and simply fall outside the rendered area.
     #[serde(default)]
     pub crop: Option<LogicalRect>,
+    /// Non-destructive orientation applied after source crop and before framing.
+    #[serde(default)]
+    pub orientation: ImageOrientation,
     /// The next identifier to hand out.
     ///
     /// Persisted so a reopened document cannot reissue an id that an undo stack
@@ -956,7 +1177,7 @@ pub struct DocumentData {
 
 impl DocumentData {
     /// The current format version.
-    pub const VERSION: u32 = 5;
+    pub const VERSION: u32 = 6;
 }
 
 impl Default for DocumentData {
@@ -966,6 +1187,7 @@ impl Default for DocumentData {
             annotations: Vec::new(),
             beautification: None,
             crop: None,
+            orientation: ImageOrientation::Identity,
             next_id: 1,
             extensions: BTreeMap::new(),
         }
@@ -989,6 +1211,7 @@ pub struct Document {
     objects: Vec<AnnotationObject>,
     beautification: Option<Beautification>,
     crop: Option<LogicalRect>,
+    orientation: ImageOrientation,
     next_id: u64,
     extensions: BTreeMap<String, serde_json::Value>,
     revision: ContentRevision,
@@ -1003,6 +1226,7 @@ impl Document {
             objects: Vec::new(),
             beautification: None,
             crop: None,
+            orientation: ImageOrientation::Identity,
             next_id: 1,
             extensions: BTreeMap::new(),
             revision: ContentRevision::fresh(),
@@ -1030,6 +1254,7 @@ impl Document {
             objects: data.annotations,
             beautification: data.beautification,
             crop,
+            orientation: data.orientation,
             next_id: data.next_id.max(highest).max(1),
             extensions: data.extensions,
             revision: ContentRevision::fresh(),
@@ -1046,6 +1271,7 @@ impl Document {
             annotations: self.objects.clone(),
             beautification: self.beautification.clone(),
             crop: self.crop,
+            orientation: self.orientation,
             next_id: self.next_id,
             extensions: self.extensions.clone(),
         }
@@ -1073,6 +1299,7 @@ impl Document {
         self.objects = data.annotations;
         self.beautification = data.beautification;
         self.crop = crop;
+        self.orientation = data.orientation;
         self.next_id = data.next_id.max(highest).max(1);
         self.extensions = data.extensions;
         self.renumber_counters();
@@ -1150,6 +1377,18 @@ impl Document {
         LogicalRect::new(LogicalPoint::new(0.0, 0.0), self.logical_size())
     }
 
+    /// The full source size after the non-destructive orientation.
+    #[must_use]
+    pub fn display_size(&self) -> LogicalSize {
+        self.orientation.apply_size(self.logical_size())
+    }
+
+    /// The full oriented image as a displayed logical rectangle.
+    #[must_use]
+    pub fn display_bounds(&self) -> LogicalRect {
+        LogicalRect::new(LogicalPoint::new(0.0, 0.0), self.display_size())
+    }
+
     /// The immutable identity of the document's current editable content.
     #[must_use]
     pub const fn revision(&self) -> ContentRevision {
@@ -1184,16 +1423,54 @@ impl Document {
         self.crop
     }
 
+    /// Current non-destructive image orientation.
+    #[must_use]
+    pub const fn orientation(&self) -> ImageOrientation {
+        self.orientation
+    }
+
+    /// Changes the image orientation without touching source pixels.
+    pub fn set_orientation(&mut self, orientation: ImageOrientation) {
+        if self.orientation != orientation {
+            self.orientation = orientation;
+            self.touch();
+        }
+    }
+
+    /// Maps source coordinates to the currently displayed full image.
+    #[must_use]
+    pub fn source_to_display(&self, point: LogicalPoint) -> LogicalPoint {
+        self.orientation.apply_point(point, self.logical_size())
+    }
+
+    /// Maps displayed full-image coordinates back to source coordinates.
+    #[must_use]
+    pub fn display_to_source(&self, point: LogicalPoint) -> LogicalPoint {
+        self.orientation.invert_point(point, self.logical_size())
+    }
+
+    /// Maps a source rectangle into displayed full-image coordinates.
+    #[must_use]
+    pub fn source_rect_to_display(&self, rect: LogicalRect) -> LogicalRect {
+        self.orientation.apply_rect(rect, self.logical_size())
+    }
+
     /// The region that renders: the crop if there is one, else the whole image.
     #[must_use]
     pub fn content_bounds(&self) -> LogicalRect {
         self.crop.unwrap_or_else(|| self.logical_bounds())
     }
 
+    /// Oriented location of the visible source region in full-image coordinates.
+    #[must_use]
+    pub fn display_content_bounds(&self) -> LogicalRect {
+        self.source_rect_to_display(self.content_bounds())
+    }
+
     /// The rendered size in logical points.
     #[must_use]
     pub fn content_size(&self) -> LogicalSize {
-        self.content_bounds().size
+        self.orientation.apply_size(self.content_bounds().size)
     }
 
     /// Crops the document to `area`, or clears the crop with `None`.
@@ -1212,6 +1489,21 @@ impl Document {
         self.crop = normalize_crop(self.logical_bounds(), area)?;
         self.touch();
         Ok(())
+    }
+
+    /// Validates a crop request and separates trimming from outward expansion.
+    ///
+    /// `source_crop` remains in original source coordinates. Scene must rotate
+    /// or flip the asymmetric `expansion` with [`Self::orientation`] when it
+    /// materialises canvas, then apply the returned source crop. Crop does not
+    /// choose a fill and does not mutate the document through this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidRequest`] for a non-finite request or one that
+    /// does not overlap the source.
+    pub fn resolve_crop(&self, area: Option<LogicalRect>) -> Result<CropResolution> {
+        resolve_crop(self.logical_bounds(), area)
     }
 
     /// Adds an annotation on top of everything else.
@@ -1564,8 +1856,15 @@ fn capture_bounds(source: &Capture) -> LogicalRect {
 }
 
 fn normalize_crop(bounds: LogicalRect, area: Option<LogicalRect>) -> Result<Option<LogicalRect>> {
+    Ok(resolve_crop(bounds, area)?.source_crop)
+}
+
+fn resolve_crop(bounds: LogicalRect, area: Option<LogicalRect>) -> Result<CropResolution> {
     let Some(area) = area else {
-        return Ok(None);
+        return Ok(CropResolution {
+            source_crop: None,
+            expansion: CropExpansion::default(),
+        });
     };
     if ![
         area.origin.x,
@@ -1591,7 +1890,15 @@ fn normalize_crop(bounds: LogicalRect, area: Option<LogicalRect>) -> Result<Opti
         ));
     }
     let clamped = geom::from_edges(left, top, right, bottom);
-    Ok((clamped != bounds).then_some(clamped))
+    Ok(CropResolution {
+        source_crop: (clamped != bounds).then_some(clamped),
+        expansion: CropExpansion {
+            left: (bounds.origin.x - area.origin.x).max(0.0),
+            top: (bounds.origin.y - area.origin.y).max(0.0),
+            right: (geom::max_x(&area) - geom::max_x(&bounds)).max(0.0),
+            bottom: (geom::max_y(&area) - geom::max_y(&bounds)).max(0.0),
+        },
+    })
 }
 
 fn normalize_redaction_styles(objects: &mut [AnnotationObject]) {

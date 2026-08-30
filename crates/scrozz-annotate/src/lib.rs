@@ -75,8 +75,8 @@ pub mod style;
 pub use annotation::{Annotation, AnnotationId, AnnotationKind, AnnotationObject, RedactStyle};
 pub use document::{
     Alignment, AnnotationMut, AspectPreset, AutomaticBackground, Background, BackgroundImage,
-    Beautification, BeautificationPreset, BuiltInBackground, Document, DocumentData,
-    ExactOutputSize, SourceInsets, Watermark,
+    Beautification, BeautificationPreset, BuiltInBackground, CropExpansion, CropResolution,
+    Document, DocumentData, ExactOutputSize, ImageOrientation, SourceInsets, Watermark,
 };
 pub use history::History;
 pub use render::{Renderer, SkiaRenderer};

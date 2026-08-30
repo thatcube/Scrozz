@@ -774,10 +774,67 @@ fn draw_crop_controls(ui: &Ui, surface: &Surface<'_>, state: &mut EditorState, c
                         {
                             state.swap_crop_dimensions();
                         }
+                        let output_label = format!("Output {width_px} x {height_px} px");
                         ui.add(
-                            egui::Label::new(format!("Image {source_width} x {source_height} px"))
+                            egui::Label::new(format!("Output {width_px} x {height_px} px"))
                                 .sense(Sense::focusable_noninteractive()),
-                        );
+                        )
+                        .widget_info(|| {
+                            WidgetInfo::labeled(WidgetType::Label, true, output_label.clone())
+                        });
+                        let source_label = format!("Source {source_width} x {source_height} px");
+                        ui.add(
+                            egui::Label::new(format!("Source {source_width} x {source_height} px"))
+                                .sense(Sense::focusable_noninteractive()),
+                        )
+                        .widget_info(|| {
+                            WidgetInfo::labeled(WidgetType::Label, true, source_label.clone())
+                        });
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("Rotate left")
+                        .on_hover_text("Rotate the crop result 90 degrees counter-clockwise")
+                        .clicked()
+                    {
+                        let _ = state.command(Command::RotateCropLeft);
+                    }
+                    if ui
+                        .button("Rotate right")
+                        .on_hover_text("Rotate the crop result 90 degrees clockwise")
+                        .clicked()
+                    {
+                        let _ = state.command(Command::RotateCropRight);
+                    }
+                    if ui
+                        .button("Flip horizontal")
+                        .on_hover_text("Mirror the crop result left to right")
+                        .clicked()
+                    {
+                        let _ = state.command(Command::FlipCropHorizontal);
+                    }
+                    if ui
+                        .button("Flip vertical")
+                        .on_hover_text("Mirror the crop result top to bottom")
+                        .clicked()
+                    {
+                        let _ = state.command(Command::FlipCropVertical);
+                    }
+
+                    if ui.button("Zoom -").clicked() {
+                        let _ = state.command(Command::ZoomOut);
+                    }
+                    ui.add(
+                        egui::Label::new(format!("{:.0}%", state.effective_zoom() * 100.0))
+                            .sense(Sense::focusable_noninteractive()),
+                    );
+                    if ui.button("Zoom +").clicked() {
+                        let _ = state.command(Command::ZoomIn);
+                    }
+                    if ui.button("Fit").clicked() {
+                        let _ = state.command(Command::ZoomReset);
                     }
 
                     let mut snap = state.crop_snap_edges();
@@ -796,7 +853,7 @@ fn draw_crop_controls(ui: &Ui, surface: &Surface<'_>, state: &mut EditorState, c
                     {
                         let _ = state.command(Command::RevertCrop);
                     }
-                    if ui.button("Crop").clicked() {
+                    if ui.button("Apply").clicked() {
                         let _ = state.command(Command::ApplyCrop);
                     }
                 });
