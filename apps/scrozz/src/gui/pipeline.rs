@@ -55,9 +55,10 @@ use std::{
 };
 
 use scrozz_annotate::{
-    AnalysisCancellation, Beautification, Document, DocumentData, GeneratedStyle, PresetBackground,
-    Renderer, SkiaRenderer, SmartFrameAnalysis, SmartFramePresetSettings, SourceInsets,
-    analyze_scene_with_style, analyze_smart_frame,
+    AnalysisCancellation, Background, Beautification, Document, DocumentData, GeneratedStyle,
+    PresetBackground, Renderer, SkiaRenderer, SmartFrameAnalysis, SmartFramePresetSettings,
+    SourceInsets, analyze_scene_with_style, analyze_smart_frame,
+    analyze_with_style_after_fixed_inset,
 };
 use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError,
@@ -2565,24 +2566,65 @@ impl Worker {
         let beautification = match plan {
             ScenePlan::Untouched => return Ok(document.source().frame.clone()),
             ScenePlan::Analyze => {
-                Self::analyze_scene(document, GeneratedStyle::Balanced)?.beautification
+                Self::analyze_scene(document, GeneratedStyle::Balanced, None)?.beautification
             }
             ScenePlan::Preset {
                 settings,
                 resolve_background,
             } => {
                 let mut beautification = settings.to_beautification();
-                if let Some(style) = resolve_background {
-                    // The background is the *only* thing `Automatic` defers to
-                    // the capture. Carrying the analysis metadata across too
-                    // would smuggle in its focus point, and with auto balance on
-                    // that silently repositions the subject — so a preset would
-                    // frame differently depending on what it was pointed at.
-                    // Placement stays the preset's own.
-                    let analysis = Self::analyze_scene(document, style)?;
-                    beautification.background = analysis.beautification.background;
-                }
                 Self::constrain_to_provenance(&mut beautification, document.source().provenance);
+                let automatic = beautification.automatic;
+                if resolve_background.is_some() || automatic.any() {
+                    let style = resolve_background
+                        .or(match &beautification.background {
+                            Background::Automatic(background) => Some(background.style),
+                            _ => None,
+                        })
+                        .unwrap_or(GeneratedStyle::Balanced);
+                    let fixed_inset = (!automatic.inset).then_some(beautification.inset);
+                    let analyzed =
+                        Self::analyze_scene(document, style, fixed_inset)?.beautification;
+
+                    // Older preset wire data can name an Automatic/Generated
+                    // background without carrying the newer per-property bit.
+                    if resolve_background.is_some() || automatic.background {
+                        beautification.background = analyzed.background.clone();
+                    }
+                    if automatic.inset {
+                        beautification.inset = analyzed.inset;
+                    }
+                    if automatic.padding {
+                        beautification.padding = analyzed.padding;
+                        beautification.canvas_padding = analyzed.canvas_padding;
+                    }
+                    if automatic.placement {
+                        beautification.alignment = analyzed.alignment;
+                        beautification.auto_balance = analyzed.auto_balance;
+                    }
+                    if automatic.corners {
+                        beautification.corner_radius = analyzed.corner_radius;
+                    }
+                    if automatic.shadow {
+                        beautification.shadow = analyzed.shadow;
+                    }
+                    if automatic.output_size {
+                        beautification.output_size = analyzed.output_size;
+                    }
+
+                    // Inset and placement are the capture-derived properties
+                    // whose metadata affects later rendering. A fixed
+                    // placement must never inherit an analyzed focus merely
+                    // because some other property remained Automatic.
+                    if automatic.inset || automatic.placement {
+                        beautification.smart_frame = analyzed.smart_frame;
+                        if !automatic.placement
+                            && let Some(metadata) = &mut beautification.smart_frame
+                        {
+                            metadata.focus.confidence = 0;
+                        }
+                    }
+                }
                 beautification
             }
         };
@@ -2607,20 +2649,34 @@ impl Worker {
         if !provenance.forbids_compositing() {
             return;
         }
-        beautification.inset = SourceInsets::default();
-        beautification.corner_radius = 0.0;
-        beautification.shadow = 0.0;
-        beautification.border_width = 0.0;
+        beautification.preserve_native_subject();
     }
 
-    fn analyze_scene(document: &Document, style: GeneratedStyle) -> CliResult<SmartFrameAnalysis> {
-        let current = SkiaRenderer.render(document)?;
-        Ok(analyze_scene_with_style(
-            &current,
-            document.source().provenance,
-            style,
-            &AnalysisCancellation::default(),
-        )?)
+    fn analyze_scene(
+        document: &Document,
+        style: GeneratedStyle,
+        fixed_inset: Option<SourceInsets>,
+    ) -> CliResult<SmartFrameAnalysis> {
+        let mut analysis_document = document.clone();
+        let inset_is_fixed = fixed_inset.is_some();
+        analysis_document.set_scene(fixed_inset.filter(|inset| !inset.is_zero()).map(|inset| {
+            Beautification {
+                inset,
+                ..Beautification::default()
+            }
+        }))?;
+        let current = SkiaRenderer.render(&analysis_document)?;
+        let cancellation = AnalysisCancellation::default();
+        Ok(if inset_is_fixed {
+            analyze_with_style_after_fixed_inset(
+                &current,
+                document.source().provenance,
+                style,
+                &cancellation,
+            )?
+        } else {
+            analyze_scene_with_style(&current, document.source().provenance, style, &cancellation)?
+        })
     }
 
     fn options_for(kind: CaptureKind) -> SelectionOptions {
@@ -2962,9 +3018,23 @@ impl Worker {
             .name(format!("scrozz-smart-frame-{}", card.0))
             .spawn(move || {
                 let provenance = document.source().provenance;
+                let fixed_inset = document
+                    .beautification()
+                    .is_some_and(|scene| !scene.automatic.inset);
                 let result = SkiaRenderer
                     .render(&document)
-                    .and_then(|frame| analyze_smart_frame(&frame, provenance, &cancellation))
+                    .and_then(|frame| {
+                        if fixed_inset {
+                            analyze_with_style_after_fixed_inset(
+                                &frame,
+                                provenance,
+                                GeneratedStyle::Balanced,
+                                &cancellation,
+                            )
+                        } else {
+                            analyze_smart_frame(&frame, provenance, &cancellation)
+                        }
+                    })
                     .map_err(|error| error.to_string());
                 if let Ok(analysis) = &result
                     && !cancellation.is_cancelled()
@@ -4926,6 +4996,7 @@ mod tests {
                     0x20, 0x30, 0x40, 0xff,
                 )),
                 auto_balance: false,
+                automatic: scrozz_annotate::SceneAutomatic::default(),
                 ..SmartFramePresetSettings::default()
             },
         );
@@ -4975,6 +5046,7 @@ mod tests {
                 corner_radius: 7.0,
                 background: PresetBackground::Automatic,
                 auto_balance: false,
+                automatic: scrozz_annotate::SceneAutomatic::default(),
                 ..SmartFramePresetSettings::default()
             },
         );
@@ -5004,6 +5076,178 @@ mod tests {
     }
 
     #[test]
+    fn a_named_scene_resolves_automatic_inset_without_moving_fixed_placement() {
+        let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-inset");
+        let fixed_background = scrozz_annotate::Color::rgba(0x20, 0x30, 0x40, 0xff);
+        let policy = preset_policy(
+            "auto-inset",
+            SmartFramePresetSettings {
+                background: PresetBackground::Solid(fixed_background),
+                auto_balance: true,
+                automatic: scrozz_annotate::SceneAutomatic {
+                    inset: true,
+                    ..scrozz_annotate::SceneAutomatic::default()
+                },
+                ..SmartFramePresetSettings::default()
+            },
+        );
+        let mut source = sample_display_capture(100, 80, 1);
+        for pixel in source.frame.data.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[0, 0, 0, 0]);
+        }
+        for y in 8..72usize {
+            for x in 10..90usize {
+                let offset = y * source.frame.stride + x * 4;
+                source.frame.data[offset..offset + 4].copy_from_slice(&[220, 80, 40, 255]);
+            }
+        }
+
+        let ready = worker
+            .finish_capture(CaptureKind::Region, CardId(24), source, &policy)
+            .unwrap();
+        let capture = ready.card.capture_id.expect("history identity");
+        let stored = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .document(&capture)
+            .unwrap()
+            .and_then(scrozz_store::DocumentState::complete)
+            .expect("complete derived document");
+        let scene = stored.beautification().expect("the preset was applied");
+
+        assert_eq!(
+            scene.inset,
+            SourceInsets {
+                left: 5.0,
+                top: 4.0,
+                right: 5.0,
+                bottom: 4.0,
+            }
+        );
+        assert!(scene.automatic.inset);
+        assert!(matches!(scene.background, Background::Solid(color) if color == fixed_background));
+        assert_eq!(
+            scene
+                .smart_frame
+                .as_ref()
+                .expect("inset metadata")
+                .focus
+                .confidence,
+            0,
+            "fixed placement must not inherit analyzed focus"
+        );
+    }
+
+    #[test]
+    fn automatic_placement_is_analyzed_inside_the_presets_fixed_inset() {
+        let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-placement");
+        let policy = preset_policy(
+            "auto-placement",
+            SmartFramePresetSettings {
+                inset: SourceInsets::uniform(5.0),
+                background: PresetBackground::Solid(scrozz_annotate::Color::rgba(
+                    0x20, 0x30, 0x40, 0xff,
+                )),
+                automatic: scrozz_annotate::SceneAutomatic {
+                    placement: true,
+                    ..scrozz_annotate::SceneAutomatic::default()
+                },
+                ..SmartFramePresetSettings::default()
+            },
+        );
+
+        let mut source = sample_display_capture(100, 80, 2);
+        for pixel in source.frame.data.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[0, 0, 0, 0]);
+        }
+        for y in 13..67usize {
+            for x in 15..85usize {
+                let offset = y * source.frame.stride + x * 4;
+                source.frame.data[offset..offset + 4].copy_from_slice(&[220, 80, 40, 255]);
+            }
+        }
+        let ready = worker
+            .finish_capture(CaptureKind::Region, CardId(25), source, &policy)
+            .unwrap();
+        let capture = ready.card.capture_id.expect("history identity");
+        let stored = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .document(&capture)
+            .unwrap()
+            .and_then(scrozz_store::DocumentState::complete)
+            .expect("complete derived document");
+        let scene = stored.beautification().expect("the preset was applied");
+        let metadata = scene.smart_frame.as_ref().expect("placement metadata");
+
+        assert_eq!(scene.inset, SourceInsets::uniform(5.0));
+        assert_eq!(
+            (metadata.source_width, metadata.source_height),
+            (80, 60),
+            "analysis must see the same inset subject rectangle the Scene renders"
+        );
+        assert_eq!(
+            metadata.inset_decision,
+            scrozz_annotate::InsetDecision::NoExcessMargin,
+            "the already-fixed subject must not be inset a second time for focus"
+        );
+    }
+
+    #[test]
+    fn fixed_zero_inset_still_disables_secondary_inset_detection() {
+        let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-zero-inset");
+        let policy = preset_policy(
+            "auto-placement-zero-inset",
+            SmartFramePresetSettings {
+                inset: SourceInsets::default(),
+                background: PresetBackground::Solid(scrozz_annotate::Color::rgba(
+                    0x20, 0x30, 0x40, 0xff,
+                )),
+                automatic: scrozz_annotate::SceneAutomatic {
+                    placement: true,
+                    ..scrozz_annotate::SceneAutomatic::default()
+                },
+                ..SmartFramePresetSettings::default()
+            },
+        );
+        let mut source = sample_display_capture(100, 80, 3);
+        for pixel in source.frame.data.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[0, 0, 0, 0]);
+        }
+        for y in 8..72usize {
+            for x in 10..90usize {
+                let offset = y * source.frame.stride + x * 4;
+                source.frame.data[offset..offset + 4].copy_from_slice(&[220, 80, 40, 255]);
+            }
+        }
+
+        let ready = worker
+            .finish_capture(CaptureKind::Region, CardId(26), source, &policy)
+            .unwrap();
+        let capture = ready.card.capture_id.expect("history identity");
+        let stored = worker
+            .store
+            .as_mut()
+            .unwrap()
+            .document(&capture)
+            .unwrap()
+            .and_then(scrozz_store::DocumentState::complete)
+            .expect("complete derived document");
+        let scene = stored.beautification().expect("the preset was applied");
+        let metadata = scene.smart_frame.as_ref().expect("placement metadata");
+
+        assert!(scene.inset.is_zero());
+        assert!(!scene.automatic.inset);
+        assert_eq!(
+            metadata.inset_decision,
+            scrozz_annotate::InsetDecision::NoExcessMargin,
+            "a migrated fixed-zero inset must not change focus coordinates"
+        );
+    }
+
+    #[test]
     fn a_generated_background_does_not_move_where_the_preset_puts_the_subject() {
         // Resolving a generated direction runs analysis, and analysis knows where the
         // capture's visual centre is. With auto balance on, letting that focus
@@ -5017,6 +5261,7 @@ mod tests {
                 padding: 48.0,
                 background: PresetBackground::Generated(GeneratedStyle::Vibrant),
                 auto_balance: true,
+                automatic: scrozz_annotate::SceneAutomatic::default(),
                 ..SmartFramePresetSettings::default()
             },
         );
@@ -5065,6 +5310,7 @@ mod tests {
             padding: 48.0,
             background: PresetBackground::Generated(GeneratedStyle::Vibrant),
             auto_balance: true,
+            automatic: scrozz_annotate::SceneAutomatic::default(),
             ..SmartFramePresetSettings::default()
         }
         .to_beautification();
@@ -5090,6 +5336,12 @@ mod tests {
                 shadow: 9.0,
                 border_width: 2.0,
                 inset: scrozz_annotate::SourceInsets::uniform(3.0),
+                automatic: scrozz_annotate::SceneAutomatic {
+                    inset: true,
+                    corners: true,
+                    shadow: true,
+                    ..scrozz_annotate::SceneAutomatic::default()
+                },
                 background: PresetBackground::Solid(scrozz_annotate::Color::rgba(
                     0x10, 0x10, 0x10, 0xff,
                 )),
@@ -5123,6 +5375,9 @@ mod tests {
         assert!(beautification.shadow <= 0.0);
         assert!(beautification.border_width <= 0.0);
         assert!(beautification.inset.is_zero());
+        assert!(!beautification.automatic.inset);
+        assert!(!beautification.automatic.corners);
+        assert!(!beautification.automatic.shadow);
     }
 
     #[test]

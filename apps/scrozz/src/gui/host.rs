@@ -1260,7 +1260,10 @@ impl Driver {
                 if got != Intent::None {
                     intent = got;
                 }
-                decided
+                // Native close is reconciled after this closure returns. Read
+                // dirty again so a Scene edit and a close request delivered in
+                // the same frame cannot use the stale pre-frame value above.
+                (decided, editor.state().is_dirty())
             });
 
             match intent {

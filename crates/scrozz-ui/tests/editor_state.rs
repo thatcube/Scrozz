@@ -11,8 +11,8 @@ use std::sync::Arc;
 use egui::CursorIcon;
 use scrozz_annotate::{
     AnalysisCancellation, Annotation, AnnotationKind, ArrowStyle, Beautification,
-    BeautificationPreset, Color, Document, ImageOrientation, RedactStyle, Renderer, ResolvedFocus,
-    SkiaRenderer, SmartFrameMetadata, Style,
+    BeautificationPreset, Color, Document, ImageOrientation, InsetDecision, RedactStyle, Renderer,
+    ResolvedFocus, SceneAutomatic, SkiaRenderer, SmartFrameMetadata, SourceInsets, Style,
 };
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
@@ -1568,6 +1568,56 @@ fn crop_invalidates_focus_in_scene_undo_and_redo_lanes() {
             .focus
             .confidence,
         0
+    );
+}
+
+#[test]
+fn crop_discards_stale_automatic_inset_and_clamps_a_fixed_one() {
+    let scene = |automatic| {
+        let mut scene = focused_scene(Color::rgb(20, 30, 40));
+        scene.inset = SourceInsets::uniform(70.0);
+        scene.automatic = SceneAutomatic {
+            inset: automatic,
+            ..SceneAutomatic::default()
+        };
+        let metadata = scene.smart_frame.as_mut().unwrap();
+        metadata.inset_decision = InsetDecision::UniformBackground;
+        metadata.inset_confidence = 100;
+        scene
+    };
+
+    let mut automatic = state();
+    automatic.begin_with(scene(true));
+    automatic.apply_scene();
+    draft_crop(&mut automatic, 100.0, 80.0, 200.0, 160.0);
+    automatic.command(Command::ApplyCrop).unwrap();
+    let resolved = automatic.document().scene().unwrap();
+    assert!(
+        resolved.inset.is_zero(),
+        "old automatic edges are not reusable"
+    );
+    let metadata = resolved.smart_frame.as_ref().unwrap();
+    assert_eq!(metadata.inset_decision, InsetDecision::NoExcessMargin);
+    assert_eq!(metadata.inset_confidence, 0);
+    assert_eq!(metadata.focus.confidence, 0);
+    SkiaRenderer
+        .render(automatic.document())
+        .expect("geometry invalidation must leave a renderable Scene");
+
+    let mut fixed = state();
+    fixed.begin_with(scene(false));
+    fixed.apply_scene();
+    draft_crop(&mut fixed, 100.0, 80.0, 200.0, 160.0);
+    fixed.command(Command::ApplyCrop).unwrap();
+    assert_eq!(
+        fixed.document().scene().unwrap().inset,
+        SourceInsets {
+            left: 25.0,
+            top: 20.0,
+            right: 25.0,
+            bottom: 20.0,
+        },
+        "a fixed inset remains the user's value but cannot consume the new source"
     );
 }
 

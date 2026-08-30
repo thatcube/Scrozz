@@ -672,6 +672,31 @@ pub fn analyze_with_style(
     style: GeneratedStyle,
     cancellation: &AnalysisCancellation,
 ) -> Result<SmartFrameAnalysis> {
+    analyze_with_style_impl(frame, provenance, style, true, cancellation)
+}
+
+/// Analyses content that has already had a user-fixed inner inset applied.
+///
+/// A second automatic inset would make the returned focus relative to a
+/// smaller rectangle than the final Scene renders. Disabling only that second
+/// inset keeps every other capture-derived property and makes automatic
+/// placement use the exact fixed subject rectangle.
+pub fn analyze_with_style_after_fixed_inset(
+    frame: &Frame,
+    provenance: Provenance,
+    style: GeneratedStyle,
+    cancellation: &AnalysisCancellation,
+) -> Result<SmartFrameAnalysis> {
+    analyze_with_style_impl(frame, provenance, style, false, cancellation)
+}
+
+fn analyze_with_style_impl(
+    frame: &Frame,
+    provenance: Provenance,
+    style: GeneratedStyle,
+    detect_automatic_inset: bool,
+    cancellation: &AnalysisCancellation,
+) -> Result<SmartFrameAnalysis> {
     cancellation.check()?;
     let pixel_count = u64::from(frame.width())
         .checked_mul(u64::from(frame.height()))
@@ -714,8 +739,14 @@ pub fn analyze_with_style(
             decision: InsetDecision::WindowPreserved,
             confidence: 100,
         }
-    } else {
+    } else if detect_automatic_inset {
         detect_inset(&image, frame.scale.get(), edge, cancellation)?
+    } else {
+        InsetAnalysis {
+            inset: SourceInsets::default(),
+            decision: InsetDecision::NoExcessMargin,
+            confidence: 100,
+        }
     };
     let focus = visual_focus(&image, inset.inset, frame.scale.get(), edge, cancellation)?;
     let stats = sampled_stats(&image, edge, cancellation)?;

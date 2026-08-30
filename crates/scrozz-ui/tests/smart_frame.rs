@@ -2,8 +2,9 @@
 
 use scrozz_annotate::{
     AspectPreset, Background, BackgroundImage, Beautification, BeautificationPreset, CanvasInsets,
-    Color, Document, GeneratedStyle, SceneAutomatic, SmartFrameAnalysis, SmartFramePreset,
-    SmartFramePresetSettings, SourceInsets, SubjectAppearance,
+    Color, Document, GeneratedStyle, ResolvedFocus, SceneAutomatic, SmartFrameAnalysis,
+    SmartFrameMetadata, SmartFramePreset, SmartFramePresetSettings, SourceInsets,
+    SubjectAppearance,
 };
 use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
@@ -88,6 +89,41 @@ fn smart_frame_starts_as_an_immediate_default_on_draft() {
 
     state.cancel_smart_frame();
     assert_eq!(state.document().data(), before);
+}
+
+#[test]
+fn a_user_edited_scene_draft_stays_dirty_while_automatic_values_resolve() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let _ = state.begin_scene();
+    assert!(
+        !state.is_dirty(),
+        "an untouched automatic preview is disposable"
+    );
+
+    let mut scene = state.document().scene().cloned().unwrap();
+    scene.padding += 8.0;
+    let _ = state.apply_scene_edit(scene);
+    assert!(
+        state.is_dirty(),
+        "a manual Scene edit must guard native close"
+    );
+
+    let mut scene = state.document().scene().cloned().unwrap();
+    scene.automatic.padding = true;
+    let _ = state.apply_scene_edit(scene);
+    let _ = state
+        .request_scene_automatic_analysis()
+        .expect("Automatic requests a fresh analysis");
+    assert!(
+        state.is_dirty(),
+        "starting analysis must not clear the sticky close-safety bit"
+    );
+
+    state.cancel_scene();
+    assert!(
+        !state.is_dirty(),
+        "discarding the draft restores the clean source"
+    );
 }
 
 #[test]
@@ -281,6 +317,157 @@ fn mixed_preset_resolves_only_automatic_properties() {
     assert_eq!(scene.corner_radius, 7.0);
     assert_eq!(scene.shadow, 3.0);
     assert_eq!(scene.aspect, AspectPreset::Square);
+}
+
+#[test]
+fn automatic_analysis_keeps_a_fixed_inset_in_its_subject_snapshot() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    state.begin_with(Beautification {
+        inset: SourceInsets::uniform(12.0),
+        automatic: SceneAutomatic {
+            placement: true,
+            ..SceneAutomatic::default()
+        },
+        ..Beautification::default()
+    });
+
+    let Intent::AnalyzeSmartFrame { data, .. } = state
+        .request_scene_automatic_analysis()
+        .expect("automatic placement needs analysis")
+    else {
+        panic!("expected analysis intent");
+    };
+    let analysis_scene = data
+        .beautification
+        .as_ref()
+        .expect("fixed inset stays in the analysis snapshot");
+    assert_eq!(analysis_scene.inset, SourceInsets::uniform(12.0));
+    assert_eq!(
+        *analysis_scene,
+        Beautification {
+            inset: SourceInsets::uniform(12.0),
+            automatic: SceneAutomatic::default(),
+            ..Beautification::default()
+        },
+        "no presentation choice besides the fixed subject inset may affect analysis"
+    );
+
+    let mut zero = EditorState::new(document(Provenance::Region));
+    zero.begin_with(Beautification {
+        automatic: SceneAutomatic {
+            placement: true,
+            ..SceneAutomatic::default()
+        },
+        ..Beautification::default()
+    });
+    let Intent::AnalyzeSmartFrame { data, .. } = zero
+        .request_scene_automatic_analysis()
+        .expect("automatic placement needs analysis")
+    else {
+        panic!("expected analysis intent");
+    };
+    assert!(
+        data.beautification.is_some(),
+        "fixedness is independent of whether the fixed inset happens to be zero"
+    );
+}
+
+#[test]
+fn automatic_nonplacement_edits_do_not_import_analyzed_focus() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    state.begin_with(Beautification {
+        inset: SourceInsets::uniform(12.0),
+        auto_balance: true,
+        automatic: SceneAutomatic {
+            padding: true,
+            ..SceneAutomatic::default()
+        },
+        ..Beautification::default()
+    });
+    let Intent::AnalyzeSmartFrame { revision, .. } = state
+        .request_scene_automatic_analysis()
+        .expect("automatic padding needs analysis")
+    else {
+        panic!("expected analysis intent");
+    };
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification {
+                padding: 42.0,
+                smart_frame: Some(SmartFrameMetadata {
+                    focus: ResolvedFocus {
+                        x: 8_000,
+                        y: 2_000,
+                        confidence: 95,
+                    },
+                    ..SmartFrameMetadata::default()
+                }),
+                ..Beautification::default()
+            },
+            inset_explanation: "fixed".to_owned(),
+        }),
+    );
+
+    let scene = state.document().scene().unwrap();
+    assert_eq!(scene.padding, 42.0);
+    assert!(
+        scene.smart_frame.is_none(),
+        "fixed placement cannot inherit focus from an unrelated automatic property"
+    );
+}
+
+#[test]
+fn automatic_background_analysis_cannot_move_fixed_placement() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let fixed_focus = ResolvedFocus {
+        x: 7_500,
+        y: 2_500,
+        confidence: 90,
+    };
+    state.begin_with(Beautification {
+        background: Background::Solid(Color::rgb(24, 32, 48)),
+        auto_balance: true,
+        smart_frame: Some(SmartFrameMetadata {
+            focus: fixed_focus,
+            ..SmartFrameMetadata::default()
+        }),
+        automatic: SceneAutomatic::default(),
+        ..Beautification::default()
+    });
+    let intent = state
+        .set_generated_scene_style(GeneratedStyle::Soft)
+        .expect("automatic background needs analysis");
+    let Intent::AnalyzeSmartFrame { revision, .. } = intent else {
+        panic!("expected analysis intent");
+    };
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification {
+                background: Background::Automatic(Default::default()),
+                smart_frame: Some(SmartFrameMetadata {
+                    focus: ResolvedFocus {
+                        x: 1_000,
+                        y: 9_000,
+                        confidence: 99,
+                    },
+                    ..SmartFrameMetadata::default()
+                }),
+                ..Beautification::default()
+            },
+            inset_explanation: "fixed".to_owned(),
+        }),
+    );
+
+    let scene = state.document().scene().unwrap();
+    assert!(matches!(scene.background, Background::Automatic(_)));
+    assert_eq!(
+        scene.smart_frame.as_ref().unwrap().focus,
+        fixed_focus,
+        "background-only analysis cannot change placement metadata"
+    );
 }
 
 #[test]
@@ -682,6 +869,11 @@ fn a_native_window_never_takes_an_inner_inset() {
 
     let mut scene = state.document().scene().cloned().unwrap();
     scene.inset = SourceInsets::uniform(8.0);
+    scene.corner_radius = 12.0;
+    scene.shadow = 9.0;
+    scene.automatic.inset = true;
+    scene.automatic.corners = true;
+    scene.automatic.shadow = true;
     let _ = state.apply_scene_edit(scene);
 
     let stored = state.document().scene().cloned().unwrap();
@@ -689,6 +881,8 @@ fn a_native_window_never_takes_an_inner_inset() {
     assert!(!stored.automatic.inset);
     assert!((stored.corner_radius).abs() < f64::EPSILON);
     assert!((stored.shadow).abs() < f64::EPSILON);
+    assert!(!stored.automatic.corners);
+    assert!(!stored.automatic.shadow);
 }
 
 #[test]

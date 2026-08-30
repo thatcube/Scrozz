@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use scrozz_annotate::{
     AnalysisCancellation, AutomaticBackground, Background, Beautification, GeneratedStyle,
     InsetDecision, MAX_ANALYSIS_SAMPLES, PresetBackground, SceneAutomatic, SmartFramePreset,
-    SmartFramePresetSettings, analyze_scene_with_style, analyze_smart_frame, contrast_ratio,
+    SmartFramePresetSettings, analyze_scene_with_style, analyze_smart_frame,
+    analyze_with_style_after_fixed_inset, contrast_ratio,
 };
 use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, Provenance, ScaleFactor};
 
@@ -72,6 +73,29 @@ fn a_transparent_outer_margin_is_held_back_by_the_inner_inset() {
     assert_eq!(
         result.inset_explanation,
         InsetDecision::TransparentMargin.explanation()
+    );
+}
+
+#[test]
+fn analysis_after_a_fixed_inset_does_not_take_a_second_inset() {
+    let mut frame = rgba_frame(100, 80, [0, 0, 0, 0], ColorSpace::Srgb);
+    paint_rect(&mut frame, 10, 8, 90, 72, [220, 80, 40, 255]);
+
+    let result = analyze_with_style_after_fixed_inset(
+        &frame,
+        Provenance::Region,
+        GeneratedStyle::Balanced,
+        &AnalysisCancellation::default(),
+    )
+    .unwrap();
+
+    assert!(result.beautification.inset.is_zero());
+    let metadata = result.beautification.smart_frame.unwrap();
+    assert_eq!(metadata.inset_decision, InsetDecision::NoExcessMargin);
+    assert_eq!(
+        (metadata.source_width, metadata.source_height),
+        (100, 80),
+        "focus remains normalized to the complete already-fixed subject"
     );
 }
 

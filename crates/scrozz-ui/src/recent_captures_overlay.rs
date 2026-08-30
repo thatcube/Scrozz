@@ -1648,6 +1648,22 @@ struct Entry {
     status: Option<String>,
 }
 
+impl Entry {
+    fn card_content(&self) -> CardContent<'_> {
+        let mut content = CardContent::new(&self.name, self.source_px, self.provenance)
+            .with_media(self.media.card_media());
+        content.editing = self.editing;
+        content.accent = self.accent;
+        content.upload_enabled = self.upload_available;
+        content.upload_unavailable_reason = self.upload_unavailable_reason.as_deref();
+        content.status = self.status.as_deref();
+        if let Some(texture) = &self.texture {
+            content.texture = Some(texture.id());
+        }
+        content
+    }
+}
+
 struct PinnedEntry {
     name: String,
     surface: PinnedSurface,
@@ -2071,6 +2087,11 @@ impl RecentCapturesOverlayApp {
                     }
                 }
                 Command::SetEditing { id, editing } => {
+                    if editing && (self.dragging == Some(id) || self.armed == Some(id)) {
+                        self.stack.cancel_drag(m);
+                        self.dragging = None;
+                        self.armed = None;
+                    }
                     if let Some(entry) = self.content.get_mut(&id)
                         && entry.editing != editing
                     {
@@ -2968,15 +2989,7 @@ impl eframe::App for RecentCapturesOverlayApp {
             let Some(entry) = self.content.get(&f.id) else {
                 continue;
             };
-            let mut content = CardContent::new(&entry.name, entry.source_px, entry.provenance)
-                .with_media(entry.media.card_media());
-            content.upload_enabled = entry.upload_available;
-            content.upload_unavailable_reason = entry.upload_unavailable_reason.as_deref();
-            content.status = entry.status.as_deref();
-            content.editing = entry.editing;
-            if let Some(tex) = &entry.texture {
-                content.texture = Some(tex.id());
-            }
+            let content = entry.card_content();
             let response = card::draw_card(ui, &surface, f, &content);
             if let Some(notice) = entry.pin_notice.as_deref() {
                 draw_card_notice(ui, f.rect, notice, &self.theme);
@@ -3308,6 +3321,37 @@ mod tests {
         assert!(keep_after_accepted_drag(true, true));
         assert!(keep_after_accepted_drag(false, false));
         assert!(keep_after_accepted_drag(false, true));
+    }
+
+    #[test]
+    fn overlay_card_content_carries_the_sampled_landing_accent() {
+        let image = egui::ColorImage {
+            size: [2, 2],
+            source_size: egui::vec2(2.0, 2.0),
+            pixels: vec![egui::Color32::from_rgb(20, 90, 230); 4],
+        };
+        let accent = card::glow::sample_accent(&image);
+        let entry = Entry {
+            name: "capture.png".to_owned(),
+            provenance: Provenance::Display,
+            source_px: (2, 2),
+            pin_id: None,
+            source_scale: 1.0,
+            media: CaptureMedia::Image,
+            texture: None,
+            pending: None,
+            accent: Some(accent),
+            pin_notice: None,
+            auto_close_started_at: 0.0,
+            editing: true,
+            upload_available: true,
+            upload_unavailable_reason: None,
+            status: None,
+        };
+
+        let content = entry.card_content();
+        assert_eq!(content.accent, Some(accent));
+        assert!(content.editing);
     }
 
     #[test]

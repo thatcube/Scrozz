@@ -10,8 +10,8 @@ use common::{
 };
 use scrozz_annotate::{
     Annotation, ArrowStyle, AutomaticBackground, Background, Beautification, CanvasInsets, Color,
-    Document, DocumentData, GeneratedStyle, GeneratedTemplate, RedactStyle, Renderer, SkiaRenderer,
-    Style,
+    Document, DocumentData, GeneratedStyle, GeneratedTemplate, ImageOrientation, RedactStyle,
+    Renderer, SkiaRenderer, SourceInsets, Style,
 };
 use scrozz_core::{LogicalPoint, Provenance};
 
@@ -39,6 +39,36 @@ fn round_trip_preserves_every_annotation_exactly() {
         assert_eq!(original.annotation, reloaded.annotation);
         assert_eq!(original.style, reloaded.style);
     }
+}
+
+#[test]
+fn loading_and_restoring_clamp_insets_against_the_persisted_geometry() {
+    let mut data = DocumentData {
+        beautification: Some(Beautification {
+            inset: SourceInsets::uniform(900.0),
+            ..Beautification::default()
+        }),
+        crop: Some(rect(10.0, 10.0, 50.0, 30.0)),
+        orientation: ImageOrientation::RotateRight,
+        ..DocumentData::default()
+    };
+    let expected = SourceInsets {
+        // The 50x30 crop becomes 30x50 after rotation.
+        left: 7.5,
+        top: 12.5,
+        right: 7.5,
+        bottom: 12.5,
+    };
+
+    let loaded = Document::from_data(region_capture(100, 80), data.clone()).unwrap();
+    assert_eq!(loaded.beautification().unwrap().inset, expected);
+
+    let mut restored = Document::new(region_capture(100, 80));
+    restored.restore(std::mem::take(&mut data)).unwrap();
+    assert_eq!(restored.beautification().unwrap().inset, expected);
+    SkiaRenderer
+        .render(&restored)
+        .expect("normalized persisted framing stays renderable");
 }
 
 #[test]

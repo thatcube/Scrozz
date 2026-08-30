@@ -24,7 +24,7 @@
 use scrozz_annotate::{
     AnalysisCancellation, Background, BackgroundImage, DocumentData, GeneratedStyle,
     ImageOrientation, SensitiveRegionReview, SmartFrameAnalysis, SmartFramePreset,
-    SmartFramePresetSettings, SourceInsets, is_reserved_smart_frame_preset_id,
+    SmartFramePresetSettings, is_reserved_smart_frame_preset_id,
     smart_frame::provisional_with_style,
 };
 use scrozz_annotate::{
@@ -725,6 +725,12 @@ pub struct SmartFrameDraft {
     analysis_pending: bool,
     /// Set when the user edits a control after the last analysis request.
     edited_after_request: bool,
+    /// Sticky close-safety bit for a user-authored draft.
+    ///
+    /// Unlike `edited_after_request`, this survives a follow-up analysis
+    /// request. Native close uses it to avoid discarding a Scene edit merely
+    /// because resolving an Automatic property reset the stale-result guard.
+    user_edited: bool,
     /// Human-readable explanation of the inset decision.
     inset_explanation: String,
     /// Whether a returning analysis should replace all settings or only the
@@ -895,8 +901,11 @@ impl EditorState {
 
     /// Whether anything has been edited since the editor opened.
     #[must_use]
-    pub const fn is_dirty(&self) -> bool {
+    pub fn is_dirty(&self) -> bool {
         self.dirty
+            || self.smart_frame.as_ref().is_some_and(|draft| {
+                draft.user_edited && self.document.beautification() != draft.before.as_ref()
+            })
     }
 
     /// The tool in hand.
@@ -3028,7 +3037,7 @@ impl EditorState {
     fn invalidate_framing_focus(&mut self) {
         let invalidate = |scene: &mut Option<Beautification>| {
             if let Some(scene) = scene {
-                scene.invalidate_resolved_focus();
+                scene.invalidate_source_geometry_analysis();
             }
         };
         let mut current = self.document.beautification().cloned();
@@ -3202,6 +3211,7 @@ impl EditorState {
 
     /// Starts Automatic Scene using a deterministic generated style direction.
     pub fn begin_scene_with_style(&mut self, style: GeneratedStyle) -> Intent {
+        let user_edited = self.smart_frame.is_some();
         let (before, source_geometry) = self.smart_frame.as_ref().map_or_else(
             || {
                 (
@@ -3235,16 +3245,15 @@ impl EditorState {
             cancellation: cancellation.clone(),
             analysis_pending: true,
             edited_after_request: false,
+            user_edited,
             inset_explanation: "Analysing this revision...".to_owned(),
             analysis_scope: AnalysisScope::All,
             generated_style: style,
         });
         self.touch();
-        let mut data = self.document.data();
-        data.beautification = None;
         Intent::AnalyzeSmartFrame {
             revision: generation,
-            data: Box::new(data),
+            data: Box::new(self.scene_analysis_data()),
             cancellation,
         }
     }
@@ -3268,13 +3277,7 @@ impl EditorState {
             // D9: the OS supplied this window's silhouette, transparent
             // corners and shadow. A preset authored on an ordinary capture
             // still applies here, minus everything that would touch them.
-            config.inset = SourceInsets::default();
-            config.corner_radius = 0.0;
-            config.shadow = 0.0;
-            config.border_width = 0.0;
-            config.automatic.inset = false;
-            config.automatic.corners = false;
-            config.automatic.shadow = false;
+            config.preserve_native_subject();
         }
         let style = generated_style(&config);
         match self.document.set_scene(Some(config)) {
@@ -3288,6 +3291,7 @@ impl EditorState {
                     cancellation: AnalysisCancellation::default(),
                     analysis_pending: false,
                     edited_after_request: true,
+                    user_edited: true,
                     inset_explanation: "Preset values are editable until Apply".to_owned(),
                     analysis_scope: AnalysisScope::All,
                     generated_style: style,
@@ -3314,6 +3318,7 @@ impl EditorState {
             cancellation: AnalysisCancellation::default(),
             analysis_pending: false,
             edited_after_request: false,
+            user_edited: false,
             inset_explanation: "Existing Scene values are unchanged".to_owned(),
             analysis_scope: AnalysisScope::All,
             generated_style: generated_style(&scene),
@@ -3353,16 +3358,15 @@ impl EditorState {
             cancellation: cancellation.clone(),
             analysis_pending: true,
             edited_after_request: false,
+            user_edited: true,
             inset_explanation: "Analysing this revision...".to_owned(),
             analysis_scope: AnalysisScope::All,
             generated_style: style,
         });
         self.touch();
-        let mut data = self.document.data();
-        data.beautification = None;
         Some(Intent::AnalyzeSmartFrame {
             revision: generation,
-            data: Box::new(data),
+            data: Box::new(self.scene_analysis_data()),
             cancellation,
         })
     }
@@ -3392,7 +3396,15 @@ impl EditorState {
         draft.analysis_pending = false;
         match result {
             Ok(analysis) => {
-                draft.inset_explanation = analysis.inset_explanation;
+                draft.inset_explanation = if self
+                    .document
+                    .scene()
+                    .is_some_and(|scene| scene.automatic.inset)
+                {
+                    analysis.inset_explanation
+                } else {
+                    "Inner inset is fixed for this Scene".to_owned()
+                };
                 let restyle = |mut scene: Beautification| {
                     if let Background::Automatic(background) = scene.background {
                         scene.background =
@@ -3407,7 +3419,6 @@ impl EditorState {
                             self.document.beautification().cloned().unwrap_or_default();
                         let analyzed = restyle(analysis.beautification);
                         current.background = analyzed.background;
-                        current.smart_frame = analyzed.smart_frame;
                         current
                     }
                     AnalysisScope::AutomaticProperties => {
@@ -3472,13 +3483,29 @@ impl EditorState {
         draft.analysis_scope = scope;
         draft.generated_style = style;
         draft.inset_explanation = explanation.to_owned();
-        let mut data = self.document.data();
-        data.beautification = None;
         Some(Intent::AnalyzeSmartFrame {
             revision: generation,
-            data: Box::new(data),
+            data: Box::new(self.scene_analysis_data()),
             cancellation,
         })
+    }
+
+    /// Snapshot analyzed by Smart Frame.
+    ///
+    /// Presentation is removed, but a fixed content inset remains: automatic
+    /// focus and background must be derived from the same subject rectangle the
+    /// eventual Scene will render, not from pixels the user explicitly held
+    /// back.
+    fn scene_analysis_data(&self) -> DocumentData {
+        let mut data = self.document.data();
+        data.beautification = self.document.scene().and_then(|scene| {
+            (!scene.automatic.inset).then(|| Beautification {
+                inset: scene.inset,
+                automatic: scrozz_annotate::SceneAutomatic::default(),
+                ..Beautification::default()
+            })
+        });
+        data
     }
 
     /// Marks the draft as manually edited, cancelling any in-flight analysis.
@@ -3487,6 +3514,7 @@ impl EditorState {
             draft.cancellation.cancel();
             draft.analysis_pending = false;
             draft.edited_after_request = true;
+            draft.user_edited = true;
         }
         self.touch();
     }
@@ -3520,7 +3548,7 @@ impl EditorState {
         if draft.source_geometry != self.source_geometry()
             && let Some(before) = &mut draft.before
         {
-            before.invalidate_resolved_focus();
+            before.invalidate_source_geometry_analysis();
         }
         if self.document.set_beautification(draft.before).is_ok() {
             self.synchronize_scene_history();
@@ -3647,8 +3675,7 @@ impl EditorState {
     /// Applies one Scene inspector edit and fixes every changed automatic property.
     pub fn apply_scene_edit(&mut self, mut config: Beautification) -> Option<Intent> {
         if !self.document.may_style_subject() {
-            config.inset = SourceInsets::default();
-            config.automatic.inset = false;
+            config.preserve_native_subject();
         }
         if let Some(current) = self.document.scene() {
             if current.background != config.background {
@@ -3760,6 +3787,11 @@ fn generated_style(scene: &Beautification) -> GeneratedStyle {
 
 fn merge_automatic_scene(mut current: Beautification, analyzed: Beautification) -> Beautification {
     let automatic = current.automatic;
+    let fixed_focus = if automatic.placement {
+        None
+    } else {
+        current.smart_frame.as_ref().map(|metadata| metadata.focus)
+    };
     if automatic.background {
         current.background = analyzed.background;
     }
@@ -3783,7 +3815,14 @@ fn merge_automatic_scene(mut current: Beautification, analyzed: Beautification) 
     if automatic.output_size {
         current.output_size = analyzed.output_size;
     }
-    current.smart_frame = analyzed.smart_frame;
+    if automatic.inset || automatic.placement {
+        current.smart_frame = analyzed.smart_frame;
+        if !automatic.placement
+            && let Some(metadata) = &mut current.smart_frame
+        {
+            metadata.focus = fixed_focus.unwrap_or_default();
+        }
+    }
     current
 }
 

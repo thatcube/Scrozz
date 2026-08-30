@@ -430,6 +430,14 @@ pub fn body_id(card: CardId) -> Id {
     Id::new(("scrozz.card.body", card))
 }
 
+fn body_sense(editing: bool) -> Sense {
+    if editing {
+        Sense::click()
+    } else {
+        Sense::click_and_drag()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------------
@@ -454,7 +462,9 @@ pub fn draw_card(
     // The body is sensed before anything is painted so the response is available
     // to the chrome, and so the card sits *under* its own buttons in the layer
     // order rather than swallowing their clicks.
-    let body = ui.interact(rect, body_id(frame.id), Sense::click_and_drag());
+    // Whole-card activation still raises the editor, but an editing card
+    // cannot start a swipe-dismiss or native drag-out.
+    let body = ui.interact(rect, body_id(frame.id), body_sense(content.editing));
 
     if alpha <= 0.001 {
         return CardResponse {
@@ -1186,6 +1196,12 @@ mod tests {
                 assert!(corners.contains(&Some(CardAction::Upload)));
             }
         }
+    }
+
+    #[test]
+    fn an_editing_card_body_can_focus_but_cannot_start_a_drag() {
+        assert_eq!(body_sense(true), Sense::click());
+        assert_eq!(body_sense(false), Sense::click_and_drag());
     }
 
     #[test]

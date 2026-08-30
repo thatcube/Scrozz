@@ -14,7 +14,7 @@ use serde::{
 use crate::{
     annotation::{Annotation, AnnotationId, AnnotationObject, RedactStyle},
     geom,
-    smart_frame::{SMART_FRAME_ALGORITHM_VERSION, SmartFrameMetadata},
+    smart_frame::{InsetDecision, SMART_FRAME_ALGORITHM_VERSION, SmartFrameMetadata},
     style::{Color, Style},
 };
 
@@ -1329,10 +1329,41 @@ impl Beautification {
             && self.border_width <= 0.0
     }
 
+    /// Removes every subject treatment forbidden for a native window capture.
+    ///
+    /// Reusable presets may legitimately carry these values from another
+    /// capture type. Callers that explicitly adapt such a preset use this
+    /// helper; direct document mutation still rejects the incompatible values.
+    pub fn preserve_native_subject(&mut self) {
+        self.inset = SourceInsets::default();
+        self.corner_radius = 0.0;
+        self.shadow = 0.0;
+        self.border_width = 0.0;
+        self.automatic.inset = false;
+        self.automatic.corners = false;
+        self.automatic.shadow = false;
+    }
+
     /// Stops resolved visual focus from being reused after source geometry changes.
     pub fn invalidate_resolved_focus(&mut self) {
         if let Some(metadata) = &mut self.smart_frame {
             metadata.focus.confidence = 0;
+        }
+    }
+
+    /// Invalidates capture-derived values after crop, orientation, or source changes.
+    ///
+    /// A fixed inset remains the user's value and is clamped separately. An
+    /// automatic inset belongs to the old source geometry, so retaining it can
+    /// hide the wrong edge or even remove the newly cropped source entirely.
+    pub fn invalidate_source_geometry_analysis(&mut self) {
+        self.invalidate_resolved_focus();
+        if self.automatic.inset {
+            self.inset = SourceInsets::default();
+            if let Some(metadata) = &mut self.smart_frame {
+                metadata.inset_decision = InsetDecision::NoExcessMargin;
+                metadata.inset_confidence = 0;
+            }
         }
     }
 
@@ -1738,6 +1769,12 @@ impl Document {
         Self::validate_data(&source, &data)?;
         normalize_redaction_styles(&mut data.annotations);
         let crop = normalize_crop(capture_bounds(&source), data.crop)?;
+        let beautification = Self::normalize_beautification_for_geometry(
+            &source,
+            crop,
+            data.orientation,
+            data.beautification,
+        )?;
         let highest = data
             .annotations
             .iter()
@@ -1747,7 +1784,7 @@ impl Document {
         let mut document = Self {
             source,
             objects: data.annotations,
-            beautification: data.beautification,
+            beautification,
             crop,
             orientation: data.orientation,
             next_id: data.next_id.max(highest).max(1),
@@ -1785,6 +1822,12 @@ impl Document {
         Self::validate_data(&self.source, &data)?;
         normalize_redaction_styles(&mut data.annotations);
         let crop = normalize_crop(self.logical_bounds(), data.crop)?;
+        let beautification = Self::normalize_beautification_for_geometry(
+            &self.source,
+            crop,
+            data.orientation,
+            data.beautification,
+        )?;
         let highest = data
             .annotations
             .iter()
@@ -1792,7 +1835,7 @@ impl Document {
             .max()
             .map_or(0, |id| id + 1);
         self.objects = data.annotations;
-        self.beautification = data.beautification;
+        self.beautification = beautification;
         self.crop = crop;
         self.orientation = data.orientation;
         self.next_id = data.next_id.max(highest).max(1);
@@ -1815,6 +1858,25 @@ impl Document {
             Self::validate_provenance(beautification, source)?;
         }
         Ok(())
+    }
+
+    fn normalize_beautification_for_geometry(
+        source: &Capture,
+        crop: Option<LogicalRect>,
+        orientation: ImageOrientation,
+        mut beautification: Option<Beautification>,
+    ) -> Result<Option<Beautification>> {
+        if let Some(value) = &mut beautification {
+            // Validate before clamping so NaN and infinity remain explicit
+            // errors rather than being success-shaped as zero.
+            value.validate()?;
+            Self::validate_provenance(value, source)?;
+            let bounds = crop.unwrap_or_else(|| capture_bounds(source));
+            value.inset = value
+                .inset
+                .clamped_within(orientation.apply_size(bounds.size));
+        }
+        Ok(beautification)
     }
 
     /// Every annotation, bottom-most first.
@@ -1895,15 +1957,19 @@ impl Document {
     ///
     /// Refuses a source whose provenance conflicts with current beautification.
     pub fn replace_source(&mut self, source: Capture) -> Result<()> {
-        if let Some(beautification) = self.beautification.clone() {
-            Self::validate_provenance(&beautification, &source)?;
-        }
         let crop = normalize_crop(capture_bounds(&source), self.crop)?;
+        let mut beautification = Self::normalize_beautification_for_geometry(
+            &source,
+            crop,
+            self.orientation,
+            self.beautification.clone(),
+        )?;
+        if let Some(value) = &mut beautification {
+            value.invalidate_source_geometry_analysis();
+        }
         self.source = source;
         self.crop = crop;
-        if let Some(beautification) = &mut self.beautification {
-            beautification.invalidate_resolved_focus();
-        }
+        self.beautification = beautification;
         self.touch();
         Ok(())
     }
@@ -1923,10 +1989,18 @@ impl Document {
     /// Changes the image orientation without touching source pixels.
     pub fn set_orientation(&mut self, orientation: ImageOrientation) {
         if self.orientation != orientation {
-            self.orientation = orientation;
-            if let Some(beautification) = &mut self.beautification {
-                beautification.invalidate_resolved_focus();
+            let mut beautification = Self::normalize_beautification_for_geometry(
+                &self.source,
+                self.crop,
+                orientation,
+                self.beautification.clone(),
+            )
+            .expect("existing Scene remains valid when orientation changes");
+            if let Some(value) = &mut beautification {
+                value.invalidate_source_geometry_analysis();
             }
+            self.orientation = orientation;
+            self.beautification = beautification;
             self.touch();
         }
     }
@@ -1982,10 +2056,17 @@ impl Document {
     pub fn set_crop(&mut self, area: Option<LogicalRect>) -> Result<()> {
         let crop = normalize_crop(self.logical_bounds(), area)?;
         if self.crop != crop {
-            self.crop = crop;
-            if let Some(beautification) = &mut self.beautification {
-                beautification.invalidate_resolved_focus();
+            let mut beautification = Self::normalize_beautification_for_geometry(
+                &self.source,
+                crop,
+                self.orientation,
+                self.beautification.clone(),
+            )?;
+            if let Some(value) = &mut beautification {
+                value.invalidate_source_geometry_analysis();
             }
+            self.crop = crop;
+            self.beautification = beautification;
             self.touch();
         }
         Ok(())
@@ -2245,10 +2326,12 @@ impl Document {
     /// Returns [`Error::InvalidRequest`] when framing would crop, round, border,
     /// or re-shadow a window capture. An outer canvas remains permitted.
     pub fn set_beautification(&mut self, beautification: Option<Beautification>) -> Result<()> {
-        if let Some(beautification) = &beautification {
-            beautification.validate()?;
-            Self::validate_provenance(beautification, &self.source)?;
-        }
+        let beautification = Self::normalize_beautification_for_geometry(
+            &self.source,
+            self.crop,
+            self.orientation,
+            beautification,
+        )?;
         if self.beautification != beautification {
             self.beautification = beautification;
             self.touch();
@@ -2277,10 +2360,6 @@ impl Document {
     /// Returns [`Error::InvalidRequest`] when a Scene would alter native window
     /// pixels or exceed render bounds.
     pub fn set_scene(&mut self, scene: Option<Scene>) -> Result<()> {
-        let scene = scene.map(|mut scene| {
-            scene.inset = scene.inset.clamped_within(self.content_size());
-            scene
-        });
         self.set_beautification(scene)
     }
 

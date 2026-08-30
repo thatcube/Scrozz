@@ -114,6 +114,18 @@ fn access_action(tree: TreeId, node: NodeId, action: Action) -> Event {
     })
 }
 
+#[test]
+fn toolbar_done_and_cancel_are_the_accessible_session_decisions() {
+    for (label, expected) in [("Done", Intent::Commit), ("Cancel", Intent::Discard)] {
+        let mut driver = Driver::new(false, 1.0);
+        let mut editor = editor();
+        let (_, output) = driver.frame(&mut editor, SIZE, Vec::new());
+        let (tree, node, _) = access_node(&output, |candidate| candidate == label);
+        let (intent, _) = driver.frame(&mut editor, SIZE, vec![activate(tree, node)]);
+        assert_eq!(intent, expected, "{label}");
+    }
+}
+
 fn set_numeric(tree: TreeId, node: NodeId, value: f64) -> Event {
     Event::AccessKitActionRequest(ActionRequest {
         action: Action::SetValue,

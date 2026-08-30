@@ -2317,10 +2317,7 @@ fn frame_section(
         }
     } else {
         native_subject_note(ui, palette);
-        config.inset = SourceInsets::default();
-        config.corner_radius = 0.0;
-        config.shadow = 0.0;
-        config.border_width = 0.0;
+        config.preserve_native_subject();
     }
 
     label_row(
@@ -2673,10 +2670,13 @@ fn status_chip(ui: &mut Ui, palette: &crate::theme::Palette, text: &str, accent:
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_owned(), Text::Caption.font(), ink);
-    let (rect, _) = ui.allocate_exact_size(
+    let (rect, response) = ui.allocate_exact_size(
         vec2(galley.size().x + Space::MD, PANEL_ROW_H - 6.0),
         Sense::hover(),
     );
+    response.widget_info(|| {
+        WidgetInfo::labeled(WidgetType::Label, true, format!("Scene status: {text}"))
+    });
     let painter = ui.painter();
     painter.rect_filled(rect, corner(Radius::pill(rect.height())), fill);
     painter.galley(rect.center() - galley.size() / 2.0, galley, ink);

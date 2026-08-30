@@ -66,6 +66,7 @@ struct LandingScene {
     editing: bool,
     reduce_motion: bool,
     appearance: Appearance,
+    accent: Option<glow::Accent>,
 }
 
 impl LandingScene {
@@ -75,6 +76,7 @@ impl LandingScene {
             editing: false,
             reduce_motion: false,
             appearance,
+            accent: None,
         }
     }
 
@@ -84,6 +86,7 @@ impl LandingScene {
             editing: false,
             reduce_motion: false,
             appearance,
+            accent: None,
         }
     }
 
@@ -94,6 +97,11 @@ impl LandingScene {
 
     const fn calm(mut self) -> Self {
         self.reduce_motion = true;
+        self
+    }
+
+    const fn with_accent(mut self, accent: glow::Accent) -> Self {
+        self.accent = Some(accent);
         self
     }
 }
@@ -131,6 +139,7 @@ impl Scene for LandingScene {
         let mut content = CardContent::new("capture-01.png", (1600, 1000), Provenance::Display)
             .with_media(CardMedia::Image);
         content.editing = self.editing;
+        content.accent = self.accent;
 
         card::draw_card(ui, &surface, &frame, &content);
     }
@@ -372,6 +381,28 @@ fn a_low_saturation_capture_lights_its_rim_white() {
     );
 }
 
+#[test]
+fn a_colourful_capture_visibly_tints_its_landing_treatment() {
+    let accent = glow::sample_accent(&image_of(|x, y| {
+        if x < 11 {
+            egui::Color32::from_rgb(235, 55, 75)
+        } else if y < 16 {
+            egui::Color32::from_rgb(45, 120, 245)
+        } else {
+            egui::Color32::from_rgb(40, 205, 145)
+        }
+    }));
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        let neutral = render(LandingScene::at(2.0, appearance));
+        let colourful = render(LandingScene::at(2.0, appearance).with_accent(accent));
+        assert_ne!(
+            colourful.fingerprint(),
+            neutral.fingerprint(),
+            "{appearance:?}: sampled capture colour must reach the pixels"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 5. The frame schedule
 // ---------------------------------------------------------------------------
@@ -517,7 +548,7 @@ fn a_dismissed_card_takes_its_glow_off_the_schedule() {
 /// opening a window:
 ///
 /// ```text
-/// SCROZZ_GLOW_SHEET=/tmp/glow cargo test -p scrozz-ui --test card_landing ///     -- --ignored contact_sheet
+/// SCROZZ_GLOW_SHEET=/tmp/glow tools/cargo-pool.sh cargo test -p scrozz-ui --test card_landing -- --ignored --exact contact_sheet
 /// ```
 #[test]
 #[ignore = "writes a contact sheet for a human to look at; not an assertion"]
@@ -526,15 +557,28 @@ fn contact_sheet() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("scrozz-glow"));
     std::fs::create_dir_all(&dir).expect("a place to write the sheet");
+    let colourful = glow::sample_accent(&image_of(|x, y| {
+        if x < 11 {
+            egui::Color32::from_rgb(235, 55, 75)
+        } else if y < 16 {
+            egui::Color32::from_rgb(45, 120, 245)
+        } else {
+            egui::Color32::from_rgb(40, 205, 145)
+        }
+    }));
     for appearance in [Appearance::Dark, Appearance::Light] {
-        for (i, s) in [0.0_f32, 0.5, 0.9, 1.1, 1.6, 2.4, 3.6, 5.0, 6.2]
-            .into_iter()
-            .enumerate()
-        {
-            let image = render(LandingScene::at(s, appearance));
-            image
-                .write_png(&dir.join(format!("glow-{appearance:?}-{i}-{s}.png")))
-                .unwrap();
+        for (variant, accent) in [("neutral", None), ("colour", Some(colourful))] {
+            for (i, s) in [0.0_f32, 0.5, 0.9, 1.1, 1.6, 2.4, 3.6, 5.0, 6.2]
+                .into_iter()
+                .enumerate()
+            {
+                let mut scene = LandingScene::at(s, appearance);
+                scene.accent = accent;
+                let image = render(scene);
+                image
+                    .write_png(&dir.join(format!("glow-{appearance:?}-{variant}-{i}-{s}.png")))
+                    .unwrap();
+            }
         }
     }
 }

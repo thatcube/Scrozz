@@ -53,7 +53,6 @@
 use egui::epaint::{Mesh, Vertex};
 use egui::{Color32, ColorImage, Painter, Pos2, Rect, Shape, TextureHandle, TextureOptions, pos2};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // The treatment
@@ -769,17 +768,24 @@ pub fn sample_accent(image: &ColorImage) -> Accent {
 
     let stride = (image.pixels.len() / TARGET_SAMPLES).max(1);
     for px in image.pixels.iter().step_by(stride) {
-        let hsva = egui::ecolor::Hsva::from(*px);
+        let [r, g, b, a] = px.to_srgba_unmultiplied();
+        if a <= 8 {
+            continue;
+        }
+        let coverage = f32::from(a) / 255.0;
+        let visible = Color32::from_rgb(r, g, b);
+        let hsva = egui::ecolor::Hsva::from(visible);
         // Very dark and very washed-out pixels carry no usable hue, and
         // letting them vote drags every capture toward the same muddy result.
-        let w = hsva.s * hsva.v.powf(0.6);
-        counted += 1.0;
+        let w = hsva.s * hsva.v.powf(0.6) * coverage;
+        counted += coverage;
         // Rec. 709 weights, in gamma space — the question is how bright this
         // looks, not how much light it emits.
         brightness += 0.2126f32.mul_add(
-            f32::from(px.r()),
-            0.7152f32.mul_add(f32::from(px.g()), 0.0722 * f32::from(px.b())),
-        ) / 255.0;
+            f32::from(r),
+            0.7152f32.mul_add(f32::from(g), 0.0722 * f32::from(b)),
+        ) / 255.0
+            * coverage;
         if w <= 0.02 {
             continue;
         }
@@ -847,10 +853,15 @@ pub fn sample_accent(image: &ColorImage) -> Accent {
 }
 
 /// Cached by rounded card size, radius and halo reach. A handful of entries
-/// at most — the stack's cards are all one size — and rebuilt if the window
-/// scale changes.
+/// at most — the stack's cards are all one size.
 type RimKey = (u32, u32, u32, u32, u32);
-static RIM_CACHE: Mutex<Option<HashMap<RimKey, TextureHandle>>> = Mutex::new(None);
+
+#[derive(Clone, Default)]
+struct RimTextureCache {
+    textures: HashMap<RimKey, TextureHandle>,
+}
+
+const RIM_CACHE_ID: &str = "scrozz-card-landing-rim-cache";
 
 /// Bakes the rim's cross-section: an alpha image of the card's rounded-rect
 /// silhouette expanded by `halo_out`, every texel holding the gaussian of its
@@ -874,15 +885,12 @@ fn rim_texture(
         halo_out.round() as u32,
         halo_in.round() as u32,
     );
-    let mut guard = RIM_CACHE.lock().ok()?;
-    let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some(handle) = cache.get(&key) {
-        return Some(handle.clone());
-    }
-    // One entry per card size per recipe; the cap only guards against a
-    // pathological resize loop interning unbounded textures.
-    if cache.len() > 16 {
-        cache.clear();
+    let cache_id = egui::Id::new(RIM_CACHE_ID);
+    if let Some(handle) = ctx.data(|data| {
+        data.get_temp::<RimTextureCache>(cache_id)
+            .and_then(|cache| cache.textures.get(&key).cloned())
+    }) {
+        return Some(handle);
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -947,6 +955,69 @@ fn rim_texture(
         image,
         TextureOptions::LINEAR,
     );
-    cache.insert(key, handle.clone());
+    // Texture handles belong to one egui texture manager. Keeping this cache
+    // in Context data prevents another editor, harness render, or test Context
+    // from reusing an identically numbered handle owned elsewhere.
+    ctx.data_mut(|data| {
+        let mut cache = data
+            .get_temp::<RimTextureCache>(cache_id)
+            .unwrap_or_default();
+        // One entry per card size per recipe; the cap only guards against a
+        // pathological resize loop interning unbounded textures.
+        if cache.textures.len() >= 16 {
+            cache.textures.clear();
+        }
+        cache.textures.insert(key, handle.clone());
+        data.insert_temp(cache_id, cache);
+    });
     Some(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(pixels: Vec<Color32>) -> ColorImage {
+        ColorImage {
+            size: [pixels.len(), 1],
+            source_size: egui::vec2(pixels.len() as f32, 1.0),
+            pixels,
+        }
+    }
+
+    #[test]
+    fn invisible_rgb_cannot_tint_or_dim_a_capture_accent() {
+        let grey = Color32::from_gray(160);
+        let visible = sample_accent(&image(vec![grey; 4]));
+        let mut pixels = vec![grey; 4];
+        pixels.extend(std::iter::repeat_n(
+            Color32::from_rgba_unmultiplied(255, 0, 0, 0),
+            4_092,
+        ));
+        let with_invisible_red = sample_accent(&image(pixels));
+
+        assert_eq!(with_invisible_red.strength, visible.strength);
+        assert!((with_invisible_red.luma - visible.luma).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rim_textures_are_cached_per_egui_context() {
+        let first = egui::Context::default();
+        let second = egui::Context::default();
+        let cache_id = egui::Id::new(RIM_CACHE_ID);
+        let cache_len = |ctx: &egui::Context| {
+            ctx.data(|data| {
+                data.get_temp::<RimTextureCache>(cache_id)
+                    .map_or(0, |cache| cache.textures.len())
+            })
+        };
+
+        assert_eq!(cache_len(&first), 0);
+        assert_eq!(cache_len(&second), 0);
+        assert!(rim_texture(&first, egui::vec2(210.0, 150.0), 12.0, 54.0, 11.0).is_some());
+        assert_eq!(cache_len(&first), 1);
+        assert_eq!(cache_len(&second), 0);
+        assert!(rim_texture(&second, egui::vec2(210.0, 150.0), 12.0, 54.0, 11.0).is_some());
+        assert_eq!(cache_len(&second), 1);
+    }
 }

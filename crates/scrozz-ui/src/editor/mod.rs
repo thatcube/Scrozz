@@ -911,8 +911,8 @@ impl EditorWindow {
     pub fn show(
         &mut self,
         ctx: &egui::Context,
-        dirty: bool,
-        build: impl FnMut(&mut Ui) -> EditorWindowExit,
+        mut dirty: bool,
+        build: impl FnMut(&mut Ui) -> (EditorWindowExit, bool),
     ) -> EditorWindowExit {
         if !self.open {
             return EditorWindowExit::None;
@@ -937,7 +937,7 @@ impl EditorWindow {
             if confirm_discard {
                 prompt_outcome = Self::show_confirm_discard(editor_ui);
             } else {
-                chrome_exit = build(editor_ui);
+                (chrome_exit, dirty) = build(editor_ui);
             }
         });
 
@@ -1149,7 +1149,7 @@ mod window_tests {
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             exit = window.show(ui.ctx(), true, |ui| {
                 ui.label("editing");
-                EditorWindowExit::None
+                (EditorWindowExit::None, true)
             });
         });
         output.textures_delta.clear();
