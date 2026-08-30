@@ -507,7 +507,11 @@ Pin to Screen is disabled with the platform error; the app never substitutes a
 made-up `1440x875 @ 1x` desktop. A pin viewport is also bounded to a 4096-pixel
 edge and 8,388,608 physical pixels after applying the destination monitor's
 scale. Moving from a 1x to a 4x display can therefore reduce the logical pin size
-before the next backing surface is allocated.
+before the next backing surface is allocated. That cannot trap the pin:
+secondary-click anywhere on an unlocked pin opens Close and Reset actions, or
+closes it directly when the native window is too small to display that menu or
+its hover toolbar. Locked pins intentionally pass all pointer input through;
+unlock them from the Scrozz menu or global hotkey first.
 
 | Session | Non-activation and stacking | Placement, desktops, and lock limits |
 |---|---|---|
