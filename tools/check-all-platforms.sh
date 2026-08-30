@@ -53,9 +53,9 @@ HOST_TRIPLE="$(rustc -vV 2>/dev/null | awk '/^host: / { print $2 }')"
 #
 # `cargo check` does not link, but it *does* run build scripts, and a build
 # script that compiles C compiles it for the *target*. `rusqlite`'s `bundled`
-# feature builds sqlite3.c, so checking `scrozz-store` (and `scrozz`, which
-# depends on it) against a foreign target needs a cross C toolchain and sysroot
-# that no ordinary machine has:
+# feature builds sqlite3.c, so checking `scrozz-store`, `scrozz-ui`, or
+# `scrozz` (which depend on it) against a foreign target needs a cross C
+# toolchain and sysroot that no ordinary machine has:
 #
 #   fatal error: 'stdlib.h' file not found      # cc --target=x86_64-pc-windows-msvc
 #
@@ -124,7 +124,7 @@ for target in "${TARGETS[@]}"; do
       echo "  This is a C build script cross-compiling to $target."
       echo "  It means a missing cross toolchain, NOT a bug in your Rust code."
       echo "  Re-run with the offending crate excluded, for example:"
-      echo "    SCROZZ_XCHECK_EXCLUDE='scrozz-store scrozz' $0 $target"
+      echo "    SCROZZ_XCHECK_EXCLUDE='scrozz-store scrozz-ui scrozz' $0 $target"
     elif grep -q "pkg-config has not been configured to support cross-compilation" "$log" 2>/dev/null; then
       echo
       echo "  This target needs native-library pkg-config metadata (GTK/ATK for scrozz-shell)."
