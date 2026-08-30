@@ -375,7 +375,17 @@ pub(crate) enum Job {
         acquisition_cancellation: scrozz_capture::CaptureCancellation,
     },
     /// Put a card's capture on the clipboard.
-    Copy(CardId),
+    Copy {
+        /// Card whose immutable bytes are being copied.
+        card: CardId,
+        /// The dispatching action id this completion answers for (round 12).
+        /// See [`Job::Upload::action`] for why every output family, not
+        /// just Upload, now carries one: a card-level dispatch racing an
+        /// editor's own in-editor Copy/Save for the same card must resolve
+        /// only the exact action it belongs to, never any other
+        /// concurrently outstanding one.
+        action: u64,
+    },
     /// Put an already-rendered image on the clipboard.
     ///
     /// Used by the editor, which has flattened its own annotations and must not
@@ -389,6 +399,8 @@ pub(crate) enum Job {
         generation: u64,
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
+        /// See [`Job::Copy::action`].
+        action: u64,
     },
     /// Write an already-rendered image to the configured folder.
     SaveImage {
@@ -400,6 +412,8 @@ pub(crate) enum Job {
         generation: u64,
         /// The flattened image and the exact document revision it represents.
         rendered: Box<RevisionedFrame>,
+        /// See [`Job::Copy::action`].
+        action: u64,
     },
     /// Write an already-rendered image to an explicitly chosen path.
     SaveImageTo {
@@ -413,15 +427,24 @@ pub(crate) enum Job {
         rendered: Box<RevisionedFrame>,
         /// Native-dialog destination.
         path: std::path::PathBuf,
+        /// See [`Job::Copy::action`].
+        action: u64,
     },
     /// Write a card's capture to the configured folder.
-    Save(CardId),
+    Save {
+        /// Card whose immutable bytes are being exported.
+        card: CardId,
+        /// See [`Job::Copy::action`].
+        action: u64,
+    },
     /// Write a card's capture to an explicitly chosen path.
     SaveTo {
         /// Card whose immutable bytes are being exported.
         card: CardId,
         /// Native-dialog destination.
         path: std::path::PathBuf,
+        /// See [`Job::Copy::action`].
+        action: u64,
     },
     /// Restore a stored capture into a new live card.
     Restore {
@@ -794,6 +817,13 @@ pub enum Outcome {
         /// older revision's save happened to finish after Done moved the
         /// card on (round 5, Finding #2).
         version: Option<(u64, u64)>,
+        /// The dispatching action id this completion answers for (round 12).
+        /// See [`Job::Copy::action`]: a card-level Copy/Save/Save-As can
+        /// now be concurrently outstanding alongside an editor's own
+        /// in-editor Copy/Save (or another card-level dispatch of a
+        /// different kind) for the same card, so `card` alone no longer
+        /// identifies which dispatch this answers for.
+        action: u64,
     },
     /// A cloud upload completed and its share link reached the clipboard.
     UploadDone {
@@ -836,6 +866,8 @@ pub enum Outcome {
         card: CardId,
         /// Why.
         error: CliError,
+        /// See [`Outcome::Done::action`].
+        action: u64,
     },
     /// Result of an atomic durable-source check and live-byte release.
     RetentionRelease {
@@ -1991,25 +2023,28 @@ impl Worker {
                     policy,
                     _permit,
                 } => self.accept_captured(kind, origin, card, capture, &policy),
-                Job::Copy(card) => self.copy(card),
+                Job::Copy { card, action } => self.copy(card, action),
                 Job::CopyImage {
                     card,
                     generation,
                     rendered,
-                } => self.copy_image(card, generation, &rendered),
+                    action,
+                } => self.copy_image(card, generation, &rendered, action),
                 Job::SaveImage {
                     card,
                     generation,
                     rendered,
-                } => self.save_image(card, generation, &rendered),
+                    action,
+                } => self.save_image(card, generation, &rendered, action),
                 Job::SaveImageTo {
                     card,
                     generation,
                     rendered,
                     path,
-                } => self.save_image_to(card, generation, &rendered, &path),
-                Job::Save(card) => self.save(card),
-                Job::SaveTo { card, path } => self.save_to(card, &path),
+                    action,
+                } => self.save_image_to(card, generation, &rendered, &path, action),
+                Job::Save { card, action } => self.save(card, action),
+                Job::SaveTo { card, path, action } => self.save_to(card, &path, action),
                 Job::Upload { card, action } => self.upload(card, action),
                 Job::UploadImage {
                     card,
@@ -2837,7 +2872,13 @@ impl Worker {
         }))
     }
 
-    fn copy_image(&mut self, card: CardId, generation: u64, rendered: &RevisionedFrame) {
+    fn copy_image(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        action: u64,
+    ) {
         tracing::debug!(
             %card,
             revision = rendered.revision(),
@@ -2850,10 +2891,21 @@ impl Worker {
             })
             .map(|()| "copied the annotated image".to_owned())
             .map_err(CliError::from);
-        self.answer(card, Some((generation, rendered.revision())), result);
+        self.answer(
+            card,
+            Some((generation, rendered.revision())),
+            action,
+            result,
+        );
     }
 
-    fn save_image(&mut self, card: CardId, generation: u64, rendered: &RevisionedFrame) {
+    fn save_image(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: &RevisionedFrame,
+        action: u64,
+    ) {
         tracing::debug!(
             %card,
             revision = rendered.revision(),
@@ -2866,7 +2918,12 @@ impl Worker {
                 let path = crate::output::export_default(&bytes)?;
                 Ok(format!("saved the annotated image to {}", path.display()))
             });
-        self.answer(card, Some((generation, rendered.revision())), result);
+        self.answer(
+            card,
+            Some((generation, rendered.revision())),
+            action,
+            result,
+        );
     }
 
     fn save_image_to(
@@ -2875,6 +2932,7 @@ impl Worker {
         generation: u64,
         rendered: &RevisionedFrame,
         path: &std::path::Path,
+        action: u64,
     ) {
         tracing::debug!(
             %card,
@@ -2889,10 +2947,15 @@ impl Worker {
                 let path = crate::output::export_to_path(&bytes, path)?;
                 Ok(format!("saved the annotated image to {}", path.display()))
             });
-        self.answer(card, Some((generation, rendered.revision())), result);
+        self.answer(
+            card,
+            Some((generation, rendered.revision())),
+            action,
+            result,
+        );
     }
 
-    fn copy(&mut self, card: CardId) {
+    fn copy(&mut self, card: CardId, action: u64) {
         // The round trip through PNG is deliberate — see the module docs — and
         // is also what will make "copy" work for a card whose capture arrived
         // over IPC, where the worker never held a `Frame` at all.
@@ -2903,23 +2966,23 @@ impl Worker {
             scrozz_shell::write_capture_to_clipboard(&frame, &cached.bytes.full)?;
             Ok("copied to the clipboard".to_owned())
         });
-        self.answer(card, None, result);
+        self.answer(card, None, action, result);
     }
 
-    fn save(&mut self, card: CardId) {
+    fn save(&mut self, card: CardId, action: u64) {
         let result = self.cached(card, "save").and_then(|cached| {
             let path = crate::output::export_default(&cached.full)?;
             Ok(format!("saved to {}", path.display()))
         });
-        self.answer(card, None, result);
+        self.answer(card, None, action, result);
     }
 
-    fn save_to(&mut self, card: CardId, path: &std::path::Path) {
+    fn save_to(&mut self, card: CardId, path: &std::path::Path, action: u64) {
         let result = self.cached(card, "save").and_then(|cached| {
             let path = crate::output::export_to_path(&cached.full, path)?;
             Ok(format!("saved to {}", path.display()))
         });
-        self.answer(card, None, result);
+        self.answer(card, None, action, result);
     }
 
     /// Hands the card's *current* bytes to the upload worker.
@@ -3632,14 +3695,25 @@ impl Worker {
         }
     }
 
-    fn answer(&self, card: CardId, version: Option<(u64, u64)>, result: CliResult<String>) {
+    fn answer(
+        &self,
+        card: CardId,
+        version: Option<(u64, u64)>,
+        action: u64,
+        result: CliResult<String>,
+    ) {
         let message = match result {
             Ok(detail) => Outcome::Done {
                 card,
                 detail,
                 version,
+                action,
             },
-            Err(error) => Outcome::OutputRefused { card, error },
+            Err(error) => Outcome::OutputRefused {
+                card,
+                error,
+                action,
+            },
         };
         self.emit(message);
     }
@@ -5072,7 +5146,10 @@ mod tests {
         let pipeline =
             Pipeline::start_with_history_and_waker(Arc::new(RefusingSelector), false, Some(waker))
                 .expect("worker");
-        assert!(pipeline.post(Job::Copy(CardId(404))));
+        assert!(pipeline.post(Job::Copy {
+            card: CardId(404),
+            action: 1,
+        }));
         let _ = wait_for(&pipeline);
         assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
@@ -6074,11 +6151,20 @@ mod tests {
     #[test]
     fn copying_a_card_that_was_never_captured_is_refused_not_ignored() {
         let pipeline = start_pipeline();
-        assert!(pipeline.post(Job::Copy(CardId(404))));
+        assert!(pipeline.post(Job::Copy {
+            card: CardId(404),
+            action: 1,
+        }));
 
         match wait_for(&pipeline) {
-            Some(Outcome::OutputRefused { card, error }) => {
+            Some(Outcome::OutputRefused {
+                card,
+                error,
+                action,
+                ..
+            }) => {
                 assert_eq!(card, CardId(404));
+                assert_eq!(action, 1);
                 assert!(error.to_string().contains("404"), "{error}");
             }
             other => panic!("expected a refusal, got {other:?}"),
@@ -6088,10 +6174,16 @@ mod tests {
     #[test]
     fn saving_a_card_that_was_never_captured_is_refused_too() {
         let pipeline = start_pipeline();
-        assert!(pipeline.post(Job::Save(CardId(7))));
+        assert!(pipeline.post(Job::Save {
+            card: CardId(7),
+            action: 2,
+        }));
 
         match wait_for(&pipeline) {
-            Some(Outcome::OutputRefused { card, .. }) => assert_eq!(card, CardId(7)),
+            Some(Outcome::OutputRefused { card, action, .. }) => {
+                assert_eq!(card, CardId(7));
+                assert_eq!(action, 2);
+            }
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
