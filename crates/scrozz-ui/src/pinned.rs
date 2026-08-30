@@ -19,6 +19,7 @@ use crate::theme::{Appearance, Theme};
 
 const TOOLBAR_HEIGHT: f32 = 42.0;
 const TOOLBAR_INSET: f32 = 8.0;
+const TOOLBAR_MIN_WIDTH: f32 = 340.0;
 const CONTROL_HEIGHT: f32 = 28.0;
 const LOCK_BADGE_HEIGHT: f32 = 27.0;
 
@@ -122,6 +123,40 @@ pub fn draw(ui: &mut Ui, mut frame: PinFrame<'_>) -> PinFrameResponse {
     };
     body.widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, frame.name));
 
+    // An egui context menu cannot escape a tiny native viewport. When the
+    // toolbar cannot fit, keep the whole image as a direct recovery target;
+    // unpinning does not delete the capture from History.
+    let secondary_released_in_pin = ui.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    ..
+                } if rect.contains(*pos)
+            )
+        })
+    });
+    if !state.locked {
+        if toolbar_fits(rect) {
+            body.context_menu(|ui| {
+                if ui.button("Close pinned capture").clicked() {
+                    output.close = true;
+                    ui.close();
+                }
+                if ui.button("Reset to original size").clicked() {
+                    reset_scale(ui, frame.surface, frame.displays);
+                    output.changed = true;
+                    ui.close();
+                }
+            });
+        } else if secondary_released_in_pin {
+            output.close = true;
+        }
+    }
+
     if let Some(border) = state.chrome.border {
         ui.painter().rect_stroke(
             rect.shrink(0.5),
@@ -180,6 +215,10 @@ fn chrome_is_visible(
     matches!(visibility, ChromeVisibility::Visible)
         || matches!(visibility, ChromeVisibility::Auto)
             && (hovered || viewport_focused || widget_focused)
+}
+
+fn toolbar_fits(window: Rect) -> bool {
+    window.width() >= TOOLBAR_MIN_WIDTH && window.height() >= TOOLBAR_HEIGHT + TOOLBAR_INSET * 2.0
 }
 
 fn handle_keys(
@@ -363,6 +402,11 @@ fn compact_button(ui: &mut Ui, label: &str, help: &str) -> Response {
 
 fn change_scale(ui: &Ui, surface: &mut PinnedSurface, displays: &DisplaySet, factor: f64) {
     surface.set_scale(surface.state().scale.get() * factor, displays);
+    send_geometry(ui, surface);
+}
+
+fn reset_scale(ui: &Ui, surface: &mut PinnedSurface, displays: &DisplaySet) {
+    surface.set_scale(1.0, displays);
     send_geometry(ui, surface);
 }
 
@@ -600,6 +644,7 @@ fn sane_zoom(zoom_factor: f32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::{Event, Modifiers, PointerButton};
     use scrozz_core::{Display, DisplayId, LockEscape, PinChromePolicy, PinId, ScaleFactor};
 
     fn displays() -> DisplaySet {
@@ -693,6 +738,169 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn secondary_click_closes_a_pin_too_small_for_its_toolbar() {
+        let set = displays();
+        let mut surface = PinnedSurface::on_display(
+            PinId("tiny".into()),
+            LogicalSize::new(200.0, 100.0),
+            &set.displays()[0],
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+        )
+        .expect("pin dimensions");
+        surface.set_scale(0.0, &set);
+        let size = Vec2::new(
+            surface.state().frame.size.width as f32,
+            surface.state().frame.size.height as f32,
+        );
+        assert!(size.y < TOOLBAR_HEIGHT);
+
+        let context = egui::Context::default();
+        let point = Pos2::new(2.0, 2.0);
+        let event = |pressed| Event::PointerButton {
+            pos: point,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let mut pass = |events| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut response = None;
+            let mut output = context.run_ui(input, |ui| {
+                response = Some(draw(
+                    ui,
+                    PinFrame {
+                        name: "Tiny pin",
+                        texture: None,
+                        content_error: None,
+                        surface: &mut surface,
+                        displays: &set,
+                        positioning: true,
+                        native_opacity: false,
+                        click_through: true,
+                        theme: &Theme::for_appearance(Appearance::Dark),
+                        chrome_visibility: ChromeVisibility::Auto,
+                    },
+                ));
+            });
+            output.textures_delta.clear();
+            response.expect("headless pin draw ran")
+        };
+
+        assert!(
+            !pass(vec![Event::PointerMoved(point), event(true)]).close,
+            "secondary press alone must not close the pin"
+        );
+        let outside = Pos2::new(size.x + 100.0, size.y + 100.0);
+        assert!(
+            pass(vec![event(false), Event::PointerMoved(outside)]).close,
+            "secondary release anywhere on the tiny pin must close it"
+        );
+        let outside_event = |pressed| Event::PointerButton {
+            pos: outside,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let _ = pass(vec![Event::PointerMoved(outside), outside_event(true)]);
+        assert!(
+            !pass(vec![outside_event(false), Event::PointerMoved(point)]).close,
+            "a release outside the pin must not borrow a later inside pointer position"
+        );
+    }
+
+    #[test]
+    fn secondary_click_does_not_immediately_close_a_toolbar_sized_pin() {
+        let set = displays();
+        let mut surface = PinnedSurface::on_display(
+            PinId("regular".into()),
+            LogicalSize::new(560.0, 360.0),
+            &set.displays()[0],
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+        )
+        .expect("pin dimensions");
+        let size = Vec2::new(
+            surface.state().frame.size.width as f32,
+            surface.state().frame.size.height as f32,
+        );
+        assert!(toolbar_fits(Rect::from_min_size(Pos2::ZERO, size)));
+
+        let context = egui::Context::default();
+        let point = Pos2::new(size.x / 2.0, size.y / 2.0);
+        let event = |pressed| Event::PointerButton {
+            pos: point,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let mut pass = |events| {
+            let mut response = None;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    response = Some(draw(
+                        ui,
+                        PinFrame {
+                            name: "Regular pin",
+                            texture: None,
+                            content_error: None,
+                            surface: &mut surface,
+                            displays: &set,
+                            positioning: true,
+                            native_opacity: false,
+                            click_through: true,
+                            theme: &Theme::for_appearance(Appearance::Dark),
+                            chrome_visibility: ChromeVisibility::Auto,
+                        },
+                    ));
+                },
+            );
+            output.textures_delta.clear();
+            response.expect("headless pin draw ran")
+        };
+
+        let _ = pass(vec![Event::PointerMoved(point), event(true)]);
+        assert!(
+            !pass(vec![Event::PointerMoved(point), event(false)]).close,
+            "a regular pin should open its context menu rather than close immediately"
+        );
+    }
+
+    #[test]
+    fn reset_size_uses_the_absolute_original_scale() {
+        let set = displays();
+        let mut surface = PinnedSurface::on_display(
+            PinId("reset".into()),
+            LogicalSize::new(200.0, 100.0),
+            &set.displays()[0],
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+        )
+        .expect("pin dimensions");
+        surface.set_scale(0.5, &set);
+        assert_eq!(surface.state().scale.get(), 0.5);
+
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            reset_scale(ui, &mut surface, &set);
+        });
+        output.textures_delta.clear();
+
+        assert_eq!(surface.state().scale.get(), 1.0);
     }
 
     #[test]
