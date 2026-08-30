@@ -19,6 +19,7 @@ pub mod drag;
 pub mod editor;
 pub mod overlay;
 pub mod permissions;
+pub mod termination;
 
 use objc2_foundation::MainThreadMarker;
 use scrozz_core::{Error, Result};

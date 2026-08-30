@@ -502,13 +502,42 @@ fn unix_now() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+/// Why the application event loop is ending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// The bounded run duration elapsed.
+    Deadline,
+    /// A user-visible action explicitly requested Quit.
+    Quit(CaptureOrigin),
+    /// The native event loop ended without an app action requesting it.
+    NativeEventLoop,
+    /// A required native lifecycle invariant could not be established.
+    NativeLifecycle,
+}
+
+impl ExitReason {
+    /// Stable spelling for logs and the final diagnostic report.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::Quit(CaptureOrigin::MenuBar) => "menu-bar-quit",
+            Self::Quit(CaptureOrigin::GlobalHotkey) => "global-hotkey-quit",
+            Self::Quit(CaptureOrigin::Startup) => "startup-quit",
+            Self::Quit(CaptureOrigin::Direct) => "direct-quit",
+            Self::NativeEventLoop => "native-event-loop",
+            Self::NativeLifecycle => "native-lifecycle",
+        }
+    }
+}
+
 /// Whether the host should keep going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
     /// Still running.
     Continue,
-    /// Quit was asked for, or the deadline passed.
-    Stop,
+    /// Stop for an explicit, attributable reason.
+    Stop(ExitReason),
 }
 
 const ASSIGNMENT_EVENT_GUARD: Duration = Duration::from_millis(150);
@@ -635,6 +664,7 @@ pub struct App {
     editor_render_failed: Option<(CardId, u64, u64)>,
     next_editor_generation: u64,
     notes: Vec<String>,
+    exit_reason: Option<ExitReason>,
     shortcuts: Shortcuts,
     shortcut_store: Option<ShortcutStore>,
     rejected: Vec<(ShortcutAction, String)>,
@@ -1032,6 +1062,7 @@ impl App {
             editor_render_failed: None,
             next_editor_generation: 1,
             notes,
+            exit_reason: None,
             shortcuts,
             shortcut_store,
             rejected: Vec::new(),
@@ -1105,17 +1136,17 @@ impl App {
         self.active_editor_card = editor.map(|snapshot| snapshot.card);
         if self.expired() {
             self.note("the run deadline passed");
-            return Tick::Stop;
+            return self.stop(ExitReason::Deadline);
         }
 
         self.drain_permission();
 
-        if self.drain_tray() == Tick::Stop {
-            return Tick::Stop;
+        if let Tick::Stop(reason) = self.drain_tray() {
+            return Tick::Stop(reason);
         }
         self.drain_hotkeys();
-        if self.drain_server() == Tick::Stop {
-            return Tick::Stop;
+        if let Tick::Stop(reason) = self.drain_server() {
+            return Tick::Stop(reason);
         }
         self.with_history(|history| history.advance_clock(Timestamp::now()));
         self.advance_recording();
@@ -1156,9 +1187,15 @@ impl App {
             }
         }
 
+        self.dispatch_tray_batch(pending)
+    }
+
+    fn dispatch_tray_batch(&mut self, pending: impl IntoIterator<Item = TrayAction>) -> Tick {
         for entry in pending {
-            if self.perform_from(CaptureOrigin::MenuBar, Action::from_tray(entry)) == Tick::Stop {
-                return Tick::Stop;
+            if let Tick::Stop(reason) =
+                self.perform_from(CaptureOrigin::MenuBar, Action::from_tray(entry))
+            {
+                return Tick::Stop(reason);
             }
         }
         Tick::Continue
@@ -2738,9 +2775,37 @@ impl App {
             }
             Action::Quit => {
                 self.note("quit");
-                Tick::Stop
+                self.stop(ExitReason::Quit(origin))
             }
         }
+    }
+
+    fn stop(&mut self, reason: ExitReason) -> Tick {
+        if self.exit_reason.is_none() {
+            tracing::info!(exit_reason = reason.label(), "application exit requested");
+            self.exit_reason = Some(reason);
+        }
+        Tick::Stop(reason)
+    }
+
+    #[must_use]
+    pub(crate) const fn exit_reason(&self) -> Option<ExitReason> {
+        self.exit_reason
+    }
+
+    pub(crate) fn record_native_event_loop_exit(&mut self) {
+        if self.exit_reason.is_none() {
+            tracing::warn!(
+                exit_reason = ExitReason::NativeEventLoop.label(),
+                "application event loop ended without an app stop request"
+            );
+            self.exit_reason = Some(ExitReason::NativeEventLoop);
+        }
+    }
+
+    pub(crate) fn stop_for_native_lifecycle(&mut self, detail: impl Into<String>) -> Tick {
+        self.note(format!("native lifecycle failure: {}", detail.into()));
+        self.stop(ExitReason::NativeLifecycle)
     }
 
     fn begin_capture(&mut self, origin: CaptureOrigin, kind: CaptureKind) {
@@ -3934,6 +3999,11 @@ impl App {
             ),
             ("tray", Json::Bool(self.tray.is_some())),
             ("ipc", Json::Bool(self.server.is_some())),
+            (
+                "exit_reason",
+                self.exit_reason
+                    .map_or(Json::Null, |reason| Json::str(reason.label())),
+            ),
             (
                 "notes",
                 Json::arr(self.notes.iter().map(|n| Json::str(n.as_str()))),
@@ -6822,14 +6892,93 @@ mod tests {
         assert_eq!(app.tick(), Tick::Continue);
 
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(app.tick(), Tick::Stop);
+        assert_eq!(app.tick(), Tick::Stop(ExitReason::Deadline));
+        assert_eq!(app.exit_reason(), Some(ExitReason::Deadline));
     }
 
     #[test]
     fn quitting_stops_the_app() {
         let (mut app, _) = app();
-        assert_eq!(app.perform(Action::Quit), Tick::Stop);
+        assert_eq!(
+            app.perform(Action::Quit),
+            Tick::Stop(ExitReason::Quit(CaptureOrigin::Direct))
+        );
+        assert_eq!(
+            app.exit_reason(),
+            Some(ExitReason::Quit(CaptureOrigin::Direct))
+        );
         assert!(app.notes().iter().any(|n| n == "quit"));
+        assert!(
+            app.report()
+                .data
+                .to_compact_string()
+                .contains(r#""exit_reason":"direct-quit""#)
+        );
+    }
+
+    #[test]
+    fn settings_only_menu_batches_cannot_stop_or_manufacture_quit() {
+        let (mut app, _) = app();
+        assert_eq!(
+            app.dispatch_tray_batch([
+                TrayAction::OpenSettings,
+                TrayAction::OpenHistory,
+                TrayAction::OpenSettings,
+            ]),
+            Tick::Continue
+        );
+        assert!(app.take_settings_request());
+        assert_eq!(app.exit_reason(), None);
+        assert!(!app.notes().iter().any(|note| note == "quit"));
+    }
+
+    #[test]
+    fn an_explicit_menu_quit_remains_legitimate_after_other_pending_actions() {
+        let (mut app, _) = app();
+        assert_eq!(
+            app.dispatch_tray_batch([TrayAction::OpenSettings, TrayAction::Quit]),
+            Tick::Stop(ExitReason::Quit(CaptureOrigin::MenuBar))
+        );
+        assert!(app.take_settings_request());
+        assert_eq!(
+            app.exit_reason(),
+            Some(ExitReason::Quit(CaptureOrigin::MenuBar))
+        );
+    }
+
+    #[test]
+    fn native_event_loop_exit_is_explicit_and_does_not_replace_an_app_reason() {
+        let (mut native_exit_app, _) = app();
+        native_exit_app.record_native_event_loop_exit();
+        assert_eq!(
+            native_exit_app.exit_reason(),
+            Some(ExitReason::NativeEventLoop)
+        );
+
+        let (mut quit_app, _) = app();
+        assert_eq!(
+            quit_app.perform(Action::Quit),
+            Tick::Stop(ExitReason::Quit(CaptureOrigin::Direct))
+        );
+        quit_app.record_native_event_loop_exit();
+        assert_eq!(
+            quit_app.exit_reason(),
+            Some(ExitReason::Quit(CaptureOrigin::Direct))
+        );
+
+        let (mut failed_app, _) = app();
+        assert_eq!(
+            failed_app.stop_for_native_lifecycle("lease unavailable"),
+            Tick::Stop(ExitReason::NativeLifecycle)
+        );
+        assert_eq!(failed_app.exit_reason(), Some(ExitReason::NativeLifecycle));
+        assert!(
+            failed_app
+                .report()
+                .data
+                .to_compact_string()
+                .contains(r#""exit_reason":"native-lifecycle""#)
+        );
     }
 
     #[test]

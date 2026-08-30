@@ -22,6 +22,8 @@ use scrozz_ui::{
     SelectionUi, select::DisplayLayout,
 };
 
+use super::card::SurfaceWaker;
+
 const BRIDGE_POLL: Duration = Duration::from_millis(25);
 const INPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -150,6 +152,7 @@ impl CaptureSelector for UnsupportedSelector {
 /// eframe loop.
 pub struct ClientOverlaySelector {
     events: Sender<BridgeEvent>,
+    wake: SurfaceWaker,
     gate: Arc<(Mutex<Gate>, Condvar)>,
     snapshot: Arc<SnapshotFn>,
     prepare: Arc<PrepareFn>,
@@ -397,12 +400,16 @@ impl ControllerPhase {
 impl ClientOverlaySelector {
     /// Creates the worker and main-thread halves for the long-running app.
     #[must_use]
-    pub fn managed(cards: OverlayGeometry) -> (Arc<Self>, ClientOverlayController) {
-        Self::pair(
+    pub fn managed(
+        cards: OverlayGeometry,
+        wake: SurfaceWaker,
+    ) -> (Arc<Self>, ClientOverlayController) {
+        Self::pair_with_waker(
             cards,
             Completion::RestoreCards,
             Arc::new(snapshot_native),
             Arc::new(prepare_native),
+            wake,
         )
     }
 
@@ -423,9 +430,20 @@ impl ClientOverlaySelector {
         snapshot: Arc<SnapshotFn>,
         prepare: Arc<PrepareFn>,
     ) -> (Arc<Self>, ClientOverlayController) {
+        Self::pair_with_waker(cards, completion, snapshot, prepare, Arc::new(|| {}))
+    }
+
+    fn pair_with_waker(
+        cards: OverlayGeometry,
+        completion: Completion,
+        snapshot: Arc<SnapshotFn>,
+        prepare: Arc<PrepareFn>,
+        wake: SurfaceWaker,
+    ) -> (Arc<Self>, ClientOverlayController) {
         let (events, receiver) = channel();
         let selector = Arc::new(Self {
             events,
+            wake,
             gate: Arc::new((Mutex::new(Gate::default()), Condvar::new())),
             snapshot,
             prepare,
@@ -438,6 +456,17 @@ impl ClientOverlaySelector {
             cancelled_preparations: Vec::new(),
         };
         (selector, controller)
+    }
+
+    fn send_event(
+        &self,
+        event: BridgeEvent,
+    ) -> std::result::Result<(), std::sync::mpsc::SendError<BridgeEvent>> {
+        let sent = self.events.send(event);
+        if sent.is_ok() {
+            (self.wake)();
+        }
+        sent
     }
 
     fn acquire(&self) -> Result<u64> {
@@ -530,7 +559,7 @@ impl ClientOverlaySelector {
         if let Some(delay) = options.delay
             && let Err(error) = self.wait_delay(delay)
         {
-            let _ = self.events.send(BridgeEvent::PreparationFailed { id });
+            let _ = self.send_event(BridgeEvent::PreparationFailed { id });
             return Err(error);
         }
 
@@ -541,20 +570,19 @@ impl ClientOverlaySelector {
         let snapshot = match (self.snapshot)(options) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let _ = self.events.send(BridgeEvent::PreparationFailed { id });
+                let _ = self.send_event(BridgeEvent::PreparationFailed { id });
                 return Err(error);
             }
         };
 
         let (hidden_tx, hidden_rx) = channel();
-        self.events
-            .send(BridgeEvent::Begin {
-                id,
-                hidden: hidden_tx,
-                surface_can_remain_visible,
-                cursor: selection_cursor(options),
-            })
-            .map_err(|_| bridge_error("the selector window closed before it could hide"))?;
+        self.send_event(BridgeEvent::Begin {
+            id,
+            hidden: hidden_tx,
+            surface_can_remain_visible,
+            cursor: selection_cursor(options),
+        })
+        .map_err(|_| bridge_error("the selector window closed before it could hide"))?;
         self.receive(
             &hidden_rx,
             "the selector window closed before confirming it was hidden",
@@ -563,19 +591,18 @@ impl ClientOverlaySelector {
         let mut prepared = match (self.prepare)(options.clone(), cursor, snapshot) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _ = self.events.send(BridgeEvent::PreparationFailed { id });
+                let _ = self.send_event(BridgeEvent::PreparationFailed { id });
                 return Err(error);
             }
         };
         let frozen_sources = std::mem::take(&mut prepared.frozen_sources);
         let (decision_tx, decision_rx) = channel();
-        self.events
-            .send(BridgeEvent::Prepared {
-                id,
-                prepared: Box::new(prepared),
-                decision: decision_tx,
-            })
-            .map_err(|_| bridge_error("the selector window closed before it could draw"))?;
+        self.send_event(BridgeEvent::Prepared {
+            id,
+            prepared: Box::new(prepared),
+            decision: decision_tx,
+        })
+        .map_err(|_| bridge_error("the selector window closed before it could draw"))?;
         let outcome = self.receive(
             &decision_rx,
             "the selector window closed before a target was chosen",
@@ -643,8 +670,7 @@ impl CaptureSelector for ClientOverlaySelector {
         let id = self.acquire()?;
         let (hidden_tx, hidden_rx) = channel();
         if self
-            .events
-            .send(BridgeEvent::BeginCapture {
+            .send_event(BridgeEvent::BeginCapture {
                 id,
                 hidden: hidden_tx,
                 surface_can_remain_visible,
@@ -705,11 +731,9 @@ impl CaptureSelector for ClientOverlaySelector {
             }
             active.id
         };
-
         let (restored_tx, restored_rx) = channel();
         if self
-            .events
-            .send(BridgeEvent::CaptureFinished {
+            .send_event(BridgeEvent::CaptureFinished {
                 id,
                 restored: restored_tx,
             })
@@ -730,7 +754,7 @@ impl CaptureSelector for ClientOverlaySelector {
             gate.active = None;
             changed.notify_all();
         }
-        let _ = self.events.send(BridgeEvent::Cancel);
+        let _ = self.send_event(BridgeEvent::Cancel);
     }
 }
 
@@ -1802,6 +1826,30 @@ mod tests {
             test_snapshotter(bounds),
             prepare,
         )
+    }
+
+    #[test]
+    fn selector_bridge_events_wake_the_root_without_idle_polling() {
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wake_count);
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+        let prepare: Arc<PrepareFn> =
+            Arc::new(|options, _cursor, snapshot| prepare_test_snapshot(options, snapshot));
+        let (selector, _controller) = ClientOverlaySelector::pair_with_waker(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            test_snapshotter(bounds),
+            prepare,
+            Arc::new(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        selector
+            .send_event(BridgeEvent::Cancel)
+            .expect("controller receiver");
+
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
     }
 
     fn prepare_test_snapshot(

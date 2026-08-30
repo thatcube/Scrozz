@@ -1728,6 +1728,14 @@ impl RecentCapturesOverlayApp {
         let Some(topology) = topology else {
             return;
         };
+        self.apply_pin_topology(topology);
+    }
+
+    /// Applies an already-queried topology to pin state.
+    ///
+    /// Hosts with native display-change notifications use this to update the
+    /// root and pinned children from the same event snapshot.
+    pub fn apply_pin_topology(&mut self, topology: PinTopology) {
         if topology.displays.displays().is_empty() {
             return;
         }
