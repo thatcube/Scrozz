@@ -261,11 +261,9 @@ jobs:
         with:
           key: golden-${{ matrix.os }}
 
-      # tools/golden.sh exits 0 with an explanation when the harness does not
-      # exist yet. During Phase 0 that is the expected outcome: the harness in
-      # crates/scrozz-ui is still a todo!(). The job starts enforcing itself
-      # automatically once egui_kittest is a dev-dependency and there are tests
-      # in crates/scrozz-ui/tests/ — no edit to this file required.
+      # The harness is registered in scrozz-ui and every committed scene must
+      # produce a real baseline comparison. A missing harness or baseline is a
+      # blocking failure rather than a skipped visual check.
       - name: Render and diff golden images
         run: tools/golden.sh
 

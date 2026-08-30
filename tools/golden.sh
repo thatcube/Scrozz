@@ -77,7 +77,6 @@ fi
 export SCROZZ_GOLDEN_PLATFORM="${RUNNER_OS:-$(uname -s)}"
 
 if [[ "$UPDATE" == "1" ]]; then
-  # The env var egui_kittest itself reads.
   export UPDATE_SNAPSHOTS=1
   echo "golden: re-recording baselines for $SCROZZ_GOLDEN_PLATFORM"
 fi

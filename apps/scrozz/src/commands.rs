@@ -25,7 +25,7 @@ use scrozz_annotate::{
 };
 use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, Frame, PhysicalSize,
-    Provenance, SelectionOptions, SelectionOutcome,
+    Provenance, ScrollAxis, SelectionOptions, SelectionOutcome,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, to_straight_rgba8};
 use scrozz_ocr::Ocr as _;
@@ -75,6 +75,22 @@ use crate::{
 /// into its own pipeline rather than keeping a second full-resolution copy
 /// alive for the duration of the reply.
 pub type CaptureSink<'a> = &'a mut dyn FnMut(CaptureKind, scrozz_core::Capture) -> CliResult<()>;
+
+pub(crate) use crate::scrolling::{
+    ScrollingTarget, fail_if_terminal_abort, resolve_scrolling_target, seal_terminal_output,
+    wayland_portal_picker_target, wayland_scrolling_capture_target,
+};
+
+/// A sink whose bytes are already written but not yet visible.
+///
+/// Staging every destination before publishing any of them is what makes a
+/// cancelled capture leave nothing behind: a Ctrl+C that arrives while the
+/// second of three files is being written must not leave the first one on disk.
+enum PreparedSink {
+    File(crate::output::StagedFile),
+    Clipboard,
+    Stdout,
+}
 
 /// Runs a command locally.
 ///
@@ -251,14 +267,24 @@ fn capture(
     sound_at_source: bool,
 ) -> CliResult<Report> {
     args.validate()?;
-    let requested_target = args.target.resolve()?;
+    // `target_spec`, not `target.resolve`: `--scrolling` is its own selector and
+    // resolving only the ordinary target flags would silently take an
+    // interactive region capture instead.
+    let requested_target = args.target_spec()?;
+    let scrolling_axis = match &requested_target {
+        TargetSpec::Scrolling { axis, .. } => Some(*axis),
+        _ => None,
+    };
     let sinks = args.sinks();
     let selection = args.selection_options(None)?;
     let beautification = resolve_beautification(args)?;
 
     let plan = Json::obj([
         ("target", target_json(&requested_target)),
-        ("interactive", Json::Bool(args.target.is_interactive())),
+        (
+            "interactive",
+            Json::Bool(matches!(requested_target, TargetSpec::Interactive(_))),
+        ),
         (
             "selection",
             Json::opt(selection.as_ref(), |options| {
@@ -345,13 +371,26 @@ fn capture(
         selector.begin_capture(backend.excludes_current_process(&request.target))?;
     }
 
-    let capture = match frozen_capture {
-        Some(capture) => capture,
-        None => crate::gui::selection::capture_selected(
-            backend.as_ref(),
-            &request,
-            selection_outcome.as_ref(),
-        )?,
+    // Scrolling is the only acquisition that outlives a single call, so it is
+    // also the only one that installs a terminal cancellation contract: one
+    // Ctrl+C keeps what has already been stitched, two discard it.
+    let (capture, mut terminal_cancel) = match scrolling_axis {
+        Some(axis) => {
+            let (capture, cancel) =
+                crate::scrolling::scrolling_capture(backend.as_ref(), request.clone(), axis, None)?;
+            (capture, Some(cancel))
+        }
+        None => {
+            let capture = match frozen_capture {
+                Some(capture) => capture,
+                None => crate::gui::selection::capture_selected(
+                    backend.as_ref(),
+                    &request,
+                    selection_outcome.as_ref(),
+                )?,
+            };
+            (capture, None)
+        }
     };
     lifecycle.finish();
     if let Some(outcome) = selection_outcome.as_ref() {
@@ -383,16 +422,38 @@ fn capture(
     let bytes = FrameEncoder::new()
         .encode(frame, args.format().to_export())
         .map_err(CliError::Core)?;
+    fail_if_terminal_abort(&mut terminal_cancel)?;
 
+    let mut prepared = Vec::with_capacity(sinks.len());
+    for sink in &sinks {
+        fail_if_terminal_abort(&mut terminal_cancel)?;
+        match sink {
+            Sink::File(path) => prepared.push(PreparedSink::File(
+                crate::output::StagedFile::for_path(&bytes, path.clone())?,
+            )),
+            Sink::Clipboard => prepared.push(PreparedSink::Clipboard),
+            Sink::Stdout => prepared.push(PreparedSink::Stdout),
+            // D18: any folder the user picks, which is what lets a Dropbox or
+            // iCloud directory provide sync for free with no service on our side.
+            // Staged against the same settings snapshot this pass started with.
+            Sink::DefaultFolder => prepared.push(PreparedSink::File(
+                crate::output::StagedFile::for_settings(&bytes, &persisted)?,
+            )),
+        }
+    }
+
+    // This is the single irreversible boundary. Abort wins before it; once this
+    // compare-exchange wins, the signal handler can no longer turn a published
+    // output into a cancellation report.
+    seal_terminal_output(&mut terminal_cancel)?;
     let mut written = Vec::new();
     let mut raw = None;
-    for sink in &sinks {
+    for sink in prepared {
         match sink {
-            Sink::File(path) => {
-                std::fs::write(path, &bytes).map_err(|e| CliError::Core(CoreError::Io(e)))?;
-                written.push(path.display().to_string());
+            PreparedSink::File(staged) => {
+                written.push(staged.commit()?.display().to_string());
             }
-            Sink::Clipboard => {
+            PreparedSink::Clipboard => {
                 let clipboard_png = if args.format() == crate::cli::Format::Png {
                     bytes.clone()
                 } else {
@@ -404,13 +465,7 @@ fn capture(
                     .map_err(CliError::Core)?;
                 written.push("clipboard".to_string());
             }
-            Sink::Stdout => raw = Some(bytes.clone()),
-            // D18: any folder the user picks, which is what lets a Dropbox or
-            // iCloud directory provide sync for free with no service on our side.
-            Sink::DefaultFolder => {
-                let path = crate::output::export_with_settings(&bytes, &persisted)?;
-                written.push(path.display().to_string());
-            }
+            PreparedSink::Stdout => raw = Some(bytes.clone()),
         }
     }
     if sound_at_source && let Err(error) = scrozz_shell::play_screenshot_sound(&screenshot_sound) {
@@ -613,7 +668,10 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
         // Resolving a name needs enumeration, so it goes through the same
         // backend the capture will use — an id resolved by a different object
         // is an id that can disagree.
-        TargetSpec::Display(sel) => {
+        TargetSpec::Scrolling { display, .. } if is_wayland() => {
+            wayland_scrolling_capture_target(display)
+        }
+        TargetSpec::Display(sel) | TargetSpec::Scrolling { display: sel, .. } => {
             let displays = platform::target_enumerator()?.displays()?;
             let found = match sel {
                 DisplaySelector::Primary => displays.iter().find(|d| d.is_primary),
@@ -635,6 +693,7 @@ fn capture_target(spec: &TargetSpec) -> CliResult<CaptureTarget> {
                     )))
                 })
         }
+
         TargetSpec::Window(name) => {
             let windows = platform::target_enumerator()?.windows()?;
             windows
@@ -1607,9 +1666,26 @@ fn list(what: ListWhat) -> CliResult<Report> {
 }
 
 /// Whether this is a Wayland session.
-fn is_wayland() -> bool {
-    std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty())
-        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
+pub(crate) fn is_wayland() -> bool {
+    is_wayland_environment(
+        std::env::var("SCROZZ_BACKEND").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+    )
+}
+
+fn is_wayland_environment(
+    forced_backend: Option<&str>,
+    wayland_display: Option<&str>,
+    session_type: Option<&str>,
+) -> bool {
+    match forced_backend.map(str::trim).map(str::to_ascii_lowercase) {
+        Some(forced) if forced == "x11" || forced == "xcb" => return false,
+        Some(forced) if forced == "wayland" => return true,
+        _ => {}
+    }
+    wayland_display.is_some_and(|value| !value.is_empty())
+        || session_type.is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2245,20 +2321,33 @@ pub fn target_json(target: &TargetSpec) -> Json {
         ]),
         TargetSpec::Display(selector) => Json::obj([
             ("kind", Json::str("display")),
-            (
-                "selector",
-                Json::str(match selector {
-                    DisplaySelector::Primary => "primary",
-                    DisplaySelector::Active => "active",
-                    DisplaySelector::Id(id) => id.as_str(),
-                }),
-            ),
+            ("selector", Json::str(display_selector_slug(selector))),
+        ]),
+        TargetSpec::Scrolling { display, axis } => Json::obj([
+            ("kind", Json::str("scrolling")),
+            ("selector", Json::str(display_selector_slug(display))),
+            ("axis", Json::str(scroll_axis_slug(*axis))),
         ]),
         TargetSpec::AllDisplays => Json::obj([("kind", Json::str("all-displays"))]),
         TargetSpec::Interactive(mode) => Json::obj([
             ("kind", Json::str("interactive")),
             ("mode", Json::str(interactive_slug(*mode))),
         ]),
+    }
+}
+
+fn display_selector_slug(selector: &DisplaySelector) -> &str {
+    match selector {
+        DisplaySelector::Primary => "primary",
+        DisplaySelector::Active => "active",
+        DisplaySelector::Id(id) => id.as_str(),
+    }
+}
+
+const fn scroll_axis_slug(axis: ScrollAxis) -> &'static str {
+    match axis {
+        ScrollAxis::Vertical => "vertical",
+        ScrollAxis::Horizontal => "horizontal",
     }
 }
 
@@ -2323,6 +2412,28 @@ fn describe_target(target: &TargetSpec) -> String {
         TargetSpec::Display(DisplaySelector::Primary) => "the primary display".to_string(),
         TargetSpec::Display(DisplaySelector::Active) => "the active display".to_string(),
         TargetSpec::Display(DisplaySelector::Id(id)) => format!("display {id}"),
+        TargetSpec::Scrolling { display, axis } => {
+            let direction = scroll_axis_slug(*axis);
+            match display {
+                DisplaySelector::Primary => {
+                    format!(
+                        "a {direction} scrolling capture of the frontmost window on the primary \
+                         display"
+                    )
+                }
+                DisplaySelector::Active => {
+                    format!(
+                        "a {direction} scrolling capture of the frontmost window on the active \
+                         display"
+                    )
+                }
+                DisplaySelector::Id(id) => {
+                    format!(
+                        "a {direction} scrolling capture of the frontmost window on display {id}"
+                    )
+                }
+            }
+        }
         TargetSpec::AllDisplays => "every display".to_string(),
         TargetSpec::Interactive(mode) => {
             format!("an interactively chosen {}", interactive_slug(*mode))
@@ -2404,6 +2515,18 @@ mod tests {
         }
     }
 
+    struct PanicFrameSession;
+
+    impl scrozz_capture::FrameSession for PanicFrameSession {
+        fn capture_frame(&mut self) -> scrozz_core::Result<Frame> {
+            panic!("a cancelled scrolling source must not request its first frame")
+        }
+
+        fn name(&self) -> &str {
+            "panic-frame-session"
+        }
+    }
+
     fn run(argv: &[&str]) -> CliResult<Report> {
         let cli = Cli::try_parse_from(argv).expect("should parse");
         cli.validate()?;
@@ -2412,6 +2535,33 @@ mod tests {
 
     fn json_of(argv: &[&str]) -> String {
         run(argv).expect("should succeed").data.to_compact_string()
+    }
+
+    #[test]
+    fn a_scrolling_dry_run_reports_a_noninteractive_stitched_target() {
+        let rendered = json_of(&["scrozz", "capture", "--scrolling=primary", "--dry-run"]);
+        assert!(rendered.contains(r#""kind":"scrolling""#), "{rendered}");
+        assert!(rendered.contains(r#""selector":"primary""#), "{rendered}");
+        assert!(rendered.contains(r#""interactive":false"#), "{rendered}");
+    }
+
+    #[test]
+    fn a_scrolling_dry_run_names_the_axis_it_would_grow_along() {
+        let vertical = json_of(&["scrozz", "capture", "--scrolling", "--dry-run"]);
+        assert!(vertical.contains(r#""axis":"vertical""#), "{vertical}");
+
+        let horizontal = json_of(&[
+            "scrozz",
+            "capture",
+            "--scrolling",
+            "--scroll-axis",
+            "horizontal",
+            "--dry-run",
+        ]);
+        assert!(
+            horizontal.contains(r#""axis":"horizontal""#),
+            "{horizontal}"
+        );
     }
 
     #[test]
@@ -2710,6 +2860,7 @@ mod tests {
             vec!["scrozz", "capture", "--dry-run"],
             vec!["scrozz", "capture", "--display", "primary", "--dry-run"],
             vec!["scrozz", "capture", "--window", "Safari", "--dry-run"],
+            vec!["scrozz", "capture", "--scrolling=active", "--dry-run"],
             vec!["scrozz", "record", "--dry-run"],
         ] {
             assert!(run(&argv).is_ok(), "{argv:?}");

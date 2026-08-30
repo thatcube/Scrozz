@@ -605,13 +605,14 @@ fn the_capture_actions_come_first_and_quit_comes_last() {
         .collect();
 
     assert_eq!(
-        &items[..5],
+        &items[..6],
         &[
             TrayAction::CaptureAllInOne,
             TrayAction::CaptureRegion,
             TrayAction::CaptureWindow,
             TrayAction::CaptureFullscreen,
             TrayAction::CaptureAllDisplays,
+            TrayAction::CaptureScrolling,
         ]
     );
     assert_eq!(*items.last().expect("non-empty"), TrayAction::Quit);
@@ -654,6 +655,7 @@ fn enabled_menu_items_are_never_clickable_no_ops() {
         TrayAction::CaptureWindow,
         TrayAction::CaptureFullscreen,
         TrayAction::CaptureAllDisplays,
+        TrayAction::CaptureScrolling,
         TrayAction::ToggleRecording,
         TrayAction::OpenHistory,
         TrayAction::OpenSettings,

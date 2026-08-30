@@ -144,6 +144,21 @@ impl PresentationLease {
 }
 
 impl MacOverlay {
+    /// Returns whether AppKit currently ignores mouse events for this window.
+    ///
+    /// The readback is what makes an automatic scrolling capture safe to start:
+    /// the click-through request is asynchronous everywhere else, and posting
+    /// wheel events into a window that has not actually become transparent
+    /// scrolls the overlay instead of the page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Platform`] off the main thread.
+    pub fn click_through(&self) -> Result<bool> {
+        let _mtm = main_thread("reading overlay click-through")?;
+        Ok(self.window.ignoresMouseEvents())
+    }
+
     /// Finds and adopts one of this process's windows by its exact title.
     ///
     /// eframe exposes native handles only for the root viewport. Pinned

@@ -330,6 +330,8 @@ pub enum Scenario {
     RecordingPresenter,
     /// Camera preferences before any permission prompt or preview.
     CameraSettings,
+    /// The scrolling HUD choosing an axis and reporting stitched progress.
+    ScrollingCapture,
 }
 
 impl Scenario {
@@ -375,6 +377,7 @@ impl Scenario {
         Self::RecordingCamera,
         Self::RecordingPresenter,
         Self::CameraSettings,
+        Self::ScrollingCapture,
     ];
 
     /// Every scenario, in stable declaration order.
@@ -405,6 +408,7 @@ impl Scenario {
             Self::RecordingCamera => "recording-camera",
             Self::RecordingPresenter => "recording-presenter",
             Self::CameraSettings => "camera-settings",
+            Self::ScrollingCapture => "scrolling-capture",
             Self::VideoEditing => "video-editing",
             Self::VideoEditingNarrow => "video-editing-narrow",
             Self::VideoExporting => "video-exporting",
@@ -807,6 +811,24 @@ mod instants {
             expectation: "card follows the pointer 1:1 with tilt proportional to travel",
         },
     ];
+
+    pub(super) const SCROLLING: &[KeyInstant] = &[
+        KeyInstant {
+            name: "choose-axis",
+            at_ms: 0,
+            expectation: "the scrolling HUD offers a tall-page and wide-canvas axis choice",
+        },
+        KeyInstant {
+            name: "vertical-progress",
+            at_ms: 180,
+            expectation: "the HUD reports a measured vertical seam and the stitched height",
+        },
+        KeyInstant {
+            name: "horizontal-progress",
+            at_ms: 360,
+            expectation: "the same HUD reports horizontal progress in width rather than height",
+        },
+    ];
 }
 
 impl Fixture {
@@ -1013,6 +1035,17 @@ impl Fixture {
                     instants::REST,
                     None,
                     Some(Self::camera_live_fixture(true)),
+                ),
+                Scenario::ScrollingCapture => (
+                    Vec::new(),
+                    Gesture::None,
+                    false,
+                    false,
+                    "Choose a direction, then keep moving",
+                    "The scrolling HUD makes axis, measured overlap, output extent, manual fallback, and keep-versus-discard cancellation visible without stealing focus.",
+                    instants::SCROLLING,
+                    None,
+                    None,
                 ),
                 Scenario::CameraSettings => (
                     Vec::new(),
@@ -1302,6 +1335,7 @@ impl Fixture {
                 ),
             };
         let size_pt = match scenario {
+            Scenario::ScrollingCapture => (640.0, 260.0),
             Scenario::EditorAnnotating
             | Scenario::EditorColorPopover
             | Scenario::EditorArrowStyles => (900.0, 620.0),
@@ -2621,7 +2655,11 @@ impl SceneRegistry {
         //   me.register(Scenario::StackFull, Box::new(crate::stack::StackScene));
         //   me.register(Scenario::DockCollapsed, Box::new(crate::dock::DockScene));
         //
-        // Until then every scenario renders a watermarked stand-in, and
+        me.register(
+            Scenario::ScrollingCapture,
+            Box::new(crate::scrolling::ScrollingScene),
+        );
+        // Until then every other scenario renders a watermarked stand-in, and
         // `Profile::Store` refuses to render those at all.
         me.register(
             Scenario::RecordingSettings,
@@ -4308,7 +4346,7 @@ fn render_label_strip(
 /// What happened when an image was compared against its baseline.
 #[derive(Debug)]
 pub enum GoldenOutcome {
-    /// No baseline existed; one was written. Review it before committing.
+    /// No baseline existed and an explicit update wrote it.
     Created(PathBuf),
     /// A baseline existed and was overwritten because updating was requested.
     Updated(PathBuf),
@@ -4445,6 +4483,13 @@ impl GoldenStore {
         let path = self.path_for(name);
 
         if !path.exists() {
+            if !self.update {
+                return Err(Error::InvalidRequest(format!(
+                    "golden baseline {} is missing; rerun with UPDATE_SNAPSHOTS=1, review the \
+                     generated image, and commit it",
+                    path.display()
+                )));
+            }
             std::fs::create_dir_all(&self.dir)?;
             image.write_png(&path)?;
             return Ok(GoldenOutcome::Created(path));
@@ -4918,8 +4963,8 @@ impl SoftwareRenderer {
     ///
     /// # Errors
     ///
-    /// Propagates render and I/O errors. A mismatch is returned in the `Vec`,
-    /// not as an error.
+    /// Propagates render and I/O errors, including a missing committed baseline.
+    /// A pixel mismatch is returned in the `Vec`, not as an error.
     pub fn check_goldens(&self, store: &GoldenStore) -> Result<Vec<GoldenFailure>> {
         let mut failures = Vec::new();
         for case in golden_plan() {

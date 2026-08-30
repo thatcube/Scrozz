@@ -51,6 +51,8 @@ pub enum TrayAction {
     CaptureFullscreen,
     /// Capture every connected display.
     CaptureAllDisplays,
+    /// Capture a scrolling page on the display under the pointer.
+    CaptureScrolling,
     /// Start recording; becomes "Stop Recording" while recording runs.
     ToggleRecording,
     /// Show previous captures.
@@ -74,12 +76,13 @@ pub fn events_pending() -> bool {
 
 impl TrayAction {
     /// Every action, in menu order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::CaptureAllInOne,
         Self::CaptureRegion,
         Self::CaptureWindow,
         Self::CaptureFullscreen,
         Self::CaptureAllDisplays,
+        Self::CaptureScrolling,
         Self::ToggleRecording,
         Self::OpenHistory,
         Self::OpenSettings,
@@ -100,6 +103,7 @@ impl TrayAction {
             Self::CaptureWindow => "capture.window",
             Self::CaptureFullscreen => "capture.fullscreen",
             Self::CaptureAllDisplays => "capture.all-displays",
+            Self::CaptureScrolling => "capture.scrolling",
             Self::ToggleRecording => "record.toggle",
             Self::OpenHistory => "history.open",
             Self::OpenSettings => "settings.open",
@@ -117,6 +121,7 @@ impl TrayAction {
             Self::CaptureWindow => scrozz_core::product_copy::CAPTURE_WINDOW,
             Self::CaptureFullscreen => scrozz_core::product_copy::CAPTURE_FULLSCREEN,
             Self::CaptureAllDisplays => scrozz_core::product_copy::CAPTURE_ALL_DISPLAYS,
+            Self::CaptureScrolling => scrozz_core::product_copy::SCROLLING_CAPTURE,
             Self::ToggleRecording => scrozz_core::product_copy::RECORD_SCREEN,
             Self::OpenHistory => scrozz_core::product_copy::CAPTURE_HISTORY,
             Self::OpenSettings => scrozz_core::product_copy::SETTINGS,
@@ -146,6 +151,7 @@ impl TrayAction {
                 | Self::CaptureWindow
                 | Self::CaptureFullscreen
                 | Self::CaptureAllDisplays
+                | Self::CaptureScrolling
                 | Self::ToggleRecording
                 | Self::Quit
                 | Self::OpenHistory
@@ -175,6 +181,9 @@ impl TrayAction {
                 session.server,
                 DisplayServer::Wayland | DisplayServer::Headless
             ),
+            // Wayland keeps the row: the capture runs there, manually, because
+            // no portal grants an application the right to post scroll input.
+            Self::CaptureScrolling => session.server != DisplayServer::Headless,
             Self::Quit | Self::OpenHistory | Self::OpenSettings | Self::UnlockPinnedCaptures => {
                 true
             }
@@ -205,6 +214,7 @@ pub const fn menu_model() -> &'static [TrayEntry] {
         TrayEntry::Item(TrayAction::CaptureWindow),
         TrayEntry::Item(TrayAction::CaptureFullscreen),
         TrayEntry::Item(TrayAction::CaptureAllDisplays),
+        TrayEntry::Item(TrayAction::CaptureScrolling),
         TrayEntry::Separator,
         TrayEntry::Item(TrayAction::ToggleRecording),
         TrayEntry::Separator,

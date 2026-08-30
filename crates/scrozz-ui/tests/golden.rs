@@ -438,8 +438,14 @@ fn a_mismatch_writes_a_legible_triptych() {
         ))
         .expect("late");
 
-    // Seed a baseline, then hand it a genuinely different picture.
-    match store.compare("triptych-case", &early).expect("create") {
+    // Seed a baseline through the explicit update path, then hand the ordinary
+    // comparison path a genuinely different picture.
+    match store
+        .clone()
+        .with_update(true)
+        .compare("triptych-case", &early)
+        .expect("create")
+    {
         GoldenOutcome::Created(p) => assert!(p.exists(), "baseline was not written"),
         other => panic!("expected a created baseline, got {other:?}"),
     }
@@ -481,6 +487,29 @@ fn a_mismatch_writes_a_legible_triptych() {
             "the failure message omits `{needle}`:\n{text}"
         );
     }
+}
+
+#[test]
+fn a_missing_baseline_fails_unless_update_was_explicitly_requested() {
+    let scratch = Scratch::new("missing-baseline");
+    let image = renderer()
+        .render(&RenderSpec::golden(
+            Scenario::StackEntering,
+            VirtualClock::from_millis(0),
+        ))
+        .expect("render");
+    let store = GoldenStore::new(scratch.path().join("golden")).with_update(false);
+
+    let error = store
+        .compare("missing", &image)
+        .expect_err("an ordinary test run must not bless a missing baseline");
+    let message = error.to_string();
+    assert!(message.contains("missing"), "{message}");
+    assert!(message.contains("UPDATE_SNAPSHOTS=1"), "{message}");
+    assert!(
+        !store.path_for("missing").exists(),
+        "the failing comparison must not create a baseline"
+    );
 }
 
 /// Differently sized images must not panic, and must not silently pass.
@@ -721,9 +750,8 @@ fn the_plans_are_well_formed() {
 
 /// The one that fails when somebody moves a rectangle.
 ///
-/// On a first run this writes every baseline and passes; that is deliberate, so
-/// a fresh clone is not blocked by files it has no way to produce. The baselines
-/// are committed, so on every subsequent run this is a real comparison.
+/// A missing baseline fails. Recording one is an explicit update operation so a
+/// forgotten or untracked PNG cannot silently turn CI green.
 #[test]
 fn golden_corpus_matches_baselines() {
     let r = renderer();

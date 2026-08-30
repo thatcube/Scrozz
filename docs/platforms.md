@@ -324,6 +324,54 @@ Windows/X11 focus, DPI and accessibility verification.
 
 ---
 
+## Scrolling capture
+
+Scrolling capture is the one still-capture path that needs *input*, not just
+pixels, so its platform story is separate from the selector's.
+
+Still captures use the ordinary `CaptureBackend` API. Scrolling capture opens
+`scrozz_capture::frame_session` instead: one target grant is retained across
+every viewport frame rather than re-acquired per frame, and the session is torn
+down in reverse order when dropped. Every `capture_frame` returns the newest
+complete observation that is newer than the previously delivered one, so a frame
+buffered while the page was still settling is accepted rather than flushed.
+
+Input delivery is per-platform and never global:
+
+* **macOS** synthesizes target-bound wheel gestures. The selected window is
+  resolved against CoreGraphics' documented front-to-back list before a gesture
+  is posted, so a window that moved behind another after selection is an error
+  rather than a scroll delivered to whatever is now on top.
+* **Windows** does not use global `SendInput`: wheel input normally follows
+  keyboard focus, which could scroll a terminal or another window after a focus
+  change. Scrozz snapshots the selected `HWND` together with its process creation
+  time, UI thread and class, revalidates that identity before every gesture,
+  resolves the child at the selected point, and sends one conservative
+  `WM_MOUSEWHEEL` or `WM_MOUSEHWHEEL` detent directly with a timeout. A recycled
+  `HWND`, moved target, hung process or UIPI rejection is an error, never
+  reported as successful scrolling. The selected `DisplayId` is retained through
+  the gesture so overlapping logical rectangles on mixed-DPI desktops are not
+  re-resolved heuristically.
+* **X11** keeps automatic XTEST scrolling, pointer-warped to the target and
+  restored afterwards.
+* **Wayland scrolling input is deliberately manual.** A separate RemoteDesktop
+  portal grant cannot guarantee that synthesized wheel input reaches the same
+  surface the user selected in ScreenCast, so Scrozz never prompts for a grant it
+  cannot bind safely. There, `--scrolling` and `--scrolling=active` mean "choose
+  one window in the ScreenCast portal"; explicit `primary` or display-ID
+  selectors are rejected before the picker opens.
+
+An automatic capture never posts input until the overlay's own window reports
+back that it has actually become mouse-transparent. The queued egui viewport
+command is not evidence: on a platform with no native click-through readback the
+capture stays manual rather than scrolling the overlay instead of the page.
+
+Cancellation is always answerable, and a cancelled or stalled session still
+salvages what it aligned: the partial stitch is written through the same atomic,
+never-overwriting output path as a completed one.
+
+---
+
 ## What this means for anyone writing platform code
 
 1. **Never guess an API.** Read the vendored bindings under
@@ -362,35 +410,70 @@ These are the dangerous class: the call returns success and nothing works.
 3. **`tray-icon` and `muda` types are `Rc`-based and `!Send`**, and — along with
    `GlobalHotKeyManager` — require the main thread with a live event loop.
    Failure to satisfy that is also silent.
+4. **PipeWire delivers empty buffers, and they look exactly like real ones.**
+   Mutter hands over a buffer with `chunk->size == 0` when nothing on screen has
+   changed. Accepting the first buffer offered therefore yields a black PNG on
+   an idle desktop — a structurally perfect frame containing nothing. A still
+   capture must keep waiting until a buffer actually carries pixels.
+5. **A malformed SPA POD is not an error, it is a hang.** The server does not
+   reject a parameter it cannot read; the stream simply never reaches
+   `Streaming`. Encoding bugs must be caught by byte-level tests, because at
+   runtime they present as a timeout with nothing to go on.
+6. **`spa_pod_builder_pad` does nothing inside a Choice or an Array.** Every POD
+   is padded to eight bytes *except* the alternatives inside a choice body,
+   which are packed contiguously at exactly the child's size. Padding them "for
+   consistency" produces a POD the server reads as garbage — see the previous
+   entry for how that presents.
+
+7. **A full Linux workspace check from macOS reaches target `pkg-config`.**
+   `scrozz-shell -> tray-icon -> libappindicator -> GTK` asks for Linux
+   GLib/GObject/GIO/Pango/GTK metadata even though `cargo check` never links.
+   Without a Linux sysroot that failure is expected; check `scrozz-capture`
+   independently and let the Ubuntu CI gate check the native shell. Never point
+   `PKG_CONFIG_ALLOW_CROSS` at the host's Darwin libraries.
 
 ### Process-global state
 
-4. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
+8. **`set_event_handler` in both `global-hotkey` and `muda` is a `OnceCell`.**
    Setting it once permanently starves the process-global receiver channel for
    *every* other consumer in the process. Use `receiver()` instead; a library
    crate must never claim the handler.
 
 ### Coordinate systems
 
-5. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
+9. **AppKit is bottom-left origin; Scrozz is top-left.** `NSScreen.frame`,
    `visibleFrame` and Vision's normalised text boxes all need flipping. This is
    the classic "everything is upside down" bug and it is easy to get almost-right.
-6. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
+10. **Windows virtual-desktop coordinates go negative** when a monitor sits left of
    or above the primary. Never assume the origin is `(0, 0)`.
+11. **A PipeWire stride is not `width * 4`.** The producer picks it, and it is
+    routinely larger. Reading the buffer linearly gives the classic diagonal
+    shear, which looks like a decoding bug and is not. The last row is also
+    entitled to end after `width * 4` bytes rather than a full stride, so
+    demanding one more byte rejects a perfectly good buffer.
 
 ### Scale
 
-7. **There is no single app-wide scale factor on Windows or Wayland.** Windows
-   desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
-   Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
+12. **There is no single app-wide scale factor on Windows or Wayland.** Windows
+    desktops routinely mix 1.0× and 1.5× monitors; Wayland has fractional scaling.
+    Scale is per-display, and `ScaleFactor` is `f64` for exactly this reason.
+13. **On Wayland, do not use a display's scale factor to convert a region to
+    pixels.** Under fractional scaling the compositor rounds the output's pixel
+    size, so the nominal scale and the real ratio disagree. The delivered frame
+    and the portal's reported logical size describe the same monitor, so their
+    ratio is the only figure that is a fact rather than an assumption.
 
 ### Testing platform code
 
-8. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
-   thread.** Anything needing the main run loop — `NSApplication`, windows, tray
-   items, hotkey managers — is unreachable from an ordinary test. Doctests run on
-   the main thread and are the workaround; failing that, test the
-   off-main-thread guard and verify real behaviour another way.
+14. **`libtest` spawns a thread per test, so no `#[test]` can reach AppKit's main
+    thread.** Anything needing the main run loop — `NSApplication`, windows, tray
+    items, hotkey managers — is unreachable from an ordinary test. Doctests run on
+    the main thread and are the workaround; failing that, test the
+    off-main-thread guard and verify real behaviour another way.
+15. **A skipped test that exits 0 is worse than no test.** It is
+    indistinguishable from a pass, so it records verification that never
+    happened. `tools/wayland-smoke.sh` exits 77 with the reason on stderr
+    instead.
 
 ---
 

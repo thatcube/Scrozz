@@ -1,19 +1,38 @@
-//! Scrolling capture: frame alignment and stitching.
+//! Scrolling capture: deterministic frame alignment, stitching and orchestration.
 //!
-//! Assembles one tall image from a sequence of frames taken while the user
-//! scrolls. The hard part is not the seam but knowing *how far* the content
-//! moved between frames, which must be recovered from the pixels themselves
-//! because no platform reports it.
-//!
-//! Sticky headers and footers are the characteristic failure: a toolbar pinned
-//! to the top of the page does not scroll with the content, so naive alignment
-//! either repeats it down the whole stitched image or drags the alignment off.
+//! Alignment is intentionally integer-only. The same frame sequence must produce
+//! the same seams on every supported architecture or the golden fixtures become
+//! noise instead of a contract.
 
 #![forbid(unsafe_code)]
 
 use scrozz_core::{Frame, Result};
 
-/// Assembles overlapping frames into one tall image.
+pub mod align;
+pub mod chrome;
+pub mod luma;
+pub mod session;
+pub mod stitch;
+
+pub use align::{
+    AlignError, Alignment, AlignmentConfig, AnalysisBand, AnalysisSpan, align_axis, align_axis_in,
+    align_horizontal, align_horizontal_in, align_vertical, align_vertical_in,
+};
+pub use chrome::{
+    ChromeBands, ChromeConfig, SideChromeBands, conservative_chrome, conservative_side_chrome,
+    detect_sticky_chrome, detect_sticky_side_chrome,
+};
+pub use luma::{ColumnProfile, LumaPlane, RowProfile};
+pub use session::{
+    AtomicCancellation, BackendFrameSource, CancelAction, CancelSignal, CompletionReason,
+    FrameSource, NeverCancel, NoopPacer, Pacer, Progress, ScrollSession, ScrollSessionConfig,
+    SessionOutput, ThreadPacer,
+};
+pub use stitch::{
+    PushOutcome, ScrollStitcher, SeamQuality, StitchConfig, StitchSummary, StopReason,
+};
+
+/// Assembles overlapping frames into one long image.
 pub trait Stitcher {
     /// Adds a frame to the sequence.
     ///

@@ -54,6 +54,8 @@ pub const SHORTCUT_CAPTURE_WINDOW: &str = "Uses this shortcut for Capture Window
 pub const SHORTCUT_CAPTURE_FULLSCREEN: &str = "Uses this shortcut for Capture Fullscreen.";
 /// Settings description for Capture All Displays.
 pub const SHORTCUT_CAPTURE_ALL_DISPLAYS: &str = "Uses this shortcut for Capture All Displays.";
+/// Settings description for Scrolling Capture.
+pub const SHORTCUT_SCROLLING_CAPTURE: &str = "Uses this shortcut for Scrolling Capture.";
 /// Settings description for Record Screen.
 pub const SHORTCUT_RECORD_SCREEN: &str = "Uses this shortcut for Record Screen.";
 

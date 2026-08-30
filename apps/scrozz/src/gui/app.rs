@@ -66,7 +66,8 @@ use scrozz_annotate::{
     AnalysisCancellation, Document, DocumentData, SmartFrameAnalysis, SmartFramePreset,
 };
 use scrozz_core::{
-    CaptureTarget, Error as CoreError, LockEscape, SelectionCapabilities, SelectionMode,
+    CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, LockEscape, ScrollAxis,
+    SelectionCapabilities, SelectionMode,
 };
 use scrozz_record::{
     CameraDevice, CameraDeviceId, CameraPermission, CameraPreviewSession, CameraRequest,
@@ -79,9 +80,11 @@ use scrozz_shell::{
     hotkey::{DesiredBinding, Rejection},
     play_screenshot_sound,
 };
+use scrozz_stitch::{CancelAction, Progress};
 use scrozz_store::{CaptureId, RetentionPolicy, Timestamp};
 use scrozz_ui::history::{HistoryAction, HistoryViewModel};
 use scrozz_ui::settings::RecordingSettingsAction;
+use scrozz_ui::{ScrollHudAction, ScrollHudState, ScrollHudStatus};
 
 use crate::{
     after_capture::{
@@ -89,6 +92,7 @@ use crate::{
         MediaKind, current_availability,
     },
     cli::{Cli, InteractiveMode, SettingsCommand},
+    commands::{ScrollingTarget, wayland_portal_picker_target},
     fault::{CliError, CliResult},
     gui::{
         action::{Action, CaptureKind, CaptureOrigin},
@@ -103,7 +107,7 @@ use crate::{
         },
         pipeline::{
             CaptureBytes, DragGeometry, DragSubject, HistoryOperation, Job, Outcome,
-            PinEditorSnapshot, Pipeline, PreparedHistoryDrag,
+            PinEditorSnapshot, Pipeline, PreparedHistoryDrag, ReadyCapture,
         },
         recording::{
             ActiveVideoEditor, ArmedStart, Completion, FinalisedRecording, PendingSelection,
@@ -113,6 +117,7 @@ use crate::{
         server::{Admission, ForwardedCapture, Forwarder, Request, Server},
     },
     json::Json,
+    platform,
     report::Report,
     shortcuts::{ShortcutAction, ShortcutStore, Shortcuts},
 };
@@ -164,6 +169,14 @@ pub const TRAY_ENV: &str = "SCROZZ_GUI_TRAY";
 /// someone's screen: the app is not trusted to be told to quit, it is given a
 /// deadline it cannot miss.
 pub const DEADLINE_ENV: &str = "SCROZZ_GUI_TIMEOUT_MS";
+
+/// How long automatic scrolling waits for the overlay to confirm that its
+/// native window really did become mouse-transparent.
+///
+/// The viewport command is asynchronous, so a request is not an
+/// acknowledgement. Without a confirmation the session is abandoned rather than
+/// scrolling Scrozz's own overlay.
+const PASSTHROUGH_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Set to `1` to take one capture immediately at startup.
 ///
@@ -449,6 +462,7 @@ fn capture_action_label(kind: CaptureKind) -> &'static str {
         CaptureKind::Window => scrozz_core::product_copy::CAPTURE_WINDOW,
         CaptureKind::Fullscreen => scrozz_core::product_copy::CAPTURE_FULLSCREEN,
         CaptureKind::AllDisplays => scrozz_core::product_copy::CAPTURE_ALL_DISPLAYS,
+        CaptureKind::Scrolling => scrozz_core::product_copy::SCROLLING_CAPTURE,
     }
 }
 
@@ -493,6 +507,10 @@ fn picker_fallback(prompt: permission::Prompt) -> PickerFallback {
             CaptureKind::AllDisplays => {
                 "Apple's picker authorizes one screen at a time, so it cannot truthfully produce \
                  an All Displays capture."
+            }
+            CaptureKind::Scrolling => {
+                "Apple's picker returns one still frame, so it cannot follow a window while it \
+                 scrolls. Grant direct access in System Settings to capture a scrolling page."
             }
             CaptureKind::AllInOne | CaptureKind::Window | CaptureKind::Fullscreen => {
                 "Apple's picker cannot complete this capture without broadening the requested \
@@ -735,6 +753,37 @@ pub struct App {
     connection_test: Option<Receiver<CliResult<()>>>,
     /// Cards currently on screen, so Upload availability can be refreshed.
     visible_cards: BTreeSet<CardId>,
+    /// The scrolling HUD as this coordinator last published it.
+    scroll_hud: Option<ScrollHudState>,
+    /// The card a running scrolling capture will become.
+    scrolling_card: Option<CardId>,
+    /// The window/display chosen when the axis picker opened.
+    scrolling_target: Option<ScrollingTarget>,
+    /// A finished scrolling capture held back one pass, so an abort that raced
+    /// the last frame still wins.
+    scrolling_ready: Option<Box<ReadyCapture>>,
+    /// The card an explicit discard is waiting to arrive for.
+    scrolling_abort_pending: Option<CardId>,
+    /// A started session waiting for the overlay to confirm click-through.
+    scrolling_start_pending: Option<PendingScrollingStart>,
+    /// Whether a keep has already been asked for, so a second invocation means
+    /// discard rather than a second keep.
+    scrolling_keep_pending: bool,
+    scrolling_target_resolver: Box<dyn Fn() -> CliResult<ScrollingTarget>>,
+    scrolling_target_refresher: Box<dyn Fn(ScrollingTarget) -> CliResult<ScrollingTarget>>,
+}
+
+/// A scrolling capture that has been prepared but not yet posted.
+///
+/// Automatic scrolling must not synthesize its first gesture until the overlay
+/// window has *confirmed* it is mouse-transparent; until then the wheel event
+/// would land on Scrozz's own window.
+struct PendingScrollingStart {
+    axis: ScrollAxis,
+    card: CardId,
+    target: Box<ScrollingTarget>,
+    needs_passthrough: bool,
+    passthrough_requested_at: Instant,
 }
 
 /// A capture the annotation editor has been asked to open.
@@ -920,6 +969,76 @@ pub struct PendingDrag {
     pub geometry: DragGeometry,
 }
 
+/// Chooses the window a scrolling capture will follow, as it is right now.
+fn snapshot_scrolling_target() -> CliResult<ScrollingTarget> {
+    let backend = platform::capture_backend()?;
+    if crate::commands::is_wayland() {
+        // Wayland never names a window, so the portal picker is the selection.
+        return crate::commands::resolve_scrolling_target(
+            backend.as_ref(),
+            CaptureRequest {
+                target: wayland_portal_picker_target(),
+                cursor: CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+        );
+    }
+    let display = backend.active_display()?;
+    let request = CaptureRequest {
+        target: CaptureTarget::Display(display.id),
+        cursor: CursorMode::Hidden,
+        include_window_shadow: false,
+    };
+    crate::commands::resolve_scrolling_target(backend.as_ref(), request)
+}
+
+/// Re-resolves a snapshotted target immediately before capture starts.
+fn refresh_scrolling_target(target: ScrollingTarget) -> CliResult<ScrollingTarget> {
+    let backend = platform::capture_backend()?;
+    target.refresh(backend.as_ref())
+}
+
+fn describe_scroll_progress(progress: &Progress) -> String {
+    match progress {
+        Progress::Prepared {
+            driver,
+            automatic,
+            manual_reason,
+        } => {
+            if *automatic {
+                format!("started scrolling with {driver}")
+            } else {
+                format!(
+                    "is ready in manual mode ({driver}); scroll the page to continue: {}",
+                    manual_reason
+                        .as_deref()
+                        .unwrap_or("automatic scrolling is unavailable")
+                )
+            }
+        }
+        Progress::FrameCaptured { frame } => format!("captured scrolling frame {frame}"),
+        Progress::WaitingForManualScroll => "is waiting for the page to scroll".to_owned(),
+        Progress::Advanced {
+            frame,
+            delta,
+            output_extent,
+            ..
+        } => format!(
+            "stitched frame {frame} ({delta} px advanced, {output_extent} px along the capture axis)"
+        ),
+        Progress::Stalled { count } => format!("saw no movement ({count})"),
+        Progress::Interrupted { reason } => {
+            format!("kept the valid stitched prefix after {reason}")
+        }
+        Progress::Finished {
+            reason,
+            frames,
+            output_extent,
+            ..
+        } => format!("finished after {frames} frames, {output_extent} px ({reason:?})"),
+    }
+}
+
 impl App {
     /// Builds the application, connecting everything that will connect.
     ///
@@ -935,6 +1054,42 @@ impl App {
         surface: Box<dyn CardSurface>,
         selector: Arc<dyn CaptureSelector>,
         permission_ui_available: bool,
+    ) -> CliResult<Self> {
+        Self::new_with_scrolling_target_handlers(
+            config,
+            surface,
+            selector,
+            permission_ui_available,
+            Box::new(snapshot_scrolling_target),
+            Box::new(refresh_scrolling_target),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_scrolling_target_resolver(
+        config: Config,
+        surface: Box<dyn CardSurface>,
+        selector: Arc<dyn CaptureSelector>,
+        permission_ui_available: bool,
+        scrolling_target_resolver: Box<dyn Fn() -> CliResult<ScrollingTarget>>,
+    ) -> CliResult<Self> {
+        Self::new_with_scrolling_target_handlers(
+            config,
+            surface,
+            selector,
+            permission_ui_available,
+            scrolling_target_resolver,
+            Box::new(Ok),
+        )
+    }
+
+    fn new_with_scrolling_target_handlers(
+        config: Config,
+        surface: Box<dyn CardSurface>,
+        selector: Arc<dyn CaptureSelector>,
+        permission_ui_available: bool,
+        scrolling_target_resolver: Box<dyn Fn() -> CliResult<ScrollingTarget>>,
+        scrolling_target_refresher: Box<dyn Fn(ScrollingTarget) -> CliResult<ScrollingTarget>>,
     ) -> CliResult<Self> {
         let waker = surface.waker();
         let pipeline = Pipeline::start_with_history_waker_and_retention(
@@ -1175,6 +1330,15 @@ impl App {
             sharing_settings_requested: false,
             connection_test: None,
             visible_cards: BTreeSet::new(),
+            scroll_hud: None,
+            scrolling_card: None,
+            scrolling_target: None,
+            scrolling_ready: None,
+            scrolling_abort_pending: None,
+            scrolling_start_pending: None,
+            scrolling_keep_pending: false,
+            scrolling_target_resolver,
+            scrolling_target_refresher,
         };
         app.refresh_tray_shortcuts();
 
@@ -1207,9 +1371,9 @@ impl App {
 
     /// Services every source once. Never blocks.
     ///
-    /// Order matters slightly: input first, so a capture asked for on this tick
-    /// is already in flight before outcomes are drained, and card events last,
-    /// so a card presented on this tick can be acted on immediately.
+    /// Order matters: HUD cancellation is applied before a completion already
+    /// waiting in the worker queue, so an explicit Discard remains authoritative
+    /// at the final frame boundary.
     pub fn tick(&mut self) -> Tick {
         self.tick_with_editor(None)
     }
@@ -1245,6 +1409,10 @@ impl App {
         self.drain_save_dialog();
         self.drain_connection_test();
         self.drain_cards(editor);
+        // After the HUD's own events: an abort raised this frame must beat the
+        // finished capture that was held back for exactly one pass.
+        self.drain_scrolling_start();
+        self.drain_scrolling_ready();
         self.drain_drags();
         self.drain_history();
         self.flush_recent_captures_overlay_settings(false);
@@ -1685,106 +1853,22 @@ impl App {
                     target,
                 } => self.open_history_recording(&capture, path, duration_secs, target),
                 Outcome::Ready(ready) => {
-                    self.captures += 1;
-                    if let Err(error) = play_screenshot_sound(&self.config.screenshot_sound) {
-                        let fell_back = !matches!(
-                            self.config.screenshot_sound,
-                            ScreenshotSound::Shutter | ScreenshotSound::Off
+                    // Scrolling publication is atomically sealed on the worker
+                    // before durable actions run. Hold the completed value until
+                    // the end of this coordinator pass, then present it.
+                    if self.scrolling_card == Some(ready.card.id) {
+                        debug_assert!(
+                            self.scrolling_ready.is_none(),
+                            "only one scrolling capture can be ready at a time"
                         );
-                        if fell_back {
-                            let _ = play_screenshot_sound(&ScreenshotSound::Shutter);
-                        }
-                        if !self.sound_warning_shown {
-                            self.sound_warning_shown = true;
-                            self.note(if fell_back {
-                                format!(
-                                    "the screenshot succeeded, but its selected sound failed; using the default this session: {error}"
-                                )
-                            } else {
-                                format!(
-                                    "the screenshot succeeded, but its sound could not play: {error}"
-                                )
-                            });
-                        }
+                        self.scrolling_ready = Some(ready);
+                        continue;
                     }
-                    let ready = *ready;
-                    let mut card = ready.card;
-                    // The card is told what Upload can do the moment it is
-                    // built, so a control that cannot work is never offered as
-                    // if it could.
-                    card.upload_available = self.cloud_settings.upload_enabled;
-                    card.upload_unavailable_reason = self.cloud_settings.unavailable_reason.clone();
-                    let history_changed = card.capture_id.is_some();
-                    let card_id = card.id;
-                    let capture_id = card.capture_id.clone();
-                    let retained_elsewhere = ready.retained_elsewhere;
-                    let exported = ready.exported;
-                    let summary = card.summary();
-                    for (action, error) in ready.actions.failures() {
-                        self.note(format!("{card_id} {} failed: {error}", action.label()));
-                    }
-                    for step in &ready.actions.steps {
-                        match &step.outcome {
-                            crate::after_capture::ActionOutcome::Succeeded(
-                                ActionEffect::Completed,
-                            ) if step.action == AfterCaptureAction::CopyToClipboard => {
-                                self.note(format!("{card_id} copied to the clipboard"));
-                            }
-                            crate::after_capture::ActionOutcome::Succeeded(
-                                ActionEffect::Saved(path),
-                            ) => {
-                                self.note(format!("{card_id} saved to {}", path.display()));
-                            }
-                            crate::after_capture::ActionOutcome::Succeeded(
-                                ActionEffect::Uploaded(url),
-                            ) => {
-                                self.note(format!("{card_id} uploaded to {url}"));
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    let show_overlay = ready
-                        .actions
-                        .has_effect(&ActionEffect::ShowRecentCapturesOverlay);
-                    let open_editor = ready.actions.has_effect(&ActionEffect::OpenEditor);
-                    let mut retained = false;
-                    if show_overlay {
-                        if let Err(err) = self.surface.present(card) {
-                            self.note(format!(
-                                "{card_id} could not be shown in Recent Captures Overlay: {err}"
-                            ));
-                        } else {
-                            retained = true;
-                            self.visible_cards.insert(card_id);
-                            self.card_retention
-                                .insert(card_id, (retained_elsewhere, exported));
-                            if let Some(capture_id) = capture_id {
-                                self.card_capture_ids.insert(card_id, capture_id);
-                            }
-                            self.note(summary);
-                        }
-                    } else {
-                        self.note(summary);
-                    }
-                    if open_editor {
-                        if self.pipeline.post(Job::Open(card_id)) {
-                            retained = true;
-                            if !show_overlay {
-                                self.editor_only_cards.insert(card_id);
-                            }
-                        } else {
-                            self.note(format!(
-                                "{card_id} could not be queued for Open Editor: the capture worker has gone"
-                            ));
-                        }
-                    }
-                    if !retained {
-                        self.pipeline.post(Job::Release(card_id));
-                    }
-                    if history_changed {
-                        self.with_history(|history| history.refresh_from_start(Timestamp::now()));
-                    }
+                    self.handle_ready(ready);
+                }
+                Outcome::Progress { card, progress } => {
+                    self.update_scroll_hud(card, &progress);
+                    self.note(format!("{card} {}", describe_scroll_progress(&progress)));
                 }
                 Outcome::Restored(mut card) => {
                     card.upload_available = self.cloud_settings.upload_enabled;
@@ -1812,7 +1896,11 @@ impl App {
                 } => {
                     let permission_denied =
                         matches!(&error, CliError::Core(CoreError::PermissionDenied { .. }));
-                    self.note(format!("{card} failed: {error}"));
+                    if kind != CaptureKind::Scrolling
+                        || !self.finish_failed_scrolling_capture(card, &error)
+                    {
+                        self.note(format!("{card} failed: {error}"));
+                    }
                     if permission_denied {
                         self.handle_capture_permission_failure(kind, origin, Self::screen_access());
                     }
@@ -2326,6 +2414,30 @@ impl App {
                         "pinned capture {} cannot be positioned: {reason}",
                         capture.0
                     ));
+                }
+            }
+        }
+
+        let mut scrolling = Vec::new();
+        while let Some(action) = self.surface.poll_scroll_hud() {
+            scrolling.push(action);
+        }
+        for action in scrolling {
+            match action {
+                ScrollHudAction::Start(axis) if self.scrolling_card.is_none() => {
+                    self.start_scrolling_capture(axis);
+                }
+                ScrollHudAction::Start(_) => {
+                    self.note("a scrolling capture is already running");
+                }
+                ScrollHudAction::Keep if self.scrolling_card.is_some() => {
+                    self.keep_scrolling_capture();
+                }
+                ScrollHudAction::Abort if self.scrolling_card.is_some() => {
+                    self.abort_scrolling_capture();
+                }
+                ScrollHudAction::Keep | ScrollHudAction::Abort => {
+                    self.finish_scrolling_hud();
                 }
             }
         }
@@ -2996,6 +3108,13 @@ impl App {
     }
 
     fn begin_capture(&mut self, origin: CaptureOrigin, kind: CaptureKind) {
+        // Scrolling is a session, not a shot. A second invocation of the same
+        // command is the keyboard-only way to end it: keep first, discard on the
+        // one after that.
+        if kind == CaptureKind::Scrolling {
+            self.begin_scrolling_capture(origin);
+            return;
+        }
         let pending = PendingCapture::new(kind, origin);
         let access = Self::screen_access();
         if access != Access::Granted && !self.permission_ui_available {
@@ -3032,6 +3151,335 @@ impl App {
                  Scrozz menu to retry now",
             );
         }
+    }
+
+    /// Publishes a finished capture: sound, card, editor, retention, history.
+    ///
+    /// Split out of the pipeline drain so a scrolling capture can be held for
+    /// one pass and then published through exactly the same path as any other.
+    fn handle_ready(&mut self, ready: Box<ReadyCapture>) {
+        if self.scrolling_card == Some(ready.card.id) {
+            self.finish_scrolling_hud();
+        }
+        self.captures += 1;
+        if let Err(error) = play_screenshot_sound(&self.config.screenshot_sound) {
+            let fell_back = !matches!(
+                self.config.screenshot_sound,
+                ScreenshotSound::Shutter | ScreenshotSound::Off
+            );
+            if fell_back {
+                let _ = play_screenshot_sound(&ScreenshotSound::Shutter);
+            }
+            if !self.sound_warning_shown {
+                self.sound_warning_shown = true;
+                self.note(if fell_back {
+                            format!(
+                                "the screenshot succeeded, but its selected sound failed; using the default this session: {error}"
+                            )
+                        } else {
+                            format!(
+                                "the screenshot succeeded, but its sound could not play: {error}"
+                            )
+                        });
+            }
+        }
+        let ready = *ready;
+        let mut card = ready.card;
+        // The card is told what Upload can do the moment it is
+        // built, so a control that cannot work is never offered as
+        // if it could.
+        card.upload_available = self.cloud_settings.upload_enabled;
+        card.upload_unavailable_reason = self.cloud_settings.unavailable_reason.clone();
+        let history_changed = card.capture_id.is_some();
+        let card_id = card.id;
+        let capture_id = card.capture_id.clone();
+        let retained_elsewhere = ready.retained_elsewhere;
+        let exported = ready.exported;
+        let summary = card.summary();
+        for (action, error) in ready.actions.failures() {
+            self.note(format!("{card_id} {} failed: {error}", action.label()));
+        }
+        for step in &ready.actions.steps {
+            match &step.outcome {
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Completed)
+                    if step.action == AfterCaptureAction::CopyToClipboard =>
+                {
+                    self.note(format!("{card_id} copied to the clipboard"));
+                }
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Saved(path)) => {
+                    self.note(format!("{card_id} saved to {}", path.display()));
+                }
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Uploaded(url)) => {
+                    self.note(format!("{card_id} uploaded to {url}"));
+                }
+                _ => {}
+            }
+        }
+
+        let show_overlay = ready
+            .actions
+            .has_effect(&ActionEffect::ShowRecentCapturesOverlay);
+        let open_editor = ready.actions.has_effect(&ActionEffect::OpenEditor);
+        let mut retained = false;
+        if show_overlay {
+            if let Err(err) = self.surface.present(card) {
+                self.note(format!(
+                    "{card_id} could not be shown in Recent Captures Overlay: {err}"
+                ));
+            } else {
+                retained = true;
+                self.visible_cards.insert(card_id);
+                self.card_retention
+                    .insert(card_id, (retained_elsewhere, exported));
+                if let Some(capture_id) = capture_id {
+                    self.card_capture_ids.insert(card_id, capture_id);
+                }
+                self.note(summary);
+            }
+        } else {
+            self.note(summary);
+        }
+        if open_editor {
+            if self.pipeline.post(Job::Open(card_id)) {
+                retained = true;
+                if !show_overlay {
+                    self.editor_only_cards.insert(card_id);
+                }
+            } else {
+                self.note(format!(
+                    "{card_id} could not be queued for Open Editor: the capture worker has gone"
+                ));
+            }
+        }
+        if !retained {
+            self.pipeline.post(Job::Release(card_id));
+        }
+        if history_changed {
+            self.with_history(|history| history.refresh_from_start(Timestamp::now()));
+        }
+    }
+
+    fn begin_scrolling_capture(&mut self, origin: CaptureOrigin) {
+        if self.scrolling_card.is_some() {
+            if self.scrolling_keep_pending {
+                self.abort_scrolling_capture();
+            } else {
+                self.keep_scrolling_capture();
+            }
+            return;
+        }
+        if self.scroll_hud.is_some() {
+            self.finish_scrolling_hud();
+            self.note("cancelled scrolling capture before it started");
+            return;
+        }
+
+        let access = Self::screen_access();
+        if access != Access::Granted {
+            self.handle_capture_permission_failure(CaptureKind::Scrolling, origin, access);
+            return;
+        }
+
+        let target = match (self.scrolling_target_resolver)() {
+            Ok(target) => target,
+            Err(error) => {
+                self.note(format!("could not select a scrolling target: {error}"));
+                return;
+            }
+        };
+        self.scrolling_target = Some(target);
+        self.set_scroll_hud(ScrollHudState::choosing(ScrollAxis::Vertical));
+        self.note("choose whether the scrolling capture should grow vertically or horizontally");
+    }
+
+    fn start_scrolling_capture(&mut self, axis: ScrollAxis) {
+        let Some(selected) = self.scrolling_target.take() else {
+            self.note("the snapshotted scrolling target is no longer available");
+            self.finish_scrolling_hud();
+            return;
+        };
+        let access = Self::screen_access();
+        if access != Access::Granted {
+            self.note_permission_unavailable(CaptureKind::Scrolling, access);
+            self.finish_scrolling_hud();
+            return;
+        }
+        // Re-resolved on purpose: the axis picker gave the user time to focus
+        // something else, and capturing the window they were looking at when
+        // the HUD opened would be a different capture than the one they asked
+        // for.
+        let target = match (self.scrolling_target_refresher)(selected) {
+            Ok(target) => target,
+            Err(error) => {
+                self.note(format!(
+                    "the selected scrolling target changed before capture started: {error}"
+                ));
+                self.finish_scrolling_hud();
+                return;
+            }
+        };
+
+        let card = self.pipeline.allocate();
+        self.scrolling_card = Some(card);
+        let needs_passthrough = target.may_synthesize_scroll();
+        self.set_scroll_hud(ScrollHudState::prepared(axis, needs_passthrough));
+        self.surface.request_scroll_passthrough(needs_passthrough);
+        self.scrolling_start_pending = Some(PendingScrollingStart {
+            axis,
+            card,
+            target: Box::new(target),
+            needs_passthrough,
+            passthrough_requested_at: Instant::now(),
+        });
+    }
+
+    fn drain_scrolling_start(&mut self) {
+        let Some(pending) = self.scrolling_start_pending.as_ref() else {
+            return;
+        };
+        if pending.needs_passthrough && !self.surface.scroll_passthrough_ready() {
+            if pending.passthrough_requested_at.elapsed() >= PASSTHROUGH_ACK_TIMEOUT {
+                self.note(
+                    "automatic scrolling did not start because the overlay could not confirm \
+                     native click-through",
+                );
+                self.finish_scrolling_hud();
+            }
+            return;
+        }
+        let pending = self
+            .scrolling_start_pending
+            .take()
+            .expect("checked pending scrolling start");
+        if !self
+            .pipeline
+            .post_scrolling(pending.axis, pending.card, pending.target)
+        {
+            self.note("the capture worker has gone");
+            self.finish_scrolling_hud();
+        }
+    }
+
+    fn drain_scrolling_ready(&mut self) {
+        if let Some(ready) = self.scrolling_ready.take() {
+            self.handle_ready(ready);
+        }
+    }
+
+    fn keep_scrolling_capture(&mut self) {
+        if self.scrolling_start_pending.is_some() {
+            self.note("cancelled scrolling capture before the first frame");
+            self.finish_scrolling_hud();
+            return;
+        }
+        if !self.pipeline.cancel_scrolling(CancelAction::Keep) {
+            self.note("the scrolling capture is already publishing its output");
+            return;
+        }
+        self.scrolling_keep_pending = true;
+        self.note(
+            "finishing the scrolling capture with the stitched frames so far; \
+             invoke Capture Scrolling again to discard",
+        );
+    }
+
+    fn abort_scrolling_capture(&mut self) {
+        let Some(card) = self.scrolling_card else {
+            self.finish_scrolling_hud();
+            return;
+        };
+        if self.scrolling_start_pending.take().is_some() {
+            self.note("discarded scrolling capture before the first frame");
+            self.finish_scrolling_hud();
+            return;
+        }
+        if !self.pipeline.cancel_scrolling(CancelAction::Abort) {
+            self.note("the scrolling capture is already publishing and cannot be discarded");
+            return;
+        }
+        self.scrolling_abort_pending = Some(card);
+        self.hide_scrolling_hud();
+        self.note("discarding the scrolling capture");
+    }
+
+    fn set_scroll_hud(&mut self, state: ScrollHudState) {
+        self.surface.show_scroll_hud(state.clone());
+        self.scroll_hud = Some(state);
+    }
+
+    fn finish_scrolling_hud(&mut self) {
+        self.hide_scrolling_hud();
+        self.scrolling_target = None;
+        self.scrolling_abort_pending = None;
+        self.scrolling_start_pending = None;
+        self.scrolling_keep_pending = false;
+        self.scrolling_card = None;
+    }
+
+    fn finish_failed_scrolling_capture(&mut self, card: CardId, error: &CliError) -> bool {
+        if self.scrolling_card != Some(card) {
+            return false;
+        }
+        if error.is_cancellation() {
+            self.note(format!("{card} discarded"));
+        } else {
+            self.note(format!("{card} scrolling capture failed: {error}"));
+        }
+        self.finish_scrolling_hud();
+        true
+    }
+
+    fn hide_scrolling_hud(&mut self) {
+        self.surface.request_scroll_passthrough(false);
+        self.surface.hide_scroll_hud();
+        self.scroll_hud = None;
+    }
+
+    fn update_scroll_hud(&mut self, card: CardId, progress: &Progress) {
+        if self.scrolling_card != Some(card) {
+            return;
+        }
+        let Some(mut state) = self.scroll_hud.clone() else {
+            return;
+        };
+        match progress {
+            Progress::Prepared { automatic, .. } => {
+                state.status = ScrollHudStatus::Prepared;
+                state.automatic = *automatic;
+                if !*automatic {
+                    // Manual capture needs the pointer back: the user is the
+                    // one scrolling now.
+                    self.surface.request_scroll_passthrough(false);
+                }
+            }
+            Progress::FrameCaptured { frame } => {
+                state.status = ScrollHudStatus::Capturing;
+                state.frame = *frame;
+            }
+            Progress::WaitingForManualScroll => {
+                state.status = ScrollHudStatus::WaitingForManualScroll;
+                state.automatic = false;
+            }
+            Progress::Advanced {
+                frame,
+                delta,
+                output_extent,
+                ..
+            } => {
+                state.status = ScrollHudStatus::Capturing;
+                state.frame = *frame;
+                state.delta = Some(*delta);
+                state.output_extent = *output_extent;
+            }
+            Progress::Stalled { count } => {
+                state.status = ScrollHudStatus::Stalled(*count);
+            }
+            Progress::Interrupted { .. } => {}
+            Progress::Finished { .. } => {
+                state.status = ScrollHudStatus::Finalizing;
+            }
+        }
+        self.set_scroll_hud(state);
     }
 
     fn note_permission_unavailable(&mut self, kind: CaptureKind, access: Access) {
@@ -4365,6 +4813,13 @@ impl App {
     /// its usefulness by even a second is the thing most likely to be left on
     /// someone's screen.
     pub fn shut_down(&mut self) {
+        // First: a running scrolling session holds the overlay click-through,
+        // and a quit that left it held would leave a transparent window over
+        // the desktop for as long as the process took to die.
+        if self.scrolling_card.is_some() || self.scrolling_start_pending.is_some() {
+            self.pipeline.cancel_scrolling(CancelAction::Keep);
+        }
+        self.finish_scrolling_hud();
         if let Err(error) = self.save_recording_settings_panel() {
             self.note(format!(
                 "recording settings could not be saved during shutdown: {error}"
@@ -6031,8 +6486,8 @@ mod tests {
     use crate::gui::card::{Card, CardId, Recording};
     use crate::gui::selection::UnsupportedSelector;
     use scrozz_core::{
-        Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
-        PhysicalSize, PixelFormat, Provenance, ScaleFactor, WindowId,
+        Capture, CaptureTarget, ColorSpace, Display, DisplayId, Frame, LogicalPoint, LogicalRect,
+        LogicalSize, PhysicalSize, PixelFormat, Provenance, ScaleFactor, WindowId,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6051,6 +6506,12 @@ mod tests {
 
     fn forwarded_capture(kind: CaptureKind) -> ForwardedCapture {
         let (provenance, target) = match kind {
+            // A scrolling capture is never forwarded as a one-shot; the test
+            // fixture treats it as the window capture it is assembled from.
+            CaptureKind::Scrolling => (
+                Provenance::Window,
+                CaptureTarget::Window(WindowId("fixture-window".to_owned())),
+            ),
             CaptureKind::Fullscreen => (
                 Provenance::Display,
                 CaptureTarget::Region(LogicalRect::new(
@@ -8349,6 +8810,183 @@ mod tests {
         assert!(!app.take_settings_request());
     }
 
+    fn scrolling_app() -> (App, Recording) {
+        let surface = Recording::new();
+        let handle = surface.handle();
+        let app = App::new_with_scrolling_target_resolver(
+            Config::sealed(),
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+            false,
+            Box::new(|| Ok(fixture_scrolling_target())),
+        )
+        .expect("a sealed app must start");
+        (app, handle)
+    }
+
+    #[test]
+    fn scrolling_capture_opens_an_axis_picker_before_anything_is_posted() {
+        let (mut app, surface) = scrolling_app();
+
+        assert_eq!(
+            app.perform(Action::Capture(CaptureKind::Scrolling)),
+            Tick::Continue
+        );
+
+        let hud = surface.scrolling_hud().expect("axis picker");
+        assert_eq!(hud.status, ScrollHudStatus::ChoosingAxis);
+        assert!(
+            app.scrolling_card.is_none(),
+            "no card may be allocated until an axis is chosen"
+        );
+    }
+
+    #[test]
+    fn a_second_scrolling_invocation_cancels_an_unstarted_picker() {
+        let (mut app, surface) = scrolling_app();
+        app.perform(Action::Capture(CaptureKind::Scrolling));
+        assert!(surface.scrolling_hud().is_some());
+
+        app.perform(Action::Capture(CaptureKind::Scrolling));
+        assert!(surface.scrolling_hud().is_none());
+        assert!(!surface.scroll_passthrough_requested());
+    }
+
+    #[test]
+    fn automatic_scrolling_waits_for_an_acknowledged_click_through() {
+        let (mut app, surface) = scrolling_app();
+        surface.set_scroll_passthrough_ready(false);
+        app.perform(Action::Capture(CaptureKind::Scrolling));
+
+        app.start_scrolling_capture(ScrollAxis::Vertical);
+        assert!(surface.scroll_passthrough_requested());
+        assert!(
+            app.scrolling_start_pending.is_some(),
+            "the session must not be posted before the overlay confirms transparency"
+        );
+
+        app.drain_scrolling_start();
+        assert!(
+            app.scrolling_start_pending.is_some(),
+            "an unacknowledged request is not an acknowledgement"
+        );
+
+        surface.set_scroll_passthrough_ready(true);
+        app.drain_scrolling_start();
+        assert!(app.scrolling_start_pending.is_none());
+    }
+
+    #[test]
+    fn manual_fallback_releases_forced_passthrough() {
+        let (mut app, surface) = scrolling_app();
+        let card = CardId(17);
+        app.scrolling_card = Some(card);
+        app.set_scroll_hud(ScrollHudState::prepared(ScrollAxis::Vertical, true));
+        app.surface.request_scroll_passthrough(true);
+
+        app.update_scroll_hud(
+            card,
+            &Progress::Prepared {
+                driver: "manual fixture".to_owned(),
+                automatic: false,
+                manual_reason: Some("fixture".to_owned()),
+            },
+        );
+
+        assert!(!surface.scroll_passthrough_requested());
+        assert_eq!(
+            surface.scrolling_hud().expect("hud").status,
+            ScrollHudStatus::Prepared
+        );
+    }
+
+    #[test]
+    fn cancelled_and_failed_scrolling_sessions_release_every_ui_owner() {
+        for error in [
+            CliError::Core(CoreError::Cancelled),
+            CliError::Core(CoreError::Platform("scroll driver failed".to_owned())),
+        ] {
+            let (mut app, surface) = scrolling_app();
+            let card = CardId(18);
+            app.scrolling_card = Some(card);
+            app.scrolling_abort_pending = Some(card);
+            app.scrolling_keep_pending = true;
+            app.set_scroll_hud(ScrollHudState::prepared(ScrollAxis::Vertical, true));
+            app.surface.request_scroll_passthrough(true);
+
+            assert!(app.finish_failed_scrolling_capture(card, &error));
+
+            assert!(app.scrolling_card.is_none());
+            assert!(app.scrolling_abort_pending.is_none());
+            assert!(!app.scrolling_keep_pending);
+            assert!(surface.scrolling_hud().is_none());
+            assert!(!surface.scroll_passthrough_requested());
+        }
+    }
+
+    #[test]
+    fn discard_after_publication_seal_is_refused_without_claiming_success() {
+        let (mut app, surface) = scrolling_app();
+        let card = CardId(19);
+        app.scrolling_card = Some(card);
+        app.set_scroll_hud(ScrollHudState::prepared(ScrollAxis::Vertical, false));
+        assert!(app.pipeline.seal_scrolling_output_for_test());
+
+        app.abort_scrolling_capture();
+
+        assert!(surface.presented().is_empty());
+        assert_eq!(app.scrolling_card, Some(card));
+        assert!(app.scrolling_abort_pending.is_none());
+        assert!(surface.scrolling_hud().is_some());
+        assert!(app.notes().iter().any(
+            |note| note.contains("already publishing") && note.contains("cannot be discarded")
+        ));
+    }
+
+    #[test]
+    fn shutting_down_never_leaves_the_overlay_click_through() {
+        let (mut app, surface) = scrolling_app();
+        app.perform(Action::Capture(CaptureKind::Scrolling));
+        app.start_scrolling_capture(ScrollAxis::Vertical);
+        assert!(surface.scroll_passthrough_requested());
+
+        app.shut_down();
+
+        assert!(!surface.scroll_passthrough_requested());
+        assert!(surface.scrolling_hud().is_none());
+    }
+
+    fn fixture_scrolling_target() -> ScrollingTarget {
+        let display = Display {
+            id: DisplayId("fixture-display".to_owned()),
+            name: "Fixture display".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_200.0, 800.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 20.0),
+                LogicalSize::new(1_200.0, 780.0),
+            ),
+            scale: ScaleFactor::IDENTITY,
+            is_primary: true,
+        };
+        let window = WindowId("fixture-window".to_owned());
+        ScrollingTarget::new(
+            CaptureRequest {
+                target: CaptureTarget::Window(window.clone()),
+                cursor: CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            display,
+            LogicalRect::new(
+                LogicalPoint::new(100.0, 100.0),
+                LogicalSize::new(900.0, 600.0),
+            ),
+            window,
+        )
+    }
+
     #[test]
     fn opening_history_makes_the_window_visible_and_queues_a_query() {
         let (mut app, _) = app();
@@ -8680,8 +9318,10 @@ mod tests {
     #[test]
     fn shutting_down_twice_is_harmless() {
         // `Drop` calls it too, so it must be idempotent.
-        let (mut app, _) = app();
+        let (mut app, surface) = app();
+        app.surface.request_scroll_passthrough(true);
         app.shut_down();
+        assert!(!surface.scroll_passthrough_requested());
         app.shut_down();
     }
 

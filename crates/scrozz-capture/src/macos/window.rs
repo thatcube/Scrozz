@@ -67,6 +67,15 @@ fn core_graphics_z_order() -> Result<Vec<CGWindowID>> {
         .collect())
 }
 
+/// Window-server identities in documented front-to-back order.
+///
+/// Scroll delivery needs the ordering alone — no ScreenCaptureKit snapshot, no
+/// geometry — to decide which window a synthesised wheel event would actually
+/// reach, so it reads the same CoreGraphics list the picker is sorted by.
+pub(crate) fn on_screen_window_ids_front_to_back() -> Result<Vec<u32>> {
+    core_graphics_z_order()
+}
+
 fn order_front_to_back(windows: &mut [Window], front_to_back: &[CGWindowID]) {
     let ranks: HashMap<_, _> = front_to_back
         .iter()

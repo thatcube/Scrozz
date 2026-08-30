@@ -26,7 +26,7 @@ use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
 use scrozz_store::CaptureId;
 use scrozz_ui::{
     CaptureMedia, CaptureRequest, RecentCapturesOverlayEvent, RecentCapturesOverlayHandle,
-    recent_captures_overlay::THUMBNAIL_PX,
+    ScrollHudAction, ScrollHudState, recent_captures_overlay::THUMBNAIL_PX,
 };
 
 use crate::gui::{
@@ -59,6 +59,12 @@ pub struct RecentCapturesOverlayCards {
     /// `drain_events` empties the overlay's outbox in one go, so a batch of
     /// five has to be held somewhere; without this, four would be dropped.
     queued: VecDeque<CardEvent>,
+    /// Scrolling-HUD decisions, drained separately from card events.
+    ///
+    /// They share the overlay's one outbox but not the app's card vocabulary,
+    /// so they are lifted out during translation rather than being forced
+    /// through a [`CardEvent`] that has no card.
+    scroll_actions: VecDeque<ScrollHudAction>,
 }
 
 impl RecentCapturesOverlayCards {
@@ -73,6 +79,7 @@ impl RecentCapturesOverlayCards {
             reverse: HashMap::new(),
             pinned: HashMap::new(),
             queued: VecDeque::new(),
+            scroll_actions: VecDeque::new(),
         }
     }
 
@@ -214,6 +221,29 @@ impl CardSurface for RecentCapturesOverlayCards {
 
     fn unlock_pins(&mut self) {
         self.handle.unlock_pins();
+    }
+
+    fn show_scroll_hud(&mut self, state: ScrollHudState) {
+        self.handle.show_scroll_hud(state);
+    }
+
+    fn hide_scroll_hud(&mut self) {
+        self.handle.hide_scroll_hud();
+    }
+
+    fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction> {
+        if self.scroll_actions.is_empty() {
+            self.translate_batch();
+        }
+        self.scroll_actions.pop_front()
+    }
+
+    fn request_scroll_passthrough(&mut self, requested: bool) {
+        self.handle.request_scroll_passthrough(requested);
+    }
+
+    fn scroll_passthrough_ready(&self) -> bool {
+        self.handle.scroll_passthrough_ready()
     }
 
     fn poll(&mut self) -> Option<CardEvent> {
@@ -380,6 +410,9 @@ impl RecentCapturesOverlayCards {
                     }
                 }
                 RecentCapturesOverlayEvent::DockExpanded | RecentCapturesOverlayEvent::Emptied => {}
+                RecentCapturesOverlayEvent::Scrolling(action) => {
+                    self.scroll_actions.push_back(action);
+                }
                 RecentCapturesOverlayEvent::PinRequested { id, pin, state } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         self.pinned.insert(pin.0.clone(), ours);

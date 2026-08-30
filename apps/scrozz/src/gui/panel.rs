@@ -34,7 +34,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use scrozz_core::LogicalRect;
 use scrozz_shell::OverlayWindow;
 use scrozz_shell::{NativeOverlay, NativeSurface, OverlayBehavior, OverlayCursor};
-use scrozz_ui::{PanelReport, recent_captures_overlay::NativePinRequest};
+use scrozz_ui::{PanelReport, PanelSetup, recent_captures_overlay::NativePinRequest};
 
 #[derive(Clone, Debug, PartialEq)]
 struct AppliedPin {
@@ -392,6 +392,41 @@ impl BehaviorController {
             .push(RecordedNativeAction::Frame(frame));
     }
 
+    /// Applies one click-through transition and reports what the window says.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's own message when the transition or the readback
+    /// was refused.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn apply_click_through(&self, requested: bool) -> Result<bool, String> {
+        if self.teardown_started.get() {
+            return Ok(false);
+        }
+        let mut slot = self.overlay.borrow_mut();
+        let Some(overlay) = slot.as_mut() else {
+            // No retained adapter is not an acknowledgement. Automatic
+            // scrolling stays blocked rather than scrolling this overlay.
+            return Ok(false);
+        };
+        overlay
+            .set_click_through(requested)
+            .map_err(|error| error.to_string())?;
+        #[cfg(target_os = "macos")]
+        {
+            overlay
+                .click_through()
+                .map(|actual| actual == requested)
+                .map_err(|error| error.to_string())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Windows has no readback API on the adapter; the style write above
+            // either returned an error or took effect.
+            Ok(true)
+        }
+    }
+
     /// Applies a card or selection behavior when a native adapter is retained.
     pub fn apply(&self, behavior: &OverlayBehavior) {
         if self.teardown_started.get() {
@@ -616,9 +651,7 @@ unsafe fn adopt_and_retain_ns_view(ns_view: *mut c_void) -> (PanelReport, Option
 
     // SAFETY: forwarded from this function's own contract — a live `NSView *`
     // on the main thread.
-    let adopted = unsafe { NativeOverlay::from_ns_view(ns_view) };
-
-    let mut overlay = match adopted {
+    let mut overlay = match unsafe { NativeOverlay::from_ns_view(ns_view) } {
         Ok(overlay) => overlay,
         Err(err) => return (PanelReport::unsupported(err.to_string()), None),
     };
@@ -706,9 +739,7 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
         let handle = match cc.window_handle() {
             Ok(handle) => handle,
             Err(err) => {
-                return PanelReport::unsupported(format!(
-                    "eframe reported no window handle: {err}"
-                ));
+                return PanelSetup::unsupported(format!("eframe reported no window handle: {err}"));
             }
         };
 
@@ -721,7 +752,7 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
 
         #[cfg(target_os = "macos")]
         let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-            return PanelReport::unsupported(
+            return PanelSetup::unsupported(
                 "the overlay window is not an AppKit window, so it has no NSView to convert",
             );
         };
@@ -736,7 +767,10 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
             if let Some(overlay) = overlay {
                 controller.install(overlay);
             }
-            report
+            // The retained adapter is the click-through controller: automatic
+            // scrolling needs an *acknowledged* transition, and only the native
+            // window can answer that.
+            PanelSetup::new(report).with_passthrough(passthrough_controller(&controller))
         }
 
         #[cfg(target_os = "linux")]
@@ -749,13 +783,24 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
                 }
                 Err(error) => error,
             };
-            PanelReport::unsupported(detail)
+            let setup = PanelSetup::new(PanelReport::unsupported(detail));
+            match handle.as_raw() {
+                RawWindowHandle::Xlib(xlib) => u32::try_from(xlib.window).map_or(setup, |window| {
+                    setup.with_passthrough(x11_passthrough(window))
+                }),
+                RawWindowHandle::Xcb(xcb) => {
+                    setup.with_passthrough(x11_passthrough(xcb.window.get()))
+                }
+                // Wayland automatic scrolling is manual-only, so there is no
+                // click-through contract to honour and none is invented.
+                _ => setup,
+            }
         }
 
         #[cfg(target_os = "windows")]
         {
             let RawWindowHandle::Win32(win32) = handle.as_raw() else {
-                return PanelReport::unsupported(
+                return PanelSetup::unsupported(
                     "the overlay window is not a Win32 window, so it cannot be excluded from capture",
                 );
             };
@@ -765,18 +810,83 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
             if let Some(overlay) = overlay {
                 controller.install(overlay);
             }
-            report
+            PanelSetup::new(report).with_passthrough(passthrough_controller(&controller))
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = handle;
             let _ = controller;
-            PanelReport::unsupported(
+            PanelSetup::unsupported(
                 "only the macOS overlay backend is implemented so far, so the \
                  window keeps its native activation behaviour",
             )
         }
+    })
+}
+
+/// A click-through controller backed by the retained native overlay adapter.
+///
+/// Returns whether the window *reports* the requested state, not whether the
+/// call was made: automatic scrolling posts globally addressed wheel input, and
+/// an unacknowledged request would send it into Scrozz's own overlay.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn passthrough_controller(controller: &BehaviorController) -> scrozz_ui::NativePassthrough {
+    let controller = controller.clone();
+    Box::new(move |requested| controller.apply_click_through(requested))
+}
+
+/// The X11 click-through controller, expressed as an empty input shape.
+///
+/// `scrozz-shell`'s X11 overlay deliberately refuses pointer transparency for
+/// pins, because a pin has no focus-release contract. A scrolling capture does:
+/// it is a bounded session that restores the input region as soon as it ends,
+/// so the shape is set here rather than by relaxing that refusal.
+#[cfg(target_os = "linux")]
+fn x11_passthrough(window: u32) -> scrozz_ui::NativePassthrough {
+    use x11rb::{
+        connection::Connection as _,
+        protocol::{
+            shape::{ConnectionExt as _, SK, SO},
+            xproto::{ClipOrdering, ConnectionExt as _, Rectangle},
+        },
+    };
+
+    let mut applied = false;
+    Box::new(move |requested| {
+        let (connection, _) = x11rb::connect(None)
+            .map_err(|error| format!("the X11 overlay connection failed: {error}"))?;
+        let rectangles = if requested {
+            Vec::new()
+        } else {
+            let geometry = connection
+                .get_geometry(window)
+                .map_err(|error| error.to_string())?
+                .reply()
+                .map_err(|error| error.to_string())?;
+            vec![Rectangle {
+                x: 0,
+                y: 0,
+                width: geometry.width,
+                height: geometry.height,
+            }]
+        };
+        connection
+            .shape_rectangles(
+                SO::SET,
+                SK::INPUT,
+                ClipOrdering::UNSORTED,
+                window,
+                0,
+                0,
+                &rectangles,
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .flush()
+            .map_err(|error| format!("the X11 input shape could not be flushed: {error}"))?;
+        applied = requested;
+        Ok(applied == requested)
     })
 }
 

@@ -22,6 +22,9 @@
 //! - [`Error::PermissionDenied`] and [`Error::Unsupported`] make D15's
 //!   permission-on-first-use and D8's documented platform gaps ordinary,
 //!   handled outcomes rather than crashes.
+//! - [`scroll::ScrollSynthesis`] makes D8's "query capabilities, never assume"
+//!   rule unavoidable for scrolling capture: a caller cannot reach the scroll
+//!   API without first having been told whether this desktop can scroll at all.
 
 #![forbid(unsafe_code)]
 
@@ -33,6 +36,7 @@ pub mod geometry;
 pub mod layout;
 pub mod pin;
 pub mod product_copy;
+pub mod scroll;
 pub mod selection;
 pub mod target;
 
@@ -48,6 +52,10 @@ pub use pin::{
     Direction as PinDirection, DisplaySet, InvalidPinSize, LockEscape, LockEscapeRequired,
     MAX_OPACITY, MAX_PIN_PHYSICAL_EDGE, MAX_PIN_PHYSICAL_PIXELS, MIN_OPACITY, NudgeStep, Opacity,
     PinBorder, PinChrome, PinChromePolicy, PinId, PinScale, PinState, PinnedSurface,
+};
+pub use scroll::{
+    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
+    ScrollSynthesis,
 };
 pub use selection::{
     AspectLock, CrosshairMode, DEFAULT_MAGNIFIER_ZOOM, DimensionLabelMode, MIN_SELECTION,

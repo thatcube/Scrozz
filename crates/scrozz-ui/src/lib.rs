@@ -97,6 +97,7 @@ pub mod pinned;
 pub mod recent_captures_overlay;
 mod recording_controls;
 pub mod recording_settings;
+pub mod scrolling;
 pub mod select;
 pub mod settings;
 pub mod stack;
@@ -123,13 +124,16 @@ pub use history::{
 };
 pub use motion::{Activity, Duration, Ease, Motion, MotionPrefs};
 pub use recent_captures_overlay::{
-    CaptureMedia, CaptureRequest, DismissReason, PanelHook, PanelReport, Passthrough, PointerProbe,
-    RecentCapturesOverlayApp, RecentCapturesOverlayEvent, RecentCapturesOverlayGeometry,
-    RecentCapturesOverlayHandle, RecentCapturesOverlayOptions, RecentCapturesOverlaySettings,
-    RecentCapturesPlacement,
+    CaptureMedia, CaptureRequest, DismissReason, NativePassthrough, PanelHook, PanelReport,
+    PanelSetup, Passthrough, PointerProbe, RecentCapturesOverlayApp, RecentCapturesOverlayEvent,
+    RecentCapturesOverlayGeometry, RecentCapturesOverlayHandle, RecentCapturesOverlayOptions,
+    RecentCapturesOverlaySettings, RecentCapturesPlacement,
 };
 pub use recording_settings::{
     RecordingSettingsAction, RecordingSettingsPanel, RecordingSettingsResponse,
+};
+pub use scrolling::{
+    ScrollHudAction, ScrollHudResponse, ScrollHudState, ScrollHudStatus, ScrollingHud,
 };
 
 pub use select::{

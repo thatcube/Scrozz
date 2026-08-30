@@ -1,30 +1,39 @@
 //! `xdg-desktop-portal` negotiation.
 //!
 //! Everything here that can be decided without D-Bus is decided here, as plain
-//! values, and tested. What remains — the calls themselves — is documented at
-//! [`acquire_frame`] and is not pretended to work.
+//! values, and tested on every platform. The D-Bus calls themselves live in
+//! [`super::screencast`], and the pixels they lead to in
+//! [`super::pipewire`].
 //!
 //! # The two portal interfaces, and why both matter
 //!
-//! `org.freedesktop.portal.Screenshot` takes a picture and hands back a `file://`
-//! URI. It is one call, needs no PipeWire, and is what a "screenshot the whole
-//! screen" command should use. What it cannot do is let the application choose
-//! the region or the window: `interactive: true` delegates the entire selection
-//! to the desktop's own UI, which means Scrozz's editor, magnifier and
-//! measurement overlay never appear. It is a correct fallback, not the product.
+//! `org.freedesktop.portal.Screenshot` takes a picture and hands back only a
+//! `file://` URI. In interactive mode the desktop owns the entire selection UI,
+//! but the response does not identify the chosen window/output or report its
+//! coordinates and scale. Scrozz therefore does not use Screenshot to satisfy a
+//! [`CaptureTarget`]: doing so would require fabricating the target facts that
+//! region selection and scrolling depend on. [`path_from_uri`] is retained for a
+//! future explicit portal-screenshot fallback, not as an exact-target route.
 //!
 //! `org.freedesktop.portal.ScreenCast` gives a PipeWire node the application
 //! reads frames from, with the selection made once and then restored silently on
-//! later captures. It is the only route to Scrozz's own selection UI, and it is
-//! the route this module is built around.
+//! later captures. It is the route this module uses for exact displays,
+//! wholly-contained regions, and explicit portal-picked window viewports. An
+//! ordinary public window target carries an OS id, while ScreenCast reveals no
+//! such id for a selected window, so that target is refused. Manual scrolling
+//! capture can explicitly opt into the sentinel
+//! [`PORTAL_PICKER_WINDOW_ID`], whose identity means "the window the portal user
+//! selects" rather than pretending to name an enumerated OS window.
 //!
 //! # Wire constants
 //!
-//! Transcribed from the portal specification and cross-checked against
-//! `ashpd`'s own definitions, which are compiled out of this build by feature
-//! gating (see [`super`]).
+//! Transcribed from the portal specification. `ashpd` has its own copies and
+//! this module is deliberately not built on them: these values are what the
+//! negotiation reasons about, and keeping them as plain integers is what lets
+//! [`SessionPlan`] be tested on a machine with no portal, no D-Bus and no
+//! Linux.
 
-use scrozz_core::CaptureTarget;
+use scrozz_core::{CaptureTarget, DisplayId, Error};
 
 use super::restore::TokenKey;
 
@@ -37,6 +46,14 @@ pub mod source_type {
     /// A virtual, compositor-synthesised source.
     pub const VIRTUAL: u32 = 4;
 }
+
+/// Advisory [`scrozz_core::WindowId`] for an explicitly portal-selected window.
+///
+/// Wayland cannot enumerate windows or map a ScreenCast stream back to an OS
+/// window id. This reserved spelling is therefore the only window target this
+/// backend accepts: it truthfully delegates identity to the trusted portal
+/// picker. Every other `WindowId` is rejected before any portal call.
+pub const PORTAL_PICKER_WINDOW_ID: &str = crate::WAYLAND_PORTAL_PICKER_WINDOW_ID;
 
 /// `CursorMode` bit flags from the ScreenCast specification.
 pub mod cursor_mode {
@@ -69,12 +86,49 @@ pub struct SessionPlan {
     pub types: u32,
     /// The `CursorMode` to request.
     pub cursor: u32,
-    /// Whether the user may pick more than one source.
-    pub multiple: bool,
     /// The `PersistMode` to request.
     pub persist: u32,
     /// Which stored token, if any, to present for silent restore.
     pub restore_key: TokenKey,
+}
+
+/// A capture target the portal cannot serve without guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanFailure {
+    /// A portal-selected window cannot be matched to Scrozz's OS window id.
+    WindowIdentityUnavailable,
+    /// ScreenCast may return several streams but does not guarantee their
+    /// positions, so they cannot always be composed into one desktop.
+    AllDisplaysNeedsPositions,
+}
+
+impl PlanFailure {
+    /// Turns the planning refusal into the public platform error.
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        match self {
+            Self::WindowIdentityUnavailable => Error::Unsupported {
+                what: "capturing a requested window id on Wayland".into(),
+                why:
+                    "The ScreenCast portal lets the user choose a window but does not reveal that \
+                      window's OS identity. Scrozz cannot prove that the selected stream is the \
+                      requested WindowId, so this target is rejected before opening the picker \
+                      instead of returning another window under the requested id. Manual Wayland \
+                      scrolling must use the explicit `xdg-desktop-portal-picker` advisory id, \
+                      which means the portal-selected window and never an enumerated OS window."
+                        .into(),
+            },
+            Self::AllDisplaysNeedsPositions => Error::Unsupported {
+                what: "capturing all displays on Wayland".into(),
+                why: "The ScreenCast portal may return one stream per monitor, but it does not \
+                      guarantee each stream's desktop position. Scrozz cannot compose a correct \
+                      virtual-desktop image without every position, so it refuses before opening \
+                      the portal picker instead of capturing only the first display. Capture one \
+                      display instead."
+                    .into(),
+            },
+        }
+    }
 }
 
 impl SessionPlan {
@@ -89,34 +143,52 @@ impl SessionPlan {
     /// - Persistence is always `EXPLICITLY_REVOKED`. `APPLICATION` sounds safer
     ///   but expires when the process does, so every launch costs a permission
     ///   dialog — which is the failure this whole mechanism exists to prevent.
-    #[must_use]
-    pub fn for_target(target: &CaptureTarget, want_cursor: bool) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Rejects all-display capture before any portal call. The portal makes
+    /// per-stream positions optional, so requesting several sources could prompt
+    /// the user and still leave no honest way to compose the result.
+    pub fn for_target(
+        target: &CaptureTarget,
+        want_cursor: bool,
+    ) -> std::result::Result<Self, PlanFailure> {
         let (types, restore_key) = match target {
-            CaptureTarget::Window(_) => (source_type::WINDOW, TokenKey::Window),
-            CaptureTarget::AllDisplays => (
-                source_type::MONITOR | source_type::VIRTUAL,
-                TokenKey::AllDisplays,
-            ),
+            CaptureTarget::Window(id) if id.0 == PORTAL_PICKER_WINDOW_ID => {
+                (source_type::WINDOW, TokenKey::Window)
+            }
+            CaptureTarget::Window(_) => return Err(PlanFailure::WindowIdentityUnavailable),
+            CaptureTarget::AllDisplays => return Err(PlanFailure::AllDisplaysNeedsPositions),
             // A region is cropped from a monitor capture after the fact.
             // The portal has no concept of a sub-rectangle, and asking the user
             // to pick a region in the portal's UI and then again in Scrozz's
             // would be absurd.
-            CaptureTarget::Display(_) | CaptureTarget::Region(_) => {
-                (source_type::MONITOR, TokenKey::Monitor)
-            }
+            CaptureTarget::Display(id) => (source_type::MONITOR, TokenKey::display(id)),
+            CaptureTarget::Region(_) => (source_type::MONITOR, TokenKey::Monitor),
         };
 
-        Self {
+        Ok(Self {
             types,
             cursor: if want_cursor {
                 cursor_mode::EMBEDDED
             } else {
                 cursor_mode::HIDDEN
             },
-            multiple: matches!(target, CaptureTarget::AllDisplays),
             persist: persist_mode::EXPLICITLY_REVOKED,
             restore_key,
-        }
+        })
+    }
+
+    /// Scopes a monitor plan to the display that must contain the result.
+    ///
+    /// Display requests already carry this identity. Region requests acquire it
+    /// from the pre-prompt geometry check because the target itself is only a
+    /// rectangle.
+    #[must_use]
+    pub fn bind_monitor(mut self, display: &DisplayId) -> Self {
+        debug_assert_eq!(self.types, source_type::MONITOR);
+        self.restore_key = TokenKey::display(display);
+        self
     }
 
     /// Narrows the plan to what the portal says it can actually do.
@@ -191,6 +263,13 @@ pub fn path_from_uri(uri: &str) -> Option<std::path::PathBuf> {
 pub struct StreamInfo {
     /// The PipeWire node to connect to.
     pub node_id: u32,
+    /// Stable PipeWire object serial added by ScreenCast portal version 6.
+    ///
+    /// Node ids can be reused after a node disappears. Modern portals therefore
+    /// require clients to select by this serial through `target.object`.
+    pub pipewire_serial: Option<u64>,
+    /// Source type reported by the portal, when available.
+    pub source_type: Option<u32>,
     /// Position in the compositor's global space, if the portal supplied one.
     ///
     /// Optional in the specification and genuinely absent on some compositors
@@ -207,40 +286,219 @@ impl StreamInfo {
     pub const fn is_placeable(&self) -> bool {
         self.position.is_some() && self.size.is_some()
     }
+
+    /// Whether the portal returned the source kind the plan requested.
+    #[must_use]
+    pub const fn matches_source_type(&self, expected: u32) -> bool {
+        match self.source_type {
+            Some(actual) => actual == expected,
+            None => true,
+        }
+    }
+
+    /// Verifies the target properties required by the advertised portal version.
+    ///
+    /// This is run after the caller durably records `Start`'s restore-token
+    /// rotation but before `OpenPipeWireRemote`, so a malformed stream can never
+    /// relax into an unspecified PipeWire auto-connect.
+    pub fn validate_contract(
+        &self,
+        portal_version: u32,
+        expected_source_type: u32,
+    ) -> std::result::Result<(), String> {
+        if portal_version >= 3 && self.source_type.is_none() {
+            return Err(
+                "ScreenCast version 3 or newer returned a stream without its required \
+                 `source_type`; Scrozz cannot verify what kind of target the picker granted"
+                    .into(),
+            );
+        }
+        if !self.matches_source_type(expected_source_type) {
+            return Err(format!(
+                "the ScreenCast portal returned source type {:?} after Scrozz requested exactly \
+                 {expected_source_type}",
+                self.source_type
+            ));
+        }
+        if portal_version >= 6 && self.pipewire_serial.is_none() {
+            return Err(
+                "ScreenCast version 6 returned a stream without its required `pipewire-serial`; \
+                 Scrozz refuses to target a reusable numeric node id"
+                    .into(),
+            );
+        }
+        if self.pipewire_serial.is_none() && self.node_id == u32::MAX {
+            return Err(
+                "the ScreenCast portal returned PipeWire's wildcard node id without a stable \
+                 object serial; Scrozz refuses to open an unspecified video source"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
-/// Reads pixels from a PipeWire node.
+/// Why a portal negotiation did not produce a stream.
 ///
-/// # Not implemented, and why
+/// A plain enum rather than a `scrozz_core::Error` so that the classification —
+/// which is the part with judgement in it — can be decided and tested without
+/// D-Bus, and so that [`super::screencast`] has one obvious place to funnel
+/// every `ashpd` error into.
 ///
-/// This is the honest boundary of the Wayland backend. Two independent things
-/// are missing, and neither can be worked around from inside this crate:
+/// The distinction that matters most is [`Self::Cancelled`]. A user who presses
+/// Escape in the portal's picker has not encountered a fault, and a screenshot
+/// tool that shows an error dialog when someone changes their mind is a
+/// screenshot tool people stop using. D15 makes this an expected outcome; the
+/// portal reports it as an ordinary D-Bus response with code 1, and it must
+/// survive the whole way out as [`scrozz_core::Error::Cancelled`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortalFailure {
+    /// The user dismissed the picker, or the compositor withdrew the request.
+    Cancelled,
+    /// No portal is running, or it does not implement ScreenCast.
+    Missing(String),
+    /// The portal is available but policy or settings deny screen capture.
+    PermissionDenied(String),
+    /// The portal is present but offers none of the sources this capture needs.
+    NoSources {
+        /// The source-type mask that was wanted.
+        wanted: u32,
+        /// The mask the portal advertised.
+        available: u32,
+    },
+    /// The portal agreed but returned no video stream.
+    NoStreams,
+    /// `SelectSources` specifically rejected the supplied restore token.
+    RestoreRejected(String),
+    /// A D-Bus or protocol failure.
+    Bus(String),
+}
+
+impl std::fmt::Display for PortalFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("the portal request was cancelled"),
+            Self::Missing(detail) => {
+                write!(formatter, "the ScreenCast portal is missing: {detail}")
+            }
+            Self::PermissionDenied(detail) => {
+                write!(
+                    formatter,
+                    "the ScreenCast portal denied permission: {detail}"
+                )
+            }
+            Self::NoSources { wanted, available } => write!(
+                formatter,
+                "the ScreenCast portal offers {} but the request needs {}",
+                describe_sources(*available),
+                describe_sources(*wanted)
+            ),
+            Self::NoStreams => formatter.write_str("the ScreenCast portal returned no streams"),
+            Self::RestoreRejected(detail) => {
+                write!(
+                    formatter,
+                    "the ScreenCast portal rejected its restore token: {detail}"
+                )
+            }
+            Self::Bus(detail) => write!(formatter, "the ScreenCast portal failed: {detail}"),
+        }
+    }
+}
+
+impl PortalFailure {
+    /// Whether retrying once without the stored token can change this outcome.
+    #[must_use]
+    pub const fn should_retry_without_restore(&self) -> bool {
+        matches!(self, Self::RestoreRejected(_))
+    }
+
+    /// Turns the failure into the error a caller should see.
+    ///
+    /// `compositor` is woven into the text because "screen capture failed" is
+    /// useless and "wlroots' portal does not offer window sources" is
+    /// actionable.
+    #[must_use]
+    pub fn into_error(self, compositor: &str) -> scrozz_core::Error {
+        use scrozz_core::Error;
+
+        match self {
+            Self::Cancelled => Error::Cancelled,
+            Self::Missing(detail) => Error::Unsupported {
+                what: "capturing on Wayland".into(),
+                why: format!(
+                    "no desktop portal implementing ScreenCast answered on the session bus, and \
+                     Wayland offers no other route to screen pixels. Install the portal for \
+                     {compositor} — `xdg-desktop-portal-gnome` on GNOME, \
+                     `xdg-desktop-portal-kde` on KDE, `xdg-desktop-portal-wlr` on wlroots \
+                     compositors such as sway or Hyprland — alongside `xdg-desktop-portal` \
+                     itself, then log out and back in. ({detail})"
+                ),
+            },
+            Self::PermissionDenied(detail) => Error::PermissionDenied {
+                capability: "Wayland screen capture".into(),
+                remedy: format!(
+                    "allow screen sharing for Scrozz in {compositor}'s privacy settings, or ask \
+                     the administrator to enable the desktop-portal ScreenCast policy ({detail})"
+                ),
+            },
+            Self::NoSources { wanted, available } => Error::Unsupported {
+                what: describe_sources(wanted),
+                why: format!(
+                    "the portal on {compositor} advertises only {} and cannot offer {}. This is a \
+                     limitation of the compositor's portal backend, not of the request",
+                    describe_sources(available),
+                    describe_sources(wanted & !available),
+                ),
+            },
+            Self::NoStreams => Error::Platform(format!(
+                "the portal on {compositor} approved the capture but returned no video stream, \
+                 which means its screen-cast backend started and then produced nothing"
+            )),
+            Self::RestoreRejected(detail) => Error::Platform(format!(
+                "the desktop portal on {compositor} rejected the stored screen-cast restore token: \
+                 {detail}"
+            )),
+            Self::Bus(detail) => Error::Platform(format!(
+                "the desktop portal on {compositor} failed: {detail}"
+            )),
+        }
+    }
+}
+
+/// Recognises xdg-desktop-portal's restore-token-specific `InvalidArgument`.
 ///
-/// 1. **The portal call itself.** `ashpd`'s `screencast` module is behind a
-///    Cargo feature this build does not enable, so `Screencast::new()` does not
-///    exist here. The negotiation above is therefore fully specified and
-///    unexecutable. Enabling `features = ["screencast", "screenshot"]` on the
-///    workspace's `ashpd` dependency is the entire fix.
-///
-/// 2. **PipeWire.** Even with the portal available, `Start` returns a node id
-///    rather than pixels. Turning that into a frame needs a PipeWire client —
-///    `pipewire-rs`, or GStreamer's `pipewiresrc` — which is a substantial
-///    dependency with its own event loop, buffer negotiation and DMA-BUF
-///    handling. That is a task in its own right, not a detail of this one.
-///
-/// Writing a plausible-looking implementation that returned a blank buffer would
-/// hide both facts behind something that appears to work, which is worse than a
-/// panic that names them.
-///
-/// # Panics
-///
-/// Always.
-#[allow(clippy::needless_pass_by_value)]
-pub fn acquire_frame(_stream: StreamInfo) -> ! {
-    todo!(
-        "PipeWire frame acquisition: connect to the node from Start, negotiate a \
-         BGRx/RGBx format, pull one buffer and copy it out. Needs a PipeWire client \
-         dependency (pipewire-rs) and ashpd's `screencast` feature, neither of which \
-         this crate's manifest currently grants."
-    )
+/// `SelectSources` can reject several unrelated options with the same D-Bus
+/// error name, so the stage and the fixed portal message both matter. Retrying
+/// every `InvalidArgument` would duplicate a failure that removing the token
+/// cannot possibly repair.
+#[must_use]
+pub fn is_restore_token_rejection(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("restore token")
+        || detail.contains("restore_token")
+        || detail.contains("restore-token")
+        || detail.contains("restoretoken")
+}
+
+/// Renders a source-type mask in words.
+#[must_use]
+pub fn describe_sources(mask: u32) -> String {
+    let mut parts = Vec::new();
+    if mask & source_type::MONITOR != 0 {
+        parts.push("whole monitors");
+    }
+    if mask & source_type::WINDOW != 0 {
+        parts.push("individual windows");
+    }
+    if mask & source_type::VIRTUAL != 0 {
+        parts.push("virtual sources");
+    }
+    match parts.len() {
+        0 => "no capture sources".into(),
+        1 => parts[0].into(),
+        _ => {
+            let last = parts.pop().unwrap_or_default();
+            format!("{} and {last}", parts.join(", "))
+        }
+    }
 }

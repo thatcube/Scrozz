@@ -9,11 +9,12 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::MONITORINFOEXW;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
 use windows::{
     Win32::{
-        Foundation::{HANDLE, HWND, LPARAM, POINT, RECT},
+        Foundation::{FILETIME, HANDLE, HWND, LPARAM, POINT, RECT},
         Graphics::Gdi::{
             EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
             MONITORINFO, MonitorFromPoint, MonitorFromWindow,
@@ -206,6 +207,15 @@ pub fn monitor_under_cursor() -> Result<MonitorRecord> {
 pub struct WindowRecord {
     /// Live handle.
     pub handle: HWND,
+    /// Owning process identifier at enumeration time.
+    pub process_id: u32,
+    /// Process creation timestamp, which prevents PID/HWND reuse from silently
+    /// retargeting a later capture.
+    pub process_started: u64,
+    /// Owning UI thread identifier at enumeration time.
+    pub thread_id: u32,
+    /// Stable fingerprint of the registered window class.
+    pub class_fingerprint: u64,
     /// Bounds in virtual-desktop device pixels, from the DWM frame where
     /// available.
     pub bounds: DeviceRect,
@@ -245,13 +255,71 @@ unsafe fn inspect_window(hwnd: HWND, state: &EnumState) -> Option<WindowRecord> 
     let bounds = unsafe { window_bounds(hwnd) }?;
     let monitor_rects: Vec<DeviceRect> = state.monitors.iter().map(|m| m.bounds).collect();
     let monitor = dominant_monitor(bounds, &monitor_rects).unwrap_or(0);
+    let identity = unsafe { window_identity(hwnd, &facts.class_name) }?;
 
     Some(WindowRecord {
         handle: hwnd,
+        process_id: identity.process_id,
+        process_started: identity.process_started,
+        thread_id: identity.thread_id,
+        class_fingerprint: identity.class_fingerprint,
         bounds,
         title: (!facts.title.is_empty()).then(|| facts.title.clone()),
         application: unsafe { window_application(facts.owner_process_id) },
         monitor,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowIdentity {
+    process_id: u32,
+    process_started: u64,
+    thread_id: u32,
+    class_fingerprint: u64,
+}
+
+unsafe fn window_identity(hwnd: HWND, class_name: &str) -> Option<WindowIdentity> {
+    let mut process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    if process_id == 0 || thread_id == 0 {
+        return None;
+    }
+    let process_started = unsafe { process_started(process_id) }.unwrap_or_default();
+    Some(WindowIdentity {
+        process_id,
+        process_started,
+        thread_id,
+        class_fingerprint: stable_text_fingerprint(class_name),
+    })
+}
+
+unsafe fn process_started(process_id: u32) -> Option<u64> {
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
+    if process.is_invalid() {
+        return None;
+    }
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let result = unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    unsafe { close_handle(process) };
+    result.ok()?;
+    Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
+fn stable_text_fingerprint(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 
@@ -429,7 +497,14 @@ pub fn to_window(record: &WindowRecord, monitors: &[MonitorRecord]) -> Window {
     );
 
     Window {
-        id: WindowId((record.handle.0 as isize).to_string()),
+        id: WindowId(format!(
+            "{}:{}:{}:{}:{:016x}",
+            record.handle.0 as isize,
+            record.process_id,
+            record.process_started,
+            record.thread_id,
+            record.class_fingerprint
+        )),
         title: record.title.clone(),
         application: record.application.clone(),
         bounds: logical_from_device(record.bounds, scale),
@@ -444,9 +519,76 @@ pub fn to_window(record: &WindowRecord, monitors: &[MonitorRecord]) -> Window {
 ///
 /// Returns [`Error::TargetGone`] for an id this backend did not produce.
 pub fn handle_from_id(id: &WindowId) -> Result<HWND> {
-    id.0.parse::<isize>()
+    id.0.split(':')
+        .next()
+        .unwrap_or_default()
+        .parse::<isize>()
         .map(|raw| HWND(raw as *mut core::ffi::c_void))
         .map_err(|_| Error::TargetGone(format!("not a window id this backend issued: {}", id.0)))
+}
+
+/// Resolves a window id only if its process/thread/class identity still matches.
+///
+/// Numeric HWND values are aggressively recycled. Automatic input must not use
+/// one without the identity snapshot emitted by [`to_window`], because a
+/// stale id could otherwise deliver a wheel event to an unrelated process.
+pub fn verified_handle_from_id(id: &WindowId) -> Result<HWND> {
+    let mut fields = id.0.split(':');
+    let handle = fields
+        .next()
+        .and_then(|value| value.parse::<isize>().ok())
+        .map(|raw| HWND(raw as *mut core::ffi::c_void));
+    let expected = (
+        fields.next().and_then(|value| value.parse::<u32>().ok()),
+        fields.next().and_then(|value| value.parse::<u64>().ok()),
+        fields.next().and_then(|value| value.parse::<u32>().ok()),
+        fields
+            .next()
+            .and_then(|value| u64::from_str_radix(value, 16).ok()),
+    );
+    let (Some(handle), (Some(process_id), Some(process_started), Some(thread_id), Some(class))) =
+        (handle, expected)
+    else {
+        return Err(Error::Unsupported {
+            what: "automatic scrolling of a stale Windows window id".into(),
+            why:
+                "the target id predates Scrozz's process-identity binding, so its HWND could have \
+                  been recycled. Select the window again, or scroll manually"
+                    .into(),
+        });
+    };
+    if fields.next().is_some() {
+        return Err(Error::TargetGone(format!(
+            "not a window id this backend issued: {}",
+            id.0
+        )));
+    }
+    if process_started == 0 {
+        return Err(Error::Unsupported {
+            what: "automatic scrolling of this Windows window".into(),
+            why: "Windows would not reveal the target process creation time, so Scrozz cannot \
+                  prove the HWND was not recycled. Scroll manually rather than risk another \
+                  application receiving the wheel event"
+                .into(),
+        });
+    }
+
+    let class_name = unsafe { class_name(handle) };
+    let Some(actual) = (unsafe { window_identity(handle, &class_name) }) else {
+        return Err(Error::TargetGone(format!("window {} has closed", id.0)));
+    };
+    let expected = WindowIdentity {
+        process_id,
+        process_started,
+        thread_id,
+        class_fingerprint: class,
+    };
+    if actual != expected {
+        return Err(Error::TargetGone(
+            "the selected Windows window identity changed before input could be delivered".into(),
+        ));
+    }
+    Ok(handle)
 }
 
 /// Finds the record for a live window id.
@@ -458,7 +600,9 @@ pub fn handle_from_id(id: &WindowId) -> Result<HWND> {
 pub fn window_by_id(id: &WindowId) -> Result<(WindowRecord, Vec<MonitorRecord>)> {
     let handle = handle_from_id(id)?;
     let monitors = monitors()?;
-    let found = windows()?.into_iter().find(|w| w.handle == handle);
+    let found = windows()?
+        .into_iter()
+        .find(|record| record.handle == handle && to_window(record, &monitors).id == *id);
     match found {
         Some(record) => Ok((record, monitors)),
         None => Err(Error::TargetGone(format!("window {} has closed", id.0))),

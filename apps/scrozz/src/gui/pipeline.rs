@@ -48,10 +48,10 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
     thread::JoinHandle,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use scrozz_annotate::{
@@ -60,10 +60,12 @@ use scrozz_annotate::{
 };
 use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError,
-    LogicalPoint, LogicalRect, PinState, Provenance, ScaleFactor, SelectionMode, SelectionOptions,
+    LogicalPoint, LogicalRect, PinState, Provenance, ScaleFactor, ScrollAxis, SelectionMode,
+    SelectionOptions,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage};
 use scrozz_shell::{DragPayload, DragPreview, byte_source};
+use scrozz_stitch::{AtomicCancellation, CancelAction, Progress};
 use scrozz_store::{
     CaptureId, CaptureRecord, CaptureSharing, DocumentState, FrameHeader, History, ImageState,
     NewCapture, Page, RemoteObjectId, RetentionPolicy, SearchQuery, ShareProvider, ShareTag,
@@ -77,6 +79,7 @@ use crate::{
         ActionEffect, ActionExecutor, AfterCaptureAction, AfterCaptureSettings, ExecutionReport,
         FinalizedScreenshot, MediaKind, orchestrate,
     },
+    commands::ScrollingTarget,
     fault::{CliError, CliResult},
     gui::{
         action::{CaptureKind, CaptureOrigin},
@@ -90,6 +93,14 @@ use crate::{
 };
 
 const MAX_ANALYSIS_CACHE_ENTRIES: usize = 32;
+
+/// How long `stop` waits for the worker to answer before reporting that it is
+/// still busy.
+///
+/// A scrolling session can be mid-gesture when the app quits; the worker is
+/// asked to cancel and then given a bounded moment to unwind, rather than the
+/// UI thread blocking on a join that a stalled compositor could hold forever.
+const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The strict ceiling on full-resolution frames the capture worker may hold.
 ///
@@ -317,6 +328,26 @@ pub(crate) enum Job {
         /// Admission token that strictly bounds full-resolution frames waiting
         /// for or being processed by the worker.
         _permit: CapturePermit,
+    },
+    /// Take and assemble repeated frames along one explicit axis.
+    ///
+    /// Separate from [`Job::Capture`] because it is the only capture that runs
+    /// for as long as the user keeps it running, reports progress while it does,
+    /// and can be ended two different ways.
+    Scrolling {
+        /// Direction the stitched image grows.
+        axis: ScrollAxis,
+        /// Identity reserved for the resulting card.
+        card: CardId,
+        /// Where the request entered the app.
+        origin: CaptureOrigin,
+        /// The persisted GUI policy snapshotted when this capture was requested.
+        policy: AfterCaptureSettings,
+        /// Window identity selected before the HUD and geometry refreshed when
+        /// the user chose an axis.
+        target: Box<ScrollingTarget>,
+        /// One-way cancellation for queued or in-flight frame acquisition.
+        acquisition_cancellation: scrozz_capture::CaptureCancellation,
     },
     /// Put a card's capture on the clipboard.
     Copy(CardId),
@@ -620,6 +651,13 @@ impl RememberedShare {
 /// What the capture thread produced.
 #[derive(Debug)]
 pub enum Outcome {
+    /// A scrolling capture reached a meaningful frame boundary.
+    Progress {
+        /// Which in-flight card the update belongs to.
+        card: CardId,
+        /// Session status suitable for the HUD and diagnostics.
+        progress: Progress,
+    },
     /// A capture succeeded and is ready to show.
     Ready(Box<ReadyCapture>),
     /// A stored capture was rebuilt as a live card.
@@ -809,6 +847,13 @@ pub struct ReadyCapture {
 pub struct Pipeline {
     jobs: Sender<Job>,
     capture_budget: CaptureBudget,
+    /// Signalled when the capture worker's loop has actually returned.
+    worker_done: Receiver<()>,
+    /// Keep/abort for the scrolling session the worker is running.
+    scrolling_cancellation: AtomicCancellation,
+    /// The acquisition token of that session, so Abort also unblocks a frame
+    /// wait inside the native backend rather than only the stitch loop.
+    active_scrolling_acquisition: Mutex<Option<scrozz_capture::CaptureCancellation>>,
     pending_pin_updates: Arc<PendingPinUpdates>,
     history_queries: Sender<HistoryQuery>,
     uploads: Sender<UploadJob>,
@@ -877,6 +922,7 @@ impl Pipeline {
         retention_policy: RetentionPolicy,
     ) -> CliResult<Self> {
         let (jobs, job_rx) = channel();
+        let (worker_done_tx, worker_done) = channel();
         let (history_queries, history_rx) = channel();
         let (uploads, upload_rx) = channel();
         let (outcome_tx, outcomes) = channel();
@@ -909,6 +955,8 @@ impl Pipeline {
             })?;
 
         let capture_uploads = uploads.clone();
+        let scrolling_cancellation = AtomicCancellation::default();
+        let worker_scrolling_cancellation = scrolling_cancellation.clone();
         let worker = match std::thread::Builder::new()
             .name("scrozz-capture".to_owned())
             .spawn(move || {
@@ -921,7 +969,11 @@ impl Pipeline {
                     waker,
                     retention_policy,
                 )
+                .with_scrolling_cancellation(worker_scrolling_cancellation)
                 .run(&job_rx, &worker_pin_updates);
+                // Sent from inside the thread so `stop` can distinguish "the
+                // loop returned" from "the join is blocked on native work".
+                let _ = worker_done_tx.send(());
             }) {
             Ok(worker) => worker,
             Err(err) => {
@@ -956,6 +1008,9 @@ impl Pipeline {
         Ok(Self {
             jobs,
             capture_budget,
+            worker_done,
+            scrolling_cancellation,
+            active_scrolling_acquisition: Mutex::new(None),
             pending_pin_updates,
             history_queries,
             uploads,
@@ -1122,15 +1177,76 @@ impl Pipeline {
             .is_ok()
     }
 
+    /// Posts a scrolling job with a token that Abort can cancel even while the
+    /// job is queued or waiting in native frame acquisition.
+    pub fn post_scrolling(
+        &self,
+        axis: ScrollAxis,
+        card: CardId,
+        target: Box<ScrollingTarget>,
+    ) -> bool {
+        self.scrolling_cancellation.reset();
+        let acquisition_cancellation = scrozz_capture::CaptureCancellation::new();
+        *self
+            .active_scrolling_acquisition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(acquisition_cancellation.clone());
+        let policy = crate::settings::stored_settings()
+            .map(|(persisted, _)| persisted)
+            .unwrap_or_default();
+        let posted = self.post(Job::Scrolling {
+            axis,
+            card,
+            origin: CaptureOrigin::Direct,
+            policy,
+            target,
+            acquisition_cancellation: acquisition_cancellation.clone(),
+        });
+        if !posted {
+            acquisition_cancellation.cancel();
+            self.active_scrolling_acquisition
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        posted
+    }
+
+    /// Asks the active scrolling session to keep its partial image or abort it.
+    ///
+    /// Abort also cancels the acquisition token, because a session blocked in
+    /// the compositor waiting for the next frame cannot observe a loop flag.
+    pub fn cancel_scrolling(&self, action: CancelAction) -> bool {
+        let accepted = self.scrolling_cancellation.cancel(action);
+        if accepted
+            && action == CancelAction::Abort
+            && let Some(cancellation) = self
+                .active_scrolling_acquisition
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+        {
+            cancellation.cancel();
+        }
+        accepted
+    }
+
+    #[cfg(test)]
+    pub fn seal_scrolling_output_for_test(&self) -> bool {
+        self.scrolling_cancellation.seal_output()
+    }
+
     /// Takes one finished piece of work, if there is one. Never blocks.
     pub fn poll(&self) -> Option<Outcome> {
         self.outcomes.try_recv().ok()
     }
 
-    /// Stops the worker and waits for it.
+    /// Cancels interactive acquisition, then stops and joins the worker.
     ///
     /// Called from `Drop`, but exposed so a host can shut down deterministically
-    /// rather than at an unspecified point during teardown.
+    /// rather than at an unspecified point during teardown. Cancelling first
+    /// closes an active Wayland ScreenCast session and dismisses its picker.
     pub fn stop(&mut self) {
         // The upload worker can still post work to the store-owning capture
         // worker, so it is drained first and the capture worker is stopped only
@@ -1144,7 +1260,20 @@ impl Pipeline {
         // store-owning worker only after uploads are fully drained.
         let _ = self.jobs.send(Job::Stop);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            match self.worker_done.recv_timeout(WORKER_STOP_TIMEOUT) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    if worker.join().is_err() {
+                        tracing::warn!("capture worker panicked during shutdown");
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        timeout_ms = WORKER_STOP_TIMEOUT.as_millis(),
+                        "capture worker did not stop in time; detaching the in-flight operation"
+                    );
+                    drop(worker);
+                }
+            }
         }
         let _ = self.history_queries.send(HistoryQuery::Stop);
         if let Some(worker) = self.history_worker.take() {
@@ -1421,6 +1550,7 @@ impl CaptureVault {
 struct Worker {
     outcomes: Sender<Outcome>,
     uploads: Sender<UploadJob>,
+    scrolling_cancellation: AtomicCancellation,
     waker: Option<SurfaceWaker>,
     selector: Arc<dyn CaptureSelector>,
     store: Option<SqliteStore>,
@@ -1436,6 +1566,13 @@ struct AnalysisCacheKey {
     card: CardId,
     document_fingerprint: u64,
     algorithm_version: u16,
+}
+
+/// Everything the worker needs to run one scrolling session.
+struct ScrollingJob {
+    axis: ScrollAxis,
+    target: ScrollingTarget,
+    acquisition_cancellation: scrozz_capture::CaptureCancellation,
 }
 
 struct CaptureLifecycle {
@@ -1498,6 +1635,7 @@ impl Worker {
         let mut worker = Self {
             outcomes,
             uploads,
+            scrolling_cancellation: AtomicCancellation::default(),
             waker,
             selector,
             store,
@@ -1509,6 +1647,17 @@ impl Worker {
         };
         worker.restore_existing_pins();
         worker
+    }
+
+    /// Shares the keep/abort token the main thread signals scrolling with.
+    ///
+    /// Separate from [`Self::new`] so the constructor keeps one job — opening
+    /// the store and restoring pins — and so the token is unmistakably the same
+    /// object the [`Pipeline`] holds, not a second one that would silently
+    /// never be signalled.
+    fn with_scrolling_cancellation(mut self, cancellation: AtomicCancellation) -> Self {
+        self.scrolling_cancellation = cancellation;
+        self
     }
 
     fn run(mut self, jobs: &Receiver<Job>, pending_pin_updates: &PendingPinUpdates) {
@@ -1524,7 +1673,25 @@ impl Worker {
                     card,
                     origin,
                     policy,
-                } => self.capture(kind, card, origin, &policy),
+                } => self.capture(kind, card, origin, &policy, None),
+                Job::Scrolling {
+                    axis,
+                    card,
+                    origin,
+                    policy,
+                    target,
+                    acquisition_cancellation,
+                } => self.capture(
+                    CaptureKind::Scrolling,
+                    card,
+                    origin,
+                    &policy,
+                    Some(ScrollingJob {
+                        axis,
+                        target: *target,
+                        acquisition_cancellation,
+                    }),
+                ),
                 #[cfg(target_os = "macos")]
                 Job::ApplePickerCapture {
                     kind,
@@ -1680,6 +1847,7 @@ impl Worker {
         card: CardId,
         origin: CaptureOrigin,
         policy: &AfterCaptureSettings,
+        scrolling: Option<ScrollingJob>,
     ) {
         tracing::debug!(
             %card,
@@ -1688,12 +1856,12 @@ impl Worker {
             "capture job started"
         );
         let mut lifecycle = CaptureLifecycle::new(Arc::clone(&self.selector));
-        let result = self.take(kind, card, policy, &mut lifecycle);
+        let result = self.take(kind, card, policy, &mut lifecycle, scrolling);
         match result {
             Ok(built) => {
                 self.emit(Outcome::Ready(Box::new(built)));
             }
-            Err(error) if error.is_cancellation() => {
+            Err(error) if error.is_cancellation() && kind != CaptureKind::Scrolling => {
                 tracing::debug!(%card, origin = origin.label(), "capture selection cancelled");
             }
             Err(error) => {
@@ -1769,10 +1937,36 @@ impl Worker {
         card: CardId,
         policy: &AfterCaptureSettings,
         lifecycle: &mut CaptureLifecycle,
+        scrolling: Option<ScrollingJob>,
     ) -> CliResult<ReadyCapture> {
         // Through `platform`, not `scrozz_capture` directly, so the
         // SCROZZ_UNSTABLE_BACKENDS guard still applies to the GUI path.
         let backend = platform::capture_backend()?;
+        if kind == CaptureKind::Scrolling {
+            let job = scrolling.ok_or_else(|| {
+                CliError::Core(CoreError::InvalidRequest(
+                    "a scrolling pipeline job must name its axis and target".to_owned(),
+                ))
+            })?;
+            let outcomes = self.outcomes.clone();
+            let capture = crate::scrolling::scrolling_capture_target_with_cancellation(
+                job.target,
+                job.axis,
+                &mut self.scrolling_cancellation,
+                &job.acquisition_cancellation,
+                move |progress| {
+                    let _ = outcomes.send(Outcome::Progress { card, progress });
+                },
+            )?;
+            lifecycle.finish();
+            // An abort that arrived while the last frame was being stitched must
+            // not produce a card, so it is checked after the session returns and
+            // before anything durable is written.
+            if !self.scrolling_cancellation.seal_output() {
+                return Err(CliError::Core(CoreError::Cancelled));
+            }
+            return self.finish_capture(kind, card, capture, policy);
+        }
         let mut selection_outcome = None;
         let target = match kind {
             // The one capture with nothing to choose, so it needs nothing but a
@@ -1789,6 +1983,9 @@ impl Worker {
                     .begin_capture(backend.excludes_current_process(&target))?;
                 target
             }
+            // Handled above, before any selector work: a scrolling session
+            // resolves its own target on the main thread.
+            CaptureKind::Scrolling => unreachable!("scrolling captures return earlier"),
             CaptureKind::AllInOne | CaptureKind::Region | CaptureKind::Window => {
                 let options = Self::options_for(kind);
                 let capabilities = self.selector.capabilities();
@@ -1987,7 +2184,7 @@ impl Worker {
                 hud: false,
                 ..SelectionOptions::for_mode(SelectionMode::Window)
             },
-            CaptureKind::Fullscreen | CaptureKind::AllDisplays => {
+            CaptureKind::Fullscreen | CaptureKind::AllDisplays | CaptureKind::Scrolling => {
                 unreachable!("fixed targets never ask for selector options")
             }
         }
@@ -3634,6 +3831,7 @@ mod tests {
         let worker = Worker {
             outcomes,
             uploads,
+            scrolling_cancellation: AtomicCancellation::default(),
             waker: None,
             selector: Arc::new(RefusingSelector),
             store: None,
@@ -3966,6 +4164,7 @@ mod tests {
             Worker {
                 outcomes,
                 uploads: channel().0,
+                scrolling_cancellation: AtomicCancellation::default(),
                 waker: None,
                 selector: Arc::new(RefusingSelector),
                 store: Some(store),
@@ -4278,6 +4477,9 @@ mod tests {
         let mut pipeline = Pipeline {
             jobs,
             capture_budget: CaptureBudget::new(),
+            worker_done: channel().1,
+            scrolling_cancellation: AtomicCancellation::default(),
+            active_scrolling_acquisition: Mutex::new(None),
             pending_pin_updates: Arc::new(PendingPinUpdates::default()),
             history_queries,
             uploads,
@@ -4348,6 +4550,9 @@ mod tests {
         let mut pipeline = Pipeline {
             jobs,
             capture_budget: CaptureBudget::new(),
+            worker_done: channel().1,
+            scrolling_cancellation: AtomicCancellation::default(),
+            active_scrolling_acquisition: Mutex::new(None),
             pending_pin_updates: Arc::new(PendingPinUpdates::default()),
             history_queries,
             uploads,
@@ -5041,6 +5246,7 @@ mod tests {
         let vault = CaptureVault::new();
         let mut worker = Worker {
             outcomes,
+            scrolling_cancellation: AtomicCancellation::default(),
             uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
@@ -5092,6 +5298,7 @@ mod tests {
         let (outcomes, _outcome_rx) = channel();
         let mut worker = Worker {
             outcomes,
+            scrolling_cancellation: AtomicCancellation::default(),
             uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
@@ -5130,6 +5337,7 @@ mod tests {
         let vault = CaptureVault::new();
         let mut worker = Worker {
             outcomes,
+            scrolling_cancellation: AtomicCancellation::default(),
             uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
@@ -5218,6 +5426,7 @@ mod tests {
         );
         let mut worker = Worker {
             outcomes,
+            scrolling_cancellation: AtomicCancellation::default(),
             uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),
@@ -5338,6 +5547,7 @@ mod tests {
         let capture = CaptureId("capture-generation".into());
         let mut worker = Worker {
             outcomes,
+            scrolling_cancellation: AtomicCancellation::default(),
             uploads: channel().0,
             waker: None,
             selector: Arc::new(RefusingSelector),

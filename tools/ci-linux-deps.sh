@@ -80,6 +80,27 @@ PACKAGES=(
   mesa-vulkan-drivers
   libgl1-mesa-dri
   libvulkan1
+
+  # PipeWire, for Wayland screen capture.
+  #
+  # This is the *runtime* library only, deliberately not `libpipewire-0.3-dev`.
+  # scrozz-capture dlopens `libpipewire-0.3.so.0` rather than linking it, so
+  # there are no headers to compile against and no pkg-config module to resolve
+  # — which is exactly what keeps `cargo check --target x86_64-unknown-linux-gnu`
+  # working from a Mac, and what lets an X11-only machine run Scrozz at all
+  # instead of failing at load time with an unresolved DT_NEEDED.
+  #
+  # Two things are NOT installed here because they cannot be made to work in a
+  # headless CI container, and installing them would imply otherwise:
+  #
+  #   pipewire                  the daemon; needs a user session bus
+  #   xdg-desktop-portal-*      the portal backend; needs a live compositor
+  #
+  # tools/wayland-smoke.sh checks for both at runtime and skips with exit 77
+  # when they are missing, rather than reporting a pass for a test that never
+  # ran. See docs/platforms.md for the full picture. The runtime package is
+  # selected after apt metadata is refreshed because Ubuntu 24.04 renamed it
+  # with the t64 transition.
 )
 
 echo "ci-linux-deps: updating package lists"
@@ -97,6 +118,15 @@ for attempt in 1 2 3; do
     exit 1
   fi
 done
+
+if apt-cache show libpipewire-0.3-0t64 >/dev/null 2>&1; then
+  PACKAGES+=(libpipewire-0.3-0t64)
+elif apt-cache show libpipewire-0.3-0 >/dev/null 2>&1; then
+  PACKAGES+=(libpipewire-0.3-0)
+else
+  echo "ci-linux-deps: no PipeWire 0.3 runtime package is available." >&2
+  exit 1
+fi
 
 echo "ci-linux-deps: installing ${#PACKAGES[@]} packages"
 if ! $SUDO apt-get install -y --no-install-recommends "${PACKAGES[@]}"; then

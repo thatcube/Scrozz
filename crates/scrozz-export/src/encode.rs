@@ -1,5 +1,7 @@
 //! Encoding frames to PNG, JPEG and WebP.
 
+use std::borrow::Cow;
+
 use image::{
     ExtendedColorType, ImageEncoder,
     codecs::{
@@ -139,7 +141,7 @@ impl FrameEncoder {
         set_profile(&mut encoder, profile, "PNG");
         let (buffer, colour) = self.body(image);
         encoder
-            .write_image(&buffer, image.width, image.height, colour)
+            .write_image(buffer.as_ref(), image.width, image.height, colour)
             .map_err(|e| Error::Codec(format!("PNG encoding failed: {e}")))?;
         Ok(out)
     }
@@ -166,17 +168,20 @@ impl FrameEncoder {
         set_profile(&mut encoder, profile, "WebP");
         let (buffer, colour) = self.body(image);
         encoder
-            .write_image(&buffer, image.width, image.height, colour)
+            .write_image(buffer.as_ref(), image.width, image.height, colour)
             .map_err(|e| Error::Codec(format!("WebP encoding failed: {e}")))?;
         Ok(out)
     }
 
     /// The pixel buffer and colour type to hand an alpha-capable encoder.
-    fn body(&self, image: &RgbaImage) -> (Vec<u8>, ExtendedColorType) {
+    fn body<'a>(&self, image: &'a RgbaImage) -> (Cow<'a, [u8]>, ExtendedColorType) {
         if self.options.drop_opaque_alpha && image.is_opaque() {
-            (image.to_rgb8([0, 0, 0]), ExtendedColorType::Rgb8)
+            (
+                Cow::Owned(image.to_rgb8([0, 0, 0])),
+                ExtendedColorType::Rgb8,
+            )
         } else {
-            (image.data.clone(), ExtendedColorType::Rgba8)
+            (Cow::Borrowed(&image.data), ExtendedColorType::Rgba8)
         }
     }
 }

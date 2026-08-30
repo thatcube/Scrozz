@@ -54,6 +54,7 @@ mod json;
 mod output;
 mod platform;
 mod report;
+mod scrolling;
 mod selection_store;
 mod settings;
 mod shortcuts;

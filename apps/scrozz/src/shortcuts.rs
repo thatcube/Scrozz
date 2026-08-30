@@ -67,18 +67,21 @@ pub enum ShortcutAction {
     CaptureFullscreen,
     /// Capture every connected display.
     CaptureAllDisplays,
+    /// Capture a scrolling page and stitch it into one image.
+    CaptureScrolling,
     /// Start or stop recording.
     ToggleRecording,
 }
 
 impl ShortcutAction {
     /// Every bindable action, in the order the settings pane lists them.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::CaptureAllInOne,
         Self::CaptureRegion,
         Self::CaptureWindow,
         Self::CaptureFullscreen,
         Self::CaptureAllDisplays,
+        Self::CaptureScrolling,
         Self::ToggleRecording,
     ];
 
@@ -91,6 +94,7 @@ impl ShortcutAction {
             Self::CaptureWindow => "capture.window",
             Self::CaptureFullscreen => "capture.fullscreen",
             Self::CaptureAllDisplays => "capture.all-displays",
+            Self::CaptureScrolling => "capture.scrolling",
             Self::ToggleRecording => "record.toggle",
         }
     }
@@ -108,6 +112,7 @@ impl ShortcutAction {
             Self::CaptureWindow => "hotkey.capture-window",
             Self::CaptureFullscreen => "hotkey.capture-display",
             Self::CaptureAllDisplays => "hotkey.capture-all-displays",
+            Self::CaptureScrolling => "hotkey.capture-scrolling",
             Self::ToggleRecording => "hotkey.record-toggle",
         }
     }
@@ -121,6 +126,7 @@ impl ShortcutAction {
             Self::CaptureWindow => scrozz_core::product_copy::CAPTURE_WINDOW,
             Self::CaptureFullscreen => scrozz_core::product_copy::CAPTURE_FULLSCREEN,
             Self::CaptureAllDisplays => scrozz_core::product_copy::CAPTURE_ALL_DISPLAYS,
+            Self::CaptureScrolling => scrozz_core::product_copy::SCROLLING_CAPTURE,
             Self::ToggleRecording => scrozz_core::product_copy::RECORD_SCREEN,
         }
     }
@@ -145,6 +151,14 @@ impl ShortcutAction {
                 "Cmd+Ctrl+Shift+7"
             } else {
                 "Super+Shift+6"
+            }),
+            // `Cmd+Shift+0` is already All-in-One on macOS, so the scrolling
+            // default moves to the same modifier family as All Displays there
+            // rather than colliding with a shortcut that ships bound.
+            Self::CaptureScrolling => Some(if mac {
+                "Cmd+Ctrl+Shift+8"
+            } else {
+                "Super+Shift+0"
             }),
             Self::ToggleRecording => None,
         }

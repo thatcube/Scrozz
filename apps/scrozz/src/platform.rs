@@ -24,7 +24,7 @@
 //! signatures means the compiler tells us the day a signature drifts, rather
 //! than the integration doing it months later.
 
-use scrozz_core::{CaptureBackend, TargetEnumerator};
+use scrozz_core::{Capture, CaptureBackend, CaptureRequest, ScrollDriver, TargetEnumerator};
 
 use crate::fault::{CliError, CliResult};
 
@@ -39,18 +39,21 @@ pub fn unstable_backends_enabled() -> bool {
 
 /// Whether the still-capture backend is ready without an opt-in guard.
 ///
-/// macOS capture has been exercised against a real display, including Retina
-/// scale, stride, premultiplied alpha, encoding and clipboard delivery. Keeping
-/// that verified path behind an environment variable makes a Finder-launched
-/// app silently reject every menu capture because Finder does not inherit shell
-/// variables.
+/// Shipping targets expose their capture backends directly. Unsupported native
+/// capabilities still fail at the backend boundary with actionable errors;
+/// they are not hidden behind a process-wide development opt-in.
 #[must_use]
 pub const fn capture_backend_is_stable() -> bool {
     // Unit tests deliberately retain the guard. Several command tests exercise
     // error paths with synthetic capture arguments; letting those reach the
     // verified backend captures the developer's real screen and writes into
     // ~/Pictures, which is both invasive and nondeterministic.
-    cfg!(all(target_os = "macos", not(test)))
+    !cfg!(test)
+        && cfg!(any(
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "linux"
+        ))
 }
 
 /// Whether still capture can be offered to a live UI in this process.
@@ -105,6 +108,18 @@ pub fn capture_backend() -> CliResult<Box<dyn CaptureBackend>> {
     Ok(scrozz_capture::backend()?)
 }
 
+/// Takes a capture whose interactive acquisition can be cancelled during shutdown.
+pub fn capture_with_cancellation(
+    request: &CaptureRequest,
+    cancellation: &scrozz_capture::CaptureCancellation,
+) -> CliResult<Capture> {
+    capture_guard("taking a capture", "scrozz-capture")?;
+    Ok(scrozz_capture::capture_with_cancellation(
+        request,
+        cancellation,
+    )?)
+}
+
 /// The display and window enumerator.
 ///
 /// # Errors
@@ -128,6 +143,18 @@ pub fn target_enumerator() -> CliResult<Box<dyn TargetEnumerator>> {
 /// its explicit platform/compositor error; callers must not invent a desktop.
 pub fn display_topology() -> CliResult<Box<dyn TargetEnumerator>> {
     Ok(scrozz_capture::backend()?)
+}
+
+/// The input driver used by scrolling capture on this desktop.
+///
+/// # Errors
+///
+/// Returns a platform or permission error when automatic synthesis was selected
+/// but cannot be prepared. Desktops without a synthesis protocol return the
+/// manual driver instead.
+pub fn scroll_driver() -> CliResult<Box<dyn ScrollDriver>> {
+    capture_guard("starting a scrolling capture", "scrozz-capture")?;
+    Ok(scrozz_capture::scroll_driver()?)
 }
 
 /// Starts a screen recording.

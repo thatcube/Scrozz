@@ -143,7 +143,9 @@ pub const fn picker_mode(
         CaptureKind::AllInOne => Some(PickerMode::WindowOrDisplay),
         CaptureKind::Window => Some(PickerMode::Window),
         CaptureKind::Fullscreen => Some(PickerMode::Display),
-        CaptureKind::Region | CaptureKind::AllDisplays => None,
+        // Apple's picker returns one still frame, so it can never stand in for
+        // a session that follows a window while it scrolls.
+        CaptureKind::Region | CaptureKind::AllDisplays | CaptureKind::Scrolling => None,
     }
 }
 

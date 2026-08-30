@@ -29,6 +29,8 @@ pub enum CaptureKind {
     Fullscreen,
     /// Every connected display. Needs nothing.
     AllDisplays,
+    /// A long image assembled while the active display scrolls.
+    Scrolling,
 }
 
 /// Where a live-app capture request entered the shared dispatcher.
@@ -63,12 +65,13 @@ impl CaptureOrigin {
 
 impl CaptureKind {
     /// Every kind, in menu order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::AllInOne,
         Self::Region,
         Self::Window,
         Self::Fullscreen,
         Self::AllDisplays,
+        Self::Scrolling,
     ];
 
     /// The stable identifier, shared with the tray and the hotkey table.
@@ -80,6 +83,7 @@ impl CaptureKind {
             Self::Window => "capture.window",
             Self::Fullscreen => "capture.fullscreen",
             Self::AllDisplays => "capture.all-displays",
+            Self::Scrolling => "capture.scrolling",
         }
     }
 
@@ -113,6 +117,9 @@ impl CaptureKind {
                 session.server,
                 DisplayServer::Wayland | DisplayServer::Headless
             ),
+            // Wayland is included on purpose: the capture runs there, manually,
+            // through the portal picker rather than through synthesized input.
+            Self::Scrolling => true,
         }
     }
 
@@ -125,6 +132,7 @@ impl CaptureKind {
             Self::Window => "window",
             Self::Fullscreen => "display",
             Self::AllDisplays => "all displays",
+            Self::Scrolling => "scrolling page",
         }
     }
 }
@@ -162,6 +170,7 @@ impl Action {
             TrayAction::CaptureWindow => Self::Capture(CaptureKind::Window),
             TrayAction::CaptureFullscreen => Self::Capture(CaptureKind::Fullscreen),
             TrayAction::CaptureAllDisplays => Self::Capture(CaptureKind::AllDisplays),
+            TrayAction::CaptureScrolling => Self::Capture(CaptureKind::Scrolling),
             TrayAction::ToggleRecording => Self::ToggleRecording,
             TrayAction::OpenHistory => Self::OpenHistory,
             TrayAction::OpenSettings => Self::OpenSettings,
@@ -210,6 +219,7 @@ impl Action {
             Self::Capture(CaptureKind::Window) => "scrozz capture --interactive window",
             Self::Capture(CaptureKind::Fullscreen) => "scrozz capture --display active",
             Self::Capture(CaptureKind::AllDisplays) => "scrozz capture --all-displays",
+            Self::Capture(CaptureKind::Scrolling) => "scrozz capture --scrolling",
             Self::ToggleRecording => "scrozz record --toggle",
             Self::OpenHistory => "scrozz history list",
             Self::OpenSettings => "scrozz settings show",
@@ -273,6 +283,7 @@ impl ShortcutAction {
             Self::CaptureWindow => Action::Capture(CaptureKind::Window),
             Self::CaptureFullscreen => Action::Capture(CaptureKind::Fullscreen),
             Self::CaptureAllDisplays => Action::Capture(CaptureKind::AllDisplays),
+            Self::CaptureScrolling => Action::Capture(CaptureKind::Scrolling),
             Self::ToggleRecording => Action::ToggleRecording,
         }
     }
@@ -286,6 +297,7 @@ impl ShortcutAction {
             Self::CaptureWindow => TrayAction::CaptureWindow,
             Self::CaptureFullscreen => TrayAction::CaptureFullscreen,
             Self::CaptureAllDisplays => TrayAction::CaptureAllDisplays,
+            Self::CaptureScrolling => TrayAction::CaptureScrolling,
             Self::ToggleRecording => TrayAction::ToggleRecording,
         }
     }

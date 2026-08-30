@@ -1072,6 +1072,12 @@ pub const SETTINGS: &[Setting] = &[
         description: scrozz_core::product_copy::SHORTCUT_CAPTURE_ALL_DISPLAYS,
     },
     Setting {
+        key: "hotkey.capture-scrolling",
+        kind: Kind::Accelerator,
+        default: ShortcutAction::CaptureScrolling.default_accelerator_setting(),
+        description: scrozz_core::product_copy::SHORTCUT_SCROLLING_CAPTURE,
+    },
+    Setting {
         key: "hotkey.record-toggle",
         kind: Kind::Accelerator,
         default: ShortcutAction::ToggleRecording.default_accelerator_setting(),

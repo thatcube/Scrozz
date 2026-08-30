@@ -46,6 +46,7 @@ raw-window-handle.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 fs2.workspace = true
@@ -69,6 +70,15 @@ windows = { workspace = true, features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true
 
 [lints]
 workspace = true

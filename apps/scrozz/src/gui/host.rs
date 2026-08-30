@@ -3342,6 +3342,7 @@ mod tests {
                 | crate::gui::action::CaptureKind::AllInOne => Provenance::Region,
                 crate::gui::action::CaptureKind::Fullscreen => Provenance::Display,
                 crate::gui::action::CaptureKind::AllDisplays => Provenance::AllDisplays,
+                crate::gui::action::CaptureKind::Scrolling => Provenance::Window,
             };
             let preview = scrozz_ui::card::CardChrome::for_provenance(provenance)
                 .geometry(slot, (3840, 2160));

@@ -81,7 +81,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
 | Annotation editor | 🟡 | 🟡 | 🟡 | Full editor UI, history, crop, zoom, Smart Frame, arrows, text, secure Redact and revision-safe copy/save/drag are implemented; final aggregate and platform validation remain |
 | Screen recording | 🟠 | 🟠 | 🟠 | Native recording engines and editor playback exist; macOS editor/export corrections and Windows/Linux runtime closure remain active |
-| Scrolling capture | 🟠 | 🟠 | 🟠 | Acquisition, alignment and stitching are under active integration; native app coverage and Wayland constraints remain |
+| Scrolling capture | 🟡 | 🟡 | 🟡 | Vertical and horizontal stitching, sticky-chrome removal, progress, cancellation and partial salvage are wired end to end. macOS synthesizes target-bound gestures; Windows and X11 have native drivers awaiting real-desktop smoke, while Wayland is deliberately manual |
 | Beautification | 🟡 | 🟡 | 🟡 | Smart Frame, automatic backgrounds, exact output sizes, custom presets and revision-safe export are integrated; hands-on aggregate validation remains |
 | BYO sharing | 🟠 | 🟠 | 🟠 | S3-compatible upload core exists; provider settings, credential-vault integration, history metadata and release packaging are active work |
 

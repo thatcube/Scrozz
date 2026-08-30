@@ -18,6 +18,8 @@
 //! The `#[path]` on each inline module block sets the directory its children
 //! resolve against, and is itself relative to `tests/`.
 
+const WAYLAND_PORTAL_PICKER_WINDOW_ID: &str = scrozz_capture::WAYLAND_PORTAL_PICKER_WINDOW_ID;
+
 #[path = "../src/linux/session.rs"]
 mod session;
 
@@ -46,6 +48,21 @@ mod wayland {
 
     #[path = "portal.rs"]
     pub mod portal;
+
+    #[path = "region.rs"]
+    pub mod region;
+
+    #[path = "pipewire"]
+    pub mod pipewire {
+        #[path = "pod.rs"]
+        pub mod pod;
+
+        #[path = "format.rs"]
+        pub mod format;
+
+        #[path = "lifecycle.rs"]
+        pub mod lifecycle;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,14 +1318,26 @@ mod randr_wire {
 // ---------------------------------------------------------------------------
 
 mod restore_tokens {
-    use super::wayland::restore::{TokenKey, TokenStore, token_path};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::wayland::restore::{
+        TokenFileLock, TokenKey, TokenStore, load, persist, persist_fail_closed, token_path,
+    };
 
     #[test]
     fn keys_round_trip_through_their_on_disk_spelling() {
-        for key in [TokenKey::Monitor, TokenKey::Window, TokenKey::AllDisplays] {
+        for key in [
+            TokenKey::Monitor,
+            TokenKey::Window,
+            TokenKey::AllDisplays,
+            TokenKey::display(&scrozz_core::DisplayId("x11:1:DP-1".into())),
+        ] {
             assert_eq!(TokenKey::parse(key.as_str()), Some(key));
         }
-        assert_eq!(TokenKey::parse("display"), None);
+        assert_eq!(TokenKey::parse("display:not-hex"), None);
         assert_eq!(TokenKey::parse(""), None);
     }
 
@@ -1317,12 +1346,47 @@ mod restore_tokens {
     #[test]
     fn tokens_are_kept_apart_by_session_kind() {
         let mut store = TokenStore::new();
-        store.set(TokenKey::Monitor, "mon-token");
-        store.set(TokenKey::Window, "win-token");
+        store.set(&TokenKey::Monitor, "mon-token");
+        store.set(&TokenKey::Window, "win-token");
 
-        assert_eq!(store.get(TokenKey::Monitor), Some("mon-token"));
-        assert_eq!(store.get(TokenKey::Window), Some("win-token"));
-        assert_eq!(store.get(TokenKey::AllDisplays), None);
+        assert_eq!(store.get(&TokenKey::Monitor), Some("mon-token"));
+        assert_eq!(store.get(&TokenKey::Window), Some("win-token"));
+        assert_eq!(store.get(&TokenKey::AllDisplays), None);
+    }
+
+    /// A token for one exact display must never silently restore another. The
+    /// encoded keys also keep arbitrary display names out of the tab-delimited
+    /// file syntax.
+    #[test]
+    fn display_tokens_are_scoped_to_one_encoded_identity() {
+        let left = TokenKey::display(&scrozz_core::DisplayId("x11:0:Left\tPanel".into()));
+        let right = TokenKey::display(&scrozz_core::DisplayId("x11:1:Right\nPanel".into()));
+        let mut store = TokenStore::new();
+        store.set(&left, "left-token");
+        store.set(&right, "right-token");
+
+        assert_eq!(store.get(&left), Some("left-token"));
+        assert_eq!(store.get(&right), Some("right-token"));
+        assert!(!left.as_str().contains(['\t', '\n']));
+        assert_eq!(TokenStore::parse(&store.serialise()), store);
+    }
+
+    /// Older builds stored one generic monitor token. It may be attempted only
+    /// as a migration candidate; the caller verifies the returned stream before
+    /// moving its rotation under the exact display key.
+    #[test]
+    fn an_exact_display_can_migrate_a_legacy_monitor_token() {
+        let display = TokenKey::display(&scrozz_core::DisplayId("x11:0:eDP-1".into()));
+        let mut store = TokenStore::new();
+        store.set(&TokenKey::Monitor, "legacy-token");
+
+        assert_eq!(
+            store.candidate(&display),
+            Some((TokenKey::Monitor, "legacy-token"))
+        );
+        store.set(&display, "rotated-token");
+        store.invalidate(&TokenKey::Monitor);
+        assert_eq!(store.candidate(&display), Some((display, "rotated-token")));
     }
 
     /// The portal returns an empty string when the user declined persistence.
@@ -1331,26 +1395,29 @@ mod restore_tokens {
     #[test]
     fn an_empty_token_removes_rather_than_stores() {
         let mut store = TokenStore::new();
-        store.set(TokenKey::Monitor, "mon-token");
-        store.set(TokenKey::Monitor, "");
-        assert_eq!(store.get(TokenKey::Monitor), None);
+        store.set(&TokenKey::Monitor, "mon-token");
+        store.set(&TokenKey::Monitor, "");
+        assert_eq!(store.get(&TokenKey::Monitor), None);
         assert!(store.is_empty());
     }
 
     #[test]
     fn a_refused_token_can_be_discarded() {
         let mut store = TokenStore::new();
-        store.set(TokenKey::AllDisplays, "stale");
-        store.invalidate(TokenKey::AllDisplays);
-        assert_eq!(store.get(TokenKey::AllDisplays), None);
-        store.invalidate(TokenKey::AllDisplays); // idempotent
+        store.set(&TokenKey::AllDisplays, "stale");
+        store.invalidate(&TokenKey::AllDisplays);
+        assert_eq!(store.get(&TokenKey::AllDisplays), None);
+        store.invalidate(&TokenKey::AllDisplays); // idempotent
     }
 
     #[test]
     fn the_store_round_trips_through_its_file_format() {
         let mut store = TokenStore::new();
-        store.set(TokenKey::Monitor, "3fdd2d7e-8d54-4b5f-9d0f-1f7f2f0f4f8a");
-        store.set(TokenKey::AllDisplays, "kwin/42");
+        store.set(
+            &TokenKey::display(&scrozz_core::DisplayId("x11:0:eDP-1".into())),
+            "3fdd2d7e-8d54-4b5f-9d0f-1f7f2f0f4f8a",
+        );
+        store.set(&TokenKey::AllDisplays, "kwin/42");
 
         let text = store.serialise();
         assert!(text.starts_with('#'), "explains itself to whoever finds it");
@@ -1371,9 +1438,9 @@ window\t
    window \t  spaced-token  
 ";
         let store = TokenStore::parse(text);
-        assert_eq!(store.get(TokenKey::Monitor), Some("good-token"));
-        assert_eq!(store.get(TokenKey::Window), Some("spaced-token"));
-        assert_eq!(store.get(TokenKey::AllDisplays), None);
+        assert_eq!(store.get(&TokenKey::Monitor), Some("good-token"));
+        assert_eq!(store.get(&TokenKey::Window), Some("spaced-token"));
+        assert_eq!(store.get(&TokenKey::AllDisplays), None);
     }
 
     #[test]
@@ -1418,6 +1485,218 @@ window\t
         assert_eq!(token_path(None, None), None);
         assert_eq!(token_path(Some("  "), Some("  ")), None);
     }
+
+    #[test]
+    fn token_file_lock_excludes_another_process_descriptor() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("scrozz-token-lock-{}-{nonce}", std::process::id()));
+        let path = directory.join("portal-tokens");
+        let first = TokenFileLock::acquire(&path).expect("first process lock");
+
+        let lock_path = directory.join("portal-tokens.lock");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&lock_path)
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            TokenFileLock::try_acquire(&path)
+                .expect("second descriptor")
+                .is_none(),
+            "the second descriptor must observe the held advisory lock"
+        );
+
+        drop(first);
+        let second = TokenFileLock::try_acquire(&path)
+            .expect("second descriptor")
+            .expect("lock is released on drop");
+        drop(second);
+        std::fs::remove_file(lock_path).expect("remove lock fixture");
+        std::fs::remove_dir(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn token_persistence_is_atomic_and_reports_storage_failures() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("scrozz-token-write-{}-{nonce}", std::process::id()));
+        let path = directory.join("state").join("portal-tokens");
+        let mut store = TokenStore::new();
+        store.set(&TokenKey::Monitor, "rotated");
+
+        persist(Some(&path), &store).expect("persist token");
+        assert_eq!(load(&path).expect("securely load token"), store);
+        let written = std::fs::read_to_string(&path).expect("read token");
+        assert_eq!(TokenStore::parse(&written), store);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("token metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("make an old store permissive");
+            let lock = TokenFileLock::acquire(&path).expect("lock and harden old store");
+            drop(lock);
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("hardened token metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::remove_file(path.with_file_name("portal-tokens.lock")).expect("remove lock");
+        }
+        assert!(
+            !path.with_file_name("portal-tokens.tmp").exists(),
+            "atomic temporary file is removed by rename"
+        );
+
+        std::fs::remove_file(&path).expect("remove token");
+        std::fs::remove_dir(directory.join("state")).expect("remove state directory");
+
+        let blocker = directory.join("not-a-directory");
+        std::fs::write(&blocker, b"file").expect("write blocker");
+        let error = persist(Some(&blocker.join("portal-tokens")), &store)
+            .expect_err("a file cannot be a parent directory");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+            ),
+            "unexpected persistence failure: {error}"
+        );
+        std::fs::remove_file(blocker).expect("remove blocker");
+        std::fs::remove_dir(directory).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_paths_refuse_leaf_symlinks_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("scrozz-token-links-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).expect("create fixture");
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"do not touch").expect("write victim");
+
+        let symlink_path = directory.join("portal-tokens");
+        symlink(&victim, &symlink_path).expect("create token symlink");
+        assert!(TokenFileLock::acquire(&symlink_path).is_err());
+        assert!(load(&symlink_path).is_err());
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"do not touch"
+        );
+        std::fs::remove_file(&symlink_path).expect("remove symlink");
+
+        let hardlink_path = directory.join("portal-tokens-hardlink");
+        std::fs::hard_link(&victim, &hardlink_path).expect("create token hardlink");
+        assert!(load(&hardlink_path).is_err());
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"do not touch"
+        );
+
+        std::fs::remove_file(hardlink_path).expect("remove hardlink");
+        std::fs::remove_file(victim).expect("remove victim");
+        std::fs::remove_dir(directory).expect("remove fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistence_unlinks_a_reserved_hardlinked_temp_without_truncating_its_target() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "scrozz-token-temp-link-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create fixture");
+        let path = directory.join("portal-tokens");
+        let temporary = directory.join("portal-tokens.tmp");
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"must survive").expect("write victim");
+        std::fs::hard_link(&victim, &temporary).expect("reserve temp as a hardlink");
+
+        let mut store = TokenStore::new();
+        store.set(&TokenKey::Monitor, "rotated");
+        persist(Some(&path), &store).expect("replace the reserved temporary name safely");
+
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"must survive",
+            "opening the temporary path must never truncate a preexisting inode"
+        );
+        assert_eq!(load(&path).expect("load replacement"), store);
+        assert!(!temporary.exists());
+
+        std::fs::remove_file(path).expect("remove token");
+        std::fs::remove_file(victim).expect("remove victim");
+        std::fs::remove_dir(directory).expect("remove fixture");
+    }
+
+    #[test]
+    fn token_files_and_rotations_have_a_bounded_size() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("scrozz-token-size-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).expect("create fixture");
+        let path = directory.join("portal-tokens");
+        std::fs::write(&path, vec![b'x'; 70 * 1024]).expect("write oversized fixture");
+        assert_eq!(
+            load(&path)
+                .expect_err("an oversized token file must be refused")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        std::fs::remove_file(&path).expect("remove oversized fixture");
+
+        let mut old_store = TokenStore::new();
+        old_store.set(&TokenKey::Monitor, "consumed");
+        persist(Some(&path), &old_store).expect("persist consumed token");
+
+        let mut store = TokenStore::new();
+        store.set(&TokenKey::Monitor, &"x".repeat(70 * 1024));
+        assert_eq!(
+            persist_fail_closed(Some(&path), &store)
+                .expect_err("an oversized rotation must not reach disk")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(
+            !path.exists(),
+            "a failed rotation must remove the old consumed token"
+        );
+        assert!(!directory.join("portal-tokens.tmp").exists());
+        std::fs::remove_dir(directory).expect("remove fixture");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,17 +1705,18 @@ window\t
 
 mod portal_negotiation {
     use super::wayland::portal::{
-        SessionPlan, StreamInfo, cursor_mode, path_from_uri, persist_mode, source_type,
+        PORTAL_PICKER_WINDOW_ID, PlanFailure, SessionPlan, StreamInfo, cursor_mode, path_from_uri,
+        persist_mode, source_type,
     };
     use super::wayland::restore::TokenKey;
     use scrozz_core::{CaptureTarget, DisplayId, LogicalPoint, LogicalRect, LogicalSize, WindowId};
 
     #[test]
     fn a_display_capture_asks_for_a_monitor() {
-        let plan = SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false);
+        let plan =
+            SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false).unwrap();
         assert_eq!(plan.types, source_type::MONITOR);
-        assert_eq!(plan.restore_key, TokenKey::Monitor);
-        assert!(!plan.multiple);
+        assert_eq!(plan.restore_key, TokenKey::display(&DisplayId("1".into())));
     }
 
     /// The portal has no concept of a sub-rectangle, and asking the user to
@@ -1447,33 +1727,66 @@ mod portal_negotiation {
             LogicalPoint::new(0.0, 0.0),
             LogicalSize::new(100.0, 100.0),
         ));
-        let plan = SessionPlan::for_target(&region, false);
+        let plan = SessionPlan::for_target(&region, false).unwrap();
         assert_eq!(plan.types, source_type::MONITOR);
         assert_eq!(plan.restore_key, TokenKey::Monitor);
+        assert_eq!(
+            plan.bind_monitor(&DisplayId("x11:0:eDP-1".into()))
+                .restore_key,
+            TokenKey::display(&DisplayId("x11:0:eDP-1".into()))
+        );
     }
 
     #[test]
-    fn a_window_capture_asks_for_a_window() {
-        let plan = SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false);
+    fn a_requested_window_id_is_refused_before_the_picker() {
+        assert_eq!(
+            SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false),
+            Err(PlanFailure::WindowIdentityUnavailable)
+        );
+        let scrozz_core::Error::Unsupported { what, why } =
+            PlanFailure::WindowIdentityUnavailable.into_error()
+        else {
+            panic!("an unverifiable window id must be unsupported");
+        };
+        assert!(what.contains("window id"));
+        assert!(why.contains("before opening the picker"));
+        assert!(why.contains("cannot prove"));
+    }
+
+    #[test]
+    fn the_explicit_portal_window_sentinel_opens_only_a_window_picker() {
+        let plan = SessionPlan::for_target(
+            &CaptureTarget::Window(WindowId(PORTAL_PICKER_WINDOW_ID.into())),
+            false,
+        )
+        .expect("the explicit portal-owned target is honest");
         assert_eq!(plan.types, source_type::WINDOW);
         assert_eq!(plan.restore_key, TokenKey::Window);
     }
 
     #[test]
-    fn all_displays_offers_monitors_and_virtual_sources_and_allows_several() {
-        let plan = SessionPlan::for_target(&CaptureTarget::AllDisplays, false);
-        assert_eq!(plan.types, source_type::MONITOR | source_type::VIRTUAL);
-        assert_eq!(plan.restore_key, TokenKey::AllDisplays);
-        assert!(plan.multiple);
+    fn all_displays_is_refused_before_portal_negotiation() {
+        assert_eq!(
+            SessionPlan::for_target(&CaptureTarget::AllDisplays, false),
+            Err(PlanFailure::AllDisplaysNeedsPositions)
+        );
+        let error = PlanFailure::AllDisplaysNeedsPositions.into_error();
+        let scrozz_core::Error::Unsupported { what, why } = error else {
+            panic!("all-display planning must return Unsupported");
+        };
+        assert!(what.contains("all displays"));
+        assert!(why.contains("before opening the portal picker"));
+        assert!(why.contains("Capture one display instead"));
     }
 
     /// A still capture cannot composite a pointer itself without getting the
     /// hotspot subtly wrong, so it asks the portal to embed one.
     #[test]
     fn the_pointer_is_requested_embedded_or_hidden() {
-        let with = SessionPlan::for_target(&CaptureTarget::AllDisplays, true);
+        let target = CaptureTarget::Display(DisplayId("1".into()));
+        let with = SessionPlan::for_target(&target, true).unwrap();
         assert_eq!(with.cursor, cursor_mode::EMBEDDED);
-        let without = SessionPlan::for_target(&CaptureTarget::AllDisplays, false);
+        let without = SessionPlan::for_target(&target, false).unwrap();
         assert_eq!(without.cursor, cursor_mode::HIDDEN);
     }
 
@@ -1482,7 +1795,8 @@ mod portal_negotiation {
     /// mechanism exists to prevent.
     #[test]
     fn persistence_outlives_the_process() {
-        let plan = SessionPlan::for_target(&CaptureTarget::AllDisplays, false);
+        let plan =
+            SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false).unwrap();
         assert_eq!(plan.persist, persist_mode::EXPLICITLY_REVOKED);
         assert_ne!(plan.persist, persist_mode::APPLICATION);
     }
@@ -1491,19 +1805,21 @@ mod portal_negotiation {
     /// sources must be met with a narrowed request, not a rejected call.
     #[test]
     fn narrowing_drops_source_types_the_portal_lacks() {
-        let plan = SessionPlan::for_target(&CaptureTarget::AllDisplays, false)
+        let plan = SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false)
+            .unwrap()
             .narrow(source_type::MONITOR, cursor_mode::HIDDEN)
             .expect("monitor survives");
         assert_eq!(plan.types, source_type::MONITOR);
     }
 
     #[test]
-    fn narrowing_to_nothing_is_a_refusal() {
+    fn narrowing_a_monitor_plan_to_nothing_is_a_refusal() {
         assert_eq!(
-            SessionPlan::for_target(&CaptureTarget::Window(WindowId("w".into())), false)
-                .narrow(source_type::MONITOR, cursor_mode::EMBEDDED),
+            SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), false)
+                .unwrap()
+                .narrow(source_type::WINDOW, cursor_mode::EMBEDDED),
             None,
-            "a portal with no window source cannot serve a window capture"
+            "a portal with no monitor source cannot serve a display capture"
         );
     }
 
@@ -1511,7 +1827,8 @@ mod portal_negotiation {
     /// losing the capture.
     #[test]
     fn an_unavailable_cursor_mode_degrades_to_hidden() {
-        let plan = SessionPlan::for_target(&CaptureTarget::AllDisplays, true)
+        let plan = SessionPlan::for_target(&CaptureTarget::Display(DisplayId("1".into())), true)
+            .unwrap()
             .narrow(source_type::MONITOR, cursor_mode::HIDDEN)
             .expect("monitor survives");
         assert_eq!(plan.cursor, cursor_mode::HIDDEN);
@@ -1584,6 +1901,8 @@ mod portal_negotiation {
         assert!(
             StreamInfo {
                 node_id: 42,
+                pipewire_serial: Some(9001),
+                source_type: Some(source_type::MONITOR),
                 position: Some((0, 0)),
                 size: Some((1920, 1080)),
             }
@@ -1592,10 +1911,1892 @@ mod portal_negotiation {
         assert!(
             !StreamInfo {
                 node_id: 42,
+                pipewire_serial: None,
+                source_type: None,
                 position: None,
                 size: Some((1920, 1080)),
             }
             .is_placeable()
+        );
+    }
+
+    #[test]
+    fn modern_portal_streams_require_exact_source_and_stable_serial() {
+        let valid = StreamInfo {
+            node_id: u32::MAX,
+            pipewire_serial: Some(9001),
+            source_type: Some(source_type::MONITOR),
+            position: Some((0, 0)),
+            size: Some((1920, 1080)),
+        };
+        assert!(valid.validate_contract(6, source_type::MONITOR).is_ok());
+
+        let mut missing_serial = valid;
+        missing_serial.pipewire_serial = None;
+        assert!(
+            missing_serial
+                .validate_contract(6, source_type::MONITOR)
+                .expect_err("v6 requires pipewire-serial")
+                .contains("pipewire-serial")
+        );
+
+        let mut wrong_source = valid;
+        wrong_source.source_type = Some(source_type::WINDOW);
+        assert!(
+            wrong_source
+                .validate_contract(6, source_type::MONITOR)
+                .expect_err("a window stream cannot satisfy a monitor plan")
+                .contains("source type")
+        );
+    }
+
+    #[test]
+    fn legacy_numeric_target_must_not_be_pipewire_wildcard() {
+        let stream = StreamInfo {
+            node_id: u32::MAX,
+            pipewire_serial: None,
+            source_type: None,
+            position: None,
+            size: None,
+        };
+        assert!(
+            stream
+                .validate_contract(2, source_type::WINDOW)
+                .expect_err("an unspecified legacy target must fail before opening PipeWire")
+                .contains("wildcard node id")
+        );
+    }
+}
+
+/// The SPA POD encoder, checked byte for byte.
+///
+/// These assertions are transcriptions of the layout in
+/// `spa/pod/pod.h`, and they are deliberately literal. A POD is a binary
+/// structure another process parses with pointer arithmetic; "it looked right in
+/// the debugger" is not a standard that catches a misplaced pad byte, and a
+/// misplaced pad byte produces a stream that silently never negotiates.
+mod spa_pod {
+    use super::wayland::pipewire::pod::{
+        Choice, Object, ObjectRef, Property, Scalar, choice, kind, pad_to_8,
+    };
+
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
+    }
+
+    #[test]
+    fn padding_rounds_up_to_the_next_multiple_of_eight() {
+        assert_eq!(pad_to_8(0), 0);
+        assert_eq!(pad_to_8(1), 8);
+        assert_eq!(pad_to_8(8), 8);
+        assert_eq!(pad_to_8(9), 16);
+        assert_eq!(pad_to_8(16), 16);
+    }
+
+    /// A four-byte value still occupies sixteen bytes: an eight-byte header,
+    /// four bytes of body, and four of padding. The declared size covers the
+    /// body only, which is the part that is easy to get backwards.
+    #[test]
+    fn a_scalar_declares_its_body_size_and_pads_its_footprint() {
+        let encoded = Scalar::id(7).encode();
+
+        assert_eq!(encoded.len(), 16);
+        assert_eq!(u32_at(&encoded, 0), 4, "size counts the body only");
+        assert_eq!(u32_at(&encoded, 4), kind::ID);
+        assert_eq!(u32_at(&encoded, 8), 7);
+        assert_eq!(&encoded[12..], &[0, 0, 0, 0], "tail is zero padding");
+    }
+
+    /// Rectangles and fractions are two `u32`s, so they need no padding at all.
+    #[test]
+    fn eight_byte_scalars_need_no_padding() {
+        let rectangle = Scalar::rectangle(1920, 1080).encode();
+        assert_eq!(rectangle.len(), 16);
+        assert_eq!(u32_at(&rectangle, 0), 8);
+        assert_eq!(u32_at(&rectangle, 4), kind::RECTANGLE);
+        assert_eq!(u32_at(&rectangle, 8), 1920);
+        assert_eq!(u32_at(&rectangle, 12), 1080);
+
+        let fraction = Scalar::fraction(60, 1).encode();
+        assert_eq!(u32_at(&fraction, 4), kind::FRACTION);
+        assert_eq!(u32_at(&fraction, 8), 60);
+        assert_eq!(u32_at(&fraction, 12), 1);
+    }
+
+    /// The rule that makes choices different from everything else: inside a
+    /// choice body the alternatives are packed contiguously at exactly the
+    /// child's size, with no per-value padding. `spa_pod_builder_pad` returns
+    /// early while the body flag is set, and a client that pads anyway produces
+    /// a POD the server reads as garbage.
+    #[test]
+    fn choice_alternatives_are_packed_without_padding() {
+        let values = vec![Scalar::id(8), Scalar::id(7), Scalar::id(12)];
+        let encoded = Choice::enumerated(values)
+            .encode()
+            .expect("uniform id values encode");
+
+        // 8 header + 16 choice body header + 3 * 4 bytes of packed ids = 36,
+        // padded to 40.
+        assert_eq!(encoded.len(), 40);
+        assert_eq!(u32_at(&encoded, 0), 28, "body is 16 + 3 * 4");
+        assert_eq!(u32_at(&encoded, 4), kind::CHOICE);
+        assert_eq!(u32_at(&encoded, 8), choice::ENUM);
+        assert_eq!(u32_at(&encoded, 12), 0, "no choice flags");
+        assert_eq!(u32_at(&encoded, 16), 4, "child size is one id");
+        assert_eq!(u32_at(&encoded, 20), kind::ID);
+        assert_eq!(u32_at(&encoded, 24), 8, "default comes first");
+        assert_eq!(u32_at(&encoded, 28), 7);
+        assert_eq!(u32_at(&encoded, 32), 12);
+    }
+
+    /// A range is default, then minimum, then maximum. Swapping the first two —
+    /// the intuitive ordering — makes every negotiation pick the minimum.
+    #[test]
+    fn a_range_choice_orders_default_min_max() {
+        let encoded = Choice::range(Scalar::int(30), Scalar::int(1), Scalar::int(60))
+            .encode()
+            .expect("uniform int values encode");
+
+        assert_eq!(u32_at(&encoded, 8), choice::RANGE);
+        assert_eq!(u32_at(&encoded, 24), 30);
+        assert_eq!(u32_at(&encoded, 28), 1);
+        assert_eq!(u32_at(&encoded, 32), 60);
+    }
+
+    /// Flags are one mask value, not an enum whose individual bits are emitted
+    /// as separate alternatives.
+    #[test]
+    fn a_flags_choice_encodes_one_integer_mask() {
+        let encoded = Choice::flags(Scalar::int(0b110))
+            .encode()
+            .expect("one integer is uniform");
+
+        assert_eq!(encoded.len(), 32);
+        assert_eq!(u32_at(&encoded, 0), 20);
+        assert_eq!(u32_at(&encoded, 8), choice::FLAGS);
+        assert_eq!(u32_at(&encoded, 16), 4);
+        assert_eq!(u32_at(&encoded, 20), kind::INT);
+        assert_eq!(u32_at(&encoded, 24), 0b110);
+    }
+
+    /// A choice whose alternatives disagree about their type cannot be encoded:
+    /// the body carries one child header for all of them.
+    #[test]
+    fn a_mixed_type_choice_is_refused_rather_than_encoded_wrongly() {
+        assert!(
+            Choice::enumerated(vec![Scalar::id(1), Scalar::int(2)])
+                .encode()
+                .is_none()
+        );
+        assert!(Choice::enumerated(Vec::new()).encode().is_none());
+    }
+
+    /// An object's declared size covers its `{ type, id }` body plus every
+    /// property, and a parse of the result must recover exactly what went in.
+    #[test]
+    fn an_object_round_trips_through_the_parser() {
+        let object = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![
+                Property::scalar(1, &Scalar::id(2)),
+                Property::scalar(0x0002_0003, &Scalar::rectangle(2560, 1440)),
+            ],
+        };
+        let encoded = object.encode();
+
+        assert_eq!(u32_at(&encoded, 0) as usize, encoded.len() - 8);
+        assert_eq!(u32_at(&encoded, 4), kind::OBJECT);
+
+        let parsed = ObjectRef::parse(&encoded).expect("the encoder produces parseable objects");
+        assert_eq!(parsed.object_type, 0x0004_0003);
+        assert_eq!(parsed.id, 4);
+        assert_eq!(parsed.properties().count(), 2);
+        assert_eq!(
+            parsed.property(1).and_then(|property| property.as_id()),
+            Some(2)
+        );
+        assert_eq!(
+            parsed
+                .property(0x0002_0003)
+                .and_then(|property| property.as_rectangle()),
+            Some((2560, 1440))
+        );
+        assert!(parsed.property(0xDEAD).is_none());
+    }
+
+    /// A server is entitled to report a fixated value still wrapped in a
+    /// single-alternative choice, and several do. Reading through that wrapper
+    /// is the difference between negotiating and hanging.
+    #[test]
+    fn a_fixated_value_is_read_through_its_choice_wrapper() {
+        let wrapped = Choice::fixed(Scalar::id(12));
+        let object = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![
+                Property::choice(0x0002_0001, &wrapped).expect("uniform choice encodes"),
+            ],
+        };
+        let encoded = object.encode();
+
+        let parsed = ObjectRef::parse(&encoded).expect("parseable");
+        assert!(parsed.property(0x0002_0001).expect("property").is_fixated());
+        assert_eq!(
+            parsed
+                .property(0x0002_0001)
+                .and_then(|property| property.as_id()),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn a_fixated_choice_may_retain_ignored_alternatives() {
+        let mut wrapped = Choice::enumerated(vec![Scalar::id(12), Scalar::id(8)]);
+        wrapped.flavour = choice::NONE;
+        let encoded = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![Property::choice(1, &wrapped).expect("uniform choice encodes")],
+        }
+        .encode();
+
+        let property = ObjectRef::parse(&encoded)
+            .expect("parseable")
+            .property(1)
+            .expect("property");
+        assert!(property.is_fixated());
+        assert_eq!(
+            property.as_id(),
+            Some(12),
+            "SPA says values beyond the current one are ignored for Choice(None)"
+        );
+    }
+
+    #[test]
+    fn a_non_fixated_choice_and_wrong_width_scalar_are_not_agreements() {
+        let choices = Choice::enumerated(vec![Scalar::id(12), Scalar::id(8)]);
+        let single_choice = Choice::enumerated(vec![Scalar::id(12)]);
+        let oversized_id = Scalar {
+            kind: kind::ID,
+            body: [7u32.to_ne_bytes(), 99u32.to_ne_bytes()].concat(),
+        };
+        let encoded = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![
+                Property::choice(1, &choices).expect("uniform choice encodes"),
+                Property::scalar(2, &oversized_id),
+                Property::choice(3, &single_choice).expect("uniform choice encodes"),
+            ],
+        }
+        .encode();
+
+        let parsed = ObjectRef::parse(&encoded).expect("the outer object is well formed");
+        assert_eq!(parsed.property(1).and_then(|value| value.as_id()), None);
+        assert_eq!(parsed.property(2).and_then(|value| value.as_id()), None);
+        let single = parsed.property(3).expect("single enum");
+        assert_eq!(single.as_id(), Some(12), "the default remains inspectable");
+        assert!(
+            !single.is_fixated(),
+            "one offered alternative is not an explicit negotiation result"
+        );
+    }
+
+    /// This parses memory another process wrote, so every truncation must be a
+    /// `None` rather than a panic or an over-read.
+    #[test]
+    fn truncated_and_mistyped_pods_are_rejected() {
+        let encoded = Object {
+            object_type: 0x0004_0003,
+            id: 4,
+            properties: vec![Property::scalar(1, &Scalar::id(2))],
+        }
+        .encode();
+
+        assert!(ObjectRef::parse(&[]).is_none());
+        assert!(ObjectRef::parse(&encoded[..8]).is_none());
+        assert!(ObjectRef::parse(&encoded[..encoded.len() - 1]).is_none());
+        assert!(
+            ObjectRef::parse(&Scalar::id(1).encode()).is_none(),
+            "a scalar is not an object"
+        );
+
+        let mut malformed_property = encoded.clone();
+        malformed_property[24..28].copy_from_slice(&12u32.to_ne_bytes());
+        assert!(
+            ObjectRef::parse(&malformed_property).is_none(),
+            "a nested value cannot extend past its enclosing object"
+        );
+
+        let mut trailing_junk = encoded.clone();
+        trailing_junk.extend_from_slice(&[0; 8]);
+        let enlarged = u32_at(&trailing_junk, 0) + 8;
+        trailing_junk[..4].copy_from_slice(&enlarged.to_ne_bytes());
+        assert!(
+            ObjectRef::parse(&trailing_junk).is_none(),
+            "an incomplete trailing property makes the whole object malformed"
+        );
+
+        let mut impossible = encoded;
+        impossible[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(
+            ObjectRef::parse(&impossible).is_none(),
+            "a peer-controlled length cannot over-read the callback buffer"
+        );
+    }
+}
+
+/// Format negotiation: what is offered, and what the answer is understood to
+/// mean.
+mod format_negotiation {
+    use scrozz_core::{ColorSpace, PixelFormat};
+
+    use super::wayland::pipewire::format::{
+        self, FormatError, MAX_DIMENSION, MAX_FRAME_BYTES, MEDIA_SUBTYPE_RAW, MEDIA_TYPE_VIDEO,
+        Negotiated, OBJECT_FORMAT, OBJECT_PARAM_BUFFERS, PREFERRED_FORMATS, PREFERRED_TRANSFERS,
+        buffer_key, data_type, key, param, primaries, transfer, video_format,
+    };
+    use super::wayland::pipewire::pod::{Choice, Object, ObjectRef, Property, Scalar, choice};
+
+    fn format_object(properties: Vec<Property>) -> Vec<u8> {
+        Object {
+            object_type: OBJECT_FORMAT,
+            id: param::FORMAT,
+            properties,
+        }
+        .encode()
+    }
+
+    fn raw_video(extra: Vec<Property>) -> Vec<u8> {
+        let mut properties = vec![
+            Property::scalar(key::MEDIA_TYPE, &Scalar::id(MEDIA_TYPE_VIDEO)),
+            Property::scalar(key::MEDIA_SUBTYPE, &Scalar::id(MEDIA_SUBTYPE_RAW)),
+        ];
+        properties.extend(extra);
+        format_object(properties)
+    }
+
+    /// The offer must announce raw video and carry a format list, a size range
+    /// and a framerate range. A missing `mediaType` is not a degraded offer —
+    /// the server discards it and the stream never starts.
+    #[test]
+    fn the_offer_is_a_well_formed_raw_video_enum_format() {
+        let offered = format::enum_format_param();
+        let parsed = ObjectRef::parse(&offered).expect("the offer is a valid object");
+
+        assert_eq!(parsed.object_type, OBJECT_FORMAT);
+        assert_eq!(parsed.id, param::ENUM_FORMAT);
+        assert_eq!(
+            parsed
+                .property(key::MEDIA_TYPE)
+                .and_then(|property| property.as_id()),
+            Some(MEDIA_TYPE_VIDEO)
+        );
+        assert_eq!(
+            parsed
+                .property(key::MEDIA_SUBTYPE)
+                .and_then(|property| property.as_id()),
+            Some(MEDIA_SUBTYPE_RAW)
+        );
+        assert!(parsed.property(key::VIDEO_FORMAT).is_some());
+        assert!(parsed.property(key::VIDEO_TRANSFER).is_some());
+        assert!(parsed.property(key::VIDEO_SIZE).is_some());
+        assert!(parsed.property(key::VIDEO_FRAMERATE).is_some());
+    }
+
+    /// No modifier is offered, and that is a decision rather than an oversight.
+    /// The follow-up ParamBuffers response makes the shared-memory fallback
+    /// explicit rather than relying on a producer default.
+    #[test]
+    fn the_offer_names_no_dma_buf_modifier() {
+        let offered = format::enum_format_param();
+        let parsed = ObjectRef::parse(&offered).expect("valid");
+        assert!(parsed.property(key::VIDEO_MODIFIER).is_none());
+    }
+
+    #[test]
+    fn the_buffer_response_allows_only_shared_memory() {
+        let response = format::shared_memory_buffer_param();
+        let parsed = ObjectRef::parse(&response).expect("valid ParamBuffers object");
+        assert_eq!(parsed.object_type, OBJECT_PARAM_BUFFERS);
+        assert_eq!(parsed.id, param::BUFFERS);
+
+        let data_types = parsed
+            .property(buffer_key::DATA_TYPE)
+            .expect("memory types are explicit");
+        assert_eq!(data_types.choice_flavour(), Some(choice::FLAGS));
+        assert_eq!(data_types.as_int(), Some(data_type::SHARED_MEMORY_MASK));
+        assert_eq!(
+            data_type::SHARED_MEMORY_MASK,
+            (1_i32 << data_type::MEM_PTR) | (1_i32 << data_type::MEM_FD)
+        );
+        assert_eq!(
+            data_type::SHARED_MEMORY_MASK & (1_i32 << data_type::DMA_BUF),
+            0
+        );
+    }
+
+    /// The framerate is a range including zero. An idle screen-cast source
+    /// reports 0/1, and a client that pinned 25/1 or 60/1 would fail to
+    /// intersect with it and wait forever for a stream that never starts.
+    #[test]
+    fn the_framerate_range_starts_at_zero() {
+        let offered = format::enum_format_param();
+        let parsed = ObjectRef::parse(&offered).expect("valid");
+        let framerate = parsed
+            .property(key::VIDEO_FRAMERATE)
+            .expect("a framerate is offered");
+        assert_eq!(
+            framerate.as_fraction(),
+            Some((0, 1)),
+            "the range's default is the idle rate"
+        );
+    }
+
+    /// BGRx first: it is what Mutter and KWin composite in, so matching it means
+    /// the server hands over its own buffer rather than converting every frame.
+    /// Alpha-bearing alternatives are intentionally absent because raw SPA
+    /// negotiation cannot communicate their alpha association.
+    #[test]
+    fn only_opaque_formats_are_offered() {
+        assert_eq!(PREFERRED_FORMATS[0], video_format::BGRX);
+        assert_eq!(PREFERRED_FORMATS.len(), 2);
+        assert!(!PREFERRED_FORMATS.contains(&video_format::BGRA));
+        assert!(!PREFERRED_FORMATS.contains(&video_format::RGBA));
+    }
+
+    /// Alpha honesty. SPA defines a premultiplication flag but its raw-format POD
+    /// does not transport it, while portal producers conventionally hand out
+    /// premultiplied compositor pixels. Accepting BGRA/RGBA as straight would
+    /// black-fringe antialiased edges, so only opaque formats are nameable.
+    #[test]
+    fn alpha_bearing_formats_are_rejected_instead_of_mislabeled() {
+        assert_eq!(
+            format::pixel_format(video_format::BGRX),
+            Some((PixelFormat::Bgra8, true))
+        );
+        assert_eq!(
+            format::pixel_format(video_format::RGBX),
+            Some((PixelFormat::Rgba8, true))
+        );
+        assert_eq!(format::pixel_format(video_format::BGRA), None);
+        assert_eq!(format::pixel_format(video_format::RGBA), None);
+        assert_eq!(format::pixel_format(0), None);
+
+        for spa in PREFERRED_FORMATS {
+            let (mapped, force_opaque) =
+                format::pixel_format(spa).expect("every offered format maps");
+            assert!(
+                !mapped.is_premultiplied(),
+                "fully opaque output is represented by the ordinary RGBA/BGRA type"
+            );
+            assert!(
+                force_opaque,
+                "every negotiated format must erase alpha ambiguity"
+            );
+        }
+    }
+
+    /// Primaries and transfer must agree before a named profile is attached.
+    /// Missing metadata stays unknown, while HDR transfer functions are refused
+    /// because this path negotiated only 8-bit SDR.
+    #[test]
+    fn colour_metadata_maps_conservatively() {
+        assert_eq!(
+            format::color_space(Some(primaries::BT709), Some(transfer::SRGB)),
+            Ok(ColorSpace::Srgb)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT2020), Some(transfer::BT2020_10)),
+            Ok(ColorSpace::Rec2020)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::SMPTE_RP431), Some(transfer::SRGB)),
+            Ok(ColorSpace::Unknown),
+            "DCI-P3 uses a different white point from Display P3 and must not receive its ICC tag"
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::SMPTE_EG432), Some(transfer::SRGB)),
+            Ok(ColorSpace::DisplayP3)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT709), Some(transfer::BT709)),
+            Ok(ColorSpace::Unknown),
+            "a representable SDR frame is kept but not given a false sRGB profile"
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT709), Some(transfer::GAMMA22)),
+            Ok(ColorSpace::Unknown),
+            "Mutter's ordinary SDR transfer is accepted without a false ICC profile"
+        );
+        assert_eq!(
+            format::color_space(None, Some(transfer::SRGB)),
+            Ok(ColorSpace::Unknown)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT709), None),
+            Ok(ColorSpace::Unknown)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::UNKNOWN), Some(transfer::UNKNOWN)),
+            Ok(ColorSpace::Unknown)
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT2020), Some(transfer::SMPTE2084)),
+            Err(FormatError::UnsupportedTransfer(transfer::SMPTE2084))
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::BT2020), Some(transfer::ARIB_STD_B67)),
+            Err(FormatError::UnsupportedTransfer(transfer::ARIB_STD_B67))
+        );
+        assert_eq!(
+            format::color_space(Some(primaries::SMPTE_RP431), Some(99)),
+            Ok(ColorSpace::Unknown),
+            "an unnameable non-HDR pair remains usable without a false profile"
+        );
+        assert!(!PREFERRED_TRANSFERS.contains(&transfer::SMPTE2084));
+        assert!(!PREFERRED_TRANSFERS.contains(&transfer::ARIB_STD_B67));
+        assert!(PREFERRED_TRANSFERS.contains(&transfer::GAMMA22));
+    }
+
+    #[test]
+    fn a_fixated_format_is_understood() {
+        let bytes = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(2560, 1440)),
+            Property::scalar(key::VIDEO_PRIMARIES, &Scalar::id(primaries::BT709)),
+            Property::scalar(key::VIDEO_TRANSFER, &Scalar::id(transfer::SRGB)),
+        ]);
+
+        assert_eq!(
+            format::parse_format(&bytes),
+            Ok(Negotiated {
+                width: 2560,
+                height: 1440,
+                pixel_format: PixelFormat::Bgra8,
+                opaque_padding: true,
+                color_space: ColorSpace::Srgb,
+            })
+        );
+    }
+
+    #[test]
+    fn a_format_without_primaries_is_still_usable() {
+        let bytes = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::RGBX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(800, 600)),
+        ]);
+
+        let negotiated = format::parse_format(&bytes).expect("usable");
+        assert_eq!(negotiated.color_space, ColorSpace::Unknown);
+        assert_eq!(negotiated.pixel_format, PixelFormat::Rgba8);
+        assert!(negotiated.opaque_padding);
+        assert_eq!(negotiated.packed_stride(), 3200);
+        assert_eq!(negotiated.packed_len(), 3200 * 600);
+    }
+
+    /// Every way the answer can be unusable has to be distinguishable, because
+    /// each one points at a different thing being wrong on the user's machine.
+    #[test]
+    fn unusable_formats_are_classified_rather_than_lumped_together() {
+        assert_eq!(format::parse_format(&[]), Err(FormatError::NotAFormat));
+
+        let audio = format_object(vec![
+            Property::scalar(key::MEDIA_TYPE, &Scalar::id(1)),
+            Property::scalar(key::MEDIA_SUBTYPE, &Scalar::id(1)),
+        ]);
+        assert_eq!(
+            format::parse_format(&audio),
+            Err(FormatError::WrongMedia {
+                media_type: 1,
+                media_subtype: 1,
+            })
+        );
+
+        let no_format = raw_video(vec![Property::scalar(
+            key::VIDEO_SIZE,
+            &Scalar::rectangle(64, 64),
+        )]);
+        assert_eq!(
+            format::parse_format(&no_format),
+            Err(FormatError::MissingFormat)
+        );
+
+        let offered_format = raw_video(vec![
+            Property::choice(
+                key::VIDEO_FORMAT,
+                &Choice::enumerated(vec![Scalar::id(video_format::BGRX)]),
+            )
+            .expect("uniform choice encodes"),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
+        ]);
+        assert_eq!(
+            format::parse_format(&offered_format),
+            Err(FormatError::MissingFormat),
+            "an enum default is not an explicitly fixated format"
+        );
+
+        let no_size = raw_video(vec![Property::scalar(
+            key::VIDEO_FORMAT,
+            &Scalar::id(video_format::BGRX),
+        )]);
+        assert_eq!(
+            format::parse_format(&no_size),
+            Err(FormatError::MissingSize)
+        );
+
+        let zero_size = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(1920, 0)),
+        ]);
+        assert_eq!(
+            format::parse_format(&zero_size),
+            Err(FormatError::MissingSize),
+            "a zero dimension is as unusable as a missing one"
+        );
+
+        let never_offered = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(9)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
+        ]);
+        assert_eq!(
+            format::parse_format(&never_offered),
+            Err(FormatError::UnsupportedFormat(9))
+        );
+
+        let oversized = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(MAX_DIMENSION + 1, 64)),
+        ]);
+        assert_eq!(
+            format::parse_format(&oversized),
+            Err(FormatError::UnsupportedSize {
+                width: MAX_DIMENSION + 1,
+                height: 64,
+            })
+        );
+
+        let memory_oversized = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(8192, 8192)),
+        ]);
+        assert_eq!(
+            format::parse_format(&memory_oversized),
+            Err(FormatError::FrameTooLarge {
+                width: 8192,
+                height: 8192,
+                bytes: 8192 * 8192 * 4,
+            })
+        );
+        assert_eq!(MAX_FRAME_BYTES, 128 * 1024 * 1024);
+
+        let modifier = raw_video(vec![
+            Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+            Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
+            Property::scalar(key::VIDEO_MODIFIER, &Scalar::long(0)),
+        ]);
+        assert_eq!(
+            format::parse_format(&modifier),
+            Err(FormatError::UnexpectedModifier)
+        );
+
+        for unsupported in [transfer::SMPTE2084, transfer::ARIB_STD_B67] {
+            let hdr = raw_video(vec![
+                Property::scalar(key::VIDEO_FORMAT, &Scalar::id(video_format::BGRX)),
+                Property::scalar(key::VIDEO_SIZE, &Scalar::rectangle(64, 64)),
+                Property::scalar(key::VIDEO_PRIMARIES, &Scalar::id(primaries::BT2020)),
+                Property::scalar(key::VIDEO_TRANSFER, &Scalar::id(unsupported)),
+            ]);
+            assert_eq!(
+                format::parse_format(&hdr),
+                Err(FormatError::UnsupportedTransfer(unsupported))
+            );
+        }
+    }
+}
+
+/// Stride handling: the single most common way a screenshot comes out skewed.
+mod stride_packing {
+    use std::borrow::Cow;
+
+    use scrozz_core::{ColorSpace, PixelFormat};
+
+    use super::wayland::pipewire::format::{
+        BufferError, Negotiated, linear_chunk, pack_rows, validate_chunk_geometry,
+    };
+
+    /// A padded buffer must be read row by row at the producer's stride and
+    /// written at the packed one. Reading it linearly gives the classic
+    /// diagonal shear, which looks like a decoding bug and is not.
+    #[test]
+    fn rows_are_lifted_out_of_padded_strides() {
+        // Two rows of two pixels, with sixteen bytes of padding per row.
+        let mut source = Vec::new();
+        for row in 0..2u8 {
+            for pixel in 0..2u8 {
+                source.extend_from_slice(&[row, pixel, 0x11, 0x22]);
+            }
+            source.extend_from_slice(&[0xEE; 16]);
+        }
+
+        let packed = pack_rows(&source, 24, 2, 2, false).expect("a padded buffer is readable");
+
+        assert_eq!(packed.len(), 16);
+        assert_eq!(
+            packed,
+            vec![
+                0, 0, 0x11, 0x22, 0, 1, 0x11, 0x22, //
+                1, 0, 0x11, 0x22, 1, 1, 0x11, 0x22,
+            ],
+            "no padding survives, and no row is shifted"
+        );
+    }
+
+    /// The final row needs only `width * 4` bytes. A producer is entitled to end
+    /// its mapping there, and demanding a full trailing stride would reject a
+    /// perfectly good buffer — which shows up as an intermittent failure on
+    /// exactly one compositor.
+    #[test]
+    fn a_buffer_ending_after_the_last_visible_row_is_accepted() {
+        let stride = 24usize;
+        let mut source = vec![0x40; stride + 8];
+        source[stride] = 0x41;
+
+        let packed = pack_rows(&source, stride as i32, 2, 2, false).expect("short tail is fine");
+        assert_eq!(packed.len(), 16);
+        assert_eq!(packed[8], 0x41);
+
+        assert_eq!(
+            pack_rows(&source[..stride + 7], stride as i32, 2, 2, false),
+            Err(BufferError::Short {
+                available: stride + 7,
+                needed: stride + 8,
+            }),
+            "one byte short is short"
+        );
+    }
+
+    /// In an `x` format the fourth byte is undefined, not opaque. Copying it
+    /// through produces a PNG with a random alpha channel — usually fully
+    /// transparent, which reads as "the screenshot is blank".
+    #[test]
+    fn undefined_padding_bytes_are_forced_opaque() {
+        let source = vec![0x10, 0x20, 0x30, 0x00, 0x40, 0x50, 0x60, 0x07];
+
+        let kept = pack_rows(&source, 8, 2, 1, false).expect("readable");
+        assert_eq!(kept[3], 0x00);
+        assert_eq!(kept[7], 0x07);
+
+        let forced = pack_rows(&source, 8, 2, 1, true).expect("readable");
+        assert_eq!(forced[3], 0xFF);
+        assert_eq!(forced[7], 0xFF);
+        assert_eq!(
+            &forced[..3],
+            &[0x10, 0x20, 0x30],
+            "only the fourth byte is touched"
+        );
+    }
+
+    #[test]
+    fn media_neutral_video_is_synthesized_as_opaque_black() {
+        let format = Negotiated {
+            width: 2,
+            height: 2,
+            pixel_format: PixelFormat::Bgra8,
+            opaque_padding: true,
+            color_space: ColorSpace::Unknown,
+        };
+        assert_eq!(
+            format.neutral_pixels().expect("small neutral frame"),
+            vec![
+                0, 0, 0, 0xff, 0, 0, 0, 0xff, //
+                0, 0, 0, 0xff, 0, 0, 0, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn pixel_chunks_require_complete_bounded_frame_geometry() {
+        assert_eq!(validate_chunk_geometry(32, 32, 16, 4, 2), Ok(32));
+        assert_eq!(
+            validate_chunk_geometry(1, 32, 16, 4, 2),
+            Err(BufferError::Short {
+                available: 1,
+                needed: 32,
+            })
+        );
+        assert_eq!(
+            validate_chunk_geometry(64, 32, 16, 4, 2),
+            Ok(32),
+            "SPA ring-buffer chunks are clamped to their backing mapping"
+        );
+        assert_eq!(
+            validate_chunk_geometry(64, 16, 16, 4, 2),
+            Err(BufferError::Short {
+                available: 16,
+                needed: 32,
+            }),
+            "clamping cannot invent bytes the mapping does not contain"
+        );
+        assert_eq!(
+            validate_chunk_geometry(32, (128 * 1024 * 1024) + 1, 16, 4, 2),
+            Err(BufferError::FrameTooLarge {
+                bytes: (128 * 1024 * 1024) + 1,
+                limit: 128 * 1024 * 1024,
+            })
+        );
+    }
+
+    /// A stride narrower than the row, or a negative one, describes a buffer
+    /// that cannot exist. Trusting it is an out-of-bounds read.
+    #[test]
+    fn impossible_strides_are_refused() {
+        let source = vec![0u8; 4096];
+
+        assert_eq!(
+            pack_rows(&source, 4, 2, 1, false),
+            Err(BufferError::BadStride {
+                stride: 4,
+                needed: 8,
+            })
+        );
+        assert_eq!(
+            pack_rows(&source, -8, 2, 1, false),
+            Err(BufferError::BadStride {
+                stride: -8,
+                needed: 8,
+            })
+        );
+        assert_eq!(
+            pack_rows(&source, 0, 2, 1, false),
+            Err(BufferError::BadStride {
+                stride: 0,
+                needed: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_geometry_is_rejected_before_arithmetic_or_allocation() {
+        assert_eq!(
+            pack_rows(&[], 4, 0, 1, false),
+            Err(BufferError::InvalidDimensions {
+                width: 0,
+                height: 1,
+            })
+        );
+        assert!(matches!(
+            pack_rows(&[], i32::MAX, u32::MAX, u32::MAX, false),
+            Err(BufferError::SizeOverflow { .. })
+        ));
+        assert_eq!(
+            pack_rows(&[], 32_768, 8192, 8192, false),
+            Err(BufferError::FrameTooLarge {
+                bytes: 8192 * 8192 * 4,
+                limit: 128 * 1024 * 1024,
+            })
+        );
+    }
+
+    /// SPA defines a chunk offset modulo maxsize. Rejecting an offset at or past
+    /// the mapping length incorrectly drops valid ring-buffer data.
+    #[test]
+    fn chunk_offsets_wrap_and_wrapped_data_is_linearized() {
+        let mapping = [0, 1, 2, 3, 4, 5, 6, 7];
+
+        let contiguous = linear_chunk(&mapping, 10, 3).expect("small chunk");
+        assert!(matches!(&contiguous, Cow::Borrowed(_)));
+        assert_eq!(contiguous.as_ref(), &[2, 3, 4]);
+
+        let wrapped = linear_chunk(&mapping, 6, 5).expect("small wrapped chunk");
+        assert!(matches!(&wrapped, Cow::Owned(_)));
+        assert_eq!(wrapped.as_ref(), &[6, 7, 0, 1, 2]);
+
+        assert_eq!(
+            linear_chunk(&mapping, 0, u32::MAX as usize)
+                .expect("size clamps to mapping")
+                .as_ref(),
+            mapping.as_slice(),
+            "chunk size is clamped to maxsize"
+        );
+    }
+}
+
+/// The capture lifecycle, which decides when to keep waiting and when to give
+/// up — and what to say when it does.
+mod stream_lifecycle {
+    use scrozz_core::{ColorSpace, Error, PixelFormat};
+
+    use super::wayland::pipewire::format::Negotiated;
+    use super::wayland::pipewire::lifecycle::{
+        Action, ChunkDisposition, Event, Failure, FrameTimeline, Lifecycle, Phase, StreamState,
+        classify_chunk, prefer_process_event, prefer_state_event,
+    };
+
+    fn negotiated() -> Negotiated {
+        Negotiated {
+            width: 64,
+            height: 32,
+            pixel_format: PixelFormat::Bgra8,
+            opaque_padding: true,
+            color_space: ColorSpace::Unknown,
+        }
+    }
+
+    fn started() -> Lifecycle {
+        let mut lifecycle = Lifecycle::new(10);
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(StreamState::Streaming, None)),
+            Action::Wait
+        );
+        assert_eq!(
+            lifecycle.observe(Event::FormatAgreed(negotiated())),
+            Action::Wait
+        );
+        lifecycle
+    }
+
+    #[test]
+    fn unknown_raw_states_are_treated_as_errors_rather_than_waited_on() {
+        assert_eq!(StreamState::from_raw(0), StreamState::Unconnected);
+        assert_eq!(StreamState::from_raw(3), StreamState::Streaming);
+        assert_eq!(StreamState::from_raw(-1), StreamState::Error);
+        assert_eq!(StreamState::from_raw(99), StreamState::Error);
+    }
+
+    #[test]
+    fn zero_byte_priming_and_media_neutral_black_are_distinct() {
+        assert_eq!(classify_chunk(0, false, false), ChunkDisposition::Priming);
+        assert_eq!(
+            classify_chunk(0, false, true),
+            ChunkDisposition::Neutral,
+            "the EMPTY flag itself authoritatively represents media-neutral black"
+        );
+        assert_eq!(classify_chunk(4096, false, true), ChunkDisposition::Neutral);
+        assert_eq!(classify_chunk(4096, false, false), ChunkDisposition::Pixels);
+        assert_eq!(
+            classify_chunk(4096, true, true),
+            ChunkDisposition::Corrupted,
+            "corruption outranks neutral content"
+        );
+    }
+
+    #[test]
+    fn a_format_then_a_frame_is_a_successful_capture() {
+        let mut lifecycle = started();
+        assert_eq!(lifecycle.observe(Event::FrameReady(1)), Action::Stop);
+        assert_eq!(*lifecycle.phase(), Phase::Captured);
+        assert_eq!(lifecycle.captured_sequence(), Some(1));
+        assert_eq!(
+            lifecycle.outcome().expect("a capture succeeds"),
+            negotiated()
+        );
+    }
+
+    /// Mutter hands over empty buffers when nothing on screen has changed.
+    /// Accepting the first buffer offered is why a naive implementation produces
+    /// a black PNG on an idle desktop; an empty buffer is an ordinary event and
+    /// must not settle anything.
+    #[test]
+    fn empty_buffers_are_expected_and_keep_the_capture_waiting() {
+        let mut lifecycle = started();
+        for _ in 0..5 {
+            assert_eq!(lifecycle.observe(Event::EmptyBuffer), Action::Wait);
+            assert!(!lifecycle.is_settled());
+        }
+        assert_eq!(lifecycle.observe(Event::FrameReady(1)), Action::Stop);
+        assert!(lifecycle.outcome().is_ok());
+    }
+
+    #[test]
+    fn draining_buffers_preserves_frame_and_failure_precedence() {
+        assert_eq!(
+            prefer_process_event(Event::FrameReady(1), Event::EmptyBuffer),
+            Event::FrameReady(1),
+            "a later empty buffer cannot erase pixels already copied"
+        );
+        assert_eq!(
+            prefer_process_event(Event::EmptyBuffer, Event::FrameReady(2)),
+            Event::FrameReady(2)
+        );
+        assert_eq!(
+            prefer_process_event(
+                Event::FrameReady(1),
+                Event::BufferRejected("bad plane".into())
+            ),
+            Event::BufferRejected("bad plane".into()),
+            "a structural rejection outranks a plausible frame"
+        );
+        assert_eq!(
+            prefer_process_event(
+                Event::BufferRejected("first diagnosis".into()),
+                Event::BufferRejected("later diagnosis".into())
+            ),
+            Event::BufferRejected("first diagnosis".into())
+        );
+        assert_eq!(
+            prefer_process_event(Event::FrameReady(1), Event::FrameReady(2)),
+            Event::FrameReady(2),
+            "the delivery sequence must follow the newest copied frame"
+        );
+        assert_eq!(
+            prefer_process_event(Event::FrameReady(2), Event::NoDamage(3)),
+            Event::NoDamage(3),
+            "a later no-damage observation reuses the pixels but advances freshness"
+        );
+    }
+
+    #[test]
+    fn terminal_stream_state_cannot_be_hidden_by_a_later_idle_transition() {
+        assert_eq!(
+            prefer_state_event(
+                Event::StateChanged(StreamState::Error, Some("first failure".into())),
+                Event::StateChanged(StreamState::Paused, None),
+            ),
+            Event::StateChanged(StreamState::Error, Some("first failure".into()))
+        );
+        assert_eq!(
+            prefer_state_event(
+                Event::StateChanged(StreamState::Paused, None),
+                Event::StateChanged(StreamState::Unconnected, None),
+            ),
+            Event::StateChanged(StreamState::Unconnected, None)
+        );
+    }
+
+    /// PipeWire keeps firing callbacks while a stream is torn down. A late
+    /// `state_changed(Unconnected)` arriving after a good frame must not turn a
+    /// captured screenshot into "the target disappeared".
+    #[test]
+    fn events_after_a_capture_cannot_undo_it() {
+        let mut lifecycle = started();
+        lifecycle.observe(Event::FrameReady(1));
+
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(StreamState::Unconnected, None)),
+            Action::Stop
+        );
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(
+                StreamState::Error,
+                Some("too late".into())
+            )),
+            Action::Stop
+        );
+        assert_eq!(*lifecycle.phase(), Phase::Captured);
+        assert!(lifecycle.outcome().is_ok());
+    }
+
+    /// The same raw state means two different things depending on whether the
+    /// stream ever ran, and the user needs to be told which.
+    #[test]
+    fn disconnection_reads_differently_before_and_after_streaming() {
+        let mut never = Lifecycle::new(10);
+        assert_eq!(
+            never.observe(Event::StateChanged(StreamState::Unconnected, None)),
+            Action::Stop
+        );
+        let Phase::Failed(Failure::Gone(before)) = never.phase().clone() else {
+            panic!("an unconnected stream is a failure");
+        };
+        assert!(
+            before.contains("does not exist"),
+            "before streaming it means the node was never there: {before}"
+        );
+
+        let mut after = started();
+        assert_eq!(
+            after.observe(Event::StateChanged(StreamState::Unconnected, None)),
+            Action::Stop
+        );
+        let Phase::Failed(Failure::Gone(during)) = after.phase().clone() else {
+            panic!("a disconnection mid-capture is a failure");
+        };
+        assert!(
+            during.contains("disappeared"),
+            "after streaming it means the target went away: {during}"
+        );
+
+        assert!(matches!(after.outcome(), Err(Error::TargetGone(_))));
+    }
+
+    #[test]
+    fn repeated_capture_retains_streaming_history_and_format() {
+        let mut resumed = Lifecycle::resume(10, Some(negotiated()));
+        assert_eq!(resumed.format(), Some(negotiated()));
+        assert_eq!(
+            resumed.observe(Event::StateChanged(StreamState::Unconnected, None)),
+            Action::Stop
+        );
+        let Phase::Failed(Failure::Gone(during)) = resumed.phase().clone() else {
+            panic!("a resumed stream disconnection is a failure");
+        };
+        assert!(
+            during.contains("disappeared"),
+            "a later lifecycle must remember that the stream previously ran: {during}"
+        );
+    }
+
+    /// Pixels whose layout is unknown are worse than no pixels: they would be
+    /// saved as a plausible-looking, wrong image.
+    #[test]
+    fn a_frame_before_any_agreed_format_is_a_failure() {
+        let mut lifecycle = Lifecycle::new(10);
+        lifecycle.observe(Event::StateChanged(StreamState::Streaming, None));
+        assert_eq!(lifecycle.observe(Event::FrameReady(1)), Action::Stop);
+        assert!(matches!(
+            lifecycle.phase(),
+            Phase::Failed(Failure::Format(_))
+        ));
+    }
+
+    #[test]
+    fn structural_failures_settle_immediately_and_carry_their_reason() {
+        let mut rejected = started();
+        assert_eq!(
+            rejected.observe(Event::BufferRejected("dma-buf".into())),
+            Action::Stop
+        );
+        assert_eq!(
+            rejected.phase().clone(),
+            Phase::Failed(Failure::Buffer("dma-buf".into()))
+        );
+
+        let mut errored = Lifecycle::new(10);
+        assert_eq!(
+            errored.observe(Event::StateChanged(
+                StreamState::Error,
+                Some("node error".into())
+            )),
+            Action::Stop
+        );
+        assert_eq!(
+            errored.phase().clone(),
+            Phase::Failed(Failure::Stream("node error".into()))
+        );
+
+        let mut silent = Lifecycle::new(10);
+        silent.observe(Event::StateChanged(StreamState::Error, None));
+        let Phase::Failed(Failure::Stream(why)) = silent.phase().clone() else {
+            panic!("an error state is a failure");
+        };
+        assert!(!why.is_empty(), "a silent error still needs words");
+    }
+
+    /// A timeout is reported as a compositor problem with the timeout in it,
+    /// because by this point the user has already granted permission and is
+    /// looking at a screenshot that appears to have hung.
+    #[test]
+    fn a_timeout_names_the_wait_and_the_likely_cause() {
+        let mut lifecycle = started();
+        assert_eq!(lifecycle.observe(Event::TimedOut), Action::Stop);
+        assert_eq!(
+            lifecycle.phase().clone(),
+            Phase::Failed(Failure::Timeout(10))
+        );
+
+        let Err(Error::Platform(message)) = lifecycle.outcome() else {
+            panic!("a timeout is a platform failure");
+        };
+        assert!(message.contains("10s"));
+        assert!(message.contains("compositor"));
+    }
+
+    /// Connecting and paused are ordinary intermediate states; treating either
+    /// as terminal would abort most captures on a cold screen-cast source.
+    #[test]
+    fn intermediate_states_keep_the_capture_alive() {
+        let mut lifecycle = Lifecycle::new(10);
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(StreamState::Connecting, None)),
+            Action::Wait
+        );
+        assert_eq!(
+            lifecycle.observe(Event::StateChanged(StreamState::Paused, None)),
+            Action::Wait
+        );
+        assert!(!lifecycle.is_settled());
+        assert_eq!(*lifecycle.phase(), Phase::Connecting);
+    }
+
+    #[test]
+    fn reusable_frame_timeline_accepts_buffered_frames_and_post_call_no_damage() {
+        let mut timeline = FrameTimeline::default();
+        let first = timeline.publish();
+        assert!(timeline.is_fresh(first));
+        timeline.mark_delivered(first);
+        assert!(!timeline.is_fresh(first));
+
+        let boundary = timeline.boundary();
+        let buffered_after_scroll = timeline.publish();
+        assert!(timeline.is_fresh(buffered_after_scroll));
+        assert!(FrameTimeline::is_after(buffered_after_scroll, boundary));
+        timeline.mark_delivered(buffered_after_scroll);
+
+        let next_boundary = timeline.boundary();
+        assert!(!FrameTimeline::is_after(
+            buffered_after_scroll,
+            next_boundary
+        ));
+        let no_damage_after_call = timeline.publish();
+        assert!(FrameTimeline::is_after(no_damage_after_call, next_boundary));
+        timeline.mark_delivered(no_damage_after_call);
+        assert!(
+            !timeline.is_fresh(buffered_after_scroll),
+            "reusing unchanged content must not relabel the old complete frame as new"
+        );
+        assert!(
+            !timeline.is_fresh(no_damage_after_call),
+            "delivery must consume the newer no-damage observation"
+        );
+    }
+}
+
+/// Turning portal failures into things a person can act on.
+mod portal_errors {
+    use scrozz_core::Error;
+
+    use super::wayland::portal::{
+        PortalFailure, describe_sources, is_restore_token_rejection, source_type,
+    };
+
+    /// The single most important mapping in this backend. Pressing Escape in the
+    /// portal's picker is not a fault, and a screenshot tool that shows an error
+    /// dialog when someone changes their mind is one people stop using.
+    #[test]
+    fn dismissing_the_picker_is_cancellation_and_nothing_else() {
+        assert!(matches!(
+            PortalFailure::Cancelled.into_error("GNOME"),
+            Error::Cancelled
+        ));
+    }
+
+    /// A missing portal must name the package to install, per-compositor. "Screen
+    /// capture failed" leaves the user with nothing to do next.
+    #[test]
+    fn a_missing_portal_names_the_packages_to_install() {
+        let Error::Unsupported { what, why } =
+            PortalFailure::Missing("no name owner".into()).into_error("sway")
+        else {
+            panic!("a missing portal is an unsupported capability");
+        };
+
+        assert!(what.contains("Wayland"));
+        assert!(why.contains("sway"), "the compositor is named: {why}");
+        assert!(why.contains("xdg-desktop-portal-wlr"));
+        assert!(why.contains("xdg-desktop-portal-gnome"));
+        assert!(why.contains("xdg-desktop-portal-kde"));
+        assert!(why.contains("no name owner"), "the detail survives: {why}");
+    }
+
+    #[test]
+    fn portal_policy_denial_is_an_actionable_permission_error() {
+        let Error::PermissionDenied { capability, remedy } =
+            PortalFailure::PermissionDenied("screen cast disabled by administrator".into())
+                .into_error("GNOME")
+        else {
+            panic!("NotAllowed must remain a permission denial");
+        };
+        assert!(capability.contains("screen capture"));
+        assert!(remedy.contains("GNOME"));
+        assert!(remedy.contains("privacy settings"));
+        assert!(remedy.contains("administrator"));
+    }
+
+    /// A portal that offers monitors but not windows is a limitation of that
+    /// compositor's backend, and saying so is more useful than a generic
+    /// refusal.
+    #[test]
+    fn an_unavailable_source_type_explains_which_side_is_missing() {
+        let Error::Unsupported { what, why } = (PortalFailure::NoSources {
+            wanted: source_type::WINDOW,
+            available: source_type::MONITOR,
+        })
+        .into_error("wlroots") else {
+            panic!("an unavailable source is an unsupported capability");
+        };
+
+        assert!(what.contains("individual windows"));
+        assert!(why.contains("whole monitors"));
+        assert!(why.contains("wlroots"));
+    }
+
+    #[test]
+    fn portal_and_bus_faults_stay_platform_errors() {
+        assert!(matches!(
+            PortalFailure::NoStreams.into_error("KDE"),
+            Error::Platform(_)
+        ));
+
+        let Error::Platform(message) = PortalFailure::Bus("timed out".into()).into_error("KDE")
+        else {
+            panic!("a bus fault is a platform error");
+        };
+        assert!(message.contains("KDE"));
+        assert!(message.contains("timed out"));
+    }
+
+    #[test]
+    fn only_an_identified_restore_rejection_is_retryable() {
+        let rejected = PortalFailure::RestoreRejected("Restore token is not valid".into());
+        assert!(rejected.should_retry_without_restore());
+
+        for failure in [
+            PortalFailure::Cancelled,
+            PortalFailure::Missing("portal absent".into()),
+            PortalFailure::PermissionDenied("disabled".into()),
+            PortalFailure::NoSources {
+                wanted: source_type::WINDOW,
+                available: source_type::MONITOR,
+            },
+            PortalFailure::NoStreams,
+            PortalFailure::Bus("connection closed".into()),
+        ] {
+            assert!(
+                !failure.should_retry_without_restore(),
+                "{failure:?} cannot be repaired by deleting a token"
+            );
+        }
+
+        for detail in [
+            "Restore token is not valid",
+            "restore_token is invalid",
+            "restore-token has expired",
+            "invalid RestoreToken",
+        ] {
+            assert!(is_restore_token_rejection(detail), "{detail}");
+        }
+        assert!(!is_restore_token_rejection("Source type is not supported"));
+        assert!(!is_restore_token_rejection(
+            "restore permissions do not allow this token type"
+        ));
+    }
+
+    #[test]
+    fn source_masks_are_described_in_readable_english() {
+        assert_eq!(describe_sources(0), "no capture sources");
+        assert_eq!(describe_sources(source_type::MONITOR), "whole monitors");
+        assert_eq!(
+            describe_sources(source_type::MONITOR | source_type::WINDOW),
+            "whole monitors and individual windows"
+        );
+        assert_eq!(
+            describe_sources(source_type::MONITOR | source_type::WINDOW | source_type::VIRTUAL),
+            "whole monitors, individual windows and virtual sources"
+        );
+    }
+}
+
+/// Placing a user-drawn region inside a portal-supplied monitor stream.
+mod region_cropping {
+    use scrozz_core::{
+        ColorSpace, Display, DisplayId, Error, Frame, LogicalPoint, LogicalRect, LogicalSize,
+        PhysicalSize, PixelFormat, ScaleFactor,
+    };
+
+    use super::wayland::portal::StreamInfo;
+    use super::wayland::region::{
+        self, CropError, CropRect, DisplayIdentityError, RegionDisplayError, StreamMatchError,
+    };
+
+    fn stream(position: Option<(i32, i32)>, size: Option<(i32, i32)>) -> StreamInfo {
+        StreamInfo {
+            node_id: 7,
+            pipewire_serial: Some(70),
+            source_type: Some(super::wayland::portal::source_type::MONITOR),
+            position,
+            size,
+        }
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
+        LogicalRect {
+            origin: LogicalPoint::new(x, y),
+            size: LogicalSize::new(width, height),
+        }
+    }
+
+    fn display(id: &str, x: f64, y: f64, width: f64, height: f64) -> Display {
+        let bounds = rect(x, y, width, height);
+        Display {
+            id: DisplayId(id.into()),
+            name: id.into(),
+            bounds,
+            work_area: bounds,
+            scale: ScaleFactor::IDENTITY,
+            is_primary: x == 0.0 && y == 0.0,
+        }
+    }
+
+    /// A frame whose pixels encode their own coordinates, so a crop that is off
+    /// by one row or one column is visible in the assertion rather than hidden
+    /// behind a length check.
+    fn coordinate_frame(width: u32, height: u32, stride_padding: usize) -> Frame {
+        let stride = width as usize * 4 + stride_padding;
+        let mut data = vec![0xEE; stride * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let at = y * stride + x * 4;
+                data[at] = x as u8;
+                data[at + 1] = y as u8;
+                data[at + 2] = 0x33;
+                data[at + 3] = 0xFF;
+            }
+        }
+        Frame {
+            data,
+            size: PhysicalSize::new(f64::from(width), f64::from(height)),
+            stride,
+            format: PixelFormat::Bgra8,
+            color_space: ColorSpace::Unknown,
+            scale: ScaleFactor::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn a_region_on_an_unscaled_monitor_maps_one_to_one() {
+        let plan = region::plan_crop(
+            rect(100.0, 50.0, 200.0, 100.0),
+            &stream(Some((0, 0)), Some((1920, 1080))),
+            (1920, 1080),
+        );
+
+        assert_eq!(
+            plan,
+            Ok(CropRect {
+                x: 100,
+                y: 50,
+                width: 200,
+                height: 100,
+            })
+        );
+    }
+
+    /// The monitor's own origin has to come out of the region's coordinates, or
+    /// a selection on a second monitor is cropped from the wrong place entirely
+    /// — usually producing a picture of the first monitor's left edge.
+    #[test]
+    fn the_monitors_desktop_origin_is_subtracted() {
+        let plan = region::plan_crop(
+            rect(2020.0, 100.0, 100.0, 100.0),
+            &stream(Some((1920, 0)), Some((1920, 1080))),
+            (1920, 1080),
+        );
+
+        assert_eq!(
+            plan,
+            Ok(CropRect {
+                x: 100,
+                y: 100,
+                width: 100,
+                height: 100,
+            })
+        );
+    }
+
+    /// The scale is derived from the frame the compositor actually delivered
+    /// against the logical size the portal reported, rather than from a display
+    /// scale factor. Under fractional scaling those disagree, and only the
+    /// former is a fact.
+    #[test]
+    fn the_scale_is_derived_from_the_delivered_frame() {
+        let plan = region::plan_crop(
+            rect(100.0, 100.0, 50.0, 50.0),
+            &stream(Some((0, 0)), Some((1920, 1080))),
+            (2400, 1350),
+        );
+
+        // 1.25x: 100 logical is pixel 125, and 50 logical is 62.5 pixels, which
+        // rounds outward to cover the whole selection.
+        assert_eq!(
+            plan,
+            Ok(CropRect {
+                x: 125,
+                y: 125,
+                width: 63,
+                height: 63,
+            })
+        );
+    }
+
+    #[test]
+    fn a_contained_edge_survives_fractional_pixel_rounding() {
+        let plan = region::plan_crop(
+            rect(0.0, 0.0, 11.0, 11.0),
+            &stream(Some((0, 0)), Some((11, 11))),
+            (25, 25),
+        );
+        assert_eq!(
+            plan,
+            Ok(CropRect {
+                x: 0,
+                y: 0,
+                width: 25,
+                height: 25,
+            }),
+            "pixel rounding is clamped only after logical containment is proven"
+        );
+    }
+
+    /// Returning the monitor intersection would silently turn a cross-monitor
+    /// selection into a smaller capture. Both edge directions therefore fail
+    /// explicitly instead of clamping.
+    #[test]
+    fn a_region_overhanging_an_edge_is_refused() {
+        let plan = region::plan_crop(
+            rect(-40.0, -40.0, 100.0, 100.0),
+            &stream(Some((0, 0)), Some((800, 600))),
+            (800, 600),
+        );
+        assert_eq!(plan, Err(CropError::PartialOverlap));
+
+        let bottom_right = region::plan_crop(
+            rect(760.0, 560.0, 200.0, 200.0),
+            &stream(Some((0, 0)), Some((800, 600))),
+            (800, 600),
+        );
+        assert_eq!(bottom_right, Err(CropError::PartialOverlap));
+
+        let Error::Unsupported { what, why } = CropError::PartialOverlap.into_error("GNOME") else {
+            panic!("a partial capture is an unsupported composition");
+        };
+        assert!(what.contains("spans displays"));
+        assert!(why.contains("smaller image"));
+    }
+
+    #[test]
+    fn preflight_assigns_a_region_to_exactly_one_display() {
+        let displays = [
+            display("left", 0.0, 0.0, 800.0, 600.0),
+            display("right", 800.0, 0.0, 1024.0, 768.0),
+        ];
+
+        assert_eq!(
+            region::display_for_region(rect(900.0, 100.0, 200.0, 100.0), &displays)
+                .map(|display| display.id.clone()),
+            Ok(DisplayId("right".into()))
+        );
+        assert_eq!(
+            region::display_for_region(rect(700.0, 100.0, 200.0, 100.0), &displays),
+            Err(RegionDisplayError::SpansDisplays)
+        );
+        assert_eq!(
+            region::display_for_region(rect(3000.0, 0.0, 20.0, 20.0), &displays),
+            Err(RegionDisplayError::Outside)
+        );
+        assert_eq!(
+            region::display_for_region(rect(-20.0, 0.0, 40.0, 20.0), &displays),
+            Err(RegionDisplayError::PartlyOutside)
+        );
+        assert_eq!(
+            region::display_for_region(rect(0.0, 0.0, 0.0, 20.0), &displays),
+            Err(RegionDisplayError::Empty)
+        );
+    }
+
+    #[test]
+    fn a_contained_region_is_rejected_when_another_display_partly_overlaps_it() {
+        let displays = [
+            display("base", 0.0, 0.0, 1000.0, 800.0),
+            display("overlap", 900.0, 200.0, 500.0, 500.0),
+        ];
+
+        assert_eq!(
+            region::display_for_region(rect(850.0, 250.0, 100.0, 100.0), &displays),
+            Err(RegionDisplayError::SpansDisplays)
+        );
+    }
+
+    #[test]
+    fn cross_monitor_regions_are_rejected_before_portal_prompting() {
+        let Error::Unsupported { what, why } = RegionDisplayError::SpansDisplays.into_error()
+        else {
+            panic!("cross-monitor capture must be unsupported");
+        };
+        assert!(what.contains("spans displays"));
+        assert!(why.contains("before opening the portal picker"));
+        assert!(why.contains("clamped, incomplete image"));
+    }
+
+    #[test]
+    fn a_monitor_stream_must_match_the_requested_display_exactly() {
+        let requested = display("right", 1920.0, -200.0, 2560.0, 1440.0);
+        assert_eq!(
+            region::verify_stream_matches_display(
+                &stream(Some((1920, -200)), Some((2560, 1440))),
+                &requested
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            region::verify_stream_matches_display(
+                &stream(Some((0, 0)), Some((1920, 1080))),
+                &requested
+            ),
+            Err(StreamMatchError::DifferentDisplay)
+        );
+        assert_eq!(
+            region::verify_stream_matches_display(&stream(None, Some((2560, 1440))), &requested),
+            Err(StreamMatchError::NoGeometry)
+        );
+    }
+
+    /// Portal geometry is integral compositor space. Fractional bounds are not
+    /// rounded into a plausible match because that would turn an approximation
+    /// back into a target-identity claim.
+    #[test]
+    fn incompatible_native_geometry_is_not_guessed() {
+        let requested = display("fractional", 0.0, 0.0, 1536.5, 864.0);
+        assert_eq!(
+            region::verify_stream_matches_display(
+                &stream(Some((0, 0)), Some((1537, 864))),
+                &requested
+            ),
+            Err(StreamMatchError::UnmappableDisplay)
+        );
+    }
+
+    #[test]
+    fn mirrored_displays_are_ambiguous_before_the_picker() {
+        let displays = [
+            display("projector", 0.0, 0.0, 1920.0, 1080.0),
+            display("panel", 0.0, 0.0, 1920.0, 1080.0),
+        ];
+        assert_eq!(
+            region::verify_display_identity(&displays[0], &displays),
+            Err(DisplayIdentityError::Ambiguous)
+        );
+        let Error::Unsupported { what, why } =
+            DisplayIdentityError::Ambiguous.into_error("KDE", &displays[0])
+        else {
+            panic!("mirrored identity must be unsupported");
+        };
+        assert!(what.contains("projector"));
+        assert!(why.contains("mirrored"));
+        assert!(why.contains("before opening the picker"));
+    }
+
+    #[test]
+    fn non_integral_native_output_geometry_cannot_prove_identity() {
+        let displays = [display("fractional", 0.0, 0.0, 1920.5, 1080.0)];
+        assert_eq!(
+            region::verify_display_identity(&displays[0], &displays),
+            Err(DisplayIdentityError::Unmappable)
+        );
+    }
+
+    #[test]
+    fn reusable_identity_detects_a_backing_output_replacement() {
+        let initial = display("panel", 0.0, 0.0, 1920.0, 1080.0);
+        let same_public_facts = initial.clone();
+
+        assert!(region::display_identity_unchanged(
+            &initial,
+            &17,
+            &same_public_facts,
+            &17
+        ));
+        assert!(
+            !region::display_identity_unchanged(&initial, &17, &same_public_facts, &23),
+            "a different wl_output global is a different physical capture target"
+        );
+    }
+
+    #[test]
+    fn a_region_that_misses_the_monitor_is_an_invalid_request() {
+        let plan = region::plan_crop(
+            rect(3000.0, 100.0, 100.0, 100.0),
+            &stream(Some((0, 0)), Some((1920, 1080))),
+            (1920, 1080),
+        );
+        assert_eq!(plan, Err(CropError::Outside));
+        assert!(matches!(
+            CropError::Outside.into_error("GNOME"),
+            Error::InvalidRequest(_)
+        ));
+    }
+
+    /// Some portals decline to say where a stream is. Returning the whole
+    /// monitor would hand back an image the user did not ask for and had no way
+    /// to notice was wrong, so the refusal is explicit and suggests what to do.
+    #[test]
+    fn a_stream_without_geometry_refuses_rather_than_guesses() {
+        assert_eq!(
+            region::plan_crop(
+                rect(0.0, 0.0, 10.0, 10.0),
+                &stream(None, Some((1920, 1080))),
+                (1920, 1080)
+            ),
+            Err(CropError::NoGeometry)
+        );
+        assert_eq!(
+            region::plan_crop(
+                rect(0.0, 0.0, 10.0, 10.0),
+                &stream(Some((0, 0)), None),
+                (1920, 1080)
+            ),
+            Err(CropError::NoGeometry)
+        );
+
+        let Error::Unsupported { what, why } = CropError::NoGeometry.into_error("Hyprland") else {
+            panic!("a placeless stream is an unsupported capability");
+        };
+        assert!(what.contains("region"));
+        assert!(why.contains("Hyprland"));
+        assert!(why.contains("whole display"), "it says what to do: {why}");
+    }
+
+    #[test]
+    fn a_degenerate_stream_is_a_platform_fault() {
+        assert_eq!(
+            region::plan_crop(
+                rect(0.0, 0.0, 10.0, 10.0),
+                &stream(Some((0, 0)), Some((0, 1080))),
+                (1920, 1080)
+            ),
+            Err(CropError::DegenerateStream)
+        );
+        assert!(matches!(
+            CropError::DegenerateStream.into_error("KDE"),
+            Error::Platform(_)
+        ));
+    }
+
+    /// The crop reads from a padded source and writes a packed destination, so
+    /// both strides are exercised at once. Checking the corner pixels is what
+    /// catches an off-by-one in either axis.
+    #[test]
+    fn cropping_copies_the_right_pixels_out_of_a_padded_frame() {
+        let frame = coordinate_frame(16, 8, 12);
+        let cropped = region::crop(
+            &frame,
+            CropRect {
+                x: 3,
+                y: 2,
+                width: 4,
+                height: 3,
+            },
+        )
+        .expect("an in-bounds crop succeeds");
+
+        assert_eq!(cropped.width(), 4);
+        assert_eq!(cropped.height(), 3);
+        assert_eq!(cropped.stride, 16, "the result is tightly packed");
+        assert_eq!(cropped.data.len(), 48);
+        assert!(cropped.is_well_formed());
+        assert_eq!(cropped.format, frame.format);
+        assert_eq!(cropped.color_space, frame.color_space);
+
+        assert_eq!(&cropped.data[0..2], &[3, 2], "top-left is (3, 2)");
+        assert_eq!(&cropped.data[12..14], &[6, 2], "top-right is (6, 2)");
+        assert_eq!(&cropped.data[32..34], &[3, 4], "bottom-left is (3, 4)");
+        assert_eq!(&cropped.data[44..46], &[6, 4], "bottom-right is (6, 4)");
+    }
+
+    /// The last line where a mistake could become an out-of-bounds read, so it
+    /// is checked rather than assumed even though `plan_crop` guarantees it.
+    #[test]
+    fn an_out_of_bounds_crop_is_refused_rather_than_read() {
+        let frame = coordinate_frame(8, 8, 0);
+
+        for bad in [
+            CropRect {
+                x: 6,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+            CropRect {
+                x: 0,
+                y: 6,
+                width: 1,
+                height: 4,
+            },
+            CropRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 4,
+            },
+            CropRect {
+                x: u32::MAX,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+        ] {
+            assert_eq!(
+                region::crop(&frame, bad).err(),
+                Some(CropError::Outside),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_frame_geometry_is_refused_without_overflow_or_allocation() {
+        let mut frame = coordinate_frame(2, 2, 0);
+        frame.stride = usize::MAX;
+
+        assert_eq!(
+            region::crop(
+                &frame,
+                CropRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 2,
+                },
+            )
+            .err(),
+            Some(CropError::UnusableFrame)
+        );
+        assert!(matches!(
+            CropError::UnusableFrame.into_error("GNOME"),
+            Error::Platform(message) if message.contains("no pixels were returned")
+        ));
+    }
+
+    #[test]
+    fn the_recovered_scale_is_the_ratio_the_compositor_used() {
+        assert_eq!(
+            region::resolve_scale(
+                &stream(Some((0, 0)), Some((1920, 1080))),
+                (3840, 2160),
+                ScaleFactor::IDENTITY
+            )
+            .get(),
+            2.0
+        );
+        assert_eq!(
+            region::resolve_scale(
+                &stream(Some((0, 0)), Some((1920, 1080))),
+                (1920, 1080),
+                ScaleFactor::new(2.0)
+            )
+            .get(),
+            1.0,
+            "a delivered 1:1 frame overrides a guessed scale"
+        );
+    }
+
+    /// The only case with nothing to divide. Falling back is right; panicking in
+    /// `ScaleFactor::new` on a zero would not be.
+    #[test]
+    fn an_unmeasurable_stream_falls_back_to_the_displays_scale() {
+        let fallback = ScaleFactor::new(1.5);
+        assert_eq!(
+            region::resolve_scale(&stream(Some((0, 0)), None), (1920, 1080), fallback),
+            fallback
+        );
+        assert_eq!(
+            region::resolve_scale(&stream(Some((0, 0)), Some((0, 0))), (1920, 1080), fallback),
+            fallback
+        );
+        assert_eq!(
+            region::resolve_scale(&stream(Some((0, 0)), Some((1920, 1080))), (0, 0), fallback),
+            fallback
         );
     }
 }
