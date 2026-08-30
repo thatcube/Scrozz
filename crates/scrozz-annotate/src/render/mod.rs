@@ -6,7 +6,8 @@ pub mod redact;
 pub mod shapes;
 
 use scrozz_core::{
-    ColorSpace, Error, Frame, LogicalRect, Result, ScaleFactor, Transform as ColorTransform,
+    ColorSpace, Error, Frame, LogicalRect, PhysicalPoint, PhysicalRect, PhysicalSize, Result,
+    ScaleFactor, Transform as ColorTransform,
 };
 use tiny_skia::{BlendMode, IntRect, IntSize, Pixmap, Transform};
 
@@ -39,6 +40,17 @@ pub trait Renderer {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SkiaRenderer;
 
+/// Physical geometry of a rendered Scene preview.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SceneRenderLayout {
+    /// Width of the complete Scene canvas.
+    pub width: u32,
+    /// Height of the complete Scene canvas.
+    pub height: u32,
+    /// Rectangle occupied by the untouched capture pixels.
+    pub subject: PhysicalRect,
+}
+
 impl SkiaRenderer {
     /// A renderer.
     #[must_use]
@@ -66,6 +78,16 @@ impl SkiaRenderer {
         scale: ScaleFactor,
         target_width: Option<u32>,
     ) -> Result<Frame> {
+        self.render_at_with_width_and_layout(document, scale, target_width)
+            .map(|(frame, _)| frame)
+    }
+
+    fn render_at_with_width_and_layout(
+        &self,
+        document: &Document,
+        scale: ScaleFactor,
+        target_width: Option<u32>,
+    ) -> Result<(Frame, Option<SceneRenderLayout>)> {
         if document.source().provenance.forbids_compositing()
             && document
                 .beautification()
@@ -120,9 +142,9 @@ impl SkiaRenderer {
             u64::try_from(document.source().frame.data.len()).map_err(|_| {
                 Error::InvalidRequest("source buffer size is not addressable".to_owned())
             })?;
-        let canvas = match document.beautification() {
+        let (canvas, scene_layout) = match document.beautification() {
             Some(beautification) if !beautification.is_noop() => {
-                beautify::apply_with_retained_bytes(
+                let (canvas, layout) = beautify::apply_with_retained_bytes_and_layout(
                     &canvas,
                     beautification,
                     beautify::ApplyOptions {
@@ -133,9 +155,27 @@ impl SkiaRenderer {
                         retained_source_bytes,
                         target_width,
                     },
-                )?
+                )?;
+                let subject = PhysicalRect::new(
+                    PhysicalPoint::new(
+                        f64::from(layout.content.left()),
+                        f64::from(layout.content.top()),
+                    ),
+                    PhysicalSize::new(
+                        f64::from(layout.content.width()),
+                        f64::from(layout.content.height()),
+                    ),
+                );
+                (
+                    canvas,
+                    Some(SceneRenderLayout {
+                        width: layout.width,
+                        height: layout.height,
+                        subject,
+                    }),
+                )
             }
-            Some(_) | None => canvas,
+            Some(_) | None => (canvas, None),
         };
         if let Some(target_width) = target_width
             && canvas.width() != target_width
@@ -159,7 +199,10 @@ impl SkiaRenderer {
             document.source().frame.color_space
         };
 
-        Ok(raster::from_pixmap(canvas, color_space, scale))
+        Ok((
+            raster::from_pixmap(canvas, color_space, scale),
+            scene_layout,
+        ))
     }
 
     /// Composites the document scaled so its output is `width` pixels wide.
@@ -169,6 +212,24 @@ impl SkiaRenderer {
     /// As [`Self::render_at`], plus [`Error::InvalidRequest`] if `width` is zero
     /// or the source has no width to scale from.
     pub fn render_to_width(&self, document: &Document, width: u32) -> Result<Frame> {
+        self.render_to_width_with_layout(document, width)
+            .map(|(frame, _)| frame)
+    }
+
+    /// Composites a preview and returns the Scene's canonical subject geometry.
+    ///
+    /// The geometry is expressed in the returned frame's physical pixel space.
+    /// `None` means the document has no visible Scene and the full frame is the
+    /// editable capture subject.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::render_to_width`].
+    pub fn render_to_width_with_layout(
+        &self,
+        document: &Document,
+        width: u32,
+    ) -> Result<(Frame, Option<SceneRenderLayout>)> {
         if width == 0 {
             return Err(Error::InvalidRequest(
                 "export width must be greater than zero".to_owned(),
@@ -180,7 +241,7 @@ impl SkiaRenderer {
                 "cannot scale a source with no width".to_owned(),
             ));
         }
-        self.render_at_with_width(
+        self.render_at_with_width_and_layout(
             document,
             ScaleFactor::new(f64::from(width) / logical.width),
             Some(width),

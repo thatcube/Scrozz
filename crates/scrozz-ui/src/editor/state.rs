@@ -30,7 +30,7 @@ use scrozz_annotate::{
     Annotation, AnnotationId, AnnotationKind, ArrowStyle, Beautification, Color, Document, History,
     REDACT_INTENSITY_DEFAULT, RedactStyle, Style, geom,
 };
-use scrozz_core::{LogicalPoint, LogicalRect, LogicalSize, Result};
+use scrozz_core::{ContentRevision, LogicalPoint, LogicalRect, LogicalSize, Result};
 use std::ops::Range;
 
 /// How close, in *screen* points, a pointer must come to a resize handle.
@@ -655,6 +655,8 @@ pub struct SmartFrameDraft {
     before: Option<Beautification>,
     /// Monotonic revision tag for the in-flight analysis request.
     analysis_revision: u64,
+    /// Document revision the request analyzed, including the current Scene draft.
+    analysis_document_revision: Option<ContentRevision>,
     /// Cooperative cancellation for the in-flight analysis.
     cancellation: AnalysisCancellation,
     /// Whether an analysis request is still outstanding.
@@ -2204,6 +2206,7 @@ impl EditorState {
             }
             Command::Undo => {
                 self.cancel_drag();
+                self.synchronize_scene_history();
                 // Only when the document actually moved. An undo with nothing
                 // behind it is not an edit, and treating it as one would clear
                 // a composition in flight and tell the platform IME to cancel
@@ -2216,6 +2219,7 @@ impl EditorState {
             }
             Command::Redo => {
                 self.cancel_drag();
+                self.synchronize_scene_history();
                 if self.history.redo(&mut self.document)? {
                     self.after_history();
                     self.touch();
@@ -2569,6 +2573,7 @@ impl EditorState {
     }
 
     fn commit(&mut self) {
+        self.synchronize_scene_history();
         let before = self.history.undo_depth();
         self.history.commit(&self.document);
         if self.history.undo_depth() != before {
@@ -2577,6 +2582,7 @@ impl EditorState {
     }
 
     fn commit_coalesced(&mut self, tag: &str) {
+        self.synchronize_scene_history();
         let before = self.history.undo_depth();
         self.history.commit_coalesced(&self.document, tag);
         if self.history.undo_depth() != before {
@@ -2644,6 +2650,11 @@ impl EditorState {
     fn mark_caret(&mut self) {
         self.history
             .mark(u64::try_from(self.caret).unwrap_or(u64::MAX));
+    }
+
+    fn synchronize_scene_history(&mut self) {
+        self.history
+            .synchronize_beautification(self.document.beautification());
     }
 
     /// Takes the pending instruction to interrupt the platform's composition.
@@ -2795,9 +2806,12 @@ impl EditorState {
         self.document
             .set_scene(Some(provisional))
             .expect("the provisional recipe is provenance-safe");
+        self.synchronize_scene_history();
+        let analysis_document_revision = self.document.revision();
         self.smart_frame = Some(SmartFrameDraft {
             before,
             analysis_revision: generation,
+            analysis_document_revision: Some(analysis_document_revision),
             cancellation: cancellation.clone(),
             analysis_pending: true,
             edited_after_request: false,
@@ -2836,9 +2850,11 @@ impl EditorState {
         let style = generated_style(&config);
         match self.document.set_scene(Some(config)) {
             Ok(()) => {
+                self.synchronize_scene_history();
                 self.smart_frame = Some(SmartFrameDraft {
                     before,
                     analysis_revision: 0,
+                    analysis_document_revision: None,
                     cancellation: AnalysisCancellation::default(),
                     analysis_pending: false,
                     edited_after_request: true,
@@ -2863,6 +2879,7 @@ impl EditorState {
         self.smart_frame = Some(SmartFrameDraft {
             before: Some(scene.clone()),
             analysis_revision: 0,
+            analysis_document_revision: None,
             cancellation: AnalysisCancellation::default(),
             analysis_pending: false,
             edited_after_request: false,
@@ -2893,9 +2910,12 @@ impl EditorState {
         self.document
             .set_scene(Some(provisional))
             .expect("the provisional recipe is provenance-safe");
+        self.synchronize_scene_history();
+        let analysis_document_revision = self.document.revision();
         self.smart_frame = Some(SmartFrameDraft {
             before,
             analysis_revision: generation,
+            analysis_document_revision: Some(analysis_document_revision),
             cancellation: cancellation.clone(),
             analysis_pending: true,
             edited_after_request: false,
@@ -2920,6 +2940,7 @@ impl EditorState {
         revision: u64,
         result: std::result::Result<SmartFrameAnalysis, String>,
     ) {
+        let document_revision = self.document.revision();
         let Some(draft) = self.smart_frame.as_mut() else {
             return;
         };
@@ -2927,6 +2948,11 @@ impl EditorState {
             || draft.edited_after_request
             || draft.cancellation.is_cancelled()
         {
+            return;
+        }
+        if draft.analysis_document_revision != Some(document_revision) {
+            draft.analysis_pending = false;
+            draft.cancellation.cancel();
             return;
         }
         draft.analysis_pending = false;
@@ -2956,7 +2982,10 @@ impl EditorState {
                     }
                 };
                 match self.document.set_scene(Some(beautification)) {
-                    Ok(()) => self.touch(),
+                    Ok(()) => {
+                        self.synchronize_scene_history();
+                        self.touch();
+                    }
                     Err(error) => tracing::warn!(%error, "analysis result rejected"),
                 }
             }
@@ -2995,12 +3024,14 @@ impl EditorState {
             .document
             .beautification()
             .map_or(GeneratedStyle::Balanced, generated_style);
+        let analysis_document_revision = self.document.revision();
         let draft = self.smart_frame.as_mut()?;
         draft.cancellation.cancel();
         let generation = self.next_analysis_generation;
         self.next_analysis_generation = self.next_analysis_generation.saturating_add(1);
         let cancellation = AnalysisCancellation::default();
         draft.analysis_revision = generation;
+        draft.analysis_document_revision = Some(analysis_document_revision);
         draft.cancellation = cancellation.clone();
         draft.analysis_pending = true;
         draft.edited_after_request = false;
@@ -3053,6 +3084,7 @@ impl EditorState {
         };
         draft.cancellation.cancel();
         if self.document.set_beautification(draft.before).is_ok() {
+            self.synchronize_scene_history();
             self.touch();
         }
     }
@@ -3067,6 +3099,7 @@ impl EditorState {
         self.cancel_smart_frame();
         let before = self.document.beautification().cloned();
         if before.is_some() && self.document.set_beautification(None).is_ok() {
+            self.synchronize_scene_history();
             self.framing_undo.push(before);
             self.framing_redo.clear();
             self.dirty = true;
@@ -3082,6 +3115,7 @@ impl EditorState {
         };
         let current = self.document.beautification().cloned();
         if self.document.set_beautification(previous).is_ok() {
+            self.synchronize_scene_history();
             self.framing_redo.push(current);
             self.dirty = true;
             self.touch();
@@ -3096,6 +3130,7 @@ impl EditorState {
         };
         let current = self.document.beautification().cloned();
         if self.document.set_beautification(next).is_ok() {
+            self.synchronize_scene_history();
             self.framing_undo.push(current);
             self.dirty = true;
             self.touch();
@@ -3201,6 +3236,7 @@ impl EditorState {
             && matches!(config.background, Background::Automatic(_));
         match self.document.set_scene(Some(config)) {
             Ok(()) => {
+                self.synchronize_scene_history();
                 self.mark_draft_edited();
                 if automatic_switched {
                     return self.request_automatic_background_analysis();
@@ -3231,6 +3267,7 @@ impl EditorState {
             tracing::warn!(%error, "generated Scene style rejected");
             return None;
         }
+        self.synchronize_scene_history();
         self.mark_draft_edited();
         self.request_automatic_background_analysis()
     }

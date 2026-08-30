@@ -44,6 +44,8 @@ const MAX_PREVIEW_COMPOSITE_PIXELS: f64 = 16_777_216.0;
 #[derive(Default)]
 pub struct Preview {
     texture: Option<egui::TextureHandle>,
+    /// Subject bounds normalised to the complete rendered Scene texture.
+    subject: Option<Rect>,
     revision: Option<u64>,
     /// The pixel width the cached texture was rendered at.
     width: u32,
@@ -60,6 +62,7 @@ impl std::fmt::Debug for Preview {
             .field("revision", &self.revision)
             .field("width", &self.width)
             .field("full_document", &self.full_document)
+            .field("subject", &self.subject)
             .field("failed", &self.failed)
             .finish_non_exhaustive()
     }
@@ -78,7 +81,7 @@ impl Preview {
         ctx: &egui::Context,
         state: &EditorState,
         target_px: u32,
-    ) -> Option<&egui::TextureHandle> {
+    ) -> Option<(egui::TextureId, Option<Rect>)> {
         let full_document = state.crop_mode();
         let key = (state.revision(), target_px, full_document);
         let fresh = self.revision == Some(key.0)
@@ -86,13 +89,14 @@ impl Preview {
             && self.full_document == full_document;
         if !fresh && self.failed != Some(key) {
             match render(state, target_px, full_document) {
-                Ok(image) => {
+                Ok(rendered) => {
                     let handle = ctx.load_texture(
                         "scrozz-editor-preview",
-                        image,
+                        rendered.image,
                         egui::TextureOptions::LINEAR,
                     );
                     self.texture = Some(handle);
+                    self.subject = rendered.subject;
                     self.revision = Some(key.0);
                     self.width = target_px;
                     self.full_document = full_document;
@@ -103,14 +107,22 @@ impl Preview {
                     // Never display an old, potentially unredacted revision
                     // after a new one failed.
                     self.texture = None;
+                    self.subject = None;
                     self.revision = None;
                     self.width = 0;
                     self.failed = Some(key);
                 }
             }
         }
-        self.texture.as_ref()
+        self.texture
+            .as_ref()
+            .map(|texture| (texture.id(), self.subject))
     }
+}
+
+struct RenderedPreview {
+    image: egui::ColorImage,
+    subject: Option<Rect>,
 }
 
 /// Renders the document to a colour image at `target_px` wide.
@@ -136,7 +148,7 @@ fn render(
     state: &EditorState,
     target_px: u32,
     full_document: bool,
-) -> scrozz_core::Result<egui::ColorImage> {
+) -> scrozz_core::Result<RenderedPreview> {
     let mut uncropped;
     let document = if full_document && state.document().crop().is_some() {
         uncropped = state.document().clone();
@@ -145,8 +157,23 @@ fn render(
     } else {
         state.document()
     };
-    let frame = SkiaRenderer.render_to_width(document, target_px.max(1))?;
-    Ok(to_color_image(&frame))
+    let (frame, layout) = SkiaRenderer.render_to_width_with_layout(document, target_px.max(1))?;
+    let subject = layout.map(|layout| {
+        Rect::from_min_size(
+            pos2(
+                (layout.subject.origin.x / f64::from(layout.width)) as f32,
+                (layout.subject.origin.y / f64::from(layout.height)) as f32,
+            ),
+            vec2(
+                (layout.subject.size.width / f64::from(layout.width)) as f32,
+                (layout.subject.size.height / f64::from(layout.height)) as f32,
+            ),
+        )
+    });
+    Ok(RenderedPreview {
+        image: to_color_image(&frame),
+        subject,
+    })
 }
 
 /// Turns a rendered frame into what egui uploads, honouring its format and
@@ -231,8 +258,10 @@ fn scale(c: u8, a: u8) -> u8 {
 /// Where the document ended up on screen, and what the pointer did.
 #[derive(Debug, Clone, Copy)]
 pub struct CanvasView {
-    /// The document's rectangle on screen.
+    /// The complete rendered Scene rectangle on screen.
     pub image: Rect,
+    /// The untouched capture subject rectangle within the Scene.
+    pub subject: Rect,
     /// The whole canvas area.
     pub area: Rect,
     /// The document rectangle being shown, in logical points.
@@ -248,7 +277,7 @@ impl CanvasView {
         if self.content.size.width <= 0.0 {
             1.0
         } else {
-            self.image.width() / self.content.size.width as f32
+            self.subject.width() / self.content.size.width as f32
         }
     }
 }
@@ -271,14 +300,36 @@ pub fn draw_canvas(
     } else {
         state.document().content_bounds()
     };
+    let output = preview_output_size(state);
+    let output_bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), output);
     let fit_area = area.shrink(Space::LG);
     let image = if state.is_fit_zoom() {
-        super::fit(content, fit_area, 1.0, state.pan())
+        super::fit(output_bounds, fit_area, 1.0, state.pan())
     } else {
-        super::fit_absolute(content, fit_area, state.zoom(), state.pan())
+        super::fit_absolute(output_bounds, fit_area, state.zoom(), state.pan())
     };
+
+    let max_texture_side = ui.ctx().input(|input| input.max_texture_side);
+    let max_texture_side = u32::try_from(max_texture_side).unwrap_or(u32::MAX);
+    let target_px = preview_width(
+        image,
+        ui.ctx().pixels_per_point(),
+        output,
+        state.document().logical_size(),
+        max_texture_side,
+    );
+    let rendered = target_px.and_then(|target_px| preview.texture(ui.ctx(), state, target_px));
+    let subject = rendered
+        .and_then(|(_, subject)| subject)
+        .map_or(image, |subject| {
+            Rect::from_min_max(
+                image.min + subject.min.to_vec2() * image.size(),
+                image.min + subject.max.to_vec2() * image.size(),
+            )
+        });
     let view = CanvasView {
         image,
+        subject,
         area,
         content,
         hovered: false,
@@ -288,20 +339,9 @@ pub fn draw_canvas(
     // against the scale that frame is actually drawn at.
     state.set_view_scale(f64::from(view.scale()));
 
-    let max_texture_side = ui.ctx().input(|input| input.max_texture_side);
-    let max_texture_side = u32::try_from(max_texture_side).unwrap_or(u32::MAX);
-    let target_px = preview_width(
-        image,
-        ui.ctx().pixels_per_point(),
-        content.size,
-        state.document().logical_size(),
-        max_texture_side,
-    );
-    if let Some(texture) =
-        target_px.and_then(|target_px| preview.texture(ui.ctx(), state, target_px))
-    {
+    if let Some((texture, _)) = rendered {
         painter.image(
-            texture.id(),
+            texture,
             image,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
@@ -347,6 +387,18 @@ pub fn draw_canvas(
     view
 }
 
+fn preview_output_size(state: &EditorState) -> LogicalSize {
+    if state.crop_mode() && state.document().crop().is_some() {
+        let mut document = state.document().clone();
+        document
+            .set_crop(None)
+            .expect("a valid document remains valid when its crop is removed");
+        document.output_logical_size()
+    } else {
+        state.document().output_logical_size()
+    }
+}
+
 /// Draws the text caret and tells the platform where to put its IME window.
 ///
 /// Publishing [`IMEOutput`](egui::output::IMEOutput) is what makes `egui_winit`
@@ -377,8 +429,8 @@ fn draw_caret(
     // multiple of the advance; no shaping pass is needed to place it.
     let x = at.x + column as f64 * font::ADVANCE * size;
     let y = at.y + row as f64 * font::LINE_HEIGHT * size;
-    let top = super::to_screen(LogicalPoint::new(x, y), view.image, view.content);
-    let bottom = super::to_screen(LogicalPoint::new(x, y + size), view.image, view.content);
+    let top = super::to_screen(LogicalPoint::new(x, y), view.subject, view.content);
+    let bottom = super::to_screen(LogicalPoint::new(x, y + size), view.subject, view.content);
     let caret = Rect::from_min_max(top, bottom);
 
     // Blink on the same cadence as the rest of the system, and keep the frame
@@ -461,7 +513,7 @@ fn gestures(ui: &Ui, state: &mut EditorState, response: &egui::Response, view: &
         }
         return;
     };
-    let point = to_document(screen, view.image, view.content);
+    let point = to_document(screen, view.subject, view.content);
     let (middle_pressed, middle_down, middle_released) = ui.ctx().input(|input| {
         (
             input.pointer.button_pressed(egui::PointerButton::Middle),
@@ -483,7 +535,7 @@ fn gestures(ui: &Ui, state: &mut EditorState, response: &egui::Response, view: &
 
     if response.drag_started() {
         let press_screen = screen - response.drag_delta();
-        let press = to_document(press_screen, view.image, view.content);
+        let press = to_document(press_screen, view.subject, view.content);
         if pan_gesture {
             state.begin_pan((press_screen.x, press_screen.y));
             state.pan_to((screen.x, screen.y));
@@ -555,14 +607,14 @@ fn draw_crop_scrim(
     let Some(rect) = state.pending_crop() else {
         return;
     };
-    let keep = rect_to_screen(rect, view.image, view.content);
+    let keep = rect_to_screen(rect, view.subject, view.content);
     if rect != state.document().logical_bounds() {
         let scrim = Color32::from_black_alpha(120);
         for band in [
-            Rect::from_min_max(view.image.min, pos2(view.image.right(), keep.top())),
-            Rect::from_min_max(pos2(view.image.left(), keep.bottom()), view.image.max),
-            Rect::from_min_max(pos2(view.image.left(), keep.top()), keep.left_bottom()),
-            Rect::from_min_max(keep.right_top(), pos2(view.image.right(), keep.bottom())),
+            Rect::from_min_max(view.subject.min, pos2(view.subject.right(), keep.top())),
+            Rect::from_min_max(pos2(view.subject.left(), keep.bottom()), view.subject.max),
+            Rect::from_min_max(pos2(view.subject.left(), keep.top()), keep.left_bottom()),
+            Rect::from_min_max(keep.right_top(), pos2(view.subject.right(), keep.bottom())),
         ] {
             if band.is_positive() {
                 painter.rect_filled(band, corner(0.0), scrim);
@@ -583,7 +635,7 @@ fn draw_crop_scrim(
     );
     thirds(painter, keep);
     for handle in Handle::ALL {
-        let at = super::to_screen(handle.position(&rect), view.image, view.content);
+        let at = super::to_screen(handle.position(&rect), view.subject, view.content);
         let radius = HANDLE_RADIUS as f32;
         let handle_rect = Rect::from_center_size(at, vec2(radius * 2.0, radius * 2.0));
         painter.rect_filled(
@@ -630,7 +682,7 @@ fn draw_selection(
     if arrow {
         let r = HANDLE_RADIUS as f32;
         for (_, position) in handles {
-            let at = super::to_screen(position, view.image, view.content);
+            let at = super::to_screen(position, view.subject, view.content);
             // Dark under-ring + white keyline + accent centre: three contrasts,
             // so the endpoint stays visible over any captured pixel.
             painter.circle_filled(at, r + 2.0, Color32::from_black_alpha(100));
@@ -639,7 +691,7 @@ fn draw_selection(
             painter.circle_stroke(at, r - 0.5, Stroke::new(1.0, palette.accent_press));
         }
         if let Some(position) = state.arrow_bend_handle() {
-            let at = super::to_screen(position, view.image, view.content);
+            let at = super::to_screen(position, view.subject, view.content);
             let near = painter
                 .ctx()
                 .pointer_hover_pos()
@@ -672,7 +724,7 @@ fn draw_selection(
         }
         return;
     }
-    let rect = rect_to_screen(bounds, view.image, view.content).expand(2.0);
+    let rect = rect_to_screen(bounds, view.subject, view.content).expand(2.0);
     // A dark under-stroke keeps the selection visible over a light capture, and
     // the accent over a dark one; a single colour disappears against one or the
     // other every time.
@@ -691,7 +743,7 @@ fn draw_selection(
 
     let r = HANDLE_RADIUS as f32;
     for (handle, position) in handles {
-        let at = super::to_screen(position, view.image, view.content);
+        let at = super::to_screen(position, view.subject, view.content);
         let at = pos2(
             at.x + handle_bias(handle.moves_left(), handle.moves_right()) * 2.0,
             at.y + handle_bias(handle.moves_top(), handle.moves_bottom()) * 2.0,
@@ -777,7 +829,7 @@ pub fn scale_for_width(content: LogicalRect, width: u32) -> ScaleFactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scrozz_annotate::{Annotation, Document, RedactStyle, Style};
+    use scrozz_annotate::{Annotation, Beautification, Document, RedactStyle, Style};
     use scrozz_core::{Capture, CaptureTarget, Frame, PhysicalSize, Provenance};
 
     #[test]
@@ -859,10 +911,59 @@ mod tests {
 
         let preview = render(&state, 8, true).unwrap();
         assert_eq!(
-            preview.pixels[1 + preview.size[0]],
+            preview.image.pixels[1 + preview.image.size[0]],
             Color32::BLACK,
             "showing the full source in crop mode exposed pixels beneath a redaction"
         );
         assert_eq!(state.document().crop().unwrap().origin.x, 4.0);
+    }
+
+    #[test]
+    fn scene_preview_keeps_canvas_aspect_and_reports_subject_mapping() {
+        let size = LogicalSize::new(8.0, 8.0);
+        let capture = Capture {
+            frame: Frame {
+                data: vec![255; 8 * 8 * 4],
+                size: PhysicalSize::new(8.0, 8.0),
+                stride: 8 * 4,
+                format: PixelFormat::Rgba8,
+                color_space: ColorSpace::Srgb,
+                scale: ScaleFactor::IDENTITY,
+            },
+            provenance: Provenance::Region,
+            target: CaptureTarget::Region(LogicalRect::new(LogicalPoint::new(0.0, 0.0), size)),
+        };
+        let mut document = Document::new(capture);
+        document
+            .set_scene(Some(Beautification {
+                output_size: Some(scrozz_annotate::ExactOutputSize {
+                    width: 16,
+                    height: 8,
+                }),
+                background: scrozz_annotate::Background::Transparent,
+                ..Beautification::default()
+            }))
+            .unwrap();
+        let state = EditorState::new(document);
+
+        let preview = render(&state, 160, false).unwrap();
+        assert_eq!(preview.image.size, [160, 80]);
+        let subject = preview.subject.expect("Scene subject mapping");
+        assert_eq!(subject.min, pos2(0.25, 0.0));
+        assert_eq!(subject.max, pos2(0.75, 1.0));
+
+        let image = Rect::from_min_size(pos2(20.0, 30.0), vec2(200.0, 100.0));
+        let subject = Rect::from_min_max(
+            image.min + subject.min.to_vec2() * image.size(),
+            image.min + subject.max.to_vec2() * image.size(),
+        );
+        assert_eq!(
+            to_document(subject.min, subject, state.document().content_bounds()),
+            LogicalPoint::new(0.0, 0.0)
+        );
+        assert_eq!(
+            to_document(subject.max, subject, state.document().content_bounds()),
+            LogicalPoint::new(8.0, 8.0)
+        );
     }
 }

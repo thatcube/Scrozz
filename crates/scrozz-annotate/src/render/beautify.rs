@@ -85,6 +85,14 @@ pub(crate) fn apply_with_retained_bytes(
     beautification: &Beautification,
     options: ApplyOptions,
 ) -> Result<Pixmap> {
+    apply_with_retained_bytes_and_layout(content, beautification, options).map(|(canvas, _)| canvas)
+}
+
+pub(crate) fn apply_with_retained_bytes_and_layout(
+    content: &Pixmap,
+    beautification: &Beautification,
+    options: ApplyOptions,
+) -> Result<(Pixmap, ResolvedLayout)> {
     let ApplyOptions {
         scale,
         source_scale,
@@ -110,7 +118,7 @@ pub(crate) fn apply_with_retained_bytes(
     )?;
     preflight_working_set(content, beautification, layout, retained_source_bytes)?;
     if beautification.is_noop() {
-        return Ok(content.clone());
+        return Ok((content.clone(), layout));
     }
     let mut canvas = Pixmap::new(layout.width, layout.height).ok_or_else(|| {
         Error::InvalidRequest(format!(
@@ -164,7 +172,7 @@ pub(crate) fn apply_with_retained_bytes(
             target_color_space,
         )?;
     }
-    Ok(canvas)
+    Ok((canvas, layout))
 }
 
 /// Resolves canvas and content geometry without allocating the canvas.

@@ -9,7 +9,7 @@ use scrozz_core::{
     Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
     PhysicalSize, PixelFormat, Provenance, ScaleFactor,
 };
-use scrozz_ui::editor::{EditorState, EditorUi, Intent};
+use scrozz_ui::editor::{Command, EditorState, EditorUi, Handle, Intent, Tool};
 
 fn document(provenance: Provenance) -> Document {
     let size = LogicalSize::new(480.0, 300.0);
@@ -28,6 +28,12 @@ fn document(provenance: Provenance) -> Document {
         provenance,
         target: CaptureTarget::Region(LogicalRect::new(LogicalPoint::new(0.0, 0.0), size)),
     })
+}
+
+fn drag(state: &mut EditorState, from: LogicalPoint, to: LogicalPoint) {
+    state.pointer_pressed(from);
+    state.pointer_dragged(to, false);
+    state.pointer_released();
 }
 
 #[test]
@@ -323,6 +329,93 @@ fn stale_analysis_never_replaces_newer_draft() {
         }),
     );
     assert_eq!(state.document().beautification(), expected.as_ref());
+}
+
+#[test]
+fn annotation_history_and_scene_history_remain_independent() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let scene = Beautification::preset(BeautificationPreset::Social);
+    state.begin_with(scene.clone());
+    state.apply_scene();
+
+    state.set_tool(Tool::Rectangle);
+    drag(
+        &mut state,
+        LogicalPoint::new(20.0, 20.0),
+        LogicalPoint::new(120.0, 90.0),
+    );
+    assert_eq!(state.document().len(), 1);
+
+    state.command(Command::Undo).unwrap();
+    assert!(state.document().is_empty());
+    assert_eq!(state.document().scene(), Some(&scene));
+
+    state.command(Command::Redo).unwrap();
+    assert_eq!(state.document().len(), 1);
+    assert_eq!(state.document().scene(), Some(&scene));
+
+    state.undo_framing();
+    assert_eq!(state.document().len(), 1);
+    assert!(state.document().scene().is_none());
+
+    state.redo_framing();
+    assert_eq!(state.document().len(), 1);
+    assert_eq!(state.document().scene(), Some(&scene));
+}
+
+#[test]
+fn annotation_mutation_invalidates_in_flight_scene_analysis() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame { revision, .. } = state.begin_scene() else {
+        panic!("expected analysis intent");
+    };
+    state.set_tool(Tool::Rectangle);
+    drag(
+        &mut state,
+        LogicalPoint::new(20.0, 20.0),
+        LogicalPoint::new(120.0, 90.0),
+    );
+    let expected = state.document().scene().cloned();
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification::preset(BeautificationPreset::Story),
+            inset_explanation: "stale annotation snapshot".to_owned(),
+        }),
+    );
+
+    assert_eq!(state.document().scene(), expected.as_ref());
+    assert!(!state.smart_frame_analysis_pending());
+}
+
+#[test]
+fn crop_mutation_invalidates_in_flight_scene_analysis() {
+    let mut state = EditorState::new(document(Provenance::Region));
+    let Intent::AnalyzeSmartFrame { revision, .. } = state.begin_scene() else {
+        panic!("expected analysis intent");
+    };
+    state.set_tool(Tool::Crop);
+    let full = state.pending_crop().expect("crop session");
+    drag(
+        &mut state,
+        Handle::TopLeft.position(&full),
+        LogicalPoint::new(40.0, 30.0),
+    );
+    state.command(Command::ApplyCrop).unwrap();
+    let expected = state.document().scene().cloned();
+
+    state.finish_smart_frame_analysis(
+        revision,
+        Ok(SmartFrameAnalysis {
+            beautification: Beautification::preset(BeautificationPreset::Story),
+            inset_explanation: "stale crop snapshot".to_owned(),
+        }),
+    );
+
+    assert!(state.document().crop().is_some());
+    assert_eq!(state.document().scene(), expected.as_ref());
+    assert!(!state.smart_frame_analysis_pending());
 }
 
 #[test]
