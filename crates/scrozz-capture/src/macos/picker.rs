@@ -7,6 +7,7 @@
 //! Scrozz's worker.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -135,16 +136,26 @@ struct InboxState {
 #[derive(Default)]
 struct PickerInbox {
     state: Mutex<InboxState>,
+    /// Whether a window selected in this session keeps its shadow.
+    ///
+    /// Apple's picker answers on its own callback long after the caller
+    /// returned, so the preference cannot be passed down the stack. It is
+    /// latched here when the picker is presented, which is also the moment the
+    /// ordinary capture path reads it — a change made while the picker is up
+    /// applies to the next capture, not the one in flight.
+    include_window_shadow: AtomicBool,
 }
 
 impl PickerInbox {
-    fn begin(&self) -> Result<u64> {
+    fn begin(&self, include_window_shadow: bool) -> Result<u64> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.awaiting {
             return Err(Error::InvalidRequest(
                 "Apple's content picker is already waiting for a selection".to_owned(),
             ));
         }
+        self.include_window_shadow
+            .store(include_window_shadow, Ordering::Relaxed);
         state.session = state.session.wrapping_add(1);
         state.awaiting = true;
         state.capturing = false;
@@ -278,13 +289,15 @@ impl PickerObserver {
         let Some(session) = inbox.claim_selection() else {
             return;
         };
-        let (configuration, scale, target, provenance) = match prepare_capture(filter) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                inbox.deliver(session, ApplePickerEvent::Failed(error));
-                return;
-            }
-        };
+        let include_window_shadow = inbox.include_window_shadow.load(Ordering::Relaxed);
+        let (configuration, scale, target, provenance) =
+            match prepare_capture(filter, include_window_shadow) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    inbox.deliver(session, ApplePickerEvent::Failed(error));
+                    return;
+                }
+            };
         let completion_inbox = Arc::clone(inbox);
         let start = sck::capture_image_async(filter, &configuration, move |result| {
             let event = match result {
@@ -405,11 +418,15 @@ impl AppleContentPicker {
 
     /// Presents one least-privilege picker.
     ///
+    /// `include_window_shadow` is the user's persisted preference, latched for
+    /// this presentation. It only reaches a window selection: a display has no
+    /// shadow to drop.
+    ///
     /// # Errors
     ///
     /// Returns an error if another picker is already in flight.
-    pub fn present(&self, mode: ApplePickerMode) -> Result<()> {
-        let _session = self.inbox.begin()?;
+    pub fn present(&self, mode: ApplePickerMode, include_window_shadow: bool) -> Result<()> {
+        let _session = self.inbox.begin(include_window_shadow)?;
 
         // SAFETY: both classes were probed in `new`. The configuration is new,
         // confined to this call, and copied by `setDefaultConfiguration:`.
@@ -466,6 +483,7 @@ impl Drop for AppleContentPicker {
 /// a thread boundary. The screenshot operation itself is asynchronous.
 fn prepare_capture(
     filter: &SCContentFilter,
+    include_window_shadow: bool,
 ) -> Result<(
     Retained<objc2_screen_capture_kit::SCStreamConfiguration>,
     ScaleFactor,
@@ -496,10 +514,18 @@ fn prepare_capture(
     let request = CaptureRequest {
         target: target.clone(),
         cursor: CursorMode::Hidden,
-        include_window_shadow: provenance == Provenance::Window,
+        include_window_shadow: shadow_for(provenance, include_window_shadow),
     };
     let configuration = super::configure(filter, &request, scale, None)?;
     Ok((configuration, scale, target, provenance))
+}
+
+/// Whether this picker selection is captured with a shadow.
+///
+/// A display has no window shadow to include, so the preference only ever
+/// removes one from a window.
+const fn shadow_for(provenance: Provenance, preferred: bool) -> bool {
+    matches!(provenance, Provenance::Window) && preferred
 }
 
 fn picker_scale(filter: &SCContentFilter) -> ScaleFactor {
@@ -556,14 +582,41 @@ mod tests {
     }
 
     #[test]
+    fn a_window_picked_with_shadows_off_is_captured_without_one() {
+        // The picker used to decide from provenance alone, so turning the
+        // setting off had no effect the moment permissions fell back to Apple's
+        // picker — the same window came back shadowed.
+        assert!(shadow_for(Provenance::Window, true));
+        assert!(!shadow_for(Provenance::Window, false));
+        // A display never had one to include either way.
+        assert!(!shadow_for(Provenance::Display, true));
+        assert!(!shadow_for(Provenance::Display, false));
+    }
+
+    #[test]
+    fn each_presentation_latches_the_preference_it_was_given() {
+        // Apple answers on its own callback, so the value read when the
+        // selection lands has to be the one in force when the picker opened.
+        let inbox = PickerInbox::default();
+
+        inbox.begin(false).unwrap();
+        assert!(!inbox.include_window_shadow.load(Ordering::Relaxed));
+        inbox.deliver_current(ApplePickerEvent::Cancelled);
+        assert!(matches!(inbox.take(), Some(ApplePickerEvent::Cancelled)));
+
+        inbox.begin(true).unwrap();
+        assert!(inbox.include_window_shadow.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn a_late_capture_cannot_satisfy_a_new_picker_session() {
         let inbox = PickerInbox::default();
-        let first = inbox.begin().unwrap();
+        let first = inbox.begin(true).unwrap();
         assert_eq!(inbox.claim_selection(), Some(first));
         inbox.state.lock().unwrap().capturing_since = Some(Instant::now() - PICKER_CAPTURE_TIMEOUT);
         assert!(matches!(inbox.take(), Some(ApplePickerEvent::Failed(_))));
 
-        let second = inbox.begin().unwrap();
+        let second = inbox.begin(true).unwrap();
         assert_ne!(first, second);
         inbox.deliver(
             first,
