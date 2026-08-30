@@ -2233,8 +2233,28 @@ impl App {
                     version,
                     action,
                 } => {
-                    self.surface.set_status(card, Some(detail.clone()));
-                    self.note(format!("{card} {detail}"));
+                    // Round 13: existence is validated *before* anything
+                    // else, by peeking (never removing) this exact action in
+                    // `outstanding_output_actions` first. A duplicate
+                    // delivery of an already-resolved completion -- the same
+                    // dispatch answered twice -- must be a total no-op: no
+                    // status, no note, no staleness check, no retention
+                    // mutation. Checking existence any later would be too
+                    // late for its own sake: once this card's last
+                    // outstanding action resolves,
+                    // `prune_settled_generation_fates` erases every fate
+                    // recorded for it, so a stale-but-already-resolved
+                    // duplicate arriving after that point would find no
+                    // fate to disagree with and be wrongly trusted as
+                    // current by `output_version_is_stale`'s own `None`
+                    // branch -- exactly the gap this closes.
+                    let outstanding = self
+                        .outstanding_output_actions
+                        .get(&card)
+                        .is_some_and(|actions| actions.contains_key(&action));
+                    if !outstanding {
+                        continue;
+                    }
                     // Round 5, Finding #2 / round 9, Finding #1: a Save
                     // dispatched against a live editor's revision can
                     // complete after a *later* Done has already committed a
@@ -2248,7 +2268,9 @@ impl App {
                     // version to race and always applies, and the first
                     // completion of a fresh, still-open editing session
                     // (nothing committed, nothing cancelled, yet) is trusted
-                    // too.
+                    // too. This is evaluated only now that `action` is
+                    // confirmed still outstanding, so the fate this reads (if
+                    // any) cannot have already been pruned out from under it.
                     let stale = self.output_version_is_stale(card, version);
                     if stale {
                         // Round 6, Finding #1: this Save/Copy answered
@@ -2264,14 +2286,22 @@ impl App {
                         // about the one before it. Retire only this stale
                         // action's own bookkeeping, resolving any overflow
                         // retirement waiting behind it against whatever the
-                        // card holds now instead. Retention is left exactly
-                        // as it was before this stale completion arrived --
-                        // for a cancelled edit that is the card's pre-edit
+                        // card holds now instead. Neither retention nor the
+                        // status line nor the notes log is touched -- for a
+                        // cancelled edit that is the card's pre-edit
                         // retention, untouched by Cancel, which is precisely
-                        // what round 9, Finding #1 requires.
+                        // what round 9, Finding #1 requires; round 13
+                        // extends the same "only a matching, current,
+                        // non-stale completion may mutate anything user-
+                        // visible" rule to the status/notes surface too.
                         self.resolve_stale_output_completion(card, action);
                         continue;
                     }
+                    // Only a matching, current, non-stale completion ever
+                    // reaches here to update the status line, the notes
+                    // log, retention, or trigger dismissal (round 13).
+                    self.surface.set_status(card, Some(detail.clone()));
+                    self.note(format!("{card} {detail}"));
                     if let Some(retention) = self.card_retention.get_mut(&card)
                         && detail.starts_with("saved")
                     {
@@ -9077,6 +9107,11 @@ mod tests {
             path: path.clone(),
             action,
         }));
+        // Round 13: `Outcome::Done` now validates this exact action is
+        // still outstanding before trusting its completion at all -- every
+        // real dispatch site registers alongside its own successful post,
+        // so this direct-post test does the same.
+        app.register_output_action(card, action, OutputActionKind::CardOutput, false);
 
         drain_until(&mut app, |app| {
             app.card_retention.get(&card) == Some(&(true, true))
@@ -9149,6 +9184,10 @@ mod tests {
             path: stale_path.clone(),
             action,
         }));
+        // Round 13: registered so `Outcome::Done` trusts this action is
+        // still outstanding, exactly as every real dispatch site does
+        // alongside its own successful post.
+        app.register_output_action(card, action, OutputActionKind::CardOutput, false);
         drain_until(&mut app, |app| stale_path.exists());
         assert_eq!(
             app.card_retention.get(&card),
@@ -9177,6 +9216,10 @@ mod tests {
             path: current_path.clone(),
             action,
         }));
+        // Round 13: registered for the same reason as the stale dispatch
+        // above -- `Outcome::Done` now requires this exact action to still
+        // be outstanding before it will trust the completion at all.
+        app.register_output_action(card, action, OutputActionKind::CardOutput, false);
         drain_until(&mut app, |app| {
             app.card_retention.get(&card) == Some(&(true, true))
         });
@@ -9229,6 +9272,10 @@ mod tests {
             path: path.clone(),
             action,
         }));
+        // Round 13: registered so `Outcome::Done` trusts this action is
+        // still outstanding, exactly as every real dispatch site does
+        // alongside its own successful post.
+        app.register_output_action(card, action, OutputActionKind::CardOutput, false);
 
         drain_until(&mut app, |app| {
             app.card_retention.get(&card) == Some(&(true, true))
@@ -9674,6 +9721,10 @@ mod tests {
             path: path.clone(),
             action,
         }));
+        // Round 13: registered so `Outcome::Done` trusts this action is
+        // still outstanding, exactly as every real dispatch site does
+        // alongside its own successful post.
+        app.register_output_action(card, action, OutputActionKind::CardOutput, false);
 
         drain_until(&mut app, |app| {
             app.card_retention.get(&card) == Some(&(true, true))
@@ -9921,6 +9972,111 @@ mod tests {
         assert!(
             !surface.trace().contains(&SurfaceCall::Dismiss(card)),
             "a stale completion for a cancelled edit must never dismiss the card"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_done_for_an_already_resolved_action_never_re_marks_retention_after_its_fate_prunes()
+     {
+        // Round 13: `Outcome::Done` previously set the status line, logged a
+        // note, and read `output_version_is_stale` -- all before ever
+        // checking whether `action` was still outstanding at all. A same-
+        // generation stale completion (every test above) is always caught
+        // by that staleness check, because *something* committed or
+        // cancelled after it leaves a fate behind to disagree with it. A
+        // genuinely duplicate delivery of an already-resolved Done slips
+        // past that guard in a way none of those tests exercise: once this
+        // action was the card's only thing outstanding, resolving it also
+        // let `prune_settled_generation_fates` erase every fate recorded
+        // for this card -- so if a *newer* commit for the same generation
+        // then lands with nothing else outstanding (pruning its own fresh
+        // fate right back out in the same call), a later duplicate of the
+        // original, already-resolved Done finds nothing left to compare its
+        // `version` against and is wrongly trusted as current, exactly as
+        // if it had never raced anything.
+        let (mut app, surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(226);
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("editor source");
+        app.card_capture_ids
+            .insert(card, CaptureId("duplicate-done".into()));
+        app.card_retention.insert(card, (false, false));
+
+        let generation = 1;
+        let action = app.allocate_output_action();
+        // `close_after: false` -- an ordinary Save/Copy dispatch must never
+        // dismiss the card purely because it finished, keeping the card
+        // around long enough for the later commit and its duplicate to
+        // actually race.
+        app.register_output_action(card, action, OutputActionKind::CardOutput, false);
+
+        // The genuine, first completion of this exact action: not stale
+        // (nothing has been committed or cancelled yet), so it is trusted
+        // and marks retention.
+        app.pipeline.inject_outcome_for_test(Outcome::Done {
+            card,
+            detail: "saved to Export Location".to_owned(),
+            version: Some((generation, 1)),
+            action,
+        });
+        app.drain_pipeline();
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(true, true)),
+            "the genuine, first completion of this action must mark retention"
+        );
+        assert!(
+            !app.outstanding_output_actions.contains_key(&card),
+            "the action must have fully resolved -- nothing else was ever \
+             registered for this card"
+        );
+
+        // A newer revision of the same generation is committed with
+        // nothing outstanding for `card` at all -- `commit_card_output`
+        // prunes this card's fate map in the very same call, so no trace
+        // of the commit (or of anything before it) survives to disagree
+        // with a later, stale duplicate.
+        let committed = RevisionedFrame::from_document(editor.document(), 2)
+            .expect("render committed revision 2");
+        app.commit_card_output(card, generation, committed, editor.document().data());
+        assert!(
+            !app.card_generation_fates.contains_key(&card),
+            "nothing was outstanding when this commit landed, so its own fate \
+             must have been pruned immediately -- the exact precondition this \
+             test exercises"
+        );
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(false, false)),
+            "the commit resets retention to describe the still-unexported new \
+             revision"
+        );
+
+        // The pipeline redelivers the exact same, already-resolved Done a
+        // second time: a genuine duplicate of the very first outcome above,
+        // naming the same now-stale `action` and `version`.
+        app.pipeline.inject_outcome_for_test(Outcome::Done {
+            card,
+            detail: "saved to Export Location".to_owned(),
+            version: Some((generation, 1)),
+            action,
+        });
+        app.drain_pipeline();
+
+        assert_eq!(
+            app.card_retention.get(&card),
+            Some(&(false, false)),
+            "a duplicate delivery of an already-resolved action must never \
+             re-mark retention -- the newer, still-unexported committed \
+             revision must not be reported as saved off a stale duplicate \
+             whose own fate has already been pruned"
+        );
+        assert!(
+            !surface.trace().contains(&SurfaceCall::Dismiss(card)),
+            "a duplicate completion must never dismiss the card either"
         );
     }
 
