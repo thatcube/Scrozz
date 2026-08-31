@@ -42,7 +42,7 @@ struct AppliedPin {
     positioning: bool,
     display_scale: scrozz_core::ScaleFactor,
     locked: bool,
-    opacity: scrozz_core::Opacity,
+    passthrough: bool,
     shadow: bool,
 }
 
@@ -53,7 +53,7 @@ impl From<&NativePinRequest> for AppliedPin {
             positioning: request.positioning,
             display_scale: request.display_scale,
             locked: request.state.locked,
-            opacity: request.state.opacity,
+            passthrough: request.passthrough,
             shadow: request.shadow,
         }
     }
@@ -63,7 +63,7 @@ impl AppliedPin {
     fn behavior_changed(&self, previous: Option<&Self>) -> bool {
         previous.is_none_or(|previous| {
             self.locked != previous.locked
-                || self.opacity != previous.opacity
+                || self.passthrough != previous.passthrough
                 || self.shadow != previous.shadow
         })
     }
@@ -230,8 +230,8 @@ impl PinPanels {
                 continue;
             }
             if desired.behavior_changed(retained.applied.as_ref()) {
-                let mut behavior = OverlayBehavior::pinned_capture(desired.locked);
-                behavior.opacity = desired.opacity;
+                let mut behavior =
+                    OverlayBehavior::pinned_capture(desired.locked, desired.passthrough);
                 behavior.has_shadow = desired.shadow;
                 match retained.window.apply(&behavior) {
                     Ok(_) => {}
@@ -1029,6 +1029,7 @@ mod tests {
                 scrozz_core::PinScale::ORIGINAL,
                 None,
             ),
+            passthrough: false,
             positioning: true,
             display_scale: scrozz_core::ScaleFactor::new(2.0),
             shadow: true,
@@ -1060,6 +1061,15 @@ mod tests {
         let locked = AppliedPin::from(&locked_request);
         assert!(!locked.frame_changed(Some(&base)));
         assert!(locked.behavior_changed(Some(&base)));
+
+        let mut control_island_request = locked_request;
+        control_island_request.passthrough = false;
+        let control_island = AppliedPin::from(&control_island_request);
+        let mut click_through_request = control_island_request;
+        click_through_request.passthrough = true;
+        let click_through = AppliedPin::from(&click_through_request);
+        assert!(click_through.locked);
+        assert!(click_through.behavior_changed(Some(&control_island)));
     }
 
     #[test]

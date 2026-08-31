@@ -345,13 +345,14 @@ impl OverlayBehavior {
     /// The behaviour of one pinned capture window.
     ///
     /// Each pin owns a native window because click-through is a whole-window
-    /// property. An unlocked pin may receive keyboard input for Escape and
-    /// arrow-key nudges; a locked pin relies on an external unlock route.
+    /// property. Durable lock state controls keyboard focus independently from
+    /// transient pointer passthrough, allowing Lock and Close control islands
+    /// to remain reachable over a click-through image.
     #[must_use]
-    pub const fn pinned_capture(locked: bool) -> Self {
+    pub const fn pinned_capture(locked: bool, passthrough: bool) -> Self {
         Self {
             level: OverlayLevel::Floating,
-            click_through: locked,
+            click_through: passthrough,
             join_all_spaces: true,
             over_fullscreen: true,
             stationary: true,

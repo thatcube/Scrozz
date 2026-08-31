@@ -31,10 +31,12 @@ use std::{
     time::SystemTime,
 };
 
-use scrozz_core::{ColorSpace, Frame, PinState, Provenance, Transform as ColorTransform};
+use scrozz_core::{
+    ColorSpace, Frame, LogicalSize, PinState, Provenance, Transform as ColorTransform,
+};
 use scrozz_store::CaptureId;
 use scrozz_ui::card::CardMedia;
-use scrozz_ui::recent_captures_overlay::RecentCapturesAutoCloseAction;
+use scrozz_ui::recent_captures_overlay::{PinnedCaptureAction, RecentCapturesAutoCloseAction};
 use scrozz_ui::{ScrollHudAction, ScrollHudState};
 
 use crate::gui::action::CaptureKind;
@@ -465,6 +467,8 @@ pub enum CardEvent {
     PinChanged(CaptureId, PinState),
     /// A pin closed and must not restore.
     Unpin(CaptureId),
+    /// A content action requested by a durable pin.
+    PinnedAction(CaptureId, PinnedCaptureAction),
     /// A native pin request was truthfully refused.
     PinUnavailable {
         /// Card that was not pinned.
@@ -496,7 +500,10 @@ impl CardEvent {
             | Self::Pin(id, _, _)
             | Self::PinUnavailable { card: id, .. } => Some(*id),
             Self::Save { card, .. } | Self::Drag { card, .. } => Some(*card),
-            Self::PinChanged(..) | Self::Unpin(..) | Self::PinPositioningUnavailable { .. } => None,
+            Self::PinChanged(..)
+            | Self::Unpin(..)
+            | Self::PinnedAction(..)
+            | Self::PinPositioningUnavailable { .. } => None,
         }
     }
 }
@@ -556,6 +563,7 @@ pub trait CardSurface {
         &mut self,
         capture: &CaptureId,
         texture: Thumbnail,
+        natural_size: LogicalSize,
     ) -> scrozz_core::Result<()>;
 
     /// Commit a successfully persisted provisional pin and retire its source card.
@@ -745,6 +753,10 @@ pub enum SurfaceCall {
     },
     /// [`CardSurface::refresh_card_image`] replaced a card's thumbnail.
     RefreshCardImage(CardId),
+    /// [`CardSurface::refresh_pin_texture`] replaced a durable pin's pixels.
+    RefreshPinTexture(CaptureId),
+    /// [`CardSurface::discard_pin`] closed a pin without changing durability.
+    DiscardPin(CaptureId),
     /// [`CardSurface::set_status`] showed or cleared a card's action status.
     SetStatus {
         /// Which card's status changed.
@@ -940,13 +952,12 @@ impl CardSurface for Recording {
 
     fn refresh_pin_texture(
         &mut self,
-        _capture: &CaptureId,
+        capture: &CaptureId,
         _texture: Thumbnail,
+        _natural_size: LogicalSize,
     ) -> scrozz_core::Result<()> {
-        Err(scrozz_core::Error::Unsupported {
-            what: "native pinned capture windows".into(),
-            why: "the recording card surface has no window host".into(),
-        })
+        self.record(SurfaceCall::RefreshPinTexture(capture.clone()));
+        Ok(())
     }
 
     fn commit_pin(
@@ -962,7 +973,9 @@ impl CardSurface for Recording {
 
     fn fail_pin(&mut self, _capture: &CaptureId, _reason: String) {}
 
-    fn discard_pin(&mut self, _capture: &CaptureId) {}
+    fn discard_pin(&mut self, capture: &CaptureId) {
+        self.record(SurfaceCall::DiscardPin(capture.clone()));
+    }
     fn unlock_pins(&mut self) {}
 
     fn poll(&mut self) -> Option<CardEvent> {

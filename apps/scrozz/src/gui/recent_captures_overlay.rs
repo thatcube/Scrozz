@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use scrozz_core::{ColorSpace, Frame, PhysicalSize, PixelFormat, ScaleFactor};
+use scrozz_core::{ColorSpace, Frame, LogicalSize, PhysicalSize, PixelFormat, ScaleFactor};
 use scrozz_store::CaptureId;
 use scrozz_ui::{
     CaptureMedia, CaptureRequest, RecentCapturesOverlayEvent, RecentCapturesOverlayHandle,
@@ -203,12 +203,14 @@ impl CardSurface for RecentCapturesOverlayCards {
         &mut self,
         capture: &CaptureId,
         texture: Thumbnail,
+        natural_size: LogicalSize,
     ) -> scrozz_core::Result<()> {
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [texture.width() as usize, texture.height() as usize],
             texture.pixels(),
         );
-        self.handle.refresh_pin_texture(capture.0.clone(), image);
+        self.handle
+            .refresh_pin_texture(capture.0.clone(), image, Some(natural_size));
         Ok(())
     }
 
@@ -218,7 +220,12 @@ impl CardSurface for RecentCapturesOverlayCards {
         texture: Option<Thumbnail>,
     ) -> scrozz_core::Result<()> {
         if let Some(texture) = texture {
-            self.refresh_pin_texture(capture, texture)?;
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [texture.width() as usize, texture.height() as usize],
+                texture.pixels(),
+            );
+            self.handle
+                .refresh_pin_texture(capture.0.clone(), image, None);
         }
         self.handle.commit_pin(capture.0.clone());
         if let Some(card) = self.pinned.remove(&capture.0) {
@@ -443,6 +450,9 @@ impl RecentCapturesOverlayCards {
                 RecentCapturesOverlayEvent::PinClosed { pin } => {
                     self.pinned.remove(&pin.0);
                     out.push(CardEvent::Unpin(CaptureId(pin.0)));
+                }
+                RecentCapturesOverlayEvent::PinActionRequested { pin, action } => {
+                    out.push(CardEvent::PinnedAction(CaptureId(pin.0), action));
                 }
                 RecentCapturesOverlayEvent::PinUnavailable { card, reason } => {
                     if let Some(ours) = self.mapped.get(&card.0).copied() {
@@ -705,6 +715,25 @@ mod tests {
             })
         );
         assert_eq!(surface.poll(), None, "the drag was drained twice");
+    }
+
+    #[test]
+    fn durable_pin_actions_do_not_require_a_live_card_mapping() {
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
+        surface
+            .handle
+            .report(RecentCapturesOverlayEvent::PinActionRequested {
+                pin: scrozz_core::PinId("capture-17".into()),
+                action: scrozz_ui::recent_captures_overlay::PinnedCaptureAction::ExtractText,
+            });
+
+        assert_eq!(
+            surface.poll(),
+            Some(CardEvent::PinnedAction(
+                CaptureId("capture-17".into()),
+                scrozz_ui::recent_captures_overlay::PinnedCaptureAction::ExtractText,
+            ))
+        );
     }
 
     #[test]

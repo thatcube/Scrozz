@@ -62,8 +62,8 @@ use scrozz_annotate::{
 };
 use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError,
-    LogicalPoint, LogicalRect, PinState, Provenance, ScaleFactor, ScrollAxis, SelectionMode,
-    SelectionOptions,
+    LogicalPoint, LogicalRect, LogicalSize, PinState, Provenance, ScaleFactor, ScrollAxis,
+    SelectionMode, SelectionOptions,
 };
 use scrozz_export::{Encoder, FrameEncoder, ImageFormat, RgbaImage};
 use scrozz_shell::{DragPayload, DragPreview, byte_source};
@@ -241,6 +241,8 @@ pub enum HistoryOperation {
     Copy,
     /// Export the rendered capture.
     Save,
+    /// Recognize text from the rendered capture and copy it.
+    ExtractText,
     /// Prepare a promised-file drag.
     Drag,
     /// Change retention protection.
@@ -263,6 +265,7 @@ impl HistoryOperation {
             Self::OpenEditor => "open editor",
             Self::Copy => "copy capture",
             Self::Save => "save capture",
+            Self::ExtractText => "extract text",
             Self::Drag => "drag capture",
             Self::Pin => "change pinned state",
             Self::Delete => "delete capture",
@@ -504,6 +507,22 @@ pub(crate) enum Job {
     CopyHistory(CaptureId),
     /// Save a stored document.
     SaveHistory(CaptureId),
+    /// Save a stored document to an explicitly chosen path.
+    SaveHistoryTo {
+        /// Durable capture to render.
+        capture: CaptureId,
+        /// Native-dialog destination.
+        path: std::path::PathBuf,
+    },
+    /// Upload a stored document through the configured provider.
+    UploadHistory {
+        /// Durable capture to render.
+        capture: CaptureId,
+        /// Session-local upload identity.
+        card: CardId,
+    },
+    /// Recognize text in a stored document and copy it.
+    ExtractHistoryText(CaptureId),
     /// Pre-render a stored document before a drag gesture starts.
     PrepareHistoryDrag(CaptureId),
     /// Change a stored capture's pinned state.
@@ -1027,6 +1046,13 @@ pub enum Outcome {
         generation: u64,
         /// The document revision now durably persisted.
         revision: u64,
+        /// Durable capture whose scene graph was updated.
+        capture: CaptureId,
+        /// Fresh pixels for a live durable pin, if this capture is still pinned.
+        ///
+        /// Kept on the exact persist acknowledgement so the main thread can
+        /// reject stale editor generations before changing what the pin shows.
+        pin_texture: CliResult<Option<(Thumbnail, LogicalSize)>>,
     },
     /// A Done exit's (or a history-only editor's) scene graph could not be
     /// persisted (Finding #4, round 5).
@@ -2170,6 +2196,11 @@ impl Worker {
                 Job::OpenHistoryRecording { capture } => self.open_history_recording(capture),
                 Job::CopyHistory(capture) => self.copy_history(capture),
                 Job::SaveHistory(capture) => self.save_history(capture),
+                Job::SaveHistoryTo { capture, path } => {
+                    self.save_history_to(capture, &path);
+                }
+                Job::UploadHistory { capture, card } => self.upload_history(capture, card),
+                Job::ExtractHistoryText(capture) => self.extract_history_text(capture),
                 Job::PrepareHistoryDrag(capture) => self.prepare_history_drag(capture),
                 Job::SetPinned { capture, pinned } => self.set_pinned(capture, pinned),
                 Job::Delete(capture) => self.delete(capture),
@@ -2755,9 +2786,10 @@ impl Worker {
             });
         match result {
             Ok(capture) => {
+                let pin_texture = self.load_pin_texture_if_pinned(&capture);
                 self.history_done(
                     HistoryOperation::Edit,
-                    Some(capture),
+                    Some(capture.clone()),
                     None,
                     format!(
                         "{card} editor {generation} revision {revision} saved to capture history"
@@ -2769,6 +2801,8 @@ impl Worker {
                     card,
                     generation,
                     revision,
+                    capture,
+                    pin_texture,
                 });
             }
             Err(error) => {
@@ -3522,6 +3556,48 @@ impl Worker {
         self.answer_history(HistoryOperation::Save, capture, result);
     }
 
+    fn save_history_to(&mut self, capture: CaptureId, destination: &std::path::Path) {
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            let path = crate::output::export_to_path(rendered.bytes.as_slice(), destination)?;
+            Ok(format!("saved to {}", path.display()))
+        });
+        self.answer_history(HistoryOperation::Save, capture, result);
+    }
+
+    fn upload_history(&mut self, capture: CaptureId, card: CardId) {
+        let action = 0;
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            let artifact = crate::cloud::FinalizedArtifact::screenshot_png(
+                rendered.bytes.as_ref().clone(),
+                format!("Screenshot-{}.png", capture.0),
+            )?;
+            self.queue_upload(
+                card,
+                Some(capture),
+                ShareVersion::original(),
+                artifact,
+                action,
+            )
+        });
+        self.answer_upload(card, action, result);
+    }
+
+    fn extract_history_text(&mut self, capture: CaptureId) {
+        use scrozz_ocr::Ocr as _;
+
+        let result = self.render_stored(&capture).and_then(|rendered| {
+            let engine = crate::platform::ocr_engine(scrozz_ocr::Options::default());
+            let blocks = engine.recognize(&rendered.frame)?;
+            let text = scrozz_ocr::plain_text(&blocks);
+            if text.trim().is_empty() {
+                return Err(CliError::usage("no text was found in this capture"));
+            }
+            scrozz_export::SystemClipboard::new().write_text(&text)?;
+            Ok("extracted text and copied it to the clipboard".to_owned())
+        });
+        self.answer_history(HistoryOperation::ExtractText, capture, result);
+    }
+
     fn prepare_history_drag(&mut self, capture: CaptureId) {
         let result = self
             .render_stored(&capture)
@@ -3886,6 +3962,14 @@ impl Worker {
     }
 
     fn load_pin_texture(&mut self, id: &CaptureId) -> CliResult<Thumbnail> {
+        self.load_pin_texture_with_size(id)
+            .map(|(texture, _)| texture)
+    }
+
+    fn load_pin_texture_with_size(
+        &mut self,
+        id: &CaptureId,
+    ) -> CliResult<(Thumbnail, LogicalSize)> {
         let store = self.store.as_mut().ok_or_else(|| {
             CliError::Core(CoreError::Storage(
                 "history is unavailable, so pin pixels cannot be loaded".into(),
@@ -3894,7 +3978,13 @@ impl Worker {
         match store.document(id) {
             Ok(Some(DocumentState::Complete(document))) => {
                 let frame = SkiaRenderer::new().render(&document)?;
-                Thumbnail::from_frame(&frame, PIN_TEXTURE_MAX_EDGE).map_err(CliError::from)
+                let natural_size = LogicalSize::new(
+                    frame.size.width / frame.scale.get(),
+                    frame.size.height / frame.scale.get(),
+                );
+                let texture =
+                    Thumbnail::from_frame(&frame, PIN_TEXTURE_MAX_EDGE).map_err(CliError::from)?;
+                Ok((texture, natural_size))
             }
             Ok(Some(DocumentState::ImageEvicted(_))) | Ok(None) => {
                 Err(CliError::Core(CoreError::Storage(format!(
@@ -3904,6 +3994,20 @@ impl Worker {
             }
             Err(err) => Err(CliError::from(err)),
         }
+    }
+
+    fn load_pin_texture_if_pinned(
+        &mut self,
+        id: &CaptureId,
+    ) -> CliResult<Option<(Thumbnail, LogicalSize)>> {
+        let pinned = self
+            .history_store()?
+            .record(id)?
+            .is_some_and(|record| record.screen_pin.is_some());
+        if !pinned {
+            return Ok(None);
+        }
+        self.load_pin_texture_with_size(id).map(Some)
     }
 
     fn answer(
@@ -6600,6 +6704,85 @@ mod tests {
             panic!("saved editor source was unexpectedly evicted");
         };
         assert_eq!(reloaded.data(), changed.data());
+    }
+
+    #[test]
+    fn closing_a_pinned_history_editor_returns_its_exact_persisted_texture() {
+        let (_dir, mut worker, receiver) = worker_with_store("worker-pinned-editor-persist");
+        let original = richly_annotated_document(1);
+        let changed = richly_annotated_document(99);
+        let id = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .insert(NewCapture::new(&original))
+            .expect("insert");
+        let state = PinState::new(
+            LogicalRect::new(
+                LogicalPoint::new(10.0, 20.0),
+                scrozz_core::LogicalSize::new(320.0, 180.0),
+            ),
+            scrozz_core::PinScale::ORIGINAL,
+            None,
+        );
+        worker
+            .store
+            .as_mut()
+            .expect("store")
+            .set_screen_pin(&id, Some(&state))
+            .expect("pin capture");
+        worker.open_history_editor(id.clone(), CardId(13));
+        let _ = received(&receiver);
+        let _ = received(&receiver);
+
+        worker.persist_document(CardId(13), 3, 9, &changed.data());
+
+        assert!(matches!(
+            received(&receiver),
+            Outcome::HistoryDone {
+                operation: HistoryOperation::Edit,
+                capture: Some(ref saved),
+                ..
+            } if saved == &id
+        ));
+        let Outcome::EditorClosePersisted {
+            card,
+            generation,
+            revision,
+            capture,
+            pin_texture: Ok(Some((actual, natural_size))),
+        } = received(&receiver)
+        else {
+            panic!("the exact persisted pin texture was not returned");
+        };
+        assert_eq!(card, CardId(13));
+        assert_eq!(generation, 3);
+        assert_eq!(revision, 9);
+        assert_eq!(capture, id);
+
+        let DocumentState::Complete(reloaded) = worker
+            .store
+            .as_mut()
+            .expect("store")
+            .document(&capture)
+            .expect("read")
+            .expect("document")
+        else {
+            panic!("saved pinned editor source was unexpectedly evicted");
+        };
+        let rendered = SkiaRenderer::new()
+            .render(&reloaded)
+            .expect("render persisted edit");
+        let expected =
+            Thumbnail::from_frame(&rendered, PIN_TEXTURE_MAX_EDGE).expect("expected texture");
+        assert_eq!(
+            natural_size,
+            LogicalSize::new(
+                rendered.size.width / rendered.scale.get(),
+                rendered.size.height / rendered.scale.get(),
+            )
+        );
+        assert_eq!(actual.pixels(), expected.pixels());
     }
 
     #[test]

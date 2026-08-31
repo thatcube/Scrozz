@@ -39,11 +39,11 @@
 //! once passthrough is on, egui can no longer see the pointer and can never
 //! learn that it has moved back over a card. The fix is a [`PointerProbe`]: a
 //! caller-supplied closure that reports the global cursor position without
-//! consuming events (`NSEvent::mouseLocation` on macOS). With a probe, tracking
-//! is exact. Without one, [`Passthrough::Auto`] falls back to re-sampling: it
-//! drops passthrough for a single frame every [`RESAMPLE_SECS`] so hover can
-//! recover. That is a bounded degradation, not a fix, and it is why the probe
-//! exists.
+//! consuming events (`NSEvent::mouseLocation` on macOS). With a working probe,
+//! tracking is exact. Without one, or whenever a supplied probe cannot produce
+//! a sample, [`Passthrough::Auto`] falls back to re-sampling: it drops
+//! passthrough for a single frame every [`RESAMPLE_SECS`] so hover can recover.
+//! That is a bounded degradation, not a fix, and it is why the probe exists.
 //!
 //! # Repainting
 //!
@@ -63,8 +63,8 @@ use std::time::Duration;
 
 use egui::{Pos2, Rect, Vec2};
 use scrozz_core::{
-    DisplayId, DisplaySet, Frame as CaptureFrame, LockEscape, LogicalSize, PinChromePolicy, PinId,
-    PinState, PinnedSurface, PixelFormat, Provenance, ScaleFactor,
+    DisplayId, DisplaySet, Frame as CaptureFrame, LockEscape, LogicalSize, PinBorder,
+    PinChromePolicy, PinId, PinState, PinnedSurface, PixelFormat, Provenance, ScaleFactor,
 };
 
 use crate::card::{self, CardAction, CardContent, CardMedia};
@@ -75,10 +75,10 @@ use crate::pinned;
 use crate::scrolling::{ScrollHudAction, ScrollHudState, ScrollingHud};
 pub use crate::stack::RecentCapturesPlacement;
 use crate::stack::{CaptureStack, CardFrame, CardId, CardMetrics, CardState, Intent, dock};
-use crate::theme::{Appearance, Radius, Theme, corner};
+use crate::theme::{Appearance, Radius, Text, Theme, corner};
 
 /// How long [`Passthrough::Auto`] waits before dropping click-through for a
-/// single frame to re-sample the pointer, when no [`PointerProbe`] is supplied.
+/// single frame to re-sample the pointer when no [`PointerProbe`] sample is available.
 pub const RESAMPLE_SECS: f32 = 0.35;
 
 /// Default longest edge, in pixels, of a card thumbnail.
@@ -88,6 +88,10 @@ pub const RESAMPLE_SECS: f32 = 0.35;
 pub const THUMBNAIL_PX: u32 = 512;
 /// Longest edge accepted for a pinned-capture GPU texture.
 pub const PIN_TEXTURE_PX: u32 = 2_048;
+const PIN_MENU_WIDTH: f32 = 282.0;
+const PIN_MENU_HEIGHT: f32 = 558.0;
+const PIN_MENU_MARGIN: f64 = 10.0;
+const LOCKED_PIN_POINTER_SAMPLE: Duration = Duration::from_millis(50);
 
 /// What automatic cleanup does once a card's interval elapses.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -830,6 +834,13 @@ pub enum RecentCapturesOverlayEvent {
         /// Durable capture identity.
         pin: PinId,
     },
+    /// Run a content action for a durable pinned capture.
+    PinActionRequested {
+        /// Durable capture identity.
+        pin: PinId,
+        /// Requested action.
+        action: PinnedCaptureAction,
+    },
     /// A requested pin could not be created.
     PinUnavailable {
         /// Source card identity.
@@ -896,6 +907,21 @@ pub enum RecentCapturesOverlayEvent {
     Scrolling(ScrollHudAction),
 }
 
+/// Content actions available from a pinned capture's detached menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinnedCaptureAction {
+    /// Open the capture in the annotation editor.
+    Annotate,
+    /// Copy the exact stored capture.
+    Copy,
+    /// Save through a native destination chooser.
+    SaveAs,
+    /// Upload through the configured provider.
+    Upload,
+    /// Recognize text and copy it.
+    ExtractText,
+}
+
 /// Something the application asks the overlay to do.
 #[derive(Clone, Debug)]
 enum Command {
@@ -936,6 +962,7 @@ enum Command {
     RefreshPinTexture {
         pin: PinId,
         image: egui::ColorImage,
+        natural_size: Option<LogicalSize>,
     },
     CommitPin(PinId),
     FailPin {
@@ -961,12 +988,37 @@ pub struct NativePinRequest {
     pub title: String,
     /// Durable state to apply.
     pub state: PinState,
+    /// Whether the image body currently passes pointer input through.
+    ///
+    /// This can be false around Lock and Close while durable `state.locked`
+    /// remains true.
+    pub passthrough: bool,
     /// Whether native code may set global geometry in this session.
     pub positioning: bool,
     /// Authoritative destination-display pixels per logical point.
     pub display_scale: ScaleFactor,
     /// Whether this pin may carry a native shadow.
     pub shadow: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PinMenu {
+    pin: PinId,
+    position: Option<Pos2>,
+    focused_once: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PinMenuCommand {
+    Content(PinnedCaptureAction),
+    Close,
+    CloseAll,
+    ToggleLock,
+    Scale(f64),
+    Opacity(f64),
+    ToggleShadow,
+    ToggleRoundedCorners,
+    ToggleBorder,
 }
 
 #[derive(Default)]
@@ -1174,10 +1226,16 @@ impl RecentCapturesOverlayHandle {
     }
 
     /// Replace a live pin's pixels without touching its newer UI-owned state.
-    pub fn refresh_pin_texture(&self, pin: impl Into<PinId>, image: egui::ColorImage) {
+    pub fn refresh_pin_texture(
+        &self,
+        pin: impl Into<PinId>,
+        image: egui::ColorImage,
+        natural_size: Option<LogicalSize>,
+    ) {
         self.command(Command::RefreshPinTexture {
             pin: pin.into(),
             image,
+            natural_size,
         });
     }
 
@@ -1697,6 +1755,7 @@ pub struct RecentCapturesOverlayApp {
     stack: CaptureStack,
     content: HashMap<CardId, Entry>,
     pins: HashMap<PinId, PinnedEntry>,
+    pin_menu: Option<PinMenu>,
     pending_pin_cards: HashMap<PinId, CardId>,
     pinned_cards: HashSet<CardId>,
     handle: RecentCapturesOverlayHandle,
@@ -1808,6 +1867,7 @@ impl RecentCapturesOverlayApp {
             ),
             content: HashMap::new(),
             pins: HashMap::new(),
+            pin_menu: None,
             pending_pin_cards: HashMap::new(),
             pinned_cards: HashSet::new(),
             handle,
@@ -1943,8 +2003,15 @@ impl RecentCapturesOverlayApp {
     /// Refreshes display-dependent pin state after a native display-change event
     /// or immediately before creating a pin.
     pub fn refresh_pin_topology(&mut self) {
-        let topology = self.pin_topology_probe.as_ref().and_then(|probe| probe());
+        let Some(probe) = self.pin_topology_probe.as_ref() else {
+            return;
+        };
+        let topology = probe();
         let Some(topology) = topology else {
+            self.invalidate_pin_topology(
+                "native pin topology could not be refreshed; Lock is disabled until display \
+                 geometry is trustworthy again",
+            );
             return;
         };
         self.apply_pin_topology(topology);
@@ -1956,6 +2023,10 @@ impl RecentCapturesOverlayApp {
     /// root and pinned children from the same event snapshot.
     pub fn apply_pin_topology(&mut self, topology: PinTopology) {
         if topology.displays.displays().is_empty() {
+            self.invalidate_pin_topology(
+                "native pin topology reported no displays; Lock is disabled until display \
+                 geometry is trustworthy again",
+            );
             return;
         }
         let limitation_notice = topology.support.limitation_notice();
@@ -1967,8 +2038,28 @@ impl RecentCapturesOverlayApp {
         for (id, entry) in &mut self.pins {
             let before = entry.surface.state().clone();
             let _ = entry.surface.reconcile(&self.displays);
+            unlock_if_click_through_is_unsafe(&mut entry.surface, self.pin_support.click_through);
             entry.positioning_notice = limitation_notice.clone();
             if entry.surface.state() != &before {
+                entry.native_frame_changed_at = None;
+                changed.push((id.clone(), entry.surface.state().clone()));
+            }
+        }
+        for (pin, state) in changed {
+            self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
+        }
+    }
+
+    fn invalidate_pin_topology(&mut self, detail: &str) {
+        self.pin_support.windows = false;
+        self.pin_support.positioning = false;
+        self.pin_support.click_through = false;
+        self.pin_support.detail = detail.to_owned();
+
+        let mut changed = Vec::new();
+        for (id, entry) in &mut self.pins {
+            entry.positioning_notice = Some(detail.to_owned());
+            if unlock_if_click_through_is_unsafe(&mut entry.surface, false) {
                 entry.native_frame_changed_at = None;
                 changed.push((id.clone(), entry.surface.state().clone()));
             }
@@ -2145,13 +2236,48 @@ impl RecentCapturesOverlayApp {
                     self.pending_settings = Some(settings.normalized());
                 }
                 Command::RestorePin { request, state } => self.restore_pin(*request, state),
-                Command::RefreshPinTexture { pin, image } => {
+                Command::RefreshPinTexture {
+                    pin,
+                    image,
+                    natural_size,
+                } => {
+                    let pending = downscale(&image, PIN_TEXTURE_PX);
+                    let mut updated_state = None;
+                    let mut discard = false;
                     if let Some(entry) = self.pins.get_mut(&pin) {
-                        entry.pending = downscale(&image, PIN_TEXTURE_PX);
-                        entry.content_error = entry
-                            .pending
-                            .is_none()
-                            .then(|| "The refreshed pin texture exceeded safe GPU limits.".into());
+                        if let Some(pending) = pending {
+                            if let Some(natural_size) = natural_size {
+                                match entry
+                                    .surface
+                                    .replace_natural_size(natural_size, &self.displays)
+                                {
+                                    Ok(changed) => {
+                                        if changed {
+                                            entry.native_frame_changed_at = None;
+                                            updated_state = Some(entry.surface.state().clone());
+                                        }
+                                    }
+                                    Err(_) => {
+                                        discard = true;
+                                    }
+                                }
+                            }
+                            if !discard {
+                                entry.pending = Some(pending);
+                                entry.content_error = None;
+                            }
+                        } else {
+                            discard = true;
+                        }
+                    }
+                    if discard {
+                        // This is not a provisional failure: the edited durable
+                        // source can no longer be represented safely. Route it
+                        // through the ordinary close event so persistence and
+                        // retention protection are cleared with the viewport.
+                        self.close_pin(ctx, &pin);
+                    } else if let Some(state) = updated_state {
+                        self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
                     }
                 }
                 Command::CommitPin(id) => self.commit_pin(&id, m),
@@ -2384,10 +2510,7 @@ impl RecentCapturesOverlayApp {
             tracing::warn!(pin = %id, "persisted pin was not restored because no display exists");
             return;
         };
-        let unlocked_for_platform = surface.state().locked && !self.pin_support.click_through;
-        if unlocked_for_platform {
-            let _ = surface.set_locked(false);
-        }
+        let _ = unlock_if_click_through_is_unsafe(&mut surface, self.pin_support.click_through);
         let normalized = surface.state().clone();
         self.pins.insert(
             id.clone(),
@@ -2454,11 +2577,19 @@ impl RecentCapturesOverlayApp {
 
     fn draw_pins(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|input| input.time);
+        let parent_pointer = self.probe.as_ref().and_then(|probe| probe());
+        let global_pointer = parent_pointer
+            .or_else(|| fresh_local_pointer(ctx))
+            .map(|point| point + self.geometry.position().to_vec2());
+        let lock_available = self.pin_support.click_through
+            && !self.pin_lock_escapes.is_empty()
+            && parent_pointer.is_some();
         let mut ids: Vec<PinId> = self.pins.keys().cloned().collect();
         ids.sort_by(|left, right| left.0.cmp(&right.0));
         let mut changed = Vec::new();
         let mut closed = Vec::new();
         let mut unavailable = Vec::new();
+        let mut opened_menu = None;
         let mut native = Vec::with_capacity(ids.len());
 
         for id in ids {
@@ -2474,9 +2605,32 @@ impl RecentCapturesOverlayApp {
                 zoom_factor,
             );
             let positioning = self.pin_support.positioning;
-            let native_opacity = self.pin_support.native_opacity;
+            // Image opacity is composited in the child viewport so Lock and
+            // Close remain fully opaque control islands.
+            let native_opacity = false;
             let displays = &self.displays;
             let theme = &self.theme;
+            let state = entry.surface.state();
+            let window_rect = Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(
+                    state.frame.size.width as f32,
+                    state.frame.size.height as f32,
+                ),
+            );
+            let local_pointer = global_pointer.and_then(|point| {
+                let local = Pos2::new(
+                    point.x - state.frame.origin.x as f32,
+                    point.y - state.frame.origin.y as f32,
+                );
+                window_rect.contains(local).then_some(local)
+            });
+            let locked_control_hovered = state.locked
+                && local_pointer
+                    .is_some_and(|point| pinned::pointer_over_control(window_rect, point));
+            let locked_hovered = state.locked && local_pointer.is_some();
+            let passthrough =
+                state.locked && self.pin_support.click_through && !locked_control_hovered;
             let (result, native_frame_changed) =
                 ctx.show_viewport_immediate(pin_viewport_id(&id), builder, |ui, _class| {
                     let native_frame_changed = positioning
@@ -2498,9 +2652,11 @@ impl RecentCapturesOverlayApp {
                             displays,
                             positioning,
                             native_opacity,
-                            click_through: self.pin_support.click_through,
+                            click_through: lock_available,
                             theme,
                             chrome_visibility: pinned::ChromeVisibility::Auto,
+                            locked_hovered,
+                            locked_control_hovered,
                         },
                     );
                     if ui.input(|input| input.viewport().close_requested()) {
@@ -2512,6 +2668,17 @@ impl RecentCapturesOverlayApp {
                     (response, native_frame_changed)
                 });
 
+            if let Some(position) = result.menu_at {
+                opened_menu = Some(PinMenu {
+                    pin: id.clone(),
+                    position: trusted_pin_menu_anchor(
+                        positioning,
+                        entry.surface.state().frame.origin,
+                        position,
+                    ),
+                    focused_once: false,
+                });
+            }
             if result.positioning_unavailable {
                 let reason = self.pin_support.detail.clone();
                 entry.positioning_notice = Some(reason.clone());
@@ -2546,11 +2713,18 @@ impl RecentCapturesOverlayApp {
                     pin: id.clone(),
                     title,
                     state: entry.surface.state().clone(),
+                    passthrough,
                     positioning,
                     display_scale,
                     shadow: entry.surface.state().chrome.shadow,
                 });
             }
+        }
+        if let Some(menu) = opened_menu {
+            self.pin_menu = Some(menu);
+        }
+        if self.pins.values().any(|entry| entry.surface.state().locked) {
+            ctx.request_repaint_after(LOCKED_PIN_POINTER_SAMPLE);
         }
 
         for (pin, state) in changed {
@@ -2562,16 +2736,164 @@ impl RecentCapturesOverlayApp {
         for pin in closed {
             self.close_pin(ctx, &pin);
         }
+        self.draw_pin_menu(ctx);
         if let Ok(mut requests) = self.handle.shared.native_pins.lock() {
             *requests = native;
         }
     }
 
+    fn draw_pin_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.pin_menu.clone() else {
+            return;
+        };
+        let Some(entry) = self.pins.get(&menu.pin) else {
+            self.pin_menu = None;
+            return;
+        };
+        let state = entry.surface.state().clone();
+        let can_lock = state.locked
+            || self.pin_support.click_through
+                && !self.pin_lock_escapes.is_empty()
+                && self.probe.is_some();
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("Pinned Capture Actions")
+            .with_app_id("com.scrozz.pinned-capture-menu")
+            .with_inner_size([PIN_MENU_WIDTH, PIN_MENU_HEIGHT])
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(true)
+            .with_close_button(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false)
+            .with_has_shadow(true);
+        if let Some(position) = menu.position {
+            builder = builder.with_position(pin_menu_position(position, &self.displays));
+        }
+        let theme = self.theme;
+        let mut dismiss = false;
+        let mut focused_once = menu.focused_once;
+        let command = ctx.show_viewport_immediate(pin_menu_viewport_id(), builder, |ui, _class| {
+            ui.input(|input| {
+                if input.viewport().focused.unwrap_or(false) {
+                    focused_once = true;
+                } else if focused_once {
+                    dismiss = true;
+                }
+                dismiss |=
+                    input.viewport().close_requested() || input.key_pressed(egui::Key::Escape);
+            });
+            draw_pin_menu_content(ui, &theme, &state, can_lock)
+        });
+        let Some(command) = command else {
+            if dismiss {
+                self.pin_menu = None;
+            } else if let Some(menu) = self.pin_menu.as_mut() {
+                menu.focused_once = focused_once;
+            }
+            return;
+        };
+        self.pin_menu = None;
+        self.apply_pin_menu_command(ctx, menu.pin, command);
+    }
+
+    fn apply_pin_menu_command(&mut self, ctx: &egui::Context, pin: PinId, command: PinMenuCommand) {
+        match command {
+            PinMenuCommand::Content(action) => {
+                self.emit(RecentCapturesOverlayEvent::PinActionRequested { pin, action });
+            }
+            PinMenuCommand::Close => self.close_pin(ctx, &pin),
+            PinMenuCommand::CloseAll => {
+                let pins: Vec<PinId> = self.pins.keys().cloned().collect();
+                for pin in pins {
+                    self.close_pin(ctx, &pin);
+                }
+            }
+            PinMenuCommand::ToggleLock => {
+                let locking = self
+                    .pins
+                    .get(&pin)
+                    .is_some_and(|entry| !entry.surface.state().locked);
+                let parent_pointer = self.probe.as_ref().and_then(|probe| probe());
+                if locking
+                    && (!self.pin_support.click_through
+                        || self.pin_lock_escapes.is_empty()
+                        || parent_pointer.is_none())
+                {
+                    return;
+                }
+                let Some(entry) = self.pins.get_mut(&pin) else {
+                    return;
+                };
+                let locked = !entry.surface.state().locked;
+                if entry.surface.set_locked(locked).is_ok() {
+                    let over_control = parent_pointer.is_some_and(|point| {
+                        let global = point + self.geometry.position().to_vec2();
+                        pointer_over_pin_control(global, entry.surface.state())
+                    });
+                    ctx.send_viewport_cmd_to(
+                        pin_viewport_id(&pin),
+                        egui::ViewportCommand::MousePassthrough(locked && !over_control),
+                    );
+                    let state = entry.surface.state().clone();
+                    self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
+                }
+            }
+            PinMenuCommand::Scale(scale) => {
+                let Some(entry) = self.pins.get_mut(&pin) else {
+                    return;
+                };
+                entry.surface.set_scale(scale, &self.displays);
+                let state = entry.surface.state().clone();
+                self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
+            }
+            PinMenuCommand::Opacity(opacity) => {
+                let Some(entry) = self.pins.get_mut(&pin) else {
+                    return;
+                };
+                entry.surface.set_opacity(opacity);
+                let state = entry.surface.state().clone();
+                self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
+            }
+            PinMenuCommand::ToggleShadow
+            | PinMenuCommand::ToggleRoundedCorners
+            | PinMenuCommand::ToggleBorder => {
+                let Some(entry) = self.pins.get_mut(&pin) else {
+                    return;
+                };
+                let mut chrome = entry.surface.state().chrome;
+                match command {
+                    PinMenuCommand::ToggleShadow => chrome.shadow = !chrome.shadow,
+                    PinMenuCommand::ToggleRoundedCorners => {
+                        chrome.corner_radius = if chrome.corner_radius > 0.0 {
+                            0.0
+                        } else {
+                            10.0
+                        };
+                    }
+                    PinMenuCommand::ToggleBorder => {
+                        chrome.border = if chrome.border.is_some() {
+                            None
+                        } else {
+                            Some(PinBorder::new(1.0))
+                        };
+                    }
+                    _ => unreachable!(),
+                }
+                entry.surface.set_chrome(chrome);
+                let state = entry.surface.state().clone();
+                self.emit(RecentCapturesOverlayEvent::PinUpdated { pin, state });
+            }
+        }
+    }
+
     fn pointer(&self, ctx: &egui::Context) -> Option<Pos2> {
-        self.probe.as_ref().map_or_else(
-            || ctx.input(|i| i.pointer.latest_pos()),
-            |probe| probe().or_else(|| ctx.input(|i| i.pointer.latest_pos())),
-        )
+        self.probe
+            .as_ref()
+            .and_then(|probe| probe())
+            .or_else(|| fresh_local_pointer(ctx))
     }
 
     fn apply_passthrough(&mut self, ctx: &egui::Context, hits: &[Rect], pointer: Option<Pos2>) {
@@ -2600,17 +2922,14 @@ impl RecentCapturesOverlayApp {
                     if pointer.is_some() {
                         self.last_seen = now;
                         passes_through(pointer, hits)
-                    } else if self.probe.is_some() {
-                        // The probe answered "nowhere"; there is genuinely no
-                        // pointer on this display.
-                        true
-                    } else if now - self.last_seen > f64::from(RESAMPLE_SECS) {
-                        // Drop click-through for one frame so the pointer becomes
-                        // visible again, then decide properly next frame.
-                        self.last_seen = now;
-                        false
                     } else {
-                        self.passthrough_now.unwrap_or(false)
+                        let (desired, last_seen) = recoverable_passthrough_without_pointer(
+                            now,
+                            self.last_seen,
+                            self.passthrough_now,
+                        );
+                        self.last_seen = last_seen;
+                        desired
                     }
                 }
             }
@@ -2618,9 +2937,9 @@ impl RecentCapturesOverlayApp {
 
         if !forced
             && self.passthrough == Passthrough::Auto
-            && self.probe.is_none()
             && desired
             && !empty
+            && pointer.is_none()
         {
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(RESAMPLE_SECS));
         }
@@ -2833,6 +3152,269 @@ fn pin_viewport_id(id: &PinId) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(("scrozz-pinned-capture", &id.0))
 }
 
+fn pin_menu_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("scrozz-pinned-capture-menu")
+}
+
+fn trusted_pin_menu_anchor(
+    positioning: bool,
+    origin: scrozz_core::LogicalPoint,
+    local: Pos2,
+) -> Option<Pos2> {
+    positioning.then(|| Pos2::new(origin.x as f32 + local.x, origin.y as f32 + local.y))
+}
+
+fn pin_menu_position(position: Pos2, displays: &DisplaySet) -> Pos2 {
+    let point = scrozz_core::LogicalPoint::new(position.x as f64, position.y as f64);
+    let display = displays
+        .containing(point)
+        .or_else(|| {
+            displays
+                .displays()
+                .iter()
+                .find(|display| display.is_primary)
+        })
+        .or_else(|| displays.displays().first());
+    let Some(display) = display else {
+        return position;
+    };
+    let work = display.work_area;
+    let minimum_x = work.origin.x + PIN_MENU_MARGIN;
+    let minimum_y = work.origin.y + PIN_MENU_MARGIN;
+    let maximum_x = (work.origin.x + work.size.width - f64::from(PIN_MENU_WIDTH) - PIN_MENU_MARGIN)
+        .max(minimum_x);
+    let maximum_y =
+        (work.origin.y + work.size.height - f64::from(PIN_MENU_HEIGHT) - PIN_MENU_MARGIN)
+            .max(minimum_y);
+    Pos2::new(
+        f64::from(position.x).clamp(minimum_x, maximum_x) as f32,
+        f64::from(position.y).clamp(minimum_y, maximum_y) as f32,
+    )
+}
+
+fn pointer_over_pin_control(pointer: Pos2, state: &PinState) -> bool {
+    let window_rect = Rect::from_min_size(
+        Pos2::ZERO,
+        Vec2::new(
+            state.frame.size.width as f32,
+            state.frame.size.height as f32,
+        ),
+    );
+    let local = Pos2::new(
+        pointer.x - state.frame.origin.x as f32,
+        pointer.y - state.frame.origin.y as f32,
+    );
+    window_rect.contains(local) && pinned::pointer_over_control(window_rect, local)
+}
+
+fn draw_pin_menu_content(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    state: &PinState,
+    can_lock: bool,
+) -> Option<PinMenuCommand> {
+    let palette = theme.palette;
+    let mut command = None;
+    egui::Frame::new()
+        .fill(palette.card_fill)
+        .stroke(egui::Stroke::new(1.0, palette.hairline))
+        .corner_radius(corner(Radius::CARD))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_size(Vec2::new(PIN_MENU_WIDTH - 20.0, PIN_MENU_HEIGHT - 20.0));
+            ui.label(
+                egui::RichText::new("Pinned capture")
+                    .font(theme.font(Text::Title))
+                    .color(palette.text),
+            );
+            ui.label(
+                egui::RichText::new("Actions stay attached to the exact saved image.")
+                    .font(theme.font(Text::Caption))
+                    .color(palette.text_muted),
+            );
+            ui.add_space(7.0);
+
+            for (label, action) in [
+                ("Open Annotation Tool", PinnedCaptureAction::Annotate),
+                ("Copy", PinnedCaptureAction::Copy),
+                ("Save As...", PinnedCaptureAction::SaveAs),
+                ("Upload", PinnedCaptureAction::Upload),
+                ("Extract Text", PinnedCaptureAction::ExtractText),
+            ] {
+                if pin_menu_row(ui, theme, label, false, false) {
+                    command = Some(PinMenuCommand::Content(action));
+                }
+            }
+
+            pin_menu_separator(ui, theme);
+            let lock_clicked = ui
+                .add_enabled_ui(can_lock, |ui| {
+                    pin_menu_row(
+                        ui,
+                        theme,
+                        if state.locked {
+                            "Unlock interaction"
+                        } else if can_lock {
+                            "Lock and click through"
+                        } else {
+                            "Lock unavailable on this desktop"
+                        },
+                        state.locked,
+                        false,
+                    )
+                })
+                .inner;
+            if lock_clicked {
+                command = Some(PinMenuCommand::ToggleLock);
+            }
+
+            pin_menu_presets(
+                ui,
+                theme,
+                "SIZE",
+                &[("50%", 0.5), ("75%", 0.75), ("100%", 1.0), ("150%", 1.5)],
+                state.scale.get(),
+                PinMenuCommand::Scale,
+                &mut command,
+            );
+            pin_menu_presets(
+                ui,
+                theme,
+                "OPACITY",
+                &[("40%", 0.4), ("70%", 0.7), ("100%", 1.0)],
+                state.opacity.get(),
+                PinMenuCommand::Opacity,
+                &mut command,
+            );
+
+            if pin_menu_row(ui, theme, "Shadow", state.chrome.shadow, false) {
+                command = Some(PinMenuCommand::ToggleShadow);
+            }
+            if pin_menu_row(
+                ui,
+                theme,
+                "Rounded corners",
+                state.chrome.corner_radius > 0.0,
+                false,
+            ) {
+                command = Some(PinMenuCommand::ToggleRoundedCorners);
+            }
+            if pin_menu_row(
+                ui,
+                theme,
+                "Hairline border",
+                state.chrome.border.is_some(),
+                false,
+            ) {
+                command = Some(PinMenuCommand::ToggleBorder);
+            }
+
+            pin_menu_separator(ui, theme);
+            if pin_menu_row(ui, theme, "Close All Pinned Captures", false, true) {
+                command = Some(PinMenuCommand::CloseAll);
+            }
+            if pin_menu_row(ui, theme, "Close", false, true) {
+                command = Some(PinMenuCommand::Close);
+            }
+        });
+    command
+}
+
+fn pin_menu_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    selected: bool,
+    destructive: bool,
+) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), egui::Sense::click());
+    let palette = theme.palette;
+    let fill = if response.is_pointer_button_down_on() {
+        palette.active
+    } else if response.hovered() {
+        palette.hover
+    } else if selected {
+        palette.accent.gamma_multiply(0.12)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, corner(Radius::BUTTON), fill);
+    if selected {
+        ui.painter().circle_filled(
+            Pos2::new(rect.left() + 12.0, rect.center().y),
+            3.5,
+            palette.accent,
+        );
+    }
+    ui.painter().text(
+        Pos2::new(
+            rect.left() + if selected { 23.0 } else { 10.0 },
+            rect.center().y,
+        ),
+        egui::Align2::LEFT_CENTER,
+        label,
+        theme.font(Text::Label),
+        if destructive {
+            palette.recording
+        } else {
+            palette.text
+        },
+    );
+    response.clicked()
+}
+
+fn pin_menu_separator(ui: &mut egui::Ui, theme: &Theme) {
+    ui.add_space(4.0);
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, theme.palette.divider);
+    ui.add_space(4.0);
+}
+
+fn pin_menu_presets(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    options: &[(&str, f64)],
+    current: f64,
+    command_for: impl Fn(f64) -> PinMenuCommand,
+    command: &mut Option<PinMenuCommand>,
+) {
+    ui.add_space(5.0);
+    ui.label(
+        egui::RichText::new(label)
+            .font(theme.font(Text::Caption))
+            .color(theme.palette.text_faint),
+    );
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        for &(text, value) in options {
+            let selected = (current - value).abs() < 0.005;
+            let button = egui::Button::new(
+                egui::RichText::new(text)
+                    .font(theme.font(Text::Shortcut))
+                    .color(if selected {
+                        theme.palette.on_accent
+                    } else {
+                        theme.palette.text_muted
+                    }),
+            )
+            .fill(if selected {
+                theme.palette.accent
+            } else {
+                theme.palette.chip_fill
+            })
+            .stroke(egui::Stroke::new(1.0, theme.palette.hairline))
+            .corner_radius(corner(Radius::CHIP))
+            .min_size(Vec2::new(49.0, 27.0));
+            if ui.add(button).clicked() {
+                *command = Some(command_for(value));
+            }
+        }
+    });
+}
+
 fn pin_viewport(
     title: &str,
     state: &PinState,
@@ -2844,7 +3426,8 @@ fn pin_viewport(
         .with_title(title)
         .with_app_id("com.scrozz.pinned-capture")
         .with_inner_size(frame.size())
-        .with_resizable(false)
+        .with_min_inner_size([44.0, 32.0])
+        .with_resizable(true)
         .with_decorations(false)
         .with_transparent(true)
         .with_active(false)
@@ -3227,6 +3810,43 @@ fn auto_close_restart_on_edit_end(
     }
 }
 
+fn unlock_if_click_through_is_unsafe(surface: &mut PinnedSurface, click_through: bool) -> bool {
+    if surface.state().locked && !click_through {
+        let _ = surface.set_locked(false);
+        true
+    } else {
+        false
+    }
+}
+
+fn recoverable_passthrough_without_pointer(
+    now: f64,
+    last_seen: f64,
+    current: Option<bool>,
+) -> (bool, f64) {
+    if now - last_seen > f64::from(RESAMPLE_SECS) {
+        // Drop click-through for one frame so native/local pointer delivery
+        // can recover even when a supplied global probe failed.
+        (false, now)
+    } else {
+        (current.unwrap_or(false), last_seen)
+    }
+}
+
+fn fresh_local_pointer(ctx: &egui::Context) -> Option<Pos2> {
+    ctx.input(|input| {
+        for event in input.events.iter().rev() {
+            match event {
+                egui::Event::PointerMoved(position)
+                | egui::Event::PointerButton { pos: position, .. } => return Some(*position),
+                egui::Event::PointerGone => return None,
+                _ => {}
+            }
+        }
+        None
+    })
+}
+
 /// The rectangle the dock occupies for a given work area, without building a
 /// stack — for a host that needs to know where to put a click target before the
 /// overlay exists.
@@ -3277,6 +3897,43 @@ mod tests {
         assert_eq!(g.size(), Vec2::new(1440.0, 850.0));
         assert_eq!(g.local().min, Pos2::ZERO);
         assert_eq!(g.local().size(), g.size());
+    }
+
+    #[test]
+    fn detached_pin_menu_is_clamped_inside_the_display_work_area() {
+        let displays = DisplaySet::new(vec![scrozz_core::Display {
+            id: DisplayId("main".into()),
+            name: "Main".into(),
+            bounds: scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_440.0, 900.0),
+            ),
+            work_area: scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(0.0, 24.0),
+                LogicalSize::new(1_440.0, 876.0),
+            ),
+            scale: ScaleFactor::new(2.0),
+            is_primary: true,
+        }]);
+
+        assert_eq!(
+            pin_menu_position(Pos2::new(1_430.0, 890.0), &displays),
+            Pos2::new(
+                1_440.0 - PIN_MENU_WIDTH - 10.0,
+                900.0 - PIN_MENU_HEIGHT - 10.0,
+            )
+        );
+    }
+
+    #[test]
+    fn detached_pin_menu_uses_only_trustworthy_global_geometry() {
+        let origin = scrozz_core::LogicalPoint::new(200.0, 300.0);
+        let local = Pos2::new(12.0, 18.0);
+        assert_eq!(
+            trusted_pin_menu_anchor(true, origin, local),
+            Some(Pos2::new(212.0, 318.0))
+        );
+        assert_eq!(trusted_pin_menu_anchor(false, origin, local), None);
     }
 
     #[test]
@@ -3512,6 +4169,73 @@ mod tests {
         let card = rect(40.0, 700.0, 210.0, 150.0);
         assert!(!passes_through(Some(Pos2::new(100.0, 760.0)), &[card]));
         assert!(passes_through(Some(Pos2::new(600.0, 400.0)), &[card]));
+    }
+
+    #[test]
+    fn a_failed_pointer_probe_sample_drops_passthrough_to_recover_input() {
+        let after_deadline = f64::from(RESAMPLE_SECS) + 0.01;
+        assert_eq!(
+            recoverable_passthrough_without_pointer(after_deadline, 0.0, Some(true)),
+            (false, after_deadline)
+        );
+        assert_eq!(
+            recoverable_passthrough_without_pointer(0.1, 0.0, Some(true)),
+            (true, 0.0),
+            "a recent sample keeps the current state only until the bounded recovery deadline"
+        );
+    }
+
+    #[test]
+    fn only_current_frame_pointer_events_are_local_pointer_evidence() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .events
+            .push(egui::Event::PointerMoved(Pos2::new(12.0, 34.0)));
+        let mut output = ctx.run_ui(input, |_| {
+            assert_eq!(fresh_local_pointer(&ctx), Some(Pos2::new(12.0, 34.0)));
+        });
+        output.textures_delta.clear();
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            assert_eq!(
+                fresh_local_pointer(&ctx),
+                None,
+                "egui's retained latest_pos must not be mistaken for a fresh sample"
+            );
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn losing_safe_click_through_unlocks_an_existing_pin() {
+        let display = scrozz_core::Display {
+            id: DisplayId("main".into()),
+            name: "Main".into(),
+            bounds: scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_440.0, 900.0),
+            ),
+            work_area: scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(0.0, 24.0),
+                LogicalSize::new(1_440.0, 876.0),
+            ),
+            scale: ScaleFactor::new(2.0),
+            is_primary: true,
+        };
+        let mut pin = PinnedSurface::on_display(
+            PinId("topology-lock".into()),
+            LogicalSize::new(400.0, 200.0),
+            &display,
+            PinChromePolicy::Allowed,
+            vec![LockEscape::TrayMenu],
+        )
+        .expect("pin");
+        pin.set_locked(true).expect("external escape permits lock");
+
+        assert!(unlock_if_click_through_is_unsafe(&mut pin, false));
+        assert!(!pin.state().locked);
+        assert!(!unlock_if_click_through_is_unsafe(&mut pin, false));
     }
 
     #[test]

@@ -128,7 +128,7 @@ use scrozz_ui::{
         PermissionPrompt as PermissionUiPrompt, PermissionStage as PermissionUiStage,
         PickerFallback,
     },
-    recent_captures_overlay::RecentCapturesAutoCloseAction,
+    recent_captures_overlay::{PinnedCaptureAction, RecentCapturesAutoCloseAction},
     settings::{
         AfterCaptureCell, AfterCaptureEdit, AfterCaptureMedia, AfterCaptureRow, ShortcutEdit,
         ShortcutRow,
@@ -863,6 +863,10 @@ pub struct App {
     recorded_history_id: Option<CaptureId>,
     /// A native destination chooser polled without blocking the application event loop.
     pending_save_dialog: Option<PendingSaveDialog>,
+    /// A modeless destination chooser for a durable pinned capture.
+    pending_pin_save_dialog: Option<PendingPinSaveDialog>,
+    /// Synthetic upload identities awaiting a pinned-capture result.
+    pending_pin_uploads: HashMap<CardId, CaptureId>,
     /// Secret-free private-sharing configuration, as the UI sees it.
     cloud_settings: scrozz_ui::CloudSettingsModel,
     /// A pending request to open the Sharing settings viewport.
@@ -1158,6 +1162,11 @@ struct PendingSaveDialog {
     /// be allocated up front rather than at the point the job is finally
     /// built.
     action: u64,
+}
+
+struct PendingPinSaveDialog {
+    capture: CaptureId,
+    future: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>,
 }
 
 impl CardOutput {
@@ -1644,6 +1653,8 @@ impl App {
             recorded_media_targets: HashMap::new(),
             recorded_history_id: None,
             pending_save_dialog: None,
+            pending_pin_save_dialog: None,
+            pending_pin_uploads: HashMap::new(),
             cloud_settings,
             sharing_settings_requested: false,
             connection_test: None,
@@ -1942,6 +1953,7 @@ impl App {
         self.sync_camera_settings_window();
         self.drain_pipeline();
         self.drain_save_dialog();
+        self.drain_pin_save_dialog();
         self.drain_connection_test();
         self.drain_cards(editors);
         // After the HUD's own events: an abort raised this frame must beat the
@@ -1970,7 +1982,7 @@ impl App {
 
     /// Whether the host should keep polling a modeless native Save As future.
     pub(crate) const fn has_pending_save_dialog(&self) -> bool {
-        self.pending_save_dialog.is_some()
+        self.pending_save_dialog.is_some() || self.pending_pin_save_dialog.is_some()
     }
 
     fn drain_tray(&mut self) -> Tick {
@@ -2533,6 +2545,11 @@ impl App {
                     version,
                     action,
                 } => {
+                    if let Some(capture) = self.pending_pin_uploads.remove(&card) {
+                        self.note(format!("pinned capture {} {detail}", capture.0));
+                        self.pipeline.post(Job::Release(card));
+                        continue;
+                    }
                     let Some(_) = self.outstanding_upload_action(card, action) else {
                         continue;
                     };
@@ -2667,6 +2684,14 @@ impl App {
                     error,
                     action,
                 } => {
+                    if let Some(capture) = self.pending_pin_uploads.remove(&card) {
+                        self.note(format!(
+                            "pinned capture {} upload refused: {error}",
+                            capture.0
+                        ));
+                        self.pipeline.post(Job::Release(card));
+                        continue;
+                    }
                     let Some(_) = self.outstanding_upload_action(card, action) else {
                         continue;
                     };
@@ -2748,13 +2773,48 @@ impl App {
                     card,
                     generation,
                     revision,
+                    capture,
+                    pin_texture,
                 } => {
-                    if let Some(pending) = self.pending_editor_closes.get_mut(&card)
-                        && pending.generation == generation
-                        && pending.revision == revision
-                    {
-                        pending.persist = Some(Ok(()));
+                    let matches_pending =
+                        self.pending_editor_closes
+                            .get(&card)
+                            .is_some_and(|pending| {
+                                pending.generation == generation && pending.revision == revision
+                            });
+                    if !matches_pending {
+                        continue;
                     }
+                    match pin_texture {
+                        Ok(Some((texture, natural_size))) => {
+                            if let Err(error) =
+                                self.surface
+                                    .refresh_pin_texture(&capture, texture, natural_size)
+                            {
+                                self.surface.discard_pin(&capture);
+                                self.note(format!(
+                                    "pinned capture {} closed because editor {generation} revision \
+                                     {revision} could not replace its pixels: {error}",
+                                    capture.0
+                                ));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            // Never leave pre-edit pixels visible after a
+                            // destructive revision has become durable.
+                            self.surface.discard_pin(&capture);
+                            self.note(format!(
+                                "pinned capture {} closed because editor {generation} revision \
+                                 {revision} could not render safe replacement pixels: {error}",
+                                capture.0
+                            ));
+                        }
+                    }
+                    self.pending_editor_closes
+                        .get_mut(&card)
+                        .expect("matching pending editor close")
+                        .persist = Some(Ok(()));
                     self.resolve_pending_editor_close(card, generation, revision);
                 }
                 Outcome::EditorClosePersistFailed {
@@ -3205,7 +3265,14 @@ impl App {
                                     continue;
                                 }
                             };
-                        if let Err(error) = self.surface.refresh_pin_texture(&capture, texture) {
+                        let natural_size = scrozz_core::LogicalSize::new(
+                            rendered.frame().size.width / rendered.frame().scale.get(),
+                            rendered.frame().size.height / rendered.frame().scale.get(),
+                        );
+                        if let Err(error) =
+                            self.surface
+                                .refresh_pin_texture(&capture, texture, natural_size)
+                        {
                             self.surface.fail_pin(&capture, error.to_string());
                             self.note(format!(
                                 "{id} could not replace provisional pin pixels: {error}"
@@ -3260,6 +3327,9 @@ impl App {
                     });
                     self.note(format!("pinned capture {} closed", capture.0));
                 }
+                CardEvent::PinnedAction(capture, action) => {
+                    self.perform_pinned_capture_action(capture, action);
+                }
                 CardEvent::PinUnavailable { card, reason } => {
                     self.note(format!("{card} could not be pinned: {reason}"));
                 }
@@ -3294,6 +3364,52 @@ impl App {
                     self.finish_scrolling_hud();
                 }
             }
+        }
+    }
+
+    fn perform_pinned_capture_action(&mut self, capture: CaptureId, action: PinnedCaptureAction) {
+        let queued = match action {
+            PinnedCaptureAction::Annotate => {
+                self.perform_history_action(HistoryAction::OpenEditor(capture.clone()))
+            }
+            PinnedCaptureAction::Copy => self.pipeline.post(Job::CopyHistory(capture.clone())),
+            PinnedCaptureAction::SaveAs => {
+                self.begin_pin_save_dialog(capture.clone());
+                true
+            }
+            PinnedCaptureAction::Upload => {
+                self.refresh_cloud_settings(scrozz_ui::CloudConnectionState::Idle);
+                if !self.cloud_settings.upload_enabled {
+                    let reason = self
+                        .cloud_settings
+                        .unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "sharing is unavailable".to_owned());
+                    self.note(format!(
+                        "pinned capture {} upload unavailable: {reason}",
+                        capture.0
+                    ));
+                    return;
+                }
+                let card = self.pipeline.allocate();
+                let posted = self.pipeline.post(Job::UploadHistory {
+                    capture: capture.clone(),
+                    card,
+                });
+                if posted {
+                    self.pending_pin_uploads.insert(card, capture.clone());
+                }
+                posted
+            }
+            PinnedCaptureAction::ExtractText => {
+                self.pipeline.post(Job::ExtractHistoryText(capture.clone()))
+            }
+        };
+        if !queued {
+            self.note(format!(
+                "pinned capture {} action could not be queued: the capture worker has gone",
+                capture.0
+            ));
         }
     }
 
@@ -3997,6 +4113,52 @@ impl App {
             self.resolve_output_action(card, action);
             self.note(format!(
                 "{card} could not be queued for save: the capture worker has gone"
+            ));
+        }
+    }
+
+    fn begin_pin_save_dialog(&mut self, capture: CaptureId) {
+        if self.has_pending_save_dialog() {
+            self.note(format!(
+                "pinned capture {} stayed on screen because another Save As dialog is open",
+                capture.0
+            ));
+            return;
+        }
+        let future = Box::pin(
+            rfd::AsyncFileDialog::new()
+                .set_title("Save Pinned Capture")
+                .set_file_name("Scrozz Capture.png")
+                .add_filter("PNG image", &["png"])
+                .save_file(),
+        );
+        self.pending_pin_save_dialog = Some(PendingPinSaveDialog { capture, future });
+    }
+
+    fn drain_pin_save_dialog(&mut self) {
+        let Some(pending) = self.pending_pin_save_dialog.as_mut() else {
+            return;
+        };
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let Poll::Ready(result) = pending.future.as_mut().poll(&mut context) else {
+            return;
+        };
+        let PendingPinSaveDialog { capture, .. } = self
+            .pending_pin_save_dialog
+            .take()
+            .expect("polled pin save dialog exists");
+        let Some(file) = result else {
+            self.note(format!("pinned capture {} save was cancelled", capture.0));
+            return;
+        };
+        if !self.pipeline.post(Job::SaveHistoryTo {
+            capture: capture.clone(),
+            path: file.path().to_path_buf(),
+        }) {
+            self.note(format!(
+                "pinned capture {} could not be queued for save: the capture worker has gone",
+                capture.0
             ));
         }
     }
@@ -10733,6 +10895,72 @@ mod tests {
                  {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn only_the_matching_persisted_editor_revision_refreshes_a_live_pin() {
+        let (mut app, surface) = app();
+        let editor = redacted_editor();
+        let card = CardId(212);
+        let capture = CaptureId("pinned-editor-refresh".into());
+        let generation = 7;
+        let revision = editor.state().revision();
+        let rendered = RevisionedFrame::from_document(editor.document(), revision)
+            .expect("render persisted revision");
+        let frame = rendered.frame().clone();
+        let natural_size = scrozz_core::LogicalSize::new(
+            frame.size.width / frame.scale.get(),
+            frame.size.height / frame.scale.get(),
+        );
+        app.pending_editor_closes.insert(
+            card,
+            PendingEditorClose {
+                generation,
+                revision,
+                frame: frame.clone(),
+                editor_only: true,
+                commit: Some(Ok(())),
+                persist: None,
+                persist_data: None,
+            },
+        );
+
+        let stale =
+            Thumbnail::from_frame(&frame, PIN_TEXTURE_MAX_EDGE).expect("stale pin texture fixture");
+        app.pipeline
+            .inject_outcome_for_test(Outcome::EditorClosePersisted {
+                card,
+                generation: generation - 1,
+                revision,
+                capture: capture.clone(),
+                pin_texture: Ok(Some((stale, natural_size))),
+            });
+        app.drain_pipeline();
+        assert!(
+            !surface
+                .trace()
+                .contains(&SurfaceCall::RefreshPinTexture(capture.clone())),
+            "a stale editor generation must not change durable pin pixels"
+        );
+        assert!(app.pending_editor_closes.contains_key(&card));
+
+        let current = Thumbnail::from_frame(&frame, PIN_TEXTURE_MAX_EDGE)
+            .expect("current pin texture fixture");
+        app.pipeline
+            .inject_outcome_for_test(Outcome::EditorClosePersisted {
+                card,
+                generation,
+                revision,
+                capture: capture.clone(),
+                pin_texture: Ok(Some((current, natural_size))),
+            });
+        app.drain_pipeline();
+        assert!(
+            surface
+                .trace()
+                .contains(&SurfaceCall::RefreshPinTexture(capture)),
+            "the exact durably persisted revision must replace live pin pixels"
+        );
     }
 
     #[test]

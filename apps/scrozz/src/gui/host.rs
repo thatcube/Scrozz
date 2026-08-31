@@ -64,6 +64,7 @@ pub const HEADLESS_ENV: &str = "SCROZZ_GUI_HEADLESS";
 const IDLE: Duration = Duration::from_millis(16);
 #[cfg(not(target_os = "macos"))]
 const IDLE_FALLBACK_WAKE: Duration = Duration::from_millis(250);
+const POINTER_PROBE_CACHE: Duration = Duration::from_millis(16);
 /// Native preview playback and queued child-viewport input must advance at UI
 /// cadence even while the shared transparent root is parked.
 const VIDEO_EDITOR_TICK: Duration = Duration::from_millis(16);
@@ -1544,7 +1545,8 @@ impl Driver {
                 if geometry != self.base_geometry || scale != self.display_scale {
                     self.base_geometry = geometry;
                     self.display_scale = scale;
-                    self.selection.set_cards_geometry(geometry);
+                    let cards = self.desired_card_target().geometry;
+                    self.selection.set_cards_geometry(cards);
                 }
             }
 
@@ -1570,7 +1572,8 @@ impl Driver {
             if geometry != self.base_geometry || scale != self.display_scale {
                 self.base_geometry = geometry;
                 self.display_scale = scale;
-                self.selection.set_cards_geometry(geometry);
+                let cards = self.desired_card_target().geometry;
+                self.selection.set_cards_geometry(cards);
             }
             self.overlay.refresh_pin_topology();
         }
@@ -2924,6 +2927,14 @@ fn pin_support_from(
                 .into(),
         );
     }
+    let click_through = capabilities.click_through.available() && positioning;
+    if capabilities.click_through.available() && !positioning {
+        gaps.push(
+            "selective click-through: the native pin position cannot be observed reliably, so \
+             Lock is disabled rather than making its controls unreachable"
+                .into(),
+        );
+    }
     let detail = if gaps.is_empty() {
         format!("{:?} pinned windows", capabilities.backend)
     } else {
@@ -2934,7 +2945,7 @@ fn pin_support_from(
         positioning,
         always_on_top: capabilities.always_on_top.available(),
         native_opacity: matches!(capabilities.native_opacity, Support::Yes),
-        click_through: capabilities.click_through.available(),
+        click_through,
         non_activating: matches!(capabilities.non_activating, Support::Yes),
         native_adoption: matches!(
             capabilities.backend,
@@ -2954,21 +2965,24 @@ fn append_support_gap(label: &str, support: &scrozz_shell::pin::Support, gaps: &
 /// An exact pointer source for the click-through logic, if one is available.
 ///
 fn pointer_probe(geometry: SharedGeometry) -> Option<scrozz_ui::PointerProbe> {
-    #[cfg(target_os = "macos")]
-    {
-        Some(Arc::new(move || {
-            let current = *geometry.lock().ok()?;
-            scrozz_shell::macos::display::pointer_location()
-                .ok()
-                .map(|point| local_pointer(current, point))
-        }))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = geometry;
-        None
-    }
+    let sample = Arc::new(Mutex::new(None));
+    Some(Arc::new(move || {
+        let now = Instant::now();
+        let point = {
+            let mut cached = sample.lock().ok()?;
+            if let Some((sampled_at, point)) = *cached
+                && now.duration_since(sampled_at) < POINTER_PROBE_CACHE
+            {
+                point
+            } else {
+                let point = scrozz_shell::pointer_location().ok();
+                *cached = Some((now, point));
+                point
+            }
+        }?;
+        let current = *geometry.lock().ok()?;
+        Some(local_pointer(current, point))
+    }))
 }
 
 fn local_pointer(
@@ -3817,13 +3831,17 @@ mod tests {
         ]);
         let support = pin_support_from(capabilities.clone(), &mixed);
         assert!(!support.positioning);
+        assert!(!support.click_through);
         assert!(support.detail.contains("mixed-DPI Windows"));
+        assert!(support.detail.contains("selective click-through"));
 
         let uniform = DisplaySet::new(vec![
             display("primary", 0.0, 1.25),
             display("second", 1_920.0, 1.25),
         ]);
-        assert!(pin_support_from(capabilities, &uniform).positioning);
+        let support = pin_support_from(capabilities, &uniform);
+        assert!(support.positioning);
+        assert!(support.click_through);
         assert!(WINDOW_GAP.contains("SCROZZ_GUI_HEADLESS"));
     }
 
@@ -4552,11 +4570,11 @@ mod tests {
     }
 
     #[test]
-    fn pointer_probe_is_available_on_macos() {
+    fn pointer_probe_delegates_platform_availability_to_each_sample() {
         let probe = pointer_probe(Arc::new(Mutex::new(
             RecentCapturesOverlayGeometry::default(),
         )));
-        assert_eq!(probe.is_some(), cfg!(target_os = "macos"));
+        assert!(probe.is_some());
     }
 
     #[test]

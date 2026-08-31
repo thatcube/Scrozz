@@ -507,11 +507,21 @@ Pin to Screen is disabled with the platform error; the app never substitutes a
 made-up `1440x875 @ 1x` desktop. A pin viewport is also bounded to a 4096-pixel
 edge and 8,388,608 physical pixels after applying the destination monitor's
 scale. Moving from a 1x to a 4x display can therefore reduce the logical pin size
-before the next backing surface is allocated. That cannot trap the pin:
-secondary-click anywhere on an unlocked pin opens Close and Reset actions, or
-closes it directly when the native window is too small to display that menu or
-its hover toolbar. Locked pins intentionally pass all pointer input through;
-unlock them from the Scrozz menu or global hotkey first.
+before the next backing surface is allocated. That cannot trap the pin. Pins
+keep a directly clickable Close control at every recoverable size, add Lock,
+scale, and movement controls as room becomes available, and resize from all four
+edges and corners while preserving the source aspect ratio. Secondary-clicking
+an unlocked image opens a separate action window, so a tiny pin cannot clip its
+own menu; it includes durable Copy, Save As, Upload, Extract Text, annotation,
+lock, size, opacity, chrome, Close, and Close All actions. Those content actions
+resolve the persisted capture identity rather than depending on a live Recent
+Captures card.
+
+A locked image remains click-through, but its Lock and Close controls are
+selective interactive islands. Hovering the locked image dims only the image to
+make that state legible; the two controls remain fully opaque. If a platform
+cannot establish pointer passthrough or an external lock escape, Scrozz refuses
+the lock rather than creating a trapping window.
 
 | Session | Non-activation and stacking | Placement, desktops, and lock limits |
 |---|---|---|
