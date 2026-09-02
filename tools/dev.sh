@@ -6,6 +6,11 @@
 # Everything CI does, you can do here first, with the same flags. If a command
 # passes locally and fails in CI, that is a bug in this script and worth
 # reporting — the two are meant to be the same thing.
+#
+# On macOS, `build` is also the development deployment path: after a successful
+# signed bundle build it installs the canonical app and relaunches it. CI never
+# invokes this command, and `SCROZZ_BUILD_NO_LAUNCH=1` keeps the install while
+# suppressing the relaunch for an explicitly headless/local build.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)" || exit 1
@@ -42,12 +47,16 @@ Scrozz developer commands
     tools/dev.sh check        type-check the workspace for this machine
     tools/dev.sh lint         clippy, warnings denied (what CI enforces)
     tools/dev.sh test         run the test suite
-    tools/dev.sh build        debug build of the app
+    tools/dev.sh build        build the app; on macOS install + relaunch it
     tools/dev.sh run -- ...   run the CLI or GUI with Scrozz arguments
     tools/dev.sh lock         refresh Cargo.lock after manifest changes
     tools/dev.sh update ...   update Cargo.lock without creating artifacts
     tools/dev.sh smoke        build and smoke-test one release binary
     tools/dev.sh package      build and package one release binary
+
+  macOS build override
+    SCROZZ_BUILD_NO_LAUNCH=1 tools/dev.sh build
+                              install the bundle without relaunching it
 
   Cross-platform (docs/platforms.md)
     tools/dev.sh platforms    type-check macOS + Windows + Linux from here
@@ -108,12 +117,77 @@ cmd_fmt_check() { cargo fmt --all -- --check; }
 cmd_check() { cargo check --workspace --all-targets; }
 cmd_lint() { cargo clippy --workspace --all-targets -- -D warnings; }
 cmd_test() { cargo test --workspace; }
-cmd_build() { cargo build --workspace; }
 cmd_lock() { "$SCRIPT_DIR/cargo-pool.sh" --refresh-lock; }
 cmd_update() { "$SCRIPT_DIR/cargo-pool.sh" --update-lock "$@"; }
 cmd_run() {
   [[ "${1:-}" == "--" ]] && shift
   cargo run -p scrozz -- "$@"
+}
+
+MACOS_APP="/Applications/Scrozz.app"
+
+macos_app_pids() {
+  local executable="$MACOS_APP/Contents/MacOS/Scrozz"
+  ps -axo pid=,command= |
+    awk -v executable="$executable" '$2 == executable { print $1 }'
+}
+
+stop_macos_app() {
+  local pids pid attempt running
+  pids="$(macos_app_pids)"
+  [[ -n "$pids" ]] || return 0
+
+  for pid in $pids; do
+    case "$pid" in
+      "" | *[!0-9]*) continue ;;
+    esac
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+
+  for attempt in {1..50}; do
+    running=0
+    for pid in $pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        running=1
+        break
+      fi
+    done
+    [[ "$running" == "0" ]] && return 0
+    sleep 0.1
+  done
+
+  echo "build: the existing Scrozz process did not stop; the new app was installed but not opened" >&2
+  return 1
+}
+
+launch_macos_app() {
+  local attempt
+  echo "==> opening $MACOS_APP"
+  open "$MACOS_APP" || return 1
+  for attempt in {1..50}; do
+    if [[ -n "$(macos_app_pids)" ]]; then
+      echo "==> Scrozz is running"
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "build: LaunchServices accepted Scrozz, but its process did not stay running" >&2
+  return 1
+}
+
+cmd_build() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    cargo build --workspace
+    return
+  fi
+
+  tools/make-app-bundle.sh "$MACOS_APP" || return
+  if [[ "${SCROZZ_BUILD_NO_LAUNCH:-0}" == "1" ]]; then
+    echo "==> installed $MACOS_APP (relaunch suppressed)"
+    return
+  fi
+  stop_macos_app || return
+  launch_macos_app
 }
 
 release_binary() {

@@ -113,9 +113,8 @@ that step cleanly without it.
 ```bash
 git clone https://github.com/thatcube/scrozz.git
 cd scrozz
-SCROZZ_SIGNING_MODE=ad-hoc-dev tools/make-app-bundle.sh
-# builds and installs /Applications/Scrozz.app with an explicit local identity
-open /Applications/Scrozz.app
+tools/dev.sh build
+# builds, signs, installs /Applications/Scrozz.app, and opens it
 ```
 
 The bundle is not a convenience. macOS attaches Screen & System Audio Recording
@@ -215,6 +214,7 @@ tools/dev.sh            # the full command list
 tools/dev.sh check      # type-check for this machine
 tools/dev.sh lint       # clippy, warnings denied
 tools/dev.sh test       # the test suite
+tools/dev.sh build      # on macOS: build, sign, install, and relaunch Scrozz
 tools/dev.sh platforms  # type-check macOS + Windows + Linux, from any of them
 tools/dev.sh golden     # headless golden-image tests
 tools/dev.sh lock       # refresh Cargo.lock after manifest changes, no build
@@ -223,6 +223,11 @@ tools/dev.sh smoke      # build + smoke-test one release binary under one lease
 tools/dev.sh package    # build + package one release binary under one lease
 tools/dev.sh ci         # everything, in CI's order — the answer before pushing
 ```
+
+On macOS, a successful `tools/dev.sh build` replaces the canonical
+`/Applications/Scrozz.app`, stops only the process running from that exact
+bundle, and opens the new build. Tests, checks, packaging, and CI never launch
+the app. Set `SCROZZ_BUILD_NO_LAUNCH=1` for an explicit install-only build.
 
 Local build commands run through a two-slot Cargo pool. The lease keeps parallel
 worktrees from writing the same target directory at once, while the fixed slot
