@@ -654,7 +654,7 @@ impl Host for Windowed {
                     parked_root_registration_passes: 0,
                     settings_activation_pending: false,
                     settings_activation_attempts: 0,
-                    visible_card_growth: None,
+                    visible_card_resize: None,
                     card_arm: None,
                     shown_card_target: None,
                     startup_rehide: true,
@@ -990,8 +990,8 @@ struct Driver {
     settings_activation_attempts: u8,
     /// Hidden resize/scale barrier before the next first visible card frame.
     card_arm: Option<CardArm>,
-    /// Visible macOS growth settling without hiding already-painted cards.
-    visible_card_growth: Option<CardArm>,
+    /// Visible macOS anchored resize settling without hiding resident cards.
+    visible_card_resize: Option<CardArm>,
     /// Geometry and scale used by the currently visible card framebuffer.
     shown_card_target: Option<CardSurfaceTarget>,
     /// Eframe orders the root in after its first rendered frame regardless of
@@ -1725,7 +1725,7 @@ impl Driver {
                 0
             },
         ));
-        self.visible_card_growth = None;
+        self.visible_card_resize = None;
         self.shown_card_target = None;
         self.root_mode = RootSurfaceMode::ArmingCards;
         tracing::debug!(
@@ -1738,7 +1738,7 @@ impl Driver {
         ctx.request_repaint();
     }
 
-    fn grow_card_surface_in_place(&mut self, ctx: &egui::Context, target: CardSurfaceTarget) {
+    fn resize_card_surface_in_place(&mut self, ctx: &egui::Context, target: CardSurfaceTarget) {
         self.overlay.set_geometry(
             target.geometry,
             ctx,
@@ -1754,11 +1754,11 @@ impl Driver {
             *current = target.geometry;
         }
         self.card_arm = None;
-        self.visible_card_growth = Some(CardArm::new(target));
+        self.visible_card_resize = Some(CardArm::new(target));
         tracing::debug!(
             position = ?target.geometry.position(),
             size = ?target.geometry.size(),
-            "growing visible card surface without hiding resident cards"
+            "resizing visible card surface without hiding resident cards"
         );
         ctx.request_repaint();
     }
@@ -1769,23 +1769,23 @@ impl Driver {
         }
 
         let target = self.desired_card_target();
-        if let Some(growth) = self.visible_card_growth.as_mut() {
-            if growth.target == target {
-                if growth.observe(root_viewport_measurement(ctx)) {
-                    let settled = growth.resolved_target();
-                    self.visible_card_growth = None;
+        if let Some(resize) = self.visible_card_resize.as_mut() {
+            if resize.target == target {
+                if resize.observe(root_viewport_measurement(ctx)) {
+                    let settled = resize.resolved_target();
+                    self.visible_card_resize = None;
                     self.shown_card_target = Some(settled);
                     tracing::debug!(
                         position = ?settled.geometry.position(),
                         size = ?settled.geometry.size(),
-                        "settled visible card-surface growth"
+                        "settled visible card-surface resize"
                     );
                 } else {
                     ctx.request_repaint();
                 }
                 return;
             }
-            self.visible_card_growth = None;
+            self.visible_card_resize = None;
         }
         if self.root_mode == RootSurfaceMode::Cards
             && self.shown_card_target.is_some_and(|shown| {
@@ -1799,9 +1799,9 @@ impl Driver {
             && self.root_mode == RootSurfaceMode::Cards
             && self
                 .shown_card_target
-                .is_some_and(|shown| visible_card_surface_can_grow(shown, target))
+                .is_some_and(|shown| visible_card_surface_can_resize(shown, target))
         {
-            self.grow_card_surface_in_place(ctx, target);
+            self.resize_card_surface_in_place(ctx, target);
             return;
         }
 
@@ -1848,7 +1848,7 @@ impl Driver {
         ctx.request_repaint();
 
         self.card_arm = None;
-        self.visible_card_growth = None;
+        self.visible_card_resize = None;
         self.shown_card_target = Some(resolved_target);
         self.root_mode = RootSurfaceMode::Cards;
         tracing::debug!(
@@ -1883,7 +1883,7 @@ impl Driver {
         );
         if mode != RootSurfaceMode::Cards {
             self.handle.suspend_global_pointer_wake();
-            self.visible_card_growth = None;
+            self.visible_card_resize = None;
         }
         if display_refresh_requested(
             refresh_requested,
@@ -2374,7 +2374,7 @@ fn shown_card_surface_matches(
     )
 }
 
-fn visible_card_surface_can_grow(shown: CardSurfaceTarget, target: CardSurfaceTarget) -> bool {
+fn visible_card_surface_can_resize(shown: CardSurfaceTarget, target: CardSurfaceTarget) -> bool {
     if shown.scale != target.scale || shown.geometry.work_area != target.geometry.work_area {
         return false;
     }
@@ -2383,7 +2383,7 @@ fn visible_card_surface_can_grow(shown: CardSurfaceTarget, target: CardSurfaceTa
     new.min.x == old.min.x
         && new.max.x == old.max.x
         && new.max.y == old.max.y
-        && new.min.y < old.min.y
+        && new.min.y != old.min.y
 }
 
 fn reveal_card_surface(
@@ -4875,7 +4875,7 @@ mod tests {
     }
 
     #[test]
-    fn upward_card_growth_keeps_residents_visible_and_globally_stationary() {
+    fn anchored_card_resize_keeps_residents_visible_and_globally_stationary() {
         let base = RecentCapturesOverlayGeometry::new(egui::Rect::from_min_size(
             egui::pos2(120.0, 85.0),
             egui::vec2(1200.0, 800.0),
@@ -4889,9 +4889,9 @@ mod tests {
             scale: one.scale,
         };
 
-        assert!(visible_card_surface_can_grow(one, three));
-        assert!(!visible_card_surface_can_grow(three, one));
-        assert!(!visible_card_surface_can_grow(
+        assert!(visible_card_surface_can_resize(one, three));
+        assert!(visible_card_surface_can_resize(three, one));
+        assert!(!visible_card_surface_can_resize(
             one,
             CardSurfaceTarget {
                 scale: Some(ScaleFactor::new(1.0)),
