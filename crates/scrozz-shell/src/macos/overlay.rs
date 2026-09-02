@@ -170,6 +170,18 @@ impl PresentationLease {
 }
 
 impl SuppressedWindows {
+    fn merge(&mut self, other: Self) {
+        for suppressed in other.windows {
+            if !self
+                .windows
+                .iter()
+                .any(|existing| existing.window.windowNumber() == suppressed.window.windowNumber())
+            {
+                self.windows.push(suppressed);
+            }
+        }
+    }
+
     fn keep_hidden(&mut self, mtm: objc2::MainThreadMarker, selector: &NSWindow) {
         let app = NSApplication::sharedApplication(mtm);
         let selector_number = selector.windowNumber();
@@ -342,7 +354,11 @@ impl MacOverlay {
                 let (presentation, suppressed) =
                     PresentationLease::acquire(mtm, self.window.as_ref());
                 self.presentation_lease = Some(presentation);
-                self.suppressed_windows = Some(suppressed);
+                if let Some(existing) = self.suppressed_windows.as_mut() {
+                    existing.merge(suppressed);
+                } else {
+                    self.suppressed_windows = Some(suppressed);
+                }
             }
         } else if let Some(lease) = self.presentation_lease.take() {
             lease.release(mtm);

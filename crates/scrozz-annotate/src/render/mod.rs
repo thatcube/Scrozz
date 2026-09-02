@@ -154,7 +154,10 @@ impl SkiaRenderer {
                         scale: scale.get(),
                         source_scale: document.source().frame.scale.get(),
                         target_color_space: document.source().frame.color_space,
-                        preserve_source_pixels: document.source().provenance.forbids_compositing(),
+                        preserve_native_geometry: document
+                            .source()
+                            .provenance
+                            .forbids_compositing(),
                         retained_source_bytes,
                         target_width,
                     },

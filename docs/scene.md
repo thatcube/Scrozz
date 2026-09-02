@@ -82,7 +82,8 @@ Window captures preserve the platform result as native appearance. Scene may
 change background, outer padding, additive inner padding, placement, ratio, and
 output size. Legacy source trimming, synthetic corners, border, and shadow are
 unavailable, and Scene never stacks a second shadow. The original subject pixels
-remain byte-stable at native export scale.
+remain immutable; transparent exterior pixels reveal the Scene background and
+the native semi-transparent shadow composites over it normally.
 
 ## Compatibility
 

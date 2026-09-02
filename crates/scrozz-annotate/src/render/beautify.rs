@@ -55,7 +55,7 @@ pub(crate) struct ApplyOptions {
     pub scale: f64,
     pub source_scale: f64,
     pub target_color_space: ColorSpace,
-    pub preserve_source_pixels: bool,
+    pub preserve_native_geometry: bool,
     pub retained_source_bytes: u64,
     pub target_width: Option<u32>,
 }
@@ -77,7 +77,7 @@ pub fn apply(content: &Pixmap, beautification: &Beautification, scale: f64) -> R
             scale,
             source_scale: scale,
             target_color_space: ColorSpace::Srgb,
-            preserve_source_pixels: false,
+            preserve_native_geometry: false,
             retained_source_bytes: 0,
             target_width: None,
         },
@@ -101,7 +101,7 @@ pub(crate) fn apply_with_retained_bytes_and_layout(
         scale,
         source_scale,
         target_color_space,
-        preserve_source_pixels,
+        preserve_native_geometry,
         retained_source_bytes,
         target_width,
     } = options;
@@ -118,7 +118,7 @@ pub(crate) fn apply_with_retained_bytes_and_layout(
         scale,
         source_scale,
         target_width,
-        preserve_source_pixels,
+        preserve_native_geometry,
     )?;
     preflight_working_set(content, beautification, layout, retained_source_bytes)?;
     if beautification.is_noop() {
@@ -148,23 +148,9 @@ pub(crate) fn apply_with_retained_bytes_and_layout(
         let padded = padded_screenshot_surface(content, layout)?;
         let source = IntRect::from_xywh(0, 0, padded.width(), padded.height())
             .expect("a validated screenshot surface is nonempty");
-        draw_content(
-            &mut canvas,
-            &padded,
-            source,
-            layout.surface,
-            radius,
-            preserve_source_pixels,
-        );
+        draw_content(&mut canvas, &padded, source, layout.surface, radius);
     } else {
-        draw_content(
-            &mut canvas,
-            content,
-            layout.source,
-            layout.content,
-            radius,
-            preserve_source_pixels,
-        );
+        draw_content(&mut canvas, content, layout.source, layout.content, radius);
     }
 
     let border = (beautification.border_width * scale) as f32;
@@ -216,7 +202,7 @@ fn resolve_layout_with_width(
     scale: f64,
     source_scale: f64,
     target_width: Option<u32>,
-    preserve_source_pixels: bool,
+    preserve_native_geometry: bool,
 ) -> Result<ResolvedLayout> {
     beautification.validate()?;
     if !scale.is_finite() || scale <= 0.0 {
@@ -331,7 +317,7 @@ fn resolve_layout_with_width(
         )
     };
 
-    let (x, y) = if preserve_source_pixels {
+    let (x, y) = if preserve_native_geometry {
         (x.round(), y.round())
     } else {
         (x, y)
@@ -1096,7 +1082,6 @@ fn draw_content(
     source_rect: IntRect,
     image_rect: Rect,
     radius: f32,
-    preserve_source_pixels: bool,
 ) {
     let exact_copy = (image_rect.width() - source_rect.width() as f32).abs() < f32::EPSILON
         && (image_rect.height() - source_rect.height() as f32).abs() < f32::EPSILON
@@ -1110,7 +1095,7 @@ fn draw_content(
             source_rect,
             image_rect.left() as u32,
             image_rect.top() as u32,
-            preserve_source_pixels,
+            false,
         );
         return;
     }
@@ -1145,11 +1130,7 @@ fn draw_content(
     let paint = Paint {
         shader,
         anti_alias: radius > 0.0,
-        blend_mode: if preserve_source_pixels {
-            BlendMode::Source
-        } else {
-            BlendMode::SourceOver
-        },
+        blend_mode: BlendMode::SourceOver,
         ..Paint::default()
     };
     let Some(path) = shapes::rounded_rect(image_rect, radius) else {

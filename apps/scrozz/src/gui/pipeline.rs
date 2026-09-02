@@ -772,6 +772,13 @@ impl RememberedShare {
 /// What the capture thread produced.
 #[derive(Debug)]
 pub enum Outcome {
+    /// Capture pixels were acquired; expensive rendering and persistence follow.
+    Shutter {
+        /// In-flight card correlated with the later ready/failure outcome.
+        card: CardId,
+        /// Main-thread acknowledgement that audio playback was started.
+        acknowledged: Sender<()>,
+    },
     /// A scrolling capture reached a meaningful frame boundary.
     Progress {
         /// Which in-flight card the update belongs to.
@@ -2277,10 +2284,14 @@ impl Worker {
         picker_capture: scrozz_capture::PickerCapture,
         policy: &AfterCaptureSettings,
     ) {
-        let result = picker_capture
-            .into_capture()
-            .map_err(CliError::Core)
-            .and_then(|capture| self.finish_capture(kind, card, capture, policy));
+        let result = picker_capture.into_capture().map_err(CliError::Core);
+        let result = match result {
+            Ok(capture) => {
+                self.announce_shutter(card);
+                self.finish_capture(kind, card, capture, policy)
+            }
+            Err(error) => Err(error),
+        };
 
         match result {
             Ok(card) => {
@@ -2328,13 +2339,14 @@ impl Worker {
                     let _ = outcomes.send(Outcome::Progress { card, progress });
                 },
             )?;
-            lifecycle.finish();
             // An abort that arrived while the last frame was being stitched must
             // not produce a card, so it is checked after the session returns and
             // before anything durable is written.
             if !self.scrolling_cancellation.seal_output() {
                 return Err(CliError::Core(CoreError::Cancelled));
             }
+            self.announce_shutter(card);
+            lifecycle.finish();
             return self.finish_capture(kind, card, capture, policy);
         }
         let mut selection_outcome = None;
@@ -2401,6 +2413,7 @@ impl Worker {
                 selection_outcome.as_ref(),
             )?,
         };
+        self.announce_shutter(card);
         lifecycle.finish();
         if let Some(outcome) = selection_outcome.as_ref()
             && outcome.mode == SelectionMode::Region
@@ -4033,6 +4046,17 @@ impl Worker {
         self.emit(message);
     }
 
+    fn announce_shutter(&self, card: CardId) {
+        let (acknowledged, acknowledgement) = channel();
+        self.emit(Outcome::Shutter { card, acknowledged });
+        if acknowledgement
+            .recv_timeout(Duration::from_secs(2))
+            .is_err()
+        {
+            tracing::warn!(%card, "main thread did not acknowledge shutter feedback in time");
+        }
+    }
+
     fn emit(&self, outcome: Outcome) {
         if self.outcomes.send(outcome).is_ok()
             && let Some(waker) = &self.waker
@@ -5027,6 +5051,39 @@ mod tests {
         receiver
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("worker outcome")
+    }
+
+    #[test]
+    fn shutter_announcement_precedes_processing_without_a_duplicate() {
+        let (dir, mut worker, outcomes) = worker_with_store("shutter-before-processing");
+        let card = CardId(41);
+        let processing = std::thread::spawn(move || {
+            let _dir = dir;
+            worker.announce_shutter(card);
+            worker.accept_captured(
+                CaptureKind::Region,
+                CaptureOrigin::GlobalHotkey,
+                card,
+                sample_capture(Provenance::Region),
+                &no_after_capture_actions(),
+            );
+        });
+
+        let Outcome::Shutter {
+            card: announced,
+            acknowledged,
+        } = received(&outcomes)
+        else {
+            panic!("pixel acquisition must be the first outcome");
+        };
+        assert_eq!(announced, card);
+        acknowledged.send(()).expect("acknowledge shutter");
+        assert!(matches!(
+            received(&outcomes),
+            Outcome::Ready(ready) if ready.card.id == card
+        ));
+        processing.join().expect("capture processing");
+        assert!(outcomes.try_recv().is_err());
     }
 
     use scrozz_annotate::SmartFramePreset;

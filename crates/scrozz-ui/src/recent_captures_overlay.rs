@@ -1023,6 +1023,8 @@ struct Shared {
     close_requested: AtomicBool,
     scroll_passthrough_requested: AtomicBool,
     passthrough_applied: AtomicBool,
+    global_pointer_wake: AtomicBool,
+    global_pointer_observation: AtomicBool,
     geometry_generation: AtomicU64,
     painted_geometry_generation: AtomicU64,
     painted_native_scale: AtomicU32,
@@ -1367,6 +1369,26 @@ impl RecentCapturesOverlayHandle {
         self.has_pending_content() || self.has_visible_content() || self.scroll_hud_visible()
     }
 
+    /// Whether a native global pointer-motion observer should wake this root.
+    #[must_use]
+    pub fn needs_global_pointer_wake(&self) -> bool {
+        self.shared.global_pointer_wake.load(Ordering::Acquire)
+    }
+
+    /// Stops global pointer wakes while the card root is parked or hidden.
+    pub fn suspend_global_pointer_wake(&self) {
+        self.shared
+            .global_pointer_wake
+            .store(false, Ordering::Release);
+    }
+
+    /// Records whether click-through cards can be woken by native pointer motion.
+    pub fn set_global_pointer_observation(&self, available: bool) {
+        self.shared
+            .global_pointer_observation
+            .store(available, Ordering::Release);
+    }
+
     /// Ask the overlay to draw a frame, if it is running.
     pub fn wake(&self) {
         if let Ok(ctx) = self.shared.ctx.lock()
@@ -1456,18 +1478,21 @@ pub fn native_options(geometry: RecentCapturesOverlayGeometry) -> eframe::Native
 
 /// Whether the compact card root should pass clicks through.
 ///
-/// The pointer is intentionally not part of the decision. The native root is
-/// already cropped to the cards and their gesture envelope; allowing that root
-/// to become click-through while content exists makes visually topmost cards
-/// intermittently untouchable on platforms that stop pointer delivery.
+/// Native passthrough is a whole-window property, so the global pointer sample
+/// makes one compact bounding window behave like independent card windows:
+/// visible card/HUD pixels accept input and transparent gaps do not.
 #[must_use]
-pub fn passes_through(_pointer: Option<Pos2>, hits: &[Rect]) -> bool {
-    automatic_passthrough(hits.is_empty())
+pub fn passes_through(pointer: Option<Pos2>, hits: &[Rect]) -> bool {
+    hits.is_empty()
+        || pointer.is_some_and(|pointer| hits.iter().all(|rect| !rect.contains(pointer)))
 }
 
-const fn automatic_passthrough(empty: bool) -> bool {
+const fn automatic_passthrough_without_pointer(empty: bool) -> bool {
     empty
 }
+
+#[cfg(not(target_os = "macos"))]
+const PASSTHROUGH_POINTER_POLL: Duration = Duration::from_millis(8);
 
 // ---------------------------------------------------------------------------
 // Card hover
@@ -2912,7 +2937,7 @@ impl RecentCapturesOverlayApp {
             .or_else(|| fresh_local_pointer(ctx))
     }
 
-    fn apply_passthrough(&mut self, ctx: &egui::Context, hits: &[Rect], _pointer: Option<Pos2>) {
+    fn apply_passthrough(&mut self, ctx: &egui::Context, hits: &[Rect], pointer: Option<Pos2>) {
         let empty = hits.is_empty();
         // Automatic scrolling delivers globally addressed wheel input, which the
         // overlay would otherwise swallow. The request outranks the pointer
@@ -2924,11 +2949,23 @@ impl RecentCapturesOverlayApp {
             .load(Ordering::Acquire);
         let desired = if forced {
             true
+        } else if self.dragging.is_some() || self.armed.is_some() {
+            false
         } else {
             match self.passthrough {
                 Passthrough::Never => false,
                 Passthrough::Always => true,
-                Passthrough::Auto => automatic_passthrough(empty),
+                Passthrough::Auto
+                    if cfg!(not(target_os = "macos"))
+                        || self
+                            .handle
+                            .shared
+                            .global_pointer_observation
+                            .load(Ordering::Acquire) =>
+                {
+                    passes_through(pointer, hits)
+                }
+                Passthrough::Auto => automatic_passthrough_without_pointer(empty),
             }
         };
 
@@ -2936,7 +2973,19 @@ impl RecentCapturesOverlayApp {
             self.passthrough_now = Some(desired);
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(desired));
         }
+
         self.acknowledge_passthrough(desired, true);
+        self.handle
+            .shared
+            .global_pointer_wake
+            .store(desired && !empty, Ordering::Release);
+        if desired && !empty {
+            // A click-through window receives no local pointer-enter event. Poll
+            // the global pointer only while it is outside visible content so
+            // cards become interactive before the pointer can settle on them.
+            #[cfg(not(target_os = "macos"))]
+            ctx.request_repaint_after(PASSTHROUGH_POINTER_POLL);
+        }
     }
 
     /// Applies the click-through transition natively and records what the
@@ -4200,16 +4249,10 @@ mod tests {
     }
 
     #[test]
-    fn visible_card_roots_never_pass_through_regardless_of_pointer_position() {
+    fn compact_root_passes_only_transparent_space_through() {
         let card = rect(40.0, 700.0, 210.0, 150.0);
         assert!(!passes_through(Some(Pos2::new(100.0, 760.0)), &[card]));
-        assert!(!passes_through(Some(Pos2::new(600.0, 400.0)), &[card]));
-    }
-
-    #[test]
-    fn automatic_passthrough_never_ignores_visible_card_input() {
-        assert!(!automatic_passthrough(false));
-        assert!(automatic_passthrough(true));
+        assert!(passes_through(Some(Pos2::new(600.0, 400.0)), &[card]));
     }
 
     #[test]

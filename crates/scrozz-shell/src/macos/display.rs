@@ -40,8 +40,10 @@ use std::{
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2_app_kit::{NSApplicationDidChangeScreenParametersNotification, NSScreen};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2_app_kit::{
+    NSApplicationDidChangeScreenParametersNotification, NSEvent, NSEventMask, NSScreen,
+};
 use objc2_core_foundation::{
     CFNumber, CFPreferencesCopyAppValue, CFPreferencesGetAppBooleanValue, CFString,
 };
@@ -398,6 +400,63 @@ impl DisplayChangeMonitor {
     pub fn changed(&mut self) -> bool {
         let generation = self.generation.load(Ordering::Acquire);
         take_generation(generation, &mut self.observed_generation)
+    }
+}
+
+/// Event-driven wake source for a click-through card root.
+///
+/// A mouse-transparent `NSWindow` receives no local pointer-enter event. AppKit's
+/// global mouse-moved monitor wakes the UI so it can sample the pointer and make
+/// visible card pixels interactive without polling an idle overlay.
+pub struct PointerMotionMonitor {
+    global: Retained<AnyObject>,
+    local: Retained<AnyObject>,
+}
+
+impl PointerMotionMonitor {
+    /// Installs a global mouse-motion observer.
+    pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self> {
+        let _mtm = main_thread("observing global pointer motion")?;
+        let global_wake = Arc::clone(&wake);
+        let global_block = RcBlock::new(move |_event: NonNull<NSEvent>| global_wake());
+        let global = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
+            NSEventMask::MouseMoved,
+            &global_block,
+        )
+        .ok_or_else(|| {
+            Error::Platform("AppKit refused the global pointer-motion monitor".to_owned())
+        })?;
+        let local_block = RcBlock::new(move |event: NonNull<NSEvent>| {
+            wake();
+            event.as_ptr()
+        });
+        // SAFETY: the block returns the exact live event pointer AppKit supplied,
+        // unchanged, after a side-effect-free wake notification.
+        let local = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+                NSEventMask::MouseMoved,
+                &local_block,
+            )
+        };
+        let Some(local) = local else {
+            // SAFETY: `global` is the exact opaque token returned above.
+            unsafe { NSEvent::removeMonitor(&global) };
+            return Err(Error::Platform(
+                "AppKit refused the local pointer-motion monitor".to_owned(),
+            ));
+        };
+        Ok(Self { global, local })
+    }
+}
+
+impl Drop for PointerMotionMonitor {
+    fn drop(&mut self) {
+        // SAFETY: both values are the exact opaque monitor tokens AppKit
+        // returned, retained until these matching removals on the GUI main thread.
+        unsafe {
+            NSEvent::removeMonitor(&self.local);
+            NSEvent::removeMonitor(&self.global);
+        }
     }
 }
 

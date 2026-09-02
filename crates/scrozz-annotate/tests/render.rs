@@ -11,7 +11,9 @@ use scrozz_annotate::{
     ExactOutputSize, GeneratedStyle, Renderer, ResolvedFocus, SkiaRenderer, SmartFrameMetadata,
     SourceInsets, Style,
 };
-use scrozz_core::{Frame, LogicalPoint, PixelFormat, Provenance, ScaleFactor};
+use scrozz_core::{
+    ColorSpace, Frame, LogicalPoint, PhysicalSize, PixelFormat, Provenance, ScaleFactor,
+};
 
 #[test]
 fn an_empty_document_renders_the_source_unchanged() {
@@ -456,6 +458,46 @@ fn native_window_pixels_are_copied_without_a_second_shadow() {
         let start = (y + 12) * out.stride + 12 * 4;
         assert_eq!(&out.data[start..start + 32 * 4], source_row);
     }
+}
+
+#[test]
+fn native_window_alpha_composites_its_shadow_directly_over_the_scene() {
+    let frame = Frame {
+        data: vec![
+            0, 0, 0, 0, // transparent capture exterior
+            0, 0, 0, 128, // half-alpha native black shadow
+            200, 100, 50, 255, // opaque window pixel
+        ],
+        size: PhysicalSize::new(3.0, 1.0),
+        stride: 12,
+        format: PixelFormat::RgbaPremultiplied8,
+        color_space: ColorSpace::Srgb,
+        scale: ScaleFactor::IDENTITY,
+    };
+    let mut doc = Document::new(capture_with(frame, Provenance::Window));
+    let source = doc.source().frame.data.clone();
+    doc.set_scene(Some(Beautification {
+        padding: 1.0,
+        inner_padding: 1.0,
+        background: Background::Solid(Color::rgb(20, 40, 180)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (7, 5));
+    assert!(near(pixel(&out, 2, 2), [20, 40, 180, 255], 1));
+    assert!(near(pixel(&out, 3, 2), [10, 20, 90, 255], 1));
+    assert_eq!(pixel(&out, 4, 2), [200, 100, 50, 255]);
+    assert_eq!(doc.source().frame.data, source);
+
+    let preview = SkiaRenderer::new().render_to_width(&doc, 14).unwrap();
+    assert!(near(pixel(&preview, 4, 4), [20, 40, 180, 255], 1));
+    assert_eq!(
+        pixel(&preview, 6, 4)[3],
+        255,
+        "downscaled preview must not recreate a transparent capture rectangle"
+    );
 }
 
 #[test]

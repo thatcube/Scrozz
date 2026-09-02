@@ -924,8 +924,10 @@ than leaking Scrozz chrome into the image.
 are real, native, movable, resizable windows with normal chrome. They are opened
 deliberately, they are long-lived, and they must behave exactly like every other
 window on the system, including tiling, mission control, snapping and window
-management shortcuts. Nothing is gained by making these custom, and everything is
-lost.
+management shortcuts. While one is open, the shared Recent Captures root parks
+off-screen and its cards remain in model state; closing the last ordinary window
+re-arms the compact card surface. Nothing is gained by letting a floating card
+root intercept the editor beneath it.
 
 **Consequence for development.** Any spike or debug build that creates a floating
 window starts at `WindowLevel::Normal`, makes always-on-top an explicit opt-in
@@ -1217,11 +1219,12 @@ cannot be reconstructed faithfully from a frozen display image. A magnifier may
 still require a prepared display frame even when the visible backdrop is live.
 
 Every successful still capture, including fullscreen, plays the configured
-screenshot sound after valid pixels exist. The default is a shutter sound;
-settings offer bundled alternatives, Off, and a custom file. A broken custom
-file falls back to the default sound and warns once per app session. Failed
-captures make no shutter sound. The desktop itself does not flash, shake, zoom,
-or animate as capture feedback.
+screenshot sound immediately when valid pixels arrive, before Scene rendering,
+encoding, clipboard/export actions, history persistence, or card publication.
+The default is a shutter sound; settings offer bundled alternatives, Off, and a
+custom file. A broken custom file falls back to the default sound and warns once
+per app session. Failed captures make no shutter sound. The desktop itself does
+not flash, shake, zoom, or animate as capture feedback.
 
 **Why.** A native crosshair communicates region selection without filling the
 screen with motion before the user acts. Guides and a loupe are precision tools,

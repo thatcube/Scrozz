@@ -647,6 +647,7 @@ pub struct App {
     server: Option<Server>,
     forwarder: Option<Forwarder>,
     pending_admissions: VecDeque<Admission>,
+    pending_pipeline_outcomes: VecDeque<Outcome>,
     selector: Arc<dyn CaptureSelector>,
     file_launcher: FileLauncher,
     /// Every card with an editor open as of the most recent tick.
@@ -1584,6 +1585,7 @@ impl App {
             server,
             forwarder,
             pending_admissions: VecDeque::new(),
+            pending_pipeline_outcomes: VecDeque::new(),
             selector,
             file_launcher: default_file_launcher(),
             active_editor_cards: HashSet::new(),
@@ -2400,9 +2402,39 @@ impl App {
         Ok(())
     }
 
-    fn drain_pipeline(&mut self) {
+    pub(crate) fn drain_capture_feedback(&mut self) {
+        let forwarded_shutters = self
+            .forwarder
+            .as_ref()
+            .map_or_else(Vec::new, crate::gui::server::Forwarder::drain_shutters);
+        for acknowledged in forwarded_shutters {
+            self.play_shutter_sound();
+            let _ = acknowledged.send(());
+        }
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {
+                Outcome::Shutter { card, acknowledged } => {
+                    tracing::debug!(%card, "playing shutter feedback at pixel acquisition");
+                    self.play_shutter_sound();
+                    let _ = acknowledged.send(());
+                }
+                other => self.pending_pipeline_outcomes.push_back(other),
+            }
+        }
+    }
+
+    fn drain_pipeline(&mut self) {
+        while let Some(outcome) = self
+            .pending_pipeline_outcomes
+            .pop_front()
+            .or_else(|| self.pipeline.poll())
+        {
+            match outcome {
+                Outcome::Shutter { card, acknowledged } => {
+                    tracing::debug!(%card, "playing shutter feedback at pixel acquisition");
+                    self.play_shutter_sound();
+                    let _ = acknowledged.send(());
+                }
                 Outcome::HistoryRecording {
                     capture,
                     path,
@@ -4572,15 +4604,7 @@ impl App {
         }
     }
 
-    /// Publishes a finished capture: sound, card, editor, retention, history.
-    ///
-    /// Split out of the pipeline drain so a scrolling capture can be held for
-    /// one pass and then published through exactly the same path as any other.
-    fn handle_ready(&mut self, ready: Box<ReadyCapture>) {
-        if self.scrolling_card == Some(ready.card.id) {
-            self.finish_scrolling_hud();
-        }
-        self.captures += 1;
+    fn play_shutter_sound(&mut self) {
         if let Err(error) = play_screenshot_sound(&self.config.screenshot_sound) {
             let fell_back = !matches!(
                 self.config.screenshot_sound,
@@ -4592,16 +4616,25 @@ impl App {
             if !self.sound_warning_shown {
                 self.sound_warning_shown = true;
                 self.note(if fell_back {
-                            format!(
-                                "the screenshot succeeded, but its selected sound failed; using the default this session: {error}"
-                            )
-                        } else {
-                            format!(
-                                "the screenshot succeeded, but its sound could not play: {error}"
-                            )
-                        });
+                    format!(
+                        "the screenshot succeeded, but its selected sound failed; using the default this session: {error}"
+                    )
+                } else {
+                    format!("the screenshot succeeded, but its sound could not play: {error}")
+                });
             }
         }
+    }
+
+    /// Publishes a processed capture: card, editor, retention, and history.
+    ///
+    /// Split out of the pipeline drain so a scrolling capture can be held for
+    /// one pass and then published through exactly the same path as any other.
+    fn handle_ready(&mut self, ready: Box<ReadyCapture>) {
+        if self.scrolling_card == Some(ready.card.id) {
+            self.finish_scrolling_hud();
+        }
+        self.captures += 1;
         let ready = *ready;
         let mut card = ready.card;
         // The card is told what Upload can do the moment it is

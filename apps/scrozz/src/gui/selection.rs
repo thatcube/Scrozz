@@ -261,7 +261,6 @@ enum BridgeEvent {
         hidden: Sender<()>,
         surface_can_remain_visible: bool,
         cursor: OverlayCursor,
-        geometry: OverlayGeometry,
     },
     Prepared {
         id: u64,
@@ -391,11 +390,7 @@ impl ControllerPhase {
     const fn wants_visible_selector(&self) -> bool {
         matches!(
             self,
-            Self::HideBeforePreparation { .. }
-                | Self::WaitingForPreparation { .. }
-                | Self::ReadyToSelect { .. }
-                | Self::Selecting { .. }
-                | Self::ReleaseBeforeHide { .. }
+            Self::Selecting { .. } | Self::ReleaseBeforeHide { .. }
         )
     }
 
@@ -588,21 +583,12 @@ impl ClientOverlaySelector {
                 return Err(error);
             }
         };
-        let geometry = match desktop_geometry(&snapshot.displays) {
-            Ok(geometry) => geometry,
-            Err(error) => {
-                let _ = self.send_event(BridgeEvent::PreparationFailed { id });
-                return Err(error);
-            }
-        };
-
         let (hidden_tx, hidden_rx) = channel();
         self.send_event(BridgeEvent::Begin {
             id,
             hidden: hidden_tx,
             surface_can_remain_visible,
             cursor: overlay_cursor,
-            geometry,
         })
         .map_err(|_| bridge_error("the selector window closed before it could hide"))?;
         self.receive(
@@ -1152,7 +1138,6 @@ impl ClientOverlayController {
                 hidden,
                 surface_can_remain_visible: true,
                 cursor,
-                geometry: _,
             } if matches!(self.phase, ControllerPhase::Cards) => {
                 self.auxiliary_suppressed = true;
                 let _ = hidden.send(());
@@ -1163,22 +1148,15 @@ impl ClientOverlayController {
                 hidden,
                 surface_can_remain_visible: false,
                 cursor,
-                geometry,
             } if matches!(self.phase, ControllerPhase::Cards) => {
                 self.auxiliary_suppressed = true;
-                // Clear the cards for one frame but keep the transparent panel
-                // alive and interactive. A hidden click-through window cannot
-                // own the system cursor, so the application underneath can
-                // restore its arrow until preparation finishes.
+                native.suppress_auxiliary_windows();
+                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 native.set_cursor(cursor);
-                native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
-                if cfg!(target_os = "macos") {
-                    native.set_frame(logical_frame(geometry));
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
-                native.set_visible(true);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                native.set_visible(false);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 ctx.request_repaint();
                 self.phase = ControllerPhase::HideBeforePreparation { id, hidden, cursor };
             }
@@ -2136,8 +2114,8 @@ mod tests {
         });
         assert_eq!(
             native.recorded_visibility(),
-            [true],
-            "{origin:?} must order the selector in only after its snapshot"
+            [false],
+            "{origin:?} must keep the selector hidden while preparation runs"
         );
         assert_eq!(snapshots.load(Ordering::SeqCst), 1);
         controller.logic(&ctx, &native);
@@ -2250,7 +2228,7 @@ mod tests {
             2,
             "{origin:?} must permit an immediate second invocation"
         );
-        assert_eq!(native.recorded_visibility().last(), Some(&true));
+        assert_eq!(native.recorded_visibility().last(), Some(&false));
 
         selector.cancel();
         controller.logic(&ctx, &native);
@@ -2290,10 +2268,6 @@ mod tests {
         let ctx = egui::Context::default();
         let (native, _) = crate::gui::panel::BehaviorController::recording();
 
-        wait_until(|| {
-            controller.logic(&ctx, &native);
-            native.recorded_visibility().last() == Some(&true)
-        });
         wait_until(|| {
             controller.logic(&ctx, &native);
             native.recorded_visibility().last() == Some(&false)
@@ -2845,8 +2819,8 @@ mod tests {
         );
         assert_eq!(
             native.recorded_visibility(),
-            [true],
-            "the selector may be ordered in only after the target snapshot"
+            [false],
+            "target snapshot completion must not create a blank fullscreen input shield"
         );
 
         controller.logic(&ctx, &native);
@@ -2859,10 +2833,10 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::selection_overlay(),
+                scrozz_shell::OverlayBehavior::hidden_surface(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
-            "the transparent preparation window must retain pointer ownership"
+            "selection becomes fullscreen and interactive only after preparation"
         );
         let cursors = native.recorded_cursors();
         assert_eq!(cursors.first(), Some(&OverlayCursor::Crosshair));
@@ -2919,7 +2893,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::selection_overlay(),
+                scrozz_shell::OverlayBehavior::hidden_surface(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
             "focus must remain owned until the decision handshake advances"
@@ -2928,7 +2902,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::selection_overlay(),
+                scrozz_shell::OverlayBehavior::hidden_surface(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
             "focus must remain owned until the committing key is released"
@@ -2965,7 +2939,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::selection_overlay(),
+                scrozz_shell::OverlayBehavior::hidden_surface(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
                 scrozz_shell::OverlayBehavior::hidden_surface(),
             ],
@@ -3635,7 +3609,7 @@ mod tests {
         );
         assert_eq!(
             *behavior_log.borrow(),
-            vec![scrozz_shell::OverlayBehavior::selection_overlay()]
+            vec![scrozz_shell::OverlayBehavior::hidden_surface()]
         );
         assert!(
             native
@@ -3702,7 +3676,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::selection_overlay(),
+                scrozz_shell::OverlayBehavior::hidden_surface(),
                 scrozz_shell::OverlayBehavior::selection_overlay()
             ]
         );

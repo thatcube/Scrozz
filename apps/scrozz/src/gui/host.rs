@@ -64,7 +64,10 @@ pub const HEADLESS_ENV: &str = "SCROZZ_GUI_HEADLESS";
 const IDLE: Duration = Duration::from_millis(16);
 #[cfg(not(target_os = "macos"))]
 const IDLE_FALLBACK_WAKE: Duration = Duration::from_millis(250);
-const POINTER_PROBE_CACHE: Duration = Duration::from_millis(16);
+#[cfg(target_os = "macos")]
+const POINTER_PROBE_CACHE: Duration = Duration::ZERO;
+#[cfg(not(target_os = "macos"))]
+const POINTER_PROBE_CACHE: Duration = Duration::from_millis(8);
 /// Native preview playback and queued child-viewport input must advance at UI
 /// cadence even while the shared transparent root is parked.
 const VIDEO_EDITOR_TICK: Duration = Duration::from_millis(16);
@@ -340,6 +343,7 @@ impl Host for Headless {
     fn run(self: Box<Self>, mut app: App) -> CliResult<Report> {
         tracing::info!("running headless");
         loop {
+            app.drain_capture_feedback();
             if matches!(app.tick(), Tick::Stop(_)) {
                 break;
             }
@@ -519,6 +523,23 @@ impl Host for Windowed {
             }
         };
         #[cfg(target_os = "macos")]
+        let pointer_motion_monitor = {
+            let pointer_waker = handle.clone();
+            match scrozz_shell::macos::display::PointerMotionMonitor::new(Arc::new(move || {
+                if pointer_waker.needs_global_pointer_wake() {
+                    pointer_waker.wake();
+                }
+            })) {
+                Ok(monitor) => Some(monitor),
+                Err(error) => {
+                    tracing::warn!(%error, "global pointer-motion notifications are unavailable");
+                    None
+                }
+            }
+        };
+        #[cfg(target_os = "macos")]
+        handle.set_global_pointer_observation(pointer_motion_monitor.is_some());
+        #[cfg(target_os = "macos")]
         let native_activity_start = scrozz_shell::macos::activity::snapshot();
         #[cfg(target_os = "macos")]
         let lifecycle_diagnostic = match LifecycleDiagnostic::start(native_activity_start) {
@@ -614,6 +635,8 @@ impl Host for Windowed {
                     next_active_display_refresh: Instant::now(),
                     #[cfg(target_os = "macos")]
                     display_changes,
+                    #[cfg(target_os = "macos")]
+                    _pointer_motion_monitor: pointer_motion_monitor,
                     #[cfg(target_os = "macos")]
                     native_activity_start,
                     #[cfg(target_os = "macos")]
@@ -939,6 +962,8 @@ struct Driver {
     next_active_display_refresh: Instant,
     #[cfg(target_os = "macos")]
     display_changes: Option<scrozz_shell::macos::display::DisplayChangeMonitor>,
+    #[cfg(target_os = "macos")]
+    _pointer_motion_monitor: Option<scrozz_shell::macos::display::PointerMotionMonitor>,
     #[cfg(target_os = "macos")]
     native_activity_start: scrozz_shell::macos::activity::NativeActivitySnapshot,
     #[cfg(target_os = "macos")]
@@ -1795,6 +1820,9 @@ impl Driver {
             self.handle.needs_visible_surface(),
             auxiliary_open,
         );
+        if mode != RootSurfaceMode::Cards {
+            self.handle.suspend_global_pointer_wake();
+        }
         if display_refresh_requested(
             refresh_requested,
             visible_surface_refresh_due(self.root_mode, mode),
@@ -2340,10 +2368,10 @@ const fn root_surface_mode(
 ) -> RootSurfaceMode {
     if selector_visible {
         RootSurfaceMode::Selector
-    } else if cards_allowed && card_content {
-        RootSurfaceMode::Cards
     } else if auxiliary_open {
         RootSurfaceMode::Parked
+    } else if cards_allowed && card_content {
+        RootSurfaceMode::Cards
     } else {
         RootSurfaceMode::Hidden
     }
@@ -2617,6 +2645,10 @@ impl eframe::App for Driver {
             }
         }
         self.announce_panel();
+        // Pixel acquisition and selector restoration can wake the same native
+        // turn. Play the shutter before `CaptureFinished` restores ordinary
+        // windows or starts any post-processing-visible lifecycle transition.
+        self.app.drain_capture_feedback();
         if self.app.take_sharing_settings_request() {
             self.cloud_settings.open(self.app.cloud_settings());
         }
@@ -2791,6 +2823,7 @@ impl eframe::App for Driver {
             // pass. Preserve already-open pins while delaying only the new
             // auxiliary child until the root's visible bootstrap is committed.
             self.show_capture_surface(ui, frame);
+            self.handle.suspend_global_pointer_wake();
             self.reconcile_pin_panels(ui.ctx());
             ui.ctx().request_repaint();
             return;
@@ -2819,6 +2852,9 @@ impl eframe::App for Driver {
             self.native.keep_suppressed_windows_hidden();
         }
         self.show_capture_surface(ui, frame);
+        if self.root_mode != RootSurfaceMode::Cards {
+            self.handle.suspend_global_pointer_wake();
+        }
         self.reconcile_pin_panels(ui.ctx());
         #[cfg(target_os = "macos")]
         self.order_out_parked_root_after_auxiliary_registration(ui.ctx());
@@ -3774,6 +3810,28 @@ mod tests {
     }
 
     #[test]
+    fn shutter_feedback_precedes_selector_restoration() {
+        let source = include_str!("host.rs");
+        let logic = source
+            .split("impl eframe::App for Driver")
+            .nth(1)
+            .and_then(|driver| driver.split("fn logic(&mut self, ctx:").nth(1))
+            .and_then(|body| body.split_once("\n    fn ui("))
+            .map(|(body, _)| body)
+            .expect("Driver logic pass");
+        let shutter = logic
+            .find("self.app.drain_capture_feedback()")
+            .expect("acquisition feedback drain");
+        let restoration = logic
+            .find("self.selection.logic(ctx, &self.native)")
+            .expect("selector lifecycle");
+        assert!(
+            shutter < restoration,
+            "CaptureFinished must not restore windows before the shutter starts"
+        );
+    }
+
+    #[test]
     fn focus_editor_requests_are_drained_alongside_the_ordinary_tick() {
         // A duplicate-open (whole-card click, Enter/Space, or Edit from any
         // menu on an already-open card) must raise the existing window on
@@ -4059,6 +4117,11 @@ mod tests {
             root_surface_mode(false, true, false, true),
             RootSurfaceMode::Parked,
             "an auxiliary child gets an off-screen parent without exposing it"
+        );
+        assert_eq!(
+            root_surface_mode(false, true, true, true),
+            RootSurfaceMode::Parked,
+            "ordinary editors and Settings must not sit beneath a blocking card root"
         );
     }
 

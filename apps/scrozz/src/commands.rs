@@ -99,7 +99,7 @@ enum PreparedSink {
 /// Whatever the command produces. Cancellation arrives here as
 /// [`scrozz_core::Error::Cancelled`] and is rendered as an outcome, not a fault.
 pub fn dispatch(command: &Command) -> CliResult<Report> {
-    dispatch_inner(command, None, &mut |_, _| Ok(()), true)
+    dispatch_inner(command, None, &mut |_, _| Ok(()), &mut || Ok(()), true)
 }
 
 /// Runs a command locally, offering any capture it takes to `observed`.
@@ -113,7 +113,7 @@ pub fn dispatch(command: &Command) -> CliResult<Report> {
 /// admission failure is propagated so an IPC caller is not acknowledged before
 /// the running app has accepted the pixels.
 pub fn dispatch_observed(command: &Command, observed: CaptureSink<'_>) -> CliResult<Report> {
-    dispatch_inner(command, None, observed, false)
+    dispatch_inner(command, None, observed, &mut || Ok(()), false)
 }
 
 /// Runs a command with an existing-loop selector supplied by the GUI.
@@ -132,17 +132,29 @@ pub fn dispatch_observed_with_selector(
     selector: &dyn CaptureSelector,
     observed: CaptureSink<'_>,
 ) -> CliResult<Report> {
-    dispatch_inner(command, Some(selector), observed, false)
+    dispatch_observed_with_selector_and_acquisition(command, selector, observed, &mut || Ok(()))
+}
+
+/// Runs a forwarded command and announces the pixel-acquisition boundary before
+/// rendering, sinks, and main-thread capture admission.
+pub fn dispatch_observed_with_selector_and_acquisition(
+    command: &Command,
+    selector: &dyn CaptureSelector,
+    observed: CaptureSink<'_>,
+    acquired: &mut dyn FnMut() -> CliResult<()>,
+) -> CliResult<Report> {
+    dispatch_inner(command, Some(selector), observed, acquired, false)
 }
 
 fn dispatch_inner(
     command: &Command,
     selector: Option<&dyn CaptureSelector>,
     observed: CaptureSink<'_>,
+    acquired: &mut dyn FnMut() -> CliResult<()>,
     sound_at_source: bool,
 ) -> CliResult<Report> {
     match command {
-        Command::Capture(args) => capture(args, selector, observed, sound_at_source),
+        Command::Capture(args) => capture(args, selector, observed, acquired, sound_at_source),
         Command::Record(args) => record(args, selector),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
@@ -265,6 +277,7 @@ fn capture(
     args: &CaptureArgs,
     selector: Option<&dyn CaptureSelector>,
     observed: CaptureSink<'_>,
+    acquired: &mut dyn FnMut() -> CliResult<()>,
     sound_at_source: bool,
 ) -> CliResult<Report> {
     args.validate()?;
@@ -393,6 +406,11 @@ fn capture(
             (capture, None)
         }
     };
+    acquired()?;
+    fail_if_terminal_abort(&mut terminal_cancel)?;
+    if sound_at_source && let Err(error) = scrozz_shell::play_screenshot_sound(&screenshot_sound) {
+        tracing::warn!(%error, "the screenshot succeeded but its sound could not play");
+    }
     lifecycle.finish();
     if let Some(outcome) = selection_outcome.as_ref() {
         remember_selection(outcome, backend.as_ref());
@@ -469,10 +487,6 @@ fn capture(
             PreparedSink::Stdout => raw = Some(bytes.clone()),
         }
     }
-    if sound_at_source && let Err(error) = scrozz_shell::play_screenshot_sound(&screenshot_sound) {
-        tracing::warn!(%error, "the screenshot succeeded but its sound could not play");
-    }
-
     let data = Json::obj([
         ("plan", plan),
         (
