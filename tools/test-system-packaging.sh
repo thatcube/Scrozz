@@ -496,6 +496,8 @@ grep -q -- '--latest=false' "$RELEASE_WORKFLOW" ||
   fail "alpha releases can accidentally become Latest"
 grep -q 'is_alpha=true' "$RELEASE_WORKFLOW" ||
   fail "release tag validation does not identify alpha tags"
+grep -q 'Alpha tag ruleset audit skipped' "$RELEASE_WORKFLOW" ||
+  fail "unconfigured tag-ruleset audit cannot degrade explicitly for alpha only"
 
 if ! ruby -ryaml - "$RELEASE_WORKFLOW" <<'RUBY'
 workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)

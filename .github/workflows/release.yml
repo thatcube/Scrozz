@@ -133,8 +133,13 @@ jobs:
         env:
           RULESET_ID: ${{ vars.RELEASE_TAG_RULESET_ID }}
           RULESET_TOKEN: ${{ secrets.RELEASE_RULESET_TOKEN }}
+          IS_ALPHA: ${{ steps.tag.outputs.is_alpha }}
         run: |
           set -euo pipefail
+          if [[ -z "$RULESET_ID" && -z "$RULESET_TOKEN" && "$IS_ALPHA" == "true" ]]; then
+            echo "::warning title=Alpha tag ruleset audit skipped::No immutable-tag audit credentials are configured. This alpha remains pinned to the push SHA and its remote tag is revalidated immediately before publication; stable releases still fail closed."
+            exit 0
+          fi
           if [[ ! "$RULESET_ID" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error title=Release tag ruleset missing::Set repository variable RELEASE_TAG_RULESET_ID to an active tag ruleset that forbids updates/deletions of refs/tags/v* with no bypass actors."
             exit 1
