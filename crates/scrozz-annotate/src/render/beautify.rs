@@ -8,6 +8,8 @@
 //! calls this module: a window may be translated onto an outer canvas, but its
 //! native pixels cannot be cropped, rounded, bordered, or re-shadowed.
 
+use std::collections::BTreeMap;
+
 use scrozz_core::{
     ColorSpace, Error, LogicalPoint, LogicalSize, Result, Transform as ColorTransform,
 };
@@ -43,8 +45,10 @@ pub struct ResolvedLayout {
     pub height: u32,
     /// Source rectangle sampled from the rendered current revision.
     pub source: IntRect,
-    /// Capture bounds inside the output.
+    /// Original capture-pixel bounds inside the output.
     pub content: Rect,
+    /// Screenshot surface bounds, including its matched-colour inner padding.
+    pub surface: Rect,
 }
 
 pub(crate) struct ApplyOptions {
@@ -135,25 +139,39 @@ pub(crate) fn apply_with_retained_bytes_and_layout(
     )?;
 
     let radius = (beautification.corner_radius * scale) as f32;
-    let radius = radius.min(layout.content.width().min(layout.content.height()) / 2.0);
+    let radius = radius.min(layout.surface.width().min(layout.surface.height()) / 2.0);
     let shadow = (beautification.shadow * scale) as f32;
     if shadow > 0.0 {
-        draw_shadow(&mut canvas, layout.content, radius, shadow)?;
+        draw_shadow(&mut canvas, layout.surface, radius, shadow)?;
     }
-    draw_content(
-        &mut canvas,
-        content,
-        layout.source,
-        layout.content,
-        radius,
-        preserve_source_pixels,
-    );
+    if beautification.inner_padding > 0.0 {
+        let padded = padded_screenshot_surface(content, layout)?;
+        let source = IntRect::from_xywh(0, 0, padded.width(), padded.height())
+            .expect("a validated screenshot surface is nonempty");
+        draw_content(
+            &mut canvas,
+            &padded,
+            source,
+            layout.surface,
+            radius,
+            preserve_source_pixels,
+        );
+    } else {
+        draw_content(
+            &mut canvas,
+            content,
+            layout.source,
+            layout.content,
+            radius,
+            preserve_source_pixels,
+        );
+    }
 
     let border = (beautification.border_width * scale) as f32;
     if border > 0.0 && !beautification.border_color.is_invisible() {
         draw_border(
             &mut canvas,
-            layout.content,
+            layout.surface,
             radius,
             border,
             converted_color(beautification.border_color, target_color_space)?,
@@ -166,7 +184,7 @@ pub(crate) fn apply_with_retained_bytes_and_layout(
     {
         draw_watermark(
             &mut canvas,
-            layout.content,
+            layout.surface,
             watermark,
             scale,
             target_color_space,
@@ -247,35 +265,50 @@ fn resolve_layout_with_width(
     let bottom = padding.bottom * scale;
     let content_width = f64::from(source.width());
     let content_height = f64::from(source.height());
-    if content_width + left + right > f64::from(width) + 0.5
-        || content_height + top + bottom > f64::from(height) + 0.5
+    let ideal_inner_total = (beautification.inner_padding * scale * 2.0).round();
+    let inner_total_x = ideal_inner_total.min(
+        (f64::from(width) - content_width - left - right)
+            .floor()
+            .max(0.0),
+    );
+    let inner_total_y = ideal_inner_total.min(
+        (f64::from(height) - content_height - top - bottom)
+            .floor()
+            .max(0.0),
+    );
+    let inner_left = (inner_total_x / 2.0).floor();
+    let inner_top = (inner_total_y / 2.0).floor();
+    let surface_width = content_width + inner_total_x;
+    let surface_height = content_height + inner_total_y;
+    if surface_width + left + right > f64::from(width) + 0.5
+        || surface_height + top + bottom > f64::from(height) + 0.5
     {
         return Err(Error::InvalidRequest(
             "Scene output is too small to retain the complete source and requested padding"
                 .to_owned(),
         ));
     }
-    let available_x = (f64::from(width) - content_width).max(0.0);
-    let available_y = (f64::from(height) - content_height).max(0.0);
+    let available_x = (f64::from(width) - surface_width).max(0.0);
+    let available_y = (f64::from(height) - surface_height).max(0.0);
 
     let (x, y) = if beautification.auto_balance {
         if let Some(focus) = resolved_focus(source, beautification) {
             (
                 balanced_position(
                     f64::from(width),
-                    content_width,
+                    surface_width,
                     available_x,
                     left,
                     right,
-                    focus.0,
+                    focus.0 + inner_left,
                 ),
                 balanced_position(
                     f64::from(height),
-                    content_height,
+                    surface_height,
                     available_y,
                     top,
                     bottom,
-                    focus.1,
+                    focus.1 + inner_top,
                 ),
             )
         } else {
@@ -304,18 +337,26 @@ fn resolve_layout_with_width(
         (x, y)
     };
     let content = Rect::from_xywh(
-        x as f32,
-        y as f32,
+        (x + inner_left) as f32,
+        (y + inner_top) as f32,
         content_width as f32,
         content_height as f32,
     )
     .ok_or_else(|| Error::InvalidRequest("resolved content rectangle is empty".to_owned()))?;
+    let surface = Rect::from_xywh(
+        x as f32,
+        y as f32,
+        surface_width as f32,
+        surface_height as f32,
+    )
+    .ok_or_else(|| Error::InvalidRequest("resolved screenshot surface is empty".to_owned()))?;
 
     Ok(ResolvedLayout {
         width,
         height,
         source,
         content,
+        surface,
     })
 }
 
@@ -392,9 +433,18 @@ fn preflight_working_set(
 ) -> Result<()> {
     let content_bytes = raster_bytes(content.width(), content.height())?;
     let canvas_bytes = raster_bytes(layout.width, layout.height)?;
+    let padded_bytes = if beautification.inner_padding > 0.0 {
+        raster_bytes(
+            layout.surface.width().round() as u32,
+            layout.surface.height().round() as u32,
+        )?
+    } else {
+        0
+    };
     let base = retained_source_bytes
         .checked_add(content_bytes)
         .and_then(|bytes| bytes.checked_add(canvas_bytes))
+        .and_then(|bytes| bytes.checked_add(padded_bytes))
         .ok_or_else(|| Error::InvalidRequest("beautification working set overflowed".to_owned()))?;
 
     let (background_retained, background_scratch) = match &beautification.background {
@@ -933,6 +983,110 @@ fn averaged_pixel(sum: [u64; 4], divisor: u64) -> PremultipliedColorU8 {
         alpha,
     )
     .unwrap_or_else(transparent)
+}
+
+fn padded_screenshot_surface(content: &Pixmap, layout: ResolvedLayout) -> Result<Pixmap> {
+    let width = checked_dimension(f64::from(layout.surface.width()), "inner surface width")?;
+    let height = checked_dimension(f64::from(layout.surface.height()), "inner surface height")?;
+    let mut surface = Pixmap::new(width, height).ok_or_else(|| {
+        Error::InvalidRequest(format!(
+            "inner-padded screenshot surface {width}x{height} is not allocatable"
+        ))
+    })?;
+    surface.fill(sk_color(matched_edge_color(content, layout.source)));
+    let inset_x = (layout.content.left() - layout.surface.left())
+        .round()
+        .max(0.0) as u32;
+    let inset_y = (layout.content.top() - layout.surface.top())
+        .round()
+        .max(0.0) as u32;
+    copy_source_rect(&mut surface, content, layout.source, inset_x, inset_y, true);
+    Ok(surface)
+}
+
+fn matched_edge_color(content: &Pixmap, source_rect: IntRect) -> Color {
+    const MAX_SAMPLES: usize = 4_096;
+    let width = source_rect.width() as usize;
+    let height = source_rect.height() as usize;
+    let perimeter = width
+        .saturating_mul(2)
+        .saturating_add(height.saturating_mul(2))
+        .saturating_sub(4)
+        .max(1);
+    let stride = perimeter.div_ceil(MAX_SAMPLES).max(1);
+    let source_x = source_rect.x().max(0) as usize;
+    let source_y = source_rect.y().max(0) as usize;
+    let raster_width = content.width() as usize;
+    let mut visited = 0_usize;
+    let mut bins = BTreeMap::<u16, ([u64; 4], u64)>::new();
+    let mut sample = |x: usize, y: usize| {
+        let take = visited.is_multiple_of(stride);
+        visited += 1;
+        if !take {
+            return;
+        }
+        let pixel = content.pixels()[(source_y + y) * raster_width + source_x + x];
+        let alpha = pixel.alpha();
+        let straight = |channel: u8| {
+            if alpha == 0 {
+                0
+            } else {
+                ((u32::from(channel) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255)
+                    as u8
+            }
+        };
+        let rgba = [
+            straight(pixel.red()),
+            straight(pixel.green()),
+            straight(pixel.blue()),
+            alpha,
+        ];
+        let key = (u16::from(rgba[0] >> 4) << 12)
+            | (u16::from(rgba[1] >> 4) << 8)
+            | (u16::from(rgba[2] >> 4) << 4)
+            | u16::from(rgba[3] >> 4);
+        let (sum, count) = bins.entry(key).or_default();
+        for (total, channel) in sum.iter_mut().zip(rgba) {
+            *total += u64::from(channel);
+        }
+        *count += 1;
+    };
+
+    for x in 0..width {
+        sample(x, 0);
+    }
+    if height > 1 {
+        for y in 1..height {
+            sample(width - 1, y);
+        }
+    }
+    if height > 1 && width > 1 {
+        for x in (0..width - 1).rev() {
+            sample(x, height - 1);
+        }
+    }
+    if width > 1 && height > 2 {
+        for y in (1..height - 1).rev() {
+            sample(0, y);
+        }
+    }
+
+    let mut best = ([0_u64; 4], 0_u64);
+    for (_, candidate) in bins {
+        if candidate.1 > best.1 {
+            best = candidate;
+        }
+    }
+    if best.1 == 0 {
+        return Color::TRANSPARENT;
+    }
+    let average = |channel: u64| ((channel + best.1 / 2) / best.1).min(255) as u8;
+    Color::rgba(
+        average(best.0[0]),
+        average(best.0[1]),
+        average(best.0[2]),
+        average(best.0[3]),
+    )
 }
 
 /// Draws the source clipped to an antialiased rounded rectangle.

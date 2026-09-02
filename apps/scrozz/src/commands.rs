@@ -772,7 +772,10 @@ fn apply_beautification_overrides(
         };
     }
     if let Some(padding) = args.padding {
-        beautification.padding = padding;
+        beautification.set_uniform_padding(padding);
+    }
+    if let Some(inner_padding) = args.inner_padding {
+        beautification.inner_padding = inner_padding;
     }
     // `--frame-aspect` and `--size` both describe the output canvas and are
     // mutually exclusive on the CLI (`clap`'s `conflicts_with`), but the model
@@ -810,6 +813,7 @@ fn apply_beautification_overrides(
 fn beautification_json(beautification: &Beautification) -> Json {
     Json::obj([
         ("padding", Json::Float(beautification.padding)),
+        ("inner_padding", Json::Float(beautification.inner_padding)),
         (
             "aspect",
             Json::str(format!("{:?}", beautification.aspect).to_lowercase()),

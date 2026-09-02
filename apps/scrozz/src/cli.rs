@@ -1145,9 +1145,13 @@ pub struct CaptureArgs {
     #[arg(long, value_name = "BACKGROUND")]
     pub background: Option<BeautifyBackground>,
 
-    /// Padding around the capture in logical points.
+    /// Outer Scene-canvas padding around the screenshot in logical points.
     #[arg(long, value_name = "POINTS", allow_hyphen_values = true)]
     pub padding: Option<f64>,
+
+    /// Padding added inside the screenshot surface using its matched edge colour.
+    #[arg(long, value_name = "POINTS", allow_hyphen_values = true)]
+    pub inner_padding: Option<f64>,
 
     /// Output canvas aspect ratio for beautification.
     ///
@@ -1344,6 +1348,7 @@ impl CaptureArgs {
             || self.smart_frame
             || self.background.is_some()
             || self.padding.is_some()
+            || self.inner_padding.is_some()
             || self.frame_aspect.is_some()
             || self.size.is_some()
             || self.alignment.is_some()
@@ -1382,6 +1387,7 @@ impl CaptureArgs {
 
         for (name, value) in [
             ("--padding", self.padding),
+            ("--inner-padding", self.inner_padding),
             ("--corner-radius", self.corner_radius),
             ("--shadow", self.shadow),
             ("--border", self.border),
@@ -1410,8 +1416,8 @@ impl CaptureArgs {
                 || self.border.is_some_and(|value| value > 0.0))
         {
             return Err(CliError::Core(scrozz_core::Error::InvalidRequest(
-                "window Smart Frame may add only an outer canvas; inset, corners, shadow, and \
-                 border are disabled to preserve native pixels (decision D9)"
+                "window Smart Frame may add only source-preserving outer or inner padding; inset, \
+                 corners, shadow, and border are disabled to preserve native pixels (decision D9)"
                     .to_owned(),
             )));
         }
@@ -3486,6 +3492,8 @@ mod tests {
             "#11223380",
             "--padding",
             "24.5",
+            "--inner-padding",
+            "12.5",
             "--frame-aspect",
             "wide",
             "--alignment",
@@ -3510,6 +3518,8 @@ mod tests {
                 0x11, 0x22, 0x33, 0x80
             )))
         );
+        assert_eq!(args.padding, Some(24.5));
+        assert_eq!(args.inner_padding, Some(12.5));
         assert_eq!(args.frame_aspect, Some(BeautifyAspect::Wide));
         assert_eq!(args.alignment, Some(BeautifyAlignment::BottomRight));
         assert!(args.auto_balance);
@@ -3646,13 +3656,15 @@ mod tests {
 
     #[test]
     fn invalid_beautification_measurements_are_usage_errors() {
-        for value in ["-1", "NaN", "20000"] {
-            let Some(Command::Capture(args)) =
-                parse(&["scrozz", "capture", "--padding", value]).command
-            else {
-                panic!("expected capture")
-            };
-            assert!(args.validate().is_err(), "{value} should fail");
+        for flag in ["--padding", "--inner-padding"] {
+            for value in ["-1", "NaN", "20000"] {
+                let Some(Command::Capture(args)) =
+                    parse(&["scrozz", "capture", flag, value]).command
+                else {
+                    panic!("expected capture")
+                };
+                assert!(args.validate().is_err(), "{flag} {value} should fail");
+            }
         }
     }
 

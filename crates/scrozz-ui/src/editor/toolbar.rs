@@ -2202,7 +2202,7 @@ const fn built_in_name(background: BuiltInBackground) -> &'static str {
     }
 }
 
-/// Additive canvas spacing and the subject's own treatment.
+/// Outer Scene spacing, screenshot-surface spacing, and subject treatment.
 fn frame_section(
     ui: &mut Ui,
     state: &mut EditorState,
@@ -2223,22 +2223,47 @@ fn frame_section(
     let row = metric_row(
         ui,
         palette,
-        "Inner Padding",
+        "Padding",
         &mut padding,
         0.0..=220.0,
         config.automatic.padding,
         true,
     );
     if row.changed {
-        resolve_again |= set_inner_padding(&mut config, padding);
+        config.set_uniform_padding(padding);
     }
     if let Some(automatic) = row.automatic {
-        resolve_again |= set_inner_padding_automatic(&mut config, automatic);
+        config.automatic.padding = automatic;
+        resolve_again |= automatic;
     }
     ui.add(
         egui::Label::new(
             egui::RichText::new(
-                "Adds Scene background around the full screenshot; no screenshot pixels are removed.",
+                "Expands the outer gradient/background canvas, or adds transparency when no background is selected.",
+            )
+            .small()
+            .color(palette.text_muted),
+        )
+        .selectable(false),
+    );
+
+    let mut inner_padding = config.inner_padding;
+    let row = metric_row(
+        ui,
+        palette,
+        "Inner Padding",
+        &mut inner_padding,
+        0.0..=220.0,
+        false,
+        false,
+    );
+    if row.changed {
+        resolve_again |= set_inner_padding(&mut config, inner_padding);
+    }
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Expands the screenshot surface itself with a colour matched from its edges.",
             )
             .small()
             .color(palette.text_muted),
@@ -2320,23 +2345,13 @@ fn frame_section(
 
 fn set_inner_padding(config: &mut Beautification, padding: f64) -> bool {
     let removed_legacy_inset = !config.inset.is_zero();
-    config.set_uniform_padding(padding);
+    config.inner_padding = padding;
     config.inset = Default::default();
     config.automatic.inset = false;
     if removed_legacy_inset {
         config.smart_frame = None;
     }
     removed_legacy_inset && config.automatic.placement
-}
-
-fn set_inner_padding_automatic(config: &mut Beautification, automatic: bool) -> bool {
-    config.automatic.padding = automatic;
-    if !automatic {
-        return false;
-    }
-    let padding = config.padding;
-    let _ = set_inner_padding(config, padding);
-    true
 }
 
 /// Everything that is a deliberate choice rather than a first impression.
@@ -2972,7 +2987,7 @@ fn native_subject_note(ui: &mut Ui, palette: &crate::theme::Palette) {
         egui::Label::new(
             egui::RichText::new(
                 "This window keeps its own silhouette, corners and shadow. \
-                 Only the canvas around it changes.",
+                 Padding only adds around its unchanged native pixels.",
             )
             .small()
             .color(palette.text_muted),
@@ -3018,7 +3033,8 @@ mod tests {
         };
 
         assert!(set_inner_padding(&mut scene, 48.0));
-        assert_eq!(scene.padding, 48.0);
+        assert_eq!(scene.padding, 0.0);
+        assert_eq!(scene.inner_padding, 48.0);
         assert!(scene.inset.is_zero());
         assert!(!scene.automatic.inset);
         assert!(
@@ -3028,18 +3044,14 @@ mod tests {
     }
 
     #[test]
-    fn automatic_inner_padding_also_retires_legacy_trim_and_stale_focus() {
+    fn outer_padding_does_not_change_inner_padding() {
         let mut scene = Beautification {
-            inset: scrozz_annotate::SourceInsets::uniform(12.0),
-            smart_frame: Some(Default::default()),
+            inner_padding: 36.0,
             ..Beautification::default()
         };
-        scene.automatic.padding = false;
+        scene.set_uniform_padding(64.0);
 
-        assert!(set_inner_padding_automatic(&mut scene, true));
-        assert!(scene.automatic.padding);
-        assert!(scene.inset.is_zero());
-        assert!(!scene.automatic.inset);
-        assert!(scene.smart_frame.is_none());
+        assert_eq!(scene.padding, 64.0);
+        assert_eq!(scene.inner_padding, 36.0);
     }
 }

@@ -518,8 +518,9 @@ Far richer than the features page implies
 - **Wallpapers** — your actual desktop wallpaper, plus custom images
 - **Blurred** — blurred wallpaper, blurred white, blurred grey
 - **Plain colour** — 18 swatches, custom picker, transparent
-- **Inner padding**, **Shadow**, **Corners** — padding grows the background
-  canvas; it never trims the screenshot
+- **Padding**, **Inner padding**, **Shadow**, **Corners** — Padding grows the
+  outer background canvas; Inner Padding grows the screenshot surface with a
+  matched edge colour; neither trims source pixels
 - **Auto-balance** toggle
 - **Alignment** — 3×3 grid
 - **Ratio** — aspect presets for social

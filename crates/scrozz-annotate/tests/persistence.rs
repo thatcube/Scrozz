@@ -309,6 +309,7 @@ fn round_trip_preserves_beautification() {
     let mut doc = document(200, 200);
     doc.set_beautification(Some(Beautification {
         padding: 48.5,
+        inner_padding: 17.25,
         corner_radius: 12.25,
         shadow: 30.0,
         background: Background::Gradient {
@@ -325,6 +326,7 @@ fn round_trip_preserves_beautification() {
 
     let b = restored.beautification().expect("beautification survives");
     assert!((b.padding - 48.5).abs() < 1e-9);
+    assert!((b.inner_padding - 17.25).abs() < 1e-9);
     assert!((b.corner_radius - 12.25).abs() < 1e-9);
     assert_eq!(
         b.background,
@@ -333,6 +335,14 @@ fn round_trip_preserves_beautification() {
             end: Color::rgb(30, 40, 160),
         }
     );
+}
+
+#[test]
+fn older_scenes_without_inner_padding_default_to_zero() {
+    let scene: Beautification =
+        serde_json::from_str(r#"{"padding":48.5,"background":"transparent"}"#).unwrap();
+    assert_eq!(scene.padding, 48.5);
+    assert_eq!(scene.inner_padding, 0.0);
 }
 
 #[test]

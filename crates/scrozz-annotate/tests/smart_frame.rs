@@ -347,6 +347,7 @@ fn a_window_capture_never_takes_an_inner_inset() {
 #[test]
 fn preset_round_trip_preserves_unknown_fields_but_never_pixels() {
     let mut beauty = Beautification {
+        inner_padding: 24.0,
         background: Background::Automatic(Default::default()),
         ..Beautification::default()
     };
@@ -371,6 +372,7 @@ fn preset_round_trip_preserves_unknown_fields_but_never_pixels() {
         SmartFramePresetSettings::from_beautification(&restored.settings.to_beautification())
             .unwrap();
     assert_eq!(rebuilt.extensions["future_control"]["enabled"], true);
+    assert_eq!(rebuilt.inner_padding, 24.0);
     assert!(!json.contains("pixels_png"));
 
     let image =
@@ -420,8 +422,10 @@ fn legacy_presets_default_only_explicit_automatic_backgrounds_to_automatic() {
     .unwrap();
     let mut fixed_json = serde_json::to_value(fixed).unwrap();
     fixed_json.as_object_mut().unwrap().remove("automatic");
+    fixed_json.as_object_mut().unwrap().remove("inner_padding");
     let fixed: SmartFramePresetSettings = serde_json::from_value(fixed_json).unwrap();
     assert!(!fixed.automatic.any());
+    assert_eq!(fixed.inner_padding, 0.0);
 
     let mut automatic_json = serde_json::to_value(SmartFramePresetSettings {
         background: PresetBackground::Automatic,

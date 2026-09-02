@@ -255,6 +255,7 @@ pub fn provisional_with_style(
     Beautification {
         padding: f64::from(padding),
         canvas_padding: stitched_padding(provenance, f64::from(padding)),
+        inner_padding: 0.0,
         inset: SourceInsets::default(),
         corner_radius,
         shadow,
@@ -357,10 +358,12 @@ pub enum PresetBackground {
 /// Pixel-free settings stored in a reusable preset.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SmartFramePresetSettings {
-    /// Padding in logical points.
+    /// Outer Scene padding in logical points.
     pub padding: f64,
     /// Optional asymmetric canvas spacing.
     pub canvas_padding: Option<CanvasInsets>,
+    /// Padding inside the screenshot surface.
+    pub inner_padding: f64,
     /// Source-space inset.
     pub inset: SourceInsets,
     /// Capture corner radius.
@@ -395,6 +398,7 @@ pub struct SmartFramePresetSettings {
 struct SmartFramePresetSettingsWire {
     padding: f64,
     canvas_padding: Option<CanvasInsets>,
+    inner_padding: f64,
     inset: SourceInsets,
     corner_radius: f64,
     shadow: f64,
@@ -417,6 +421,7 @@ impl Default for SmartFramePresetSettingsWire {
         Self {
             padding: defaults.padding,
             canvas_padding: defaults.canvas_padding,
+            inner_padding: defaults.inner_padding,
             inset: defaults.inset,
             corner_radius: defaults.corner_radius,
             shadow: defaults.shadow,
@@ -450,6 +455,7 @@ impl<'de> Deserialize<'de> for SmartFramePresetSettings {
         Ok(Self {
             padding: wire.padding,
             canvas_padding: wire.canvas_padding,
+            inner_padding: wire.inner_padding,
             inset: wire.inset,
             corner_radius: wire.corner_radius,
             shadow: wire.shadow,
@@ -507,6 +513,7 @@ impl SmartFramePresetSettings {
         Ok(Self {
             padding: value.padding,
             canvas_padding: value.canvas_padding,
+            inner_padding: value.inner_padding,
             inset: value.inset,
             corner_radius: value.corner_radius,
             shadow: value.shadow,
@@ -553,9 +560,10 @@ impl SmartFramePresetSettings {
         Beautification {
             padding: self.padding,
             canvas_padding: self.canvas_padding,
+            inner_padding: self.inner_padding,
             // Source trimming was previously presented as "Inner" padding.
-            // Keep reading the field for wire compatibility, but never carry it
-            // into a newly applied Scene: padding only expands the canvas.
+            // Keep reading it for wire compatibility, but newly applied Scenes
+            // use the two additive outer- and inner-padding fields above.
             inset: SourceInsets::default(),
             corner_radius: self.corner_radius,
             shadow: self.shadow,
@@ -795,6 +803,7 @@ fn analyze_with_style_impl(
     let beautification = Beautification {
         padding: f64::from(padding),
         canvas_padding: stitched_padding(provenance, f64::from(padding)),
+        inner_padding: 0.0,
         inset: inset.inset,
         corner_radius,
         shadow,

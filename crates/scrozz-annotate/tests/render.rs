@@ -773,7 +773,7 @@ fn the_inner_inset_holds_back_the_capture_s_own_margin() {
 }
 
 #[test]
-fn scene_inner_padding_expands_the_background_without_shrinking_the_screenshot() {
+fn scene_outer_padding_expands_the_background_without_shrinking_the_screenshot() {
     let source = frame_with(20, 10, 1.0, |_, _| [220, 40, 60, 255]);
     let mut doc = Document::new(capture_with(source, Provenance::Region));
     doc.set_scene(Some(Beautification {
@@ -791,6 +791,93 @@ fn scene_inner_padding_expands_the_background_without_shrinking_the_screenshot()
         "the screenshot starts after additive padding at its original size"
     );
     assert!(near(pixel(&out, 24, 14), [220, 40, 60, 255], 2));
+}
+
+#[test]
+fn scene_inner_padding_expands_the_screenshot_surface_with_its_edge_colour() {
+    let source = frame_with(8, 6, 1.0, |x, y| {
+        if (2..6).contains(&x) && (2..4).contains(&y) {
+            [220, 40, 60, 255]
+        } else {
+            [18, 24, 32, 255]
+        }
+    });
+    let mut doc = Document::new(capture_with(source.clone(), Provenance::Region));
+    doc.set_scene(Some(Beautification {
+        padding: 3.0,
+        inner_padding: 2.0,
+        background: Background::Solid(Color::rgb(0, 200, 0)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (18, 16));
+    assert!(
+        near(pixel(&out, 1, 1), [0, 200, 0, 255], 2),
+        "outer Padding belongs to the Scene background"
+    );
+    assert!(
+        near(pixel(&out, 4, 4), [18, 24, 32, 255], 2),
+        "Inner Padding belongs to the screenshot and matches its edge colour"
+    );
+    for y in 0..source.height() {
+        for x in 0..source.width() {
+            assert_eq!(
+                pixel(&out, x + 5, y + 5),
+                pixel(&source, x, y),
+                "source pixel ({x}, {y}) changed"
+            );
+        }
+    }
+    let (_, layout) = SkiaRenderer::new()
+        .render_to_width_with_layout(&doc, 18)
+        .unwrap();
+    let subject = layout.expect("Scene layout").subject;
+    assert_eq!(subject.origin, scrozz_core::PhysicalPoint::new(5.0, 5.0));
+    assert_eq!(subject.size, scrozz_core::PhysicalSize::new(8.0, 6.0));
+}
+
+#[test]
+fn fractional_inner_padding_distributes_the_rounded_total_without_overgrowing() {
+    let mut doc = Document::new(capture_with(
+        flat(10, 10, [18, 24, 32, 255]),
+        Provenance::Region,
+    ));
+    doc.set_scene(Some(Beautification {
+        inner_padding: 12.5,
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (35, 35));
+    let (_, layout) = SkiaRenderer::new()
+        .render_to_width_with_layout(&doc, 35)
+        .unwrap();
+    let subject = layout.expect("Scene layout").subject;
+    assert_eq!(subject.origin, scrozz_core::PhysicalPoint::new(12.0, 12.0));
+    assert_eq!(subject.size, scrozz_core::PhysicalSize::new(10.0, 10.0));
+}
+
+#[test]
+fn preview_width_absorbs_independent_rounding_without_rejecting_inner_padding() {
+    let mut doc = Document::new(capture_with(
+        flat(100, 100, [18, 24, 32, 255]),
+        Provenance::Region,
+    ));
+    doc.set_scene(Some(Beautification {
+        inner_padding: 10.0,
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let (preview, layout) = SkiaRenderer::new()
+        .render_to_width_with_layout(&doc, 603)
+        .unwrap();
+    assert_eq!((preview.width(), preview.height()), (603, 603));
+    let subject = layout.expect("Scene layout").subject;
+    assert_eq!(subject.size, scrozz_core::PhysicalSize::new(503.0, 503.0));
 }
 
 #[test]

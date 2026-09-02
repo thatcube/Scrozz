@@ -966,9 +966,9 @@ pub struct SceneAutomatic {
     pub background: bool,
     /// Resolve a legacy source-margin trim.
     ///
-    /// New Scenes leave this false: user-facing inner padding grows the canvas
-    /// and never subtracts screenshot pixels. The field remains readable so
-    /// existing documents keep their historical non-destructive framing.
+    /// New Scenes leave this false: the user-facing Inner Padding field is a
+    /// separate additive screenshot-surface expansion. This legacy field remains
+    /// readable so existing documents keep their historical framing.
     pub inset: bool,
     /// Resolve proportional canvas padding.
     pub padding: bool,
@@ -1046,10 +1046,12 @@ impl SceneAutomatic {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Beautification {
-    /// Padding around the image, in logical points.
+    /// Outer spacing between the screenshot surface and Scene canvas.
     pub padding: f64,
     /// Optional per-edge canvas padding, for asymmetric expansion.
     pub canvas_padding: Option<CanvasInsets>,
+    /// Space added to the screenshot surface itself using its matched edge colour.
+    pub inner_padding: f64,
     /// Non-destructive source-space trim.
     pub inset: SourceInsets,
     /// Corner radius applied to the image.
@@ -1086,6 +1088,7 @@ impl Default for Beautification {
         Self {
             padding: 0.0,
             canvas_padding: None,
+            inner_padding: 0.0,
             inset: SourceInsets::uniform(0.0),
             corner_radius: 0.0,
             shadow: 0.0,
@@ -1117,6 +1120,7 @@ impl Beautification {
         Self {
             padding,
             canvas_padding: None,
+            inner_padding: 0.0,
             inset: SourceInsets::uniform(0.0),
             corner_radius: 0.0,
             shadow: 0.0,
@@ -1141,6 +1145,7 @@ impl Beautification {
             BeautificationPreset::Clean => Self {
                 padding: 40.0,
                 canvas_padding: None,
+                inner_padding: 0.0,
                 inset: SourceInsets::uniform(0.0),
                 corner_radius: 16.0,
                 shadow: 18.0,
@@ -1159,6 +1164,7 @@ impl Beautification {
             BeautificationPreset::Social => Self {
                 padding: 64.0,
                 canvas_padding: None,
+                inner_padding: 0.0,
                 inset: SourceInsets::uniform(0.0),
                 corner_radius: 20.0,
                 shadow: 24.0,
@@ -1177,6 +1183,7 @@ impl Beautification {
             BeautificationPreset::Story => Self {
                 padding: 72.0,
                 canvas_padding: None,
+                inner_padding: 0.0,
                 inset: SourceInsets::uniform(0.0),
                 corner_radius: 24.0,
                 shadow: 28.0,
@@ -1195,6 +1202,7 @@ impl Beautification {
             BeautificationPreset::Editorial => Self {
                 padding: 56.0,
                 canvas_padding: None,
+                inner_padding: 0.0,
                 inset: SourceInsets::uniform(0.0),
                 corner_radius: 10.0,
                 shadow: 14.0,
@@ -1227,6 +1235,7 @@ impl Beautification {
     #[must_use]
     pub fn is_noop(&self) -> bool {
         self.resolved_padding().is_zero()
+            && self.inner_padding <= 0.0
             && self.corner_radius <= 0.0
             && self.shadow <= 0.0
             && self.background == Background::Transparent
@@ -1249,6 +1258,7 @@ impl Beautification {
     pub fn validate(&self) -> Result<()> {
         for (name, value) in [
             ("padding", self.padding),
+            ("inner padding", self.inner_padding),
             ("left inset", self.inset.left),
             ("top inset", self.inset.top),
             ("right inset", self.inset.right),
@@ -1375,8 +1385,8 @@ impl Beautification {
         let content_width = (content.width - self.inset.left - self.inset.right).max(1.0);
         let content_height = (content.height - self.inset.top - self.inset.bottom).max(1.0);
         let padding = self.resolved_padding();
-        let base_width = content_width + padding.left + padding.right;
-        let base_height = content_height + padding.top + padding.bottom;
+        let base_width = content_width + self.inner_padding * 2.0 + padding.left + padding.right;
+        let base_height = content_height + self.inner_padding * 2.0 + padding.top + padding.bottom;
         let Some(ratio) = self.aspect.ratio() else {
             return LogicalSize::new(base_width, base_height);
         };
@@ -1400,8 +1410,8 @@ impl Beautification {
         let content_height = (content.height - self.inset.top - self.inset.bottom).max(1.0);
         let padding = self.resolved_padding();
         let minimum = LogicalSize::new(
-            content_width + padding.left + padding.right,
-            content_height + padding.top + padding.bottom,
+            content_width + self.inner_padding * 2.0 + padding.left + padding.right,
+            content_height + self.inner_padding * 2.0 + padding.top + padding.bottom,
         );
         let ratio = exact.ratio();
         let requested_width = f64::from(exact.width) / source_scale;
@@ -2341,14 +2351,12 @@ impl Document {
 
     /// Applies or removes the nondestructive Scene around the source pixels.
     ///
-    /// A Scene has two independent spacings, and this is where the inner one is
-    /// made safe. [`Beautification::inset`] is the *content* inset: the margin
-    /// the capture already carries around its own subject, held back so the
-    /// subject sits centred inside the Scene rather than adrift in whatever
-    /// dead space the screenshot happened to include.
-    /// [`Beautification::padding`] is the outer one, between that subject and
-    /// the Scene background. Neither destroys anything: the complete source
-    /// stays in the document, and clearing the inset restores it exactly.
+    /// A Scene has two independent additive spacings:
+    /// [`Beautification::inner_padding`] expands the screenshot surface with a
+    /// matched edge colour, while [`Beautification::padding`] adds the selected
+    /// Scene background outside it. Legacy [`Beautification::inset`] remains a
+    /// non-destructive source trim for documents authored before the two additive
+    /// controls were separated.
     ///
     /// The inset is clamped to [`SourceInsets::MAX_EDGE_FRACTION`] of the
     /// content on each axis rather than rejected, so a preset authored against
@@ -2366,8 +2374,8 @@ impl Document {
     fn validate_provenance(beautification: &Beautification, source: &Capture) -> Result<()> {
         if source.provenance.forbids_compositing() && !beautification.preserves_subject_pixels() {
             return Err(Error::InvalidRequest(
-                "window Smart Frame may add only an outer canvas; inset, corners, shadow, and border \
-                 are disabled to preserve native pixels (decision D9)"
+                "window Smart Frame may add only source-preserving outer or inner padding; inset, \
+                 corners, shadow, and border are disabled to preserve native pixels (decision D9)"
                     .to_owned(),
             ));
         }
