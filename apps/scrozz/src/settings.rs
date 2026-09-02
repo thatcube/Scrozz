@@ -998,6 +998,12 @@ pub const SETTINGS: &[Setting] = &[
         description: "Default destination behavior of the Recent Captures Save button.",
     },
     Setting {
+        key: "hotkey.capture-history",
+        kind: Kind::Accelerator,
+        default: ShortcutAction::OpenHistory.default_accelerator_setting(),
+        description: "Uses this shortcut to open Capture History.",
+    },
+    Setting {
         key: "hotkey.capture-all-in-one",
         kind: Kind::Accelerator,
         default: ShortcutAction::CaptureAllInOne.default_accelerator_setting(),

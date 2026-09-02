@@ -3403,7 +3403,7 @@ impl EditorState {
                 {
                     analysis.inset_explanation
                 } else {
-                    "Inner inset is fixed for this Scene".to_owned()
+                    "Full screenshot preserved; padding extends the Scene canvas".to_owned()
                 };
                 let restyle = |mut scene: Beautification| {
                     if let Background::Automatic(background) = scene.background {
@@ -3437,7 +3437,7 @@ impl EditorState {
             Err(error) if error.to_lowercase().contains("cancel") => {}
             Err(error) => {
                 draft.inset_explanation =
-                    "Inset left at zero because analysis did not complete".to_owned();
+                    "Full screenshot preserved because analysis did not complete".to_owned();
                 tracing::warn!(%error, "smart frame analysis failed");
             }
         }
@@ -3499,7 +3499,7 @@ impl EditorState {
     fn scene_analysis_data(&self) -> DocumentData {
         let mut data = self.document.data();
         data.beautification = self.document.scene().and_then(|scene| {
-            (!scene.automatic.inset).then(|| Beautification {
+            (!scene.automatic.inset && !scene.inset.is_zero()).then(|| Beautification {
                 inset: scene.inset,
                 automatic: scrozz_annotate::SceneAutomatic::default(),
                 ..Beautification::default()

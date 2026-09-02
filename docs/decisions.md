@@ -1405,15 +1405,13 @@ of its own; the Crop bar's transaction controls are named *Cancel Crop* and
 mean different things. Done commits any open Scene draft as part of finishing
 the session, which is why the inspector needs no Apply.
 
-**Two spacings.** A Scene has an *inner content inset* — how much of the
-capture's own outer margin is held back so its content sits centred — and an
-*outer padding* between that content and the Scene background. Both are
-non-destructive, per-property Automatic, undoable, serialised, and preset-
-compatible; both render identically in preview and export because both go
-through the same renderer. Automatic inner inset is deliberately timid: uniform
-or transparent edges only, never more than a quarter of an axis, nothing below
-its confidence floor, and the complete source as the fallback. A window capture
-never takes one at all (D9). See `docs/scene.md`.
+**Additive inner padding.** A Scene's user-facing spacing grows the background
+canvas around the complete screenshot. It is per-property Automatic, undoable,
+serialised, preset-compatible, and identical in preview and export because both
+go through the same renderer. The old source-margin inset remains readable for
+document compatibility, but automatic analysis and newly applied presets
+preserve the full source instead of subtracting pixels under a control named
+padding. See `docs/scene.md`.
 
 **Semantic tokens, not hardcoded surfaces.** `theme::apply_style` now resolves
 egui's five widget states from the palette, and starts from the appearance's own

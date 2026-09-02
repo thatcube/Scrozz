@@ -46,7 +46,7 @@ const NORMALIZED_MAX: u16 = 10_000;
 const FOREGROUND_DISTANCE: u32 = 24;
 const UNIFORM_DISTANCE: u32 = 8;
 
-/// The confidence an automatic inner inset must reach before it is applied.
+/// The confidence a legacy automatic margin trim must reach before it is applied.
 ///
 /// Below this the detector says nothing rather than guessing: the complete
 /// source is always a correct framing, an over-crop never is.
@@ -548,10 +548,15 @@ impl SmartFramePresetSettings {
                 tint: *tint,
             },
         };
+        let mut automatic = self.automatic;
+        automatic.inset = false;
         Beautification {
             padding: self.padding,
             canvas_padding: self.canvas_padding,
-            inset: self.inset,
+            // Source trimming was previously presented as "Inner" padding.
+            // Keep reading the field for wire compatibility, but never carry it
+            // into a newly applied Scene: padding only expands the canvas.
+            inset: SourceInsets::default(),
             corner_radius: self.corner_radius,
             shadow: self.shadow,
             background,
@@ -563,7 +568,7 @@ impl SmartFramePresetSettings {
             border_color: self.border_color,
             watermark: self.watermark.clone(),
             smart_frame: None,
-            automatic: self.automatic,
+            automatic,
             extensions: self.extensions.clone(),
         }
     }
@@ -672,7 +677,10 @@ pub fn analyze_with_style(
     style: GeneratedStyle,
     cancellation: &AnalysisCancellation,
 ) -> Result<SmartFrameAnalysis> {
-    analyze_with_style_impl(frame, provenance, style, true, cancellation)
+    // Scene padding expands the canvas around the complete screenshot. Older
+    // documents may still carry an explicit source inset, but new automatic
+    // analysis must never subtract pixels under a control called padding.
+    analyze_with_style_impl(frame, provenance, style, false, cancellation)
 }
 
 /// Analyses content that has already had a user-fixed inner inset applied.
@@ -729,10 +737,9 @@ fn analyze_with_style_impl(
     cancellation.check()?;
 
     let edge = edge_reference(&image, cancellation)?;
-    // The inner inset: how much of the capture's own outer margin to hold back
-    // so the meaningful content sits centred inside the Scene. D9 makes this
-    // unconditional for a window — its silhouette, transparent corners and
-    // shadow are the OS's pixels, and nothing here may trim them.
+    // Legacy source-margin trim. New automatic Scenes pass
+    // `detect_automatic_inset = false` so the complete screenshot is preserved
+    // and all user-facing padding expands the background canvas instead.
     let inset = if provenance == Provenance::Window {
         InsetAnalysis {
             inset: SourceInsets::default(),

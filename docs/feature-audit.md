@@ -496,6 +496,18 @@ The Shortcuts tab shows CleanShot binds *composite actions*, not just modes:
 > free — and on wlroots Linux, where no `GlobalShortcuts` portal exists, this is
 > literally the only mechanism available.
 
+The current Scrozz shortcut surface is intentionally tracked in three tiers:
+
+| Tier | Actions |
+|---|---|
+| **Configurable now** | Capture History, All-in-One, Capture Area, Capture Window, Capture Fullscreen, Capture All Displays, Scrolling Capture, Record Screen toggle |
+| **Underlying behavior exists; shortcut route remains** | Capture Previous Area, Self-Timer, Area → Copy/Save/Upload/Annotate/Pin, separate recording Start/Stop, recording Pause/Resume, OCR with preserved/collapsed line breaks, Restore Last Capture, Close All Pins |
+| **Feature must land first** | desktop-icon toggle, direct GIF recording, recording restart/camera fullscreen, Recent Captures hide/save/close-all product actions, pin-file/visibility/pin-last actions, annotation object/file/print/import commands, Background/Spotlight/Filled Rectangle tools, and advanced video cut/split/timeline/fullscreen/upload/frame-export navigation |
+
+Do not fill the Settings pane with inert rows. Add a shortcut when the action has
+one truthful end-to-end route, then expose the same stable action id to native
+global registration and compositor-generated CLI bindings.
+
 ### The Background/beautify panel in detail
 
 Far richer than the features page implies
@@ -506,7 +518,8 @@ Far richer than the features page implies
 - **Wallpapers** — your actual desktop wallpaper, plus custom images
 - **Blurred** — blurred wallpaper, blurred white, blurred grey
 - **Plain colour** — 18 swatches, custom picker, transparent
-- **Padding**, **Inset**, **Shadow**, **Corners** — independent sliders
+- **Inner padding**, **Shadow**, **Corners** — padding grows the background
+  canvas; it never trims the screenshot
 - **Auto-balance** toggle
 - **Alignment** — 3×3 grid
 - **Ratio** — aspect presets for social

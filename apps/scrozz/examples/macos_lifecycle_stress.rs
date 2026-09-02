@@ -60,12 +60,26 @@ fn main() -> eframe::Result {
                 native
                     .apply(&OverlayBehavior::capture_card())
                     .expect("apply tiny card behavior");
+                assert!(
+                    !native
+                        .diagnostics()
+                        .expect("input diagnostics")
+                        .ignores_mouse_events,
+                    "a visible capture-card root must never remain click-through"
+                );
                 native.set_visible(false).expect("order tiny root out");
+                native
+                    .apply(&OverlayBehavior::capture_card())
+                    .expect("restore card input before reveal");
                 native.set_visible(true).expect("reuse tiny root");
+                let diagnostics = native.diagnostics().expect("root diagnostics");
                 assert_eq!(
-                    native.diagnostics().expect("root diagnostics").class_name,
-                    self.native_class,
+                    diagnostics.class_name, self.native_class,
                     "native class changed during lifecycle stress"
+                );
+                assert!(
+                    !diagnostics.ignores_mouse_events,
+                    "a revealed capture-card root must accept input"
                 );
             }
 

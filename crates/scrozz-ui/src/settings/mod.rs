@@ -650,14 +650,20 @@ fn request_foreground(ctx: &egui::Context, requested: bool) {
 /// Stable shortcut data used by platform golden renders.
 #[must_use]
 pub fn preview_shortcuts(platform: SettingsPlatform) -> Vec<ShortcutRow> {
+    let history = match platform {
+        SettingsPlatform::MacOs => "⌃⇧⌘H",
+        SettingsPlatform::Windows => "Win + Shift + H",
+        SettingsPlatform::Linux => "Super + Shift + H",
+    };
     let symbols = match platform {
-        SettingsPlatform::MacOs => ["⇧⌘0", "⇧⌘8", "⇧⌘9", "⇧⌘7", "⌃⇧⌘7"],
+        SettingsPlatform::MacOs => ["⇧⌘0", "⇧⌘8", "⇧⌘9", "⇧⌘7", "⌃⇧⌘7", "⌃⇧⌘8"],
         SettingsPlatform::Windows => [
             "Win + Shift + 2",
             "Win + Shift + 4",
             "Win + Shift + 5",
             "Win + Shift + 3",
             "Win + Ctrl + Shift + 3",
+            "Win + Shift + 0",
         ],
         SettingsPlatform::Linux => [
             "Super + Shift + 2",
@@ -665,9 +671,11 @@ pub fn preview_shortcuts(platform: SettingsPlatform) -> Vec<ShortcutRow> {
             "Super + Shift + 5",
             "Super + Shift + 3",
             "Super + Ctrl + Shift + 3",
+            "Super + Shift + 0",
         ],
     };
     [
+        ("history.open", "Capture History", history, true),
         ("capture.all-in-one", "All-in-One", symbols[0], true),
         ("capture.region", "Capture Region", symbols[1], true),
         ("capture.window", "Capture Window", symbols[2], true),
@@ -678,6 +686,7 @@ pub fn preview_shortcuts(platform: SettingsPlatform) -> Vec<ShortcutRow> {
             symbols[4],
             true,
         ),
+        ("capture.scrolling", "Scrolling Capture", symbols[5], true),
         ("record.toggle", "Start / Stop Recording", "", false),
     ]
     .into_iter()
@@ -1329,32 +1338,48 @@ fn draw_shortcuts(
         "Click a shortcut to record a new combination."
     };
     let all_default = rows.iter().all(|row| row.is_default);
-    let split = rows
+    let screenshot_start = rows
+        .iter()
+        .position(|row| row.id.starts_with("capture."))
+        .unwrap_or(rows.len());
+    let recording_start = rows
         .iter()
         .position(|row| row.id.starts_with("record."))
         .unwrap_or(rows.len());
 
     kit::page(ui, theme, "Shortcuts", Some(subtitle), |ui| {
-        if split > 0 {
+        if screenshot_start > 0 {
+            draw_shortcut_group(
+                ui,
+                theme,
+                icons,
+                "General",
+                Icon::History,
+                &rows[..screenshot_start],
+                recording,
+                &mut edits,
+            );
+        }
+        if screenshot_start < recording_start {
             draw_shortcut_group(
                 ui,
                 theme,
                 icons,
                 "Screenshots",
                 Icon::Viewfinder,
-                &rows[..split],
+                &rows[screenshot_start..recording_start],
                 recording,
                 &mut edits,
             );
         }
-        if split < rows.len() {
+        if recording_start < rows.len() {
             draw_shortcut_group(
                 ui,
                 theme,
                 icons,
                 "Recording",
                 Icon::Video,
-                &rows[split..],
+                &rows[recording_start..],
                 recording,
                 &mut edits,
             );

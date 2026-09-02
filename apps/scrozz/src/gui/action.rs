@@ -221,7 +221,7 @@ impl Action {
             Self::Capture(CaptureKind::AllDisplays) => "scrozz capture --all-displays",
             Self::Capture(CaptureKind::Scrolling) => "scrozz capture --scrolling",
             Self::ToggleRecording => "scrozz record --toggle",
-            Self::OpenHistory => "scrozz history list",
+            Self::OpenHistory => "scrozz history show",
             Self::OpenSettings => "scrozz settings show",
             // This must execute in the live GUI process. Pretending a second
             // `scrozz gui` invocation unlocks pins would create a false escape.
@@ -259,9 +259,8 @@ impl Action {
 
     /// The bindable action this is, if a global shortcut can trigger it.
     ///
-    /// `None` for quit, settings and history: they are one click away in the
-    /// tray, and a system-wide key grab is a scarce resource taken from every
-    /// other application on the machine.
+    /// `None` for quit, Settings and the pin escape. Capture History remains
+    /// bindable because restoring recent work is part of the capture workflow.
     #[must_use]
     pub fn shortcut(self) -> Option<ShortcutAction> {
         ShortcutAction::from_id(self.id())
@@ -278,6 +277,7 @@ impl ShortcutAction {
     #[must_use]
     pub const fn action(self) -> Action {
         match self {
+            Self::OpenHistory => Action::OpenHistory,
             Self::CaptureAllInOne => Action::Capture(CaptureKind::AllInOne),
             Self::CaptureRegion => Action::Capture(CaptureKind::Region),
             Self::CaptureWindow => Action::Capture(CaptureKind::Window),
@@ -292,6 +292,7 @@ impl ShortcutAction {
     #[must_use]
     pub const fn tray(self) -> TrayAction {
         match self {
+            Self::OpenHistory => TrayAction::OpenHistory,
             Self::CaptureAllInOne => TrayAction::CaptureAllInOne,
             Self::CaptureRegion => TrayAction::CaptureRegion,
             Self::CaptureWindow => TrayAction::CaptureWindow,
@@ -408,7 +409,7 @@ mod tests {
             let bindable = action.shortcut().is_some();
             let expected = !matches!(
                 action,
-                Action::Quit | Action::OpenSettings | Action::OpenHistory | Action::UnlockPins
+                Action::Quit | Action::OpenSettings | Action::UnlockPins
             );
             assert_eq!(
                 bindable, expected,
@@ -418,13 +419,16 @@ mod tests {
     }
 
     #[test]
-    fn capture_history_is_available_from_the_tray_without_a_global_shortcut() {
+    fn capture_history_is_available_from_both_tray_and_global_shortcuts() {
         assert!(Action::OpenHistory.is_available(
             SelectionCapabilities::NONE,
             &Session::detect(),
             false,
         ));
-        assert!(Action::OpenHistory.shortcut().is_none());
+        assert_eq!(
+            Action::OpenHistory.shortcut(),
+            Some(ShortcutAction::OpenHistory)
+        );
     }
 
     #[test]

@@ -316,6 +316,16 @@ impl ScrollingTarget {
         matches!(self.context, ScrollingContext::Native { .. })
     }
 
+    /// Whether synthetic scrolling needs the compact Recent Captures root to
+    /// ignore pointer input.
+    ///
+    /// macOS posts wheel events directly to the selected process after
+    /// revalidating its window identity, so making visible HUD/cards
+    /// click-through there is both unnecessary and actively harmful.
+    pub(crate) fn requires_overlay_passthrough(&self) -> bool {
+        self.may_synthesize_scroll() && !cfg!(target_os = "macos")
+    }
+
     pub(crate) fn refresh(self, backend: &dyn CaptureBackend) -> CliResult<Self> {
         if matches!(&self.context, ScrollingContext::ManualPortal) {
             return Ok(self);

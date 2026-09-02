@@ -21,7 +21,7 @@ use super::paint::CanvasView;
 use super::state::{Command, CropAspect, EditorState, Intent, Tool};
 use scrozz_annotate::{
     Alignment, AspectPreset, Background, Beautification, BeautificationPreset, BuiltInBackground,
-    ExactOutputSize, GeneratedStyle, SourceInsets,
+    ExactOutputSize, GeneratedStyle,
 };
 
 /// The height of one row of controls, in points.
@@ -2202,11 +2202,7 @@ const fn built_in_name(background: BuiltInBackground) -> &'static str {
     }
 }
 
-/// The two spacings, and the subject's own treatment.
-///
-/// *Inner* is the capture's own margin, held back so its content sits centred
-/// inside the Scene. *Outer* is the space between that content and the Scene
-/// background. They are different distances and they get different rows.
+/// Additive canvas spacing and the subject's own treatment.
 fn frame_section(
     ui: &mut Ui,
     state: &mut EditorState,
@@ -2216,10 +2212,6 @@ fn frame_section(
     let mut config = state.document().scene().cloned().unwrap_or_default();
     let before = config.clone();
     let stylable = state.document().may_style_subject();
-    let content = state.document().content_size();
-    let inset_limit = SourceInsets::limit_for(content.width)
-        .min(SourceInsets::limit_for(content.height))
-        .max(1.0);
     // Set when a property is handed *back* to Automatic, which is the one
     // inspector edit that needs the capture looked at again rather than just
     // stored.
@@ -2227,57 +2219,32 @@ fn frame_section(
 
     label_row(ui, palette, "Frame", "", false);
 
-    if stylable {
-        // One slider for four edges. An automatic inset can be asymmetric —
-        // the detector measures each edge on its own — and touching this
-        // control replaces it with a uniform one, which is exactly what fixing
-        // a value by hand means everywhere else in this panel.
-        let mut inner = config.inset.largest();
-        let row = metric_row(
-            ui,
-            palette,
-            "Inner",
-            &mut inner,
-            0.0..=inset_limit,
-            config.automatic.inset,
-            true,
-        );
-        if row.changed {
-            config.inset = SourceInsets::uniform(inner);
-        }
-        if let Some(automatic) = row.automatic {
-            config.automatic.inset = automatic;
-            resolve_again |= automatic;
-        }
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "Holds back the capture's own outer margin. Nothing is discarded.",
-                )
-                .small()
-                .color(palette.text_muted),
-            )
-            .selectable(false),
-        );
-    }
-
     let mut padding = config.padding;
     let row = metric_row(
         ui,
         palette,
-        "Outer",
+        "Inner Padding",
         &mut padding,
         0.0..=220.0,
         config.automatic.padding,
         true,
     );
     if row.changed {
-        config.set_uniform_padding(padding);
+        resolve_again |= set_inner_padding(&mut config, padding);
     }
     if let Some(automatic) = row.automatic {
-        config.automatic.padding = automatic;
-        resolve_again |= automatic;
+        resolve_again |= set_inner_padding_automatic(&mut config, automatic);
     }
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Adds Scene background around the full screenshot; no screenshot pixels are removed.",
+            )
+            .small()
+            .color(palette.text_muted),
+        )
+        .selectable(false),
+    );
 
     if stylable {
         let mut corners = config.corner_radius;
@@ -2349,6 +2316,27 @@ fn frame_section(
             edit
         };
     }
+}
+
+fn set_inner_padding(config: &mut Beautification, padding: f64) -> bool {
+    let removed_legacy_inset = !config.inset.is_zero();
+    config.set_uniform_padding(padding);
+    config.inset = Default::default();
+    config.automatic.inset = false;
+    if removed_legacy_inset {
+        config.smart_frame = None;
+    }
+    removed_legacy_inset && config.automatic.placement
+}
+
+fn set_inner_padding_automatic(config: &mut Beautification, automatic: bool) -> bool {
+    config.automatic.padding = automatic;
+    if !automatic {
+        return false;
+    }
+    let padding = config.padding;
+    let _ = set_inner_padding(config, padding);
+    true
 }
 
 /// Everything that is a deliberate choice rather than a first impression.
@@ -3015,4 +3003,43 @@ fn pill_button(
             .corner_radius(corner(Radius::CHIP))
             .min_size(vec2(0.0, PANEL_ROW_H)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_inner_padding_retires_legacy_trim_and_stale_focus() {
+        let mut scene = Beautification {
+            inset: scrozz_annotate::SourceInsets::uniform(12.0),
+            smart_frame: Some(Default::default()),
+            ..Beautification::default()
+        };
+
+        assert!(set_inner_padding(&mut scene, 48.0));
+        assert_eq!(scene.padding, 48.0);
+        assert!(scene.inset.is_zero());
+        assert!(!scene.automatic.inset);
+        assert!(
+            scene.smart_frame.is_none(),
+            "focus normalized against the old inset must be recomputed"
+        );
+    }
+
+    #[test]
+    fn automatic_inner_padding_also_retires_legacy_trim_and_stale_focus() {
+        let mut scene = Beautification {
+            inset: scrozz_annotate::SourceInsets::uniform(12.0),
+            smart_frame: Some(Default::default()),
+            ..Beautification::default()
+        };
+        scene.automatic.padding = false;
+
+        assert!(set_inner_padding_automatic(&mut scene, true));
+        assert!(scene.automatic.padding);
+        assert!(scene.inset.is_zero());
+        assert!(!scene.automatic.inset);
+        assert!(scene.smart_frame.is_none());
+    }
 }

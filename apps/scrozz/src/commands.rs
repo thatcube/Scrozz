@@ -1700,12 +1700,20 @@ fn is_wayland_environment(
 // ---------------------------------------------------------------------------
 
 fn history(command: &HistoryCommand) -> CliResult<Report> {
+    if matches!(command, HistoryCommand::Show) {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "Capture History requires the running Scrozz app".to_owned(),
+        )));
+    }
     let mut store = platform::store()?;
     history_with_store(&mut store, command)
 }
 
 fn history_with_store(store: &mut SqliteStore, command: &HistoryCommand) -> CliResult<Report> {
     match command {
+        HistoryCommand::Show => Err(CliError::Core(CoreError::InvalidRequest(
+            "Capture History requires the running Scrozz app".to_owned(),
+        ))),
         HistoryCommand::List {
             limit,
             offset,

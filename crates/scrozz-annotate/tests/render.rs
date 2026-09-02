@@ -773,6 +773,27 @@ fn the_inner_inset_holds_back_the_capture_s_own_margin() {
 }
 
 #[test]
+fn scene_inner_padding_expands_the_background_without_shrinking_the_screenshot() {
+    let source = frame_with(20, 10, 1.0, |_, _| [220, 40, 60, 255]);
+    let mut doc = Document::new(capture_with(source, Provenance::Region));
+    doc.set_scene(Some(Beautification {
+        padding: 5.0,
+        background: Background::Solid(Color::rgb(0, 200, 0)),
+        ..Beautification::default()
+    }))
+    .unwrap();
+
+    let out = SkiaRenderer::new().render(&doc).unwrap();
+    assert_eq!((out.width(), out.height()), (30, 20));
+    assert!(near(pixel(&out, 1, 1), [0, 200, 0, 255], 2));
+    assert!(
+        near(pixel(&out, 5, 5), [220, 40, 60, 255], 2),
+        "the screenshot starts after additive padding at its original size"
+    );
+    assert!(near(pixel(&out, 24, 14), [220, 40, 60, 255], 2));
+}
+
+#[test]
 fn preview_and_export_apply_the_same_inner_inset() {
     // The editor previews through `render_to_width_with_layout` and exports
     // through `render`. If those ever disagreed about the inset, what the user

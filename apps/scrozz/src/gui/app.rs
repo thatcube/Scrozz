@@ -2156,6 +2156,16 @@ impl App {
             let needs_live_pin_state = parsed.as_ref().is_some_and(|command| {
                 forwarded_unpin(command).is_some() || forwarded_unlock_pins(command)
             });
+            let opens_history = parsed.as_ref().is_some_and(forwarded_open_history);
+
+            if opens_history {
+                self.perform(Action::OpenHistory);
+                request.answer(&Ok(Report::new(
+                    Json::obj([("state", Json::str("open"))]),
+                    "Capture History opened.".to_owned(),
+                )));
+                continue;
+            }
 
             // A recording belongs to this process, so a forwarded `record`
             // cannot be run on the worker like an ordinary command: it has to
@@ -4732,7 +4742,7 @@ impl App {
 
         let card = self.pipeline.allocate();
         self.scrolling_card = Some(card);
-        let needs_passthrough = target.may_synthesize_scroll();
+        let needs_passthrough = target.requires_overlay_passthrough();
         self.set_scroll_hud(ScrollHudState::prepared(axis, needs_passthrough));
         self.surface.request_scroll_passthrough(needs_passthrough);
         self.scrolling_start_pending = Some(PendingScrollingStart {
@@ -8231,6 +8241,13 @@ fn forwarded_unlock_pins(command: &crate::cli::Command) -> bool {
         return false;
     };
     matches!(&history.command, crate::cli::HistoryCommand::UnlockPins)
+}
+
+fn forwarded_open_history(command: &crate::cli::Command) -> bool {
+    let crate::cli::Command::History(history) = command else {
+        return false;
+    };
+    matches!(&history.command, crate::cli::HistoryCommand::Show)
 }
 
 impl Drop for App {
@@ -12645,6 +12662,21 @@ mod tests {
     }
 
     #[test]
+    fn history_show_is_routed_to_the_running_viewport() {
+        let show = Cli::try_parse_from(["scrozz", "history", "show"])
+            .expect("valid history show")
+            .command
+            .expect("command");
+        assert!(forwarded_open_history(&show));
+
+        let list = Cli::try_parse_from(["scrozz", "history", "list"])
+            .expect("valid history list")
+            .command
+            .expect("command");
+        assert!(!forwarded_open_history(&list));
+    }
+
+    #[test]
     fn pin_settlements_require_the_current_identity_generation() {
         let (mut app, _) = app();
         let capture = CaptureId("same-capture".into());
@@ -13372,12 +13404,21 @@ mod tests {
     }
 
     #[test]
-    fn automatic_scrolling_waits_for_an_acknowledged_click_through() {
+    fn automatic_scrolling_waits_only_where_overlay_passthrough_is_required() {
         let (mut app, surface) = scrolling_app();
         surface.set_scroll_passthrough_ready(false);
         app.perform(Action::Capture(CaptureKind::Scrolling));
 
         app.start_scrolling_capture(ScrollAxis::Vertical);
+        if cfg!(target_os = "macos") {
+            assert!(
+                !surface.scroll_passthrough_requested(),
+                "macOS posts to the selected process and must keep its visible HUD interactive"
+            );
+            app.drain_scrolling_start();
+            assert!(app.scrolling_start_pending.is_none());
+            return;
+        }
         assert!(surface.scroll_passthrough_requested());
         assert!(
             app.scrolling_start_pending.is_some(),
@@ -13467,7 +13508,10 @@ mod tests {
         let (mut app, surface) = scrolling_app();
         app.perform(Action::Capture(CaptureKind::Scrolling));
         app.start_scrolling_capture(ScrollAxis::Vertical);
-        assert!(surface.scroll_passthrough_requested());
+        assert_eq!(
+            surface.scroll_passthrough_requested(),
+            !cfg!(target_os = "macos")
+        );
 
         app.shut_down();
 

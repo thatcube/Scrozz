@@ -10,8 +10,8 @@ same renderer; export flattens a copy and never consumes the retained document.
   source composition.
 - **Clear canvas** is different: Scene remains editable, but its canvas is
   transparent.
-- Scene owns background, the inner content inset, asymmetric canvas padding,
-  placement, subject corners and shadow, aspect ratio, and minimum output size.
+- Scene owns background, additive inner padding, placement, subject corners and
+  shadow, aspect ratio, and minimum output size.
 - Aspect ratio starts at **Original** and is always an explicit choice.
 - Ratio and output size only grow the canvas. They never crop, stretch, or
   force the source into a smaller frame.
@@ -20,41 +20,22 @@ same renderer; export flattens a copy and never consumes the retained document.
 - Asymmetric canvas padding is the shared model for scrolling captures and
   future outward Crop expansion.
 
-## The two spacings
+## Inner padding
 
-Scene has an inner spacing and an outer one, and they are different distances
-doing different jobs.
+**Inner padding adds canvas around the complete screenshot.** The new pixels use
+the Scene background — including a capture-derived Automatic background — while
+the screenshot remains full-size and untouched. Increasing padding therefore
+always grows the output dimensions; it never subtracts source pixels.
 
-**Inner content inset** is how much of the capture's *own* outer margin Scene
-holds back, so that what the screenshot is actually of ends up centred in the
-Scene rather than adrift in whatever dead space the capture happened to
-include. It is expressed per edge in source logical points and is
-nondestructive: the complete source stays in the document, the inset is stored
-as a number beside it, and clearing the inset restores every pixel. Preview and
-export apply it through the same renderer, so what is approved is what leaves
-the app.
-
-**Outer Scene padding** is the space between that content and the Scene
-background. It is the outer canvas, and it is what a background, an aspect
-preset, or a minimum output size grows.
-
-The inner inset can be Automatic or fixed, exactly like every other Scene
-property. Automatic resolves it from the capture during analysis, and the
-detector is deliberately timid: it takes an edge only when that edge is
-transparent or highly uniform, never more than a quarter of an axis, and never
-at all below its confidence floor. Anything less than clear evidence resolves
-to zero, because the complete source is always a correct framing and an
-over-crop never is. A fixed inset is bounded to the same quarter-axis envelope,
-so a preset authored against a much larger capture degrades to the nearest safe
-framing instead of refusing to open.
-
-Window captures never take an inner inset at all — see *Native window
-appearance*.
+Older documents may contain the former source-margin `inset` field. It remains
+readable so those documents render as authored, but new automatic analysis does
+not create one, the editor does not present it as padding, and applying a preset
+migrates it to the full-source contract.
 
 ## Automatic properties
 
-Background, inner inset, padding, placement, corners, shadow, and output size
-can each remain Automatic or become fixed. The editor shows the resolved value. Editing that
+Background, padding, placement, corners, shadow, and output size can each remain
+Automatic or become fixed. The editor shows the resolved value. Editing that
 value fixes only that property. **Reset to Automatic** restores the immutable
 built-in Automatic Scene.
 

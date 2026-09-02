@@ -944,7 +944,7 @@ pub enum BeautificationPreset {
 pub enum SceneProperty {
     /// Capture-derived or curated background.
     Background,
-    /// Inner content inset around the meaningful part of the capture.
+    /// Legacy source-margin trim retained for existing documents.
     Inset,
     /// Canvas padding.
     Padding,
@@ -964,11 +964,11 @@ pub enum SceneProperty {
 pub struct SceneAutomatic {
     /// Resolve the background from capture colours.
     pub background: bool,
-    /// Resolve the inner content inset from the capture's own margins.
+    /// Resolve a legacy source-margin trim.
     ///
-    /// Absent from a sidecar or preset written before the inner inset existed,
-    /// where `serde`'s `false` is exactly right: those Scenes were authored
-    /// against a fixed, zero inset and must keep rendering that way.
+    /// New Scenes leave this false: user-facing inner padding grows the canvas
+    /// and never subtracts screenshot pixels. The field remains readable so
+    /// existing documents keep their historical non-destructive framing.
     pub inset: bool,
     /// Resolve proportional canvas padding.
     pub padding: bool,
@@ -988,7 +988,7 @@ impl SceneAutomatic {
     pub const fn ordinary() -> Self {
         Self {
             background: true,
-            inset: true,
+            inset: false,
             padding: true,
             placement: true,
             corners: true,

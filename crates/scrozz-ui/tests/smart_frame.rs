@@ -367,8 +367,8 @@ fn automatic_analysis_keeps_a_fixed_inset_in_its_subject_snapshot() {
         panic!("expected analysis intent");
     };
     assert!(
-        data.beautification.is_some(),
-        "fixedness is independent of whether the fixed inset happens to be zero"
+        data.beautification.is_none(),
+        "a zero legacy inset has no framing to carry into analysis"
     );
 }
 
@@ -777,13 +777,12 @@ fn revert_framing_is_undoable() {
 }
 
 // ---------------------------------------------------------------------------
-// The inner content inset
+// Additive Scene padding and legacy source insets
 // ---------------------------------------------------------------------------
 //
-// Two spacings, not one. `inset` holds back the capture's own outer margin so
-// the content inside it sits centred in the Scene; `padding` is the space
-// between that content and the Scene background. Both are non-destructive:
-// the complete source stays in the document either way.
+// New user-facing padding expands the Scene background around the complete
+// screenshot. `inset` remains readable for historical documents but is no
+// longer produced by automatic Scene analysis or exposed as padding.
 
 #[test]
 fn inner_inset_and_outer_padding_are_independent_and_both_reversible() {
@@ -886,7 +885,7 @@ fn a_native_window_never_takes_an_inner_inset() {
 }
 
 #[test]
-fn the_inner_inset_round_trips_through_a_preset() {
+fn a_legacy_inner_inset_does_not_propagate_into_a_newly_applied_preset() {
     let mut state = EditorState::new(document(Provenance::Region));
     let _ = state.begin_scene();
     let mut scene = state.document().scene().cloned().unwrap();
@@ -900,44 +899,48 @@ fn the_inner_inset_round_trips_through_a_preset() {
 
     let settings =
         SmartFramePresetSettings::from_beautification(state.document().scene().unwrap()).unwrap();
-    assert_eq!(settings.inset, scene.inset);
+    assert_eq!(settings.inset, scene.inset, "legacy data remains readable");
 
     let json = serde_json::to_string(&settings).unwrap();
     let back: SmartFramePresetSettings = serde_json::from_str(&json).unwrap();
     assert_eq!(back.inset, scene.inset);
-    assert_eq!(back.to_beautification().inset, scene.inset);
+    assert!(back.to_beautification().inset.is_zero());
+    assert!(!back.to_beautification().automatic.inset);
 }
 
 #[test]
-fn an_automatic_inner_inset_is_resolved_by_analysis_and_bound_to_the_revision() {
+fn automatic_scene_analysis_keeps_the_full_source_and_expands_the_canvas() {
     let mut state = EditorState::new(document(Provenance::Region));
     let intent = state.begin_scene();
     let Intent::AnalyzeSmartFrame { revision, .. } = intent else {
         panic!("a fresh draft asks for analysis");
     };
     assert!(
-        state.document().scene().unwrap().automatic.inset,
-        "an ordinary capture resolves its own inner inset until the user says \
-         otherwise"
+        !state.document().scene().unwrap().automatic.inset,
+        "new Scenes never turn padding into a source trim"
     );
 
     let mut resolved = state.document().scene().cloned().unwrap();
-    resolved.inset = SourceInsets::uniform(5.0);
+    resolved.padding = 48.0;
+    resolved.inset = SourceInsets::default();
     state.finish_smart_frame_analysis(
         revision,
         Ok(SmartFrameAnalysis {
             beautification: resolved,
-            inset_explanation: "Trimmed a high-confidence uniform margin".to_owned(),
+            inset_explanation: "Full screenshot preserved".to_owned(),
         }),
     );
-    assert_eq!(
-        state.document().scene().unwrap().inset,
-        SourceInsets::uniform(5.0)
-    );
+    let scene = state.document().scene().unwrap();
+    assert!(scene.inset.is_zero());
+    assert_eq!(scene.padding, 48.0);
+    let output = state.document().output_logical_size();
+    let source = state.document().content_size();
+    assert!(output.width > source.width);
+    assert!(output.height > source.height);
 
-    // Stale results for an older revision are dropped, inset included.
+    // Stale results for an older revision are dropped, padding included.
     let mut stale = state.document().scene().cloned().unwrap();
-    stale.inset = SourceInsets::uniform(80.0);
+    stale.padding = 80.0;
     state.finish_smart_frame_analysis(
         revision,
         Ok(SmartFrameAnalysis {
@@ -945,8 +948,5 @@ fn an_automatic_inner_inset_is_resolved_by_analysis_and_bound_to_the_revision() 
             inset_explanation: String::new(),
         }),
     );
-    assert_eq!(
-        state.document().scene().unwrap().inset,
-        SourceInsets::uniform(5.0)
-    );
+    assert_eq!(state.document().scene().unwrap().padding, 48.0);
 }

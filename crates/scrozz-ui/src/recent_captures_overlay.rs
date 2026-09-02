@@ -25,25 +25,16 @@
 //!
 //! # Click-through
 //!
-//! The overlay is a large, almost entirely empty window with a few opaque cards
-//! at the bottom-left. Everything between and around them must stay clickable,
-//! or the overlay is worse than no overlay at all.
+//! The native root hugs the visible card stack and its gesture envelope. While
+//! any card or dock control is present, that compact root always accepts input:
+//! visual topmost without input topmost is a click-through trap. Only an empty
+//! root, or the explicit scrolling-capture handoff, becomes mouse-transparent.
 //!
-//! `mouse_passthrough` is per-window and all-or-nothing, so it is toggled every
-//! frame from whether the pointer is inside an interactive rectangle —
-//! [`passes_through`] is that decision, as a pure function, so it can be
-//! asserted without a window.
-//!
-//! There is a platform trap here worth stating plainly. On macOS,
-//! `ignoresMouseEvents` means the window receives *no* mouse events at all, so
-//! once passthrough is on, egui can no longer see the pointer and can never
-//! learn that it has moved back over a card. The fix is a [`PointerProbe`]: a
-//! caller-supplied closure that reports the global cursor position without
-//! consuming events (`NSEvent::mouseLocation` on macOS). With a working probe,
-//! tracking is exact. Without one, or whenever a supplied probe cannot produce
-//! a sample, [`Passthrough::Auto`] falls back to re-sampling: it drops
-//! passthrough for a single frame every [`RESAMPLE_SECS`] so hover can recover.
-//! That is a bounded degradation, not a fix, and it is why the probe exists.
+//! `mouse_passthrough` is per-window and all-or-nothing. It must never be
+//! inferred from hover while cards exist: on macOS, `ignoresMouseEvents` stops
+//! the very pointer events needed to reverse that inference. A [`PointerProbe`]
+//! still drives accurate hover and selective locked-pin controls, but card
+//! input safety does not depend on polling it.
 //!
 //! # Repainting
 //!
@@ -76,10 +67,6 @@ use crate::scrolling::{ScrollHudAction, ScrollHudState, ScrollingHud};
 pub use crate::stack::RecentCapturesPlacement;
 use crate::stack::{CaptureStack, CardFrame, CardId, CardMetrics, CardState, Intent, dock};
 use crate::theme::{Appearance, Radius, Text, Theme, corner};
-
-/// How long [`Passthrough::Auto`] waits before dropping click-through for a
-/// single frame to re-sample the pointer when no [`PointerProbe`] sample is available.
-pub const RESAMPLE_SECS: f32 = 0.35;
 
 /// Default longest edge, in pixels, of a card thumbnail.
 ///
@@ -338,8 +325,8 @@ impl PanelSetup {
 /// Reports the pointer position in the overlay window's own logical
 /// coordinates, whether or not the window is currently accepting mouse events.
 ///
-/// Required on macOS for [`Passthrough::Auto`] to track precisely; see the
-/// module documentation.
+/// Required for accurate hover and selective locked-pin controls while a
+/// native window is otherwise not receiving pointer motion.
 pub type PointerProbe = Arc<dyn Fn() -> Option<Pos2> + Send + Sync>;
 
 /// A fresh display/capability snapshot for pinned child windows.
@@ -363,10 +350,10 @@ pub type PinTopologyProbe = Arc<dyn Fn() -> Option<PinTopology> + Send + Sync>;
 /// How the overlay handles clicks on its empty space.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Passthrough {
-    /// Toggle per frame: opaque over cards, transparent everywhere else.
+    /// Accept input whenever visible content exists; pass through only when empty.
     #[default]
     Auto,
-    /// Never pass clicks through. Correct only when the window hugs its content.
+    /// Never pass clicks through.
     Never,
     /// Always pass clicks through. The overlay becomes purely decorative —
     /// useful for a screenshot or a diagnostic run that must not be clickable.
@@ -1433,36 +1420,28 @@ pub fn native_options(geometry: RecentCapturesOverlayGeometry) -> eframe::Native
 // Click-through
 // ---------------------------------------------------------------------------
 
-/// Whether the window should pass clicks through, given where the pointer is.
+/// Whether the compact card root should pass clicks through.
 ///
-/// Two rules, and the asymmetry between them is deliberate.
-///
-/// **An empty overlay always passes through.** There is nothing to click, and
-/// the entire desktop is underneath. This holds even when the pointer is
-/// unknown, because it is trivially recoverable: the moment a card exists,
-/// `hits` is non-empty and the second rule takes over.
-///
-/// **With something to hit, an unknown pointer never passes through.** Guessing
-/// "yes" makes the overlay permanently invisible to the mouse on a platform
-/// that stops delivering pointer events under passthrough — macOS sets
-/// `ignoresMouseEvents`, so egui never learns the pointer came back — and there
-/// is then no way out of it. Eating clicks for one frame is recoverable;
-/// becoming untouchable is not.
+/// The pointer is intentionally not part of the decision. The native root is
+/// already cropped to the cards and their gesture envelope; allowing that root
+/// to become click-through while content exists makes visually topmost cards
+/// intermittently untouchable on platforms that stop pointer delivery.
 #[must_use]
-pub fn passes_through(pointer: Option<Pos2>, hits: &[Rect]) -> bool {
-    if hits.is_empty() {
-        return true;
-    }
-    pointer.is_some_and(|p| !hits.iter().any(|r| r.contains(p)))
+pub fn passes_through(_pointer: Option<Pos2>, hits: &[Rect]) -> bool {
+    automatic_passthrough(hits.is_empty())
+}
+
+const fn automatic_passthrough(empty: bool) -> bool {
+    empty
 }
 
 // ---------------------------------------------------------------------------
 // Card hover
 // ---------------------------------------------------------------------------
 
-/// Which card, if any, sits under the pointer — hit-tested from the same
-/// authoritative pointer source click-through already trusts, rather than
-/// read back from whether egui has *observed* a pointer event over that card.
+/// Which card, if any, sits under the pointer — hit-tested from an
+/// authoritative pointer source rather than read back from whether egui has
+/// *observed* a pointer event over that card.
 ///
 /// # Why `Response::hovered()` is not enough on its own
 ///
@@ -1471,11 +1450,9 @@ pub fn passes_through(pointer: Option<Pos2>, hits: &[Rect]) -> bool {
 /// window can expand underneath a pointer that has not moved — the ordinary
 /// shape of "reveal a card that just grew into place" — and winit has nothing
 /// to deliver in that case, so `hovered()` stays false for every card until
-/// the next click manufactures an event. [`RecentCapturesOverlayApp::pointer`] already
-/// tracks the pointer independently of that, through the macOS
-/// [`PointerProbe`] when one is installed, for exactly the reason that
-/// click-through cannot trust egui's pointer state either (see
-/// [`passes_through`]); this reuses the same source for hover.
+/// the next click manufactures an event. [`RecentCapturesOverlayApp::pointer`]
+/// tracks the pointer independently through the macOS [`PointerProbe`] when one
+/// is installed.
 ///
 /// `hits` must already be in back-to-front paint order, as produced by
 /// [`sort_card_frames_for_painting`] — later entries are on top and win where
@@ -1765,6 +1742,8 @@ pub struct RecentCapturesOverlayApp {
     passthrough: Passthrough,
     probe: Option<PointerProbe>,
     native_passthrough: Option<NativePassthrough>,
+    /// Native behavior changed outside the renderer and must be reasserted once.
+    passthrough_native_dirty: bool,
     thumbnail_px: u32,
     displays: DisplaySet,
     active_display: Option<DisplayId>,
@@ -1777,8 +1756,6 @@ pub struct RecentCapturesOverlayApp {
     /// change rather than every frame. `None` means native code changed the
     /// window behind this renderer and the next frame must reassert its choice.
     passthrough_now: Option<bool>,
-    /// When the pointer was last actually known, for re-sampling.
-    last_seen: f64,
     hovered: Option<CardId>,
     dock_collapsed: bool,
     dragging: Option<CardId>,
@@ -1851,14 +1828,6 @@ impl RecentCapturesOverlayApp {
             *slot = options.settings;
         }
 
-        if options.passthrough == Passthrough::Auto && options.probe.is_none() {
-            tracing::warn!(
-                "no pointer probe: click-through will re-sample every {RESAMPLE_SECS}s, \
-                 which is imprecise on platforms that stop delivering pointer events \
-                 to a click-through window"
-            );
-        }
-
         Self {
             stack: CaptureStack::configured(
                 options.geometry.local(),
@@ -1877,6 +1846,7 @@ impl RecentCapturesOverlayApp {
             passthrough: options.passthrough,
             probe: options.probe,
             native_passthrough,
+            passthrough_native_dirty: true,
             thumbnail_px: options.thumbnail_px.max(1),
             displays: options.displays,
             active_display: options.active_display,
@@ -1886,7 +1856,6 @@ impl RecentCapturesOverlayApp {
             #[cfg(not(target_os = "macos"))]
             last_pin_topology_refresh: f64::NEG_INFINITY,
             passthrough_now: None,
-            last_seen: 0.0,
             hovered: None,
             dock_collapsed: false,
             dragging: None,
@@ -1938,6 +1907,7 @@ impl RecentCapturesOverlayApp {
     /// no longer authoritative when the cards return.
     pub fn invalidate_passthrough_cache(&mut self) {
         self.passthrough_now = None;
+        self.passthrough_native_dirty = true;
     }
 
     /// Restores pointer input before the host begins a potentially blocking
@@ -1954,6 +1924,7 @@ impl RecentCapturesOverlayApp {
         self.handle.hide_scroll_hud();
         self.passthrough_now = Some(false);
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
+        self.passthrough_native_dirty = true;
         self.acknowledge_passthrough(false, false);
     }
 
@@ -2896,8 +2867,7 @@ impl RecentCapturesOverlayApp {
             .or_else(|| fresh_local_pointer(ctx))
     }
 
-    fn apply_passthrough(&mut self, ctx: &egui::Context, hits: &[Rect], pointer: Option<Pos2>) {
-        let now = ctx.input(|i| i.time);
+    fn apply_passthrough(&mut self, ctx: &egui::Context, hits: &[Rect], _pointer: Option<Pos2>) {
         let empty = hits.is_empty();
         // Automatic scrolling delivers globally addressed wheel input, which the
         // overlay would otherwise swallow. The request outranks the pointer
@@ -2913,36 +2883,10 @@ impl RecentCapturesOverlayApp {
             match self.passthrough {
                 Passthrough::Never => false,
                 Passthrough::Always => true,
-                // Nothing to click. Pass everything through unconditionally and do
-                // not re-sample: an empty overlay that blinked its click-through
-                // off once a second would eat a desktop click for no reason, and
-                // an idle overlay has no business scheduling repaints.
-                Passthrough::Auto if empty => true,
-                Passthrough::Auto => {
-                    if pointer.is_some() {
-                        self.last_seen = now;
-                        passes_through(pointer, hits)
-                    } else {
-                        let (desired, last_seen) = recoverable_passthrough_without_pointer(
-                            now,
-                            self.last_seen,
-                            self.passthrough_now,
-                        );
-                        self.last_seen = last_seen;
-                        desired
-                    }
-                }
+                Passthrough::Auto => automatic_passthrough(empty),
             }
         };
 
-        if !forced
-            && self.passthrough == Passthrough::Auto
-            && desired
-            && !empty
-            && pointer.is_none()
-        {
-            ctx.request_repaint_after(std::time::Duration::from_secs_f32(RESAMPLE_SECS));
-        }
         if self.passthrough_now != Some(desired) {
             self.passthrough_now = Some(desired);
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(desired));
@@ -2961,18 +2905,28 @@ impl RecentCapturesOverlayApp {
             .shared
             .passthrough_applied
             .load(Ordering::Acquire);
-        let acknowledged =
-            apply_native_passthrough(self.native_passthrough.as_mut(), desired, applied)
-                .unwrap_or_else(|err| {
-                    if warn {
-                        tracing::warn!(
-                            requested = desired,
-                            error = %err,
-                            "native overlay click-through transition failed"
-                        );
-                    }
-                    applied
-                });
+        let acknowledged = match apply_native_passthrough(
+            self.native_passthrough.as_mut(),
+            desired,
+            applied,
+            self.passthrough_native_dirty,
+        ) {
+            Ok(result) => {
+                self.passthrough_native_dirty = !result.acknowledged;
+                result.state
+            }
+            Err(err) => {
+                self.passthrough_native_dirty = true;
+                if warn {
+                    tracing::warn!(
+                        requested = desired,
+                        error = %err,
+                        "native overlay click-through transition failed"
+                    );
+                }
+                applied
+            }
+        };
         self.handle
             .shared
             .passthrough_applied
@@ -3819,20 +3773,6 @@ fn unlock_if_click_through_is_unsafe(surface: &mut PinnedSurface, click_through:
     }
 }
 
-fn recoverable_passthrough_without_pointer(
-    now: f64,
-    last_seen: f64,
-    current: Option<bool>,
-) -> (bool, f64) {
-    if now - last_seen > f64::from(RESAMPLE_SECS) {
-        // Drop click-through for one frame so native/local pointer delivery
-        // can recover even when a supplied global probe failed.
-        (false, now)
-    } else {
-        (current.unwrap_or(false), last_seen)
-    }
-}
-
 fn fresh_local_pointer(ctx: &egui::Context) -> Option<Pos2> {
     ctx.input(|input| {
         for event in input.events.iter().rev() {
@@ -3868,18 +3808,37 @@ fn apply_native_passthrough(
     controller: Option<&mut NativePassthrough>,
     desired: bool,
     applied: bool,
-) -> Result<bool, String> {
-    if desired == applied {
-        return Ok(applied);
+    force: bool,
+) -> Result<PassthroughApply, String> {
+    if !force && desired == applied {
+        return Ok(PassthroughApply {
+            state: applied,
+            acknowledged: true,
+        });
     }
     let Some(controller) = controller else {
-        return Ok(applied);
+        return Ok(PassthroughApply {
+            state: applied,
+            acknowledged: false,
+        });
     };
     if controller(desired)? {
-        Ok(desired)
+        Ok(PassthroughApply {
+            state: desired,
+            acknowledged: true,
+        })
     } else {
-        Ok(applied)
+        Ok(PassthroughApply {
+            state: applied,
+            acknowledged: false,
+        })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassthroughApply {
+    state: bool,
+    acknowledged: bool,
 }
 
 #[cfg(test)]
@@ -4165,24 +4124,16 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_is_off_over_a_card_and_on_beside_it() {
+    fn visible_card_roots_never_pass_through_regardless_of_pointer_position() {
         let card = rect(40.0, 700.0, 210.0, 150.0);
         assert!(!passes_through(Some(Pos2::new(100.0, 760.0)), &[card]));
-        assert!(passes_through(Some(Pos2::new(600.0, 400.0)), &[card]));
+        assert!(!passes_through(Some(Pos2::new(600.0, 400.0)), &[card]));
     }
 
     #[test]
-    fn a_failed_pointer_probe_sample_drops_passthrough_to_recover_input() {
-        let after_deadline = f64::from(RESAMPLE_SECS) + 0.01;
-        assert_eq!(
-            recoverable_passthrough_without_pointer(after_deadline, 0.0, Some(true)),
-            (false, after_deadline)
-        );
-        assert_eq!(
-            recoverable_passthrough_without_pointer(0.1, 0.0, Some(true)),
-            (true, 0.0),
-            "a recent sample keeps the current state only until the bounded recovery deadline"
-        );
+    fn automatic_passthrough_never_ignores_visible_card_input() {
+        assert!(!automatic_passthrough(false));
+        assert!(automatic_passthrough(true));
     }
 
     #[test]
@@ -4459,16 +4410,71 @@ mod tests {
     #[test]
     fn native_passthrough_readback_controls_the_acknowledgement() {
         let mut refused: NativePassthrough = Box::new(|_| Ok(false));
-        assert!(!apply_native_passthrough(Some(&mut refused), true, false).unwrap());
+        assert_eq!(
+            apply_native_passthrough(Some(&mut refused), true, false, false).unwrap(),
+            PassthroughApply {
+                state: false,
+                acknowledged: false
+            }
+        );
 
         let mut accepted: NativePassthrough = Box::new(|_| Ok(true));
-        assert!(apply_native_passthrough(Some(&mut accepted), true, false).unwrap());
-        assert!(!apply_native_passthrough(Some(&mut accepted), false, true).unwrap());
+        assert_eq!(
+            apply_native_passthrough(Some(&mut accepted), true, false, false).unwrap(),
+            PassthroughApply {
+                state: true,
+                acknowledged: true
+            }
+        );
+        assert_eq!(
+            apply_native_passthrough(Some(&mut accepted), false, true, false).unwrap(),
+            PassthroughApply {
+                state: false,
+                acknowledged: true
+            }
+        );
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&calls);
+        let mut already_matching: NativePassthrough = Box::new(move |_| {
+            counted.set(counted.get() + 1);
+            Ok(true)
+        });
+        assert_eq!(
+            apply_native_passthrough(Some(&mut already_matching), false, false, true).unwrap(),
+            PassthroughApply {
+                state: false,
+                acknowledged: true
+            }
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "native input is reasserted even when a stale cache says it already matches"
+        );
+        assert_eq!(
+            apply_native_passthrough(Some(&mut already_matching), false, false, false).unwrap(),
+            PassthroughApply {
+                state: false,
+                acknowledged: true
+            }
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "a settled non-dirty X11-style controller is not called every frame"
+        );
     }
 
     #[test]
     fn missing_native_passthrough_never_invents_an_acknowledgement() {
-        assert!(!apply_native_passthrough(None, true, false).unwrap());
+        assert_eq!(
+            apply_native_passthrough(None, true, false, false).unwrap(),
+            PassthroughApply {
+                state: false,
+                acknowledged: false
+            }
+        );
     }
 
     #[test]

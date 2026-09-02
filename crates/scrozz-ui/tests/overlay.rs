@@ -372,7 +372,7 @@ fn every_preview_container_casts_the_stack_shadow() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn clicks_pass_through_the_gaps_between_cards() {
+fn compact_visible_card_root_keeps_input_across_its_gesture_gaps() {
     let a = Rect::from_min_size(pos2(10.0, 10.0), vec2(100.0, 60.0));
     let b = Rect::from_min_size(pos2(10.0, 110.0), vec2(100.0, 60.0));
     let hits = [a, b];
@@ -385,13 +385,14 @@ fn clicks_pass_through_the_gaps_between_cards() {
         Some(b.center()),
         &hits
     ));
-    // The gap between them is desktop, and must stay clickable.
-    assert!(recent_captures_overlay::passes_through(
+    // The native root is cropped to these cards plus their gesture envelope.
+    // Making its small internal gaps transparent also makes every card
+    // intermittently untouchable on platforms with whole-window passthrough.
+    assert!(!recent_captures_overlay::passes_through(
         Some(pos2(60.0, 90.0)),
         &hits
     ));
-    // So is everything outside.
-    assert!(recent_captures_overlay::passes_through(
+    assert!(!recent_captures_overlay::passes_through(
         Some(pos2(400.0, 400.0)),
         &hits
     ));

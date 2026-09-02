@@ -53,26 +53,29 @@ fn analysis_is_byte_deterministic() {
 }
 
 #[test]
-fn a_transparent_outer_margin_is_held_back_by_the_inner_inset() {
-    // Nothing is destroyed: the inset is a number stored beside an untouched
-    // source, and clearing it brings the margin back. What it buys is that the
-    // orange subject, not the dead transparent border, is what the Scene
-    // centres and pads.
+fn automatic_scene_preserves_transparent_edges_and_adds_canvas_padding() {
     let mut frame = rgba_frame(100, 80, [0, 0, 0, 0], ColorSpace::DisplayP3);
     paint_rect(&mut frame, 10, 8, 90, 72, [220, 80, 40, 255]);
 
     let result =
         analyze_smart_frame(&frame, Provenance::Region, &AnalysisCancellation::default()).unwrap();
     let inset = result.beautification.inset;
-    assert_eq!((inset.left, inset.right), (10.0, 10.0));
-    assert_eq!((inset.top, inset.bottom), (8.0, 8.0));
-    assert!(result.beautification.automatic.inset);
+    assert!(
+        inset.is_zero(),
+        "automatic Scenes preserve every source pixel"
+    );
+    assert!(!result.beautification.automatic.inset);
+    let output = result
+        .beautification
+        .output_size(scrozz_core::LogicalSize::new(100.0, 80.0));
+    assert!(output.width > 100.0);
+    assert!(output.height > 80.0);
     let metadata = result.beautification.smart_frame.as_ref().unwrap();
-    assert_eq!(metadata.inset_decision, InsetDecision::TransparentMargin);
+    assert_eq!(metadata.inset_decision, InsetDecision::NoExcessMargin);
     assert_eq!(metadata.inset_confidence, 100);
     assert_eq!(
         result.inset_explanation,
-        InsetDecision::TransparentMargin.explanation()
+        InsetDecision::NoExcessMargin.explanation()
     );
 }
 
@@ -511,7 +514,7 @@ fn disconnected_objects_contribute_to_one_stable_focus() {
 }
 
 #[test]
-fn detailed_photo_like_edges_disable_automatic_inset() {
+fn detailed_photo_like_edges_keep_the_full_source() {
     let mut frame = rgba_frame(256, 160, [0, 0, 0, 255], ColorSpace::Srgb);
     for y in 0..frame.height() as usize {
         for x in 0..frame.width() as usize {
@@ -532,9 +535,8 @@ fn detailed_photo_like_edges_disable_automatic_inset() {
     assert!(result.beautification.inset.is_zero());
     assert_eq!(
         result.beautification.smart_frame.unwrap().inset_decision,
-        InsetDecision::LowConfidence,
-        "a noisy edge is not a margin, and the detector says so rather than \
-         guessing at one"
+        InsetDecision::NoExcessMargin,
+        "automatic Scene analysis never turns source pixels into padding"
     );
 }
 

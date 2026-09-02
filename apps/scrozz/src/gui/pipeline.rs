@@ -5180,7 +5180,7 @@ mod tests {
     }
 
     #[test]
-    fn a_named_scene_resolves_automatic_inset_without_moving_fixed_placement() {
+    fn a_named_scene_migrates_legacy_automatic_inset_to_full_source_padding() {
         let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-inset");
         let fixed_background = scrozz_annotate::Color::rgba(0x20, 0x30, 0x40, 0xff);
         let policy = preset_policy(
@@ -5220,31 +5220,14 @@ mod tests {
             .expect("complete derived document");
         let scene = stored.beautification().expect("the preset was applied");
 
-        assert_eq!(
-            scene.inset,
-            SourceInsets {
-                left: 5.0,
-                top: 4.0,
-                right: 5.0,
-                bottom: 4.0,
-            }
-        );
-        assert!(scene.automatic.inset);
+        assert!(scene.inset.is_zero());
+        assert!(!scene.automatic.inset);
         assert!(matches!(scene.background, Background::Solid(color) if color == fixed_background));
-        assert_eq!(
-            scene
-                .smart_frame
-                .as_ref()
-                .expect("inset metadata")
-                .focus
-                .confidence,
-            0,
-            "fixed placement must not inherit analyzed focus"
-        );
+        assert!(scene.smart_frame.is_none());
     }
 
     #[test]
-    fn automatic_placement_is_analyzed_inside_the_presets_fixed_inset() {
+    fn automatic_placement_uses_full_source_when_preset_has_legacy_inset() {
         let (_dir, mut worker, _outcomes) = worker_with_store("named-scene-placement");
         let policy = preset_policy(
             "auto-placement",
@@ -5286,11 +5269,11 @@ mod tests {
         let scene = stored.beautification().expect("the preset was applied");
         let metadata = scene.smart_frame.as_ref().expect("placement metadata");
 
-        assert_eq!(scene.inset, SourceInsets::uniform(5.0));
+        assert!(scene.inset.is_zero());
         assert_eq!(
             (metadata.source_width, metadata.source_height),
-            (80, 60),
-            "analysis must see the same inset subject rectangle the Scene renders"
+            (100, 80),
+            "placement analysis must see the same complete screenshot the Scene renders"
         );
         assert_eq!(
             metadata.inset_decision,

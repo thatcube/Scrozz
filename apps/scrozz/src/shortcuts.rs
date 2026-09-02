@@ -53,10 +53,13 @@ const FILE_NAME: &str = "shortcuts.json";
 ///
 /// Deliberately a subset of [`Action`](crate::gui::action::Action): "quit" and
 /// "open settings" are reachable from the tray and are not worth a system-wide
-/// key grab, and every entry here must be something the user would plausibly
-/// want to trigger without Scrozz being frontmost.
+/// key grab. Capture History is different: restoring recent work is a frequent
+/// capture workflow, and every entry here must be something the user would
+/// plausibly want to trigger without Scrozz being frontmost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ShortcutAction {
+    /// Open the capture history window.
+    OpenHistory,
     /// Open the selector with every still-capture mode available.
     CaptureAllInOne,
     /// Drag out a region and capture it.
@@ -75,7 +78,8 @@ pub enum ShortcutAction {
 
 impl ShortcutAction {
     /// Every bindable action, in the order the settings pane lists them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::OpenHistory,
         Self::CaptureAllInOne,
         Self::CaptureRegion,
         Self::CaptureWindow,
@@ -89,6 +93,7 @@ impl ShortcutAction {
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
+            Self::OpenHistory => "history.open",
             Self::CaptureAllInOne => "capture.all-in-one",
             Self::CaptureRegion => "capture.region",
             Self::CaptureWindow => "capture.window",
@@ -107,6 +112,7 @@ impl ShortcutAction {
     #[must_use]
     pub const fn settings_key(self) -> &'static str {
         match self {
+            Self::OpenHistory => "hotkey.capture-history",
             Self::CaptureAllInOne => "hotkey.capture-all-in-one",
             Self::CaptureRegion => "hotkey.capture-region",
             Self::CaptureWindow => "hotkey.capture-window",
@@ -121,6 +127,7 @@ impl ShortcutAction {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::OpenHistory => scrozz_core::product_copy::CAPTURE_HISTORY,
             Self::CaptureAllInOne => scrozz_core::product_copy::ALL_IN_ONE,
             Self::CaptureRegion => scrozz_core::product_copy::CAPTURE_AREA,
             Self::CaptureWindow => scrozz_core::product_copy::CAPTURE_WINDOW,
@@ -143,6 +150,11 @@ impl ShortcutAction {
         // defaulting to them would fail silently rather than loudly.
         let mac = cfg!(target_os = "macos");
         match self {
+            Self::OpenHistory => Some(if mac {
+                "Cmd+Ctrl+Shift+H"
+            } else {
+                "Super+Shift+H"
+            }),
             Self::CaptureAllInOne => Some(if mac { "Cmd+Shift+0" } else { "Super+Shift+2" }),
             Self::CaptureRegion => Some(if mac { "Cmd+Shift+8" } else { "Super+Shift+4" }),
             Self::CaptureWindow => Some(if mac { "Cmd+Shift+9" } else { "Super+Shift+5" }),

@@ -152,6 +152,7 @@ impl Command {
                 ListWhat::Cameras => "list.cameras".into(),
             },
             Self::History(args) => match args.command {
+                HistoryCommand::Show => "history.show".into(),
                 HistoryCommand::List { .. } => "history.list".into(),
                 HistoryCommand::Get { .. } => "history.get".into(),
                 HistoryCommand::Delete { .. } => "history.delete".into(),
@@ -1821,6 +1822,8 @@ pub struct HistoryArgs {
 /// Operations on the capture history.
 #[derive(Debug, Clone, Subcommand)]
 pub enum HistoryCommand {
+    /// Open Capture History in the running Scrozz app.
+    Show,
     /// List stored captures, newest first.
     List {
         /// Show at most this many.
@@ -2484,6 +2487,8 @@ pub enum Compositor {
 /// An action a compositor keybinding can invoke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HotkeyAction {
+    /// Open Capture History in the running Scrozz app.
+    CaptureHistory,
     /// Drag out a region.
     CaptureRegion,
     /// Pick a window.
@@ -2503,6 +2508,7 @@ impl HotkeyAction {
     #[must_use]
     pub const fn all() -> &'static [Self] {
         &[
+            Self::CaptureHistory,
             Self::CaptureRegion,
             Self::CaptureWindow,
             Self::CaptureDisplay,
@@ -2516,6 +2522,7 @@ impl HotkeyAction {
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
+            Self::CaptureHistory => "capture-history",
             Self::CaptureRegion => "capture-region",
             Self::CaptureWindow => "capture-window",
             Self::CaptureDisplay => "capture-display",
@@ -2534,6 +2541,7 @@ impl HotkeyAction {
     #[must_use]
     pub const fn arguments(self) -> &'static [&'static str] {
         match self {
+            Self::CaptureHistory => &["history", "show"],
             Self::CaptureRegion => &["capture", "--interactive", "region"],
             Self::CaptureWindow => &["capture", "--interactive", "window"],
             Self::CaptureDisplay => &["capture", "--display", "active"],
@@ -2558,6 +2566,7 @@ impl HotkeyAction {
     #[must_use]
     pub const fn default_accelerator(self) -> &'static str {
         match self {
+            Self::CaptureHistory => ShortcutAction::OpenHistory.default_accelerator_setting(),
             Self::CaptureRegion => ShortcutAction::CaptureRegion.default_accelerator_setting(),
             Self::CaptureWindow => ShortcutAction::CaptureWindow.default_accelerator_setting(),
             Self::CaptureDisplay => ShortcutAction::CaptureFullscreen.default_accelerator_setting(),
@@ -2573,6 +2582,7 @@ impl HotkeyAction {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
+            Self::CaptureHistory => scrozz_core::product_copy::CAPTURE_HISTORY,
             Self::CaptureRegion => scrozz_core::product_copy::CAPTURE_AREA,
             Self::CaptureWindow => scrozz_core::product_copy::CAPTURE_WINDOW,
             Self::CaptureDisplay => scrozz_core::product_copy::CAPTURE_FULLSCREEN,
@@ -3791,6 +3801,14 @@ mod tests {
         };
         assert_eq!(limit, 5);
         assert!(pinned);
+    }
+
+    #[test]
+    fn history_show_targets_the_running_app() {
+        let Some(Command::History(args)) = parse(&["scrozz", "history", "show"]).command else {
+            panic!("expected history")
+        };
+        assert!(matches!(args.command, HistoryCommand::Show));
     }
 
     #[test]
