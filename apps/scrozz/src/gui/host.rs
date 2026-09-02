@@ -1643,16 +1643,22 @@ impl Driver {
     }
 
     fn prepare_card_surface(&mut self, ctx: &egui::Context, target: CardSurfaceTarget) {
-        // Order out before changing position, size, or scale. A parked or old
-        // card framebuffer must never be visible during this transition.
+        // macOS and Windows keep the resized root drawable at zero native alpha,
+        // so the next backing frame can be committed without flashing stale
+        // pixels. Other hosts retain the established hidden two-turn barrier.
+        let paint_before_reveal = cfg!(any(target_os = "macos", target_os = "windows"));
         self.startup_rehide = false;
-        self.native
-            .apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+        let arming_behavior = if paint_before_reveal {
+            scrozz_shell::OverlayBehavior::preparing_capture_card()
+        } else {
+            scrozz_shell::OverlayBehavior::hidden_surface()
+        };
+        self.native.apply(&arming_behavior);
         self.native.set_cursor(scrozz_shell::OverlayCursor::Arrow);
-        self.native.set_visible(false);
+        self.native.set_visible(paint_before_reveal);
         ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(paint_before_reveal));
 
         self.overlay.set_geometry(
             target.geometry,
@@ -1669,14 +1675,25 @@ impl Driver {
             *current = target.geometry;
         }
 
-        self.card_arm = Some(CardArm::new(target));
+        if paint_before_reveal {
+            self.handle.invalidate_geometry_paint();
+        }
+        self.card_arm = Some(CardArm::after_paint(
+            target,
+            if paint_before_reveal {
+                self.handle.geometry_generation()
+            } else {
+                0
+            },
+        ));
         self.shown_card_target = None;
         self.root_mode = RootSurfaceMode::ArmingCards;
         tracing::debug!(
             position = ?target.geometry.position(),
             size = ?target.geometry.size(),
             scale = ?target.scale.map(ScaleFactor::get),
-            "arming hidden card surface"
+            paint_before_reveal,
+            "arming card surface"
         );
         ctx.request_repaint();
     }
@@ -1715,6 +1732,11 @@ impl Driver {
             } else {
                 arm.observe(measurement)
             }
+        }) && self.card_arm.is_some_and(|arm| {
+            arm.paint_ready(
+                self.handle.painted_geometry_generation(),
+                self.handle.painted_native_scale(),
+            )
         });
         if !ready {
             ctx.request_repaint();
@@ -1904,7 +1926,7 @@ impl Driver {
     }
 
     fn show_settings(&mut self, ctx: &egui::Context) {
-        let edits = self.settings.show(
+        let edits = self.settings.show_visible(
             ctx,
             &scrozz_ui::settings::SettingsInput {
                 build: scrozz_ui::settings::BuildInfo {
@@ -1919,6 +1941,7 @@ impl Driver {
                 capture: self.app.capture_settings(),
                 platform: scrozz_ui::settings::SettingsPlatform::current(),
             },
+            !self.selection.suppresses_auxiliary_windows(),
         );
         self.app.set_keyboard_owner(
             KeyboardOwner::ShortcutRecorder,
@@ -2064,6 +2087,7 @@ struct CardArm {
     target: CardSurfaceTarget,
     ready_observations: u8,
     observed_scale: Option<f32>,
+    required_paint_generation: u64,
 }
 
 impl CardArm {
@@ -2072,6 +2096,14 @@ impl CardArm {
             target,
             ready_observations: 0,
             observed_scale: None,
+            required_paint_generation: 0,
+        }
+    }
+
+    const fn after_paint(target: CardSurfaceTarget, required_paint_generation: u64) -> Self {
+        Self {
+            required_paint_generation,
+            ..Self::new(target)
         }
     }
 
@@ -2103,7 +2135,29 @@ impl CardArm {
         } else {
             self.ready_observations = 0;
         }
-        self.ready_observations >= CARD_READY_OBSERVATIONS
+
+        let required_observations = if self.required_paint_generation == 0 {
+            CARD_READY_OBSERVATIONS
+        } else {
+            1
+        };
+        self.ready_observations >= required_observations
+    }
+
+    fn paint_ready(self, painted_generation: u64, painted_scale: Option<f32>) -> bool {
+        if self.required_paint_generation == 0 {
+            return true;
+        }
+        if painted_generation < self.required_paint_generation {
+            return false;
+        }
+        self.target
+            .scale
+            .map(|scale| scale.get() as f32)
+            .or(self.observed_scale)
+            .is_none_or(|expected| {
+                painted_scale.is_some_and(|actual| (actual - expected).abs() <= 0.01)
+            })
     }
 
     fn resolved_target(self) -> CardSurfaceTarget {
@@ -2367,12 +2421,16 @@ impl Driver {
     }
 
     fn show_history(&self, ctx: &egui::Context) {
+        let suppressed = self.selection.suppresses_auxiliary_windows();
         let history = self.app.history();
         let (visible, focus) = {
             let mut history = history
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (history.is_visible(), history.take_focus_request())
+            (
+                history.is_visible(),
+                !suppressed && history.take_focus_request(),
+            )
         };
         if !visible {
             return;
@@ -2381,22 +2439,26 @@ impl Driver {
         let viewport = viewport_id();
         let waker = self.handle.clone();
         ctx.request_repaint_of(viewport);
-        ctx.show_viewport_deferred(viewport, viewport_builder(focus), move |ui, _class| {
-            let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
-            let mut history = history
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if close_requested {
-                history.close();
-                return;
-            }
-            history.ui(ui);
-            let needs_dispatch = history.has_pending_actions();
-            drop(history);
-            if needs_dispatch {
-                waker.wake();
-            }
-        });
+        ctx.show_viewport_deferred(
+            viewport,
+            viewport_builder(focus).with_visible(!suppressed),
+            move |ui, _class| {
+                let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+                let mut history = history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if close_requested {
+                    history.close();
+                    return;
+                }
+                history.ui(ui);
+                let needs_dispatch = history.has_pending_actions();
+                drop(history);
+                if needs_dispatch {
+                    waker.wake();
+                }
+            },
+        );
     }
 
     fn service_history_drag(&mut self, ctx: &egui::Context) {
@@ -2689,6 +2751,9 @@ impl eframe::App for Driver {
         self.show_camera_settings(ui.ctx());
         self.show_history(ui.ctx());
         self.service_history_drag(ui.ctx());
+        if self.selection.suppresses_auxiliary_windows() {
+            self.native.keep_suppressed_windows_hidden();
+        }
         self.show_capture_surface(ui, frame);
         self.reconcile_pin_panels(ui.ctx());
         #[cfg(target_os = "macos")]
@@ -4358,6 +4423,26 @@ mod tests {
             assert_eq!(slot.size(), expected);
             assert_eq!(slot.size() * scale as f32, expected * scale as f32);
         }
+    }
+
+    #[test]
+    fn resized_card_surface_waits_for_a_target_generation_paint() {
+        let target = card_target(2.0, egui::pos2(100.0, 40.0));
+        let mut arm = CardArm::after_paint(target, 7);
+        let preparing = scrozz_shell::OverlayBehavior::preparing_capture_card();
+
+        assert!(preparing.click_through);
+        assert_eq!(preparing.opacity, scrozz_core::Opacity::TRANSPARENT);
+        assert!(arm.observe(Some(exact_measurement(target))));
+        assert!(
+            !arm.paint_ready(6, Some(2.0)),
+            "matching window geometry cannot reveal an old backing frame"
+        );
+        assert!(
+            !arm.paint_ready(7, Some(1.0)),
+            "a backing frame painted at the old display scale must not reveal"
+        );
+        assert!(arm.paint_ready(7, Some(2.0)));
     }
 
     #[test]

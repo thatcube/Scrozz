@@ -44,9 +44,9 @@ pub trait CaptureSelector: RegionSelector {
 
     /// Runs selection with the pointer policy that the following capture uses.
     ///
-    /// A selector that owns picker surfaces must snapshot native targets as its
-    /// first operation, before it asks the host to raise, resize, show, or create
-    /// any of those surfaces. The snapshot belongs to this call only.
+    /// A selector may arm non-activating cursor feedback first, but it must
+    /// snapshot native targets before asking the host to raise, resize, show, or
+    /// create picker surfaces. The snapshot belongs to this call only.
     fn select_for_capture(
         &self,
         options: &SelectionOptions,
@@ -247,6 +247,10 @@ impl SelectorViewports {
 }
 
 enum BridgeEvent {
+    ArmCursor {
+        id: u64,
+        cursor: OverlayCursor,
+    },
     BeginCapture {
         id: u64,
         hidden: Sender<()>,
@@ -257,6 +261,7 @@ enum BridgeEvent {
         hidden: Sender<()>,
         surface_can_remain_visible: bool,
         cursor: OverlayCursor,
+        geometry: OverlayGeometry,
     },
     Prepared {
         id: u64,
@@ -276,6 +281,7 @@ enum BridgeEvent {
 impl BridgeEvent {
     const fn name(&self) -> &'static str {
         match self {
+            Self::ArmCursor { .. } => "arm-cursor",
             Self::BeginCapture { .. } => "begin-capture",
             Self::Begin { .. } => "begin-selection",
             Self::Prepared { .. } => "prepared",
@@ -287,7 +293,8 @@ impl BridgeEvent {
 
     const fn id(&self) -> Option<u64> {
         match self {
-            Self::BeginCapture { id, .. }
+            Self::ArmCursor { id, .. }
+            | Self::BeginCapture { id, .. }
             | Self::Begin { id, .. }
             | Self::Prepared { id, .. }
             | Self::PreparationFailed { id }
@@ -310,6 +317,7 @@ pub struct ClientOverlayController {
     cards: OverlayGeometry,
     completion: Completion,
     cancelled_preparations: Vec<u64>,
+    auxiliary_suppressed: bool,
 }
 
 enum ControllerPhase {
@@ -335,7 +343,6 @@ enum ControllerPhase {
         id: u64,
         prepared: Box<PreparedSelection>,
         decision: Sender<Result<SelectionOutcome>>,
-        saw_quiet_frame: bool,
         ready_since: Instant,
     },
     Selecting {
@@ -454,6 +461,7 @@ impl ClientOverlaySelector {
             cards,
             completion,
             cancelled_preparations: Vec::new(),
+            auxiliary_suppressed: false,
         };
         (selector, controller)
     }
@@ -562,13 +570,26 @@ impl ClientOverlaySelector {
             let _ = self.send_event(BridgeEvent::PreparationFailed { id });
             return Err(error);
         }
+        let overlay_cursor = selection_cursor(options);
+        self.send_event(BridgeEvent::ArmCursor {
+            id,
+            cursor: overlay_cursor,
+        })
+        .map_err(|_| bridge_error("the selector window closed before it could arm"))?;
 
-        // The target snapshot is the first native action for an invocation.
-        // Nothing is sent to the main thread until this finishes, so Scrozz
-        // cannot raise, resize, or create selector surfaces ahead of the OS
-        // window list whose z-order the picker must preserve.
+        // Cursor feedback is safe before discovery because it neither activates
+        // Scrozz nor mutates a selector surface. Target discovery must still
+        // finish before the host raises, resizes, or creates any picker window,
+        // preserving the OS window-list z-order that this invocation selected.
         let snapshot = match (self.snapshot)(options) {
             Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = self.send_event(BridgeEvent::PreparationFailed { id });
+                return Err(error);
+            }
+        };
+        let geometry = match desktop_geometry(&snapshot.displays) {
+            Ok(geometry) => geometry,
             Err(error) => {
                 let _ = self.send_event(BridgeEvent::PreparationFailed { id });
                 return Err(error);
@@ -580,7 +601,8 @@ impl ClientOverlaySelector {
             id,
             hidden: hidden_tx,
             surface_can_remain_visible,
-            cursor: selection_cursor(options),
+            cursor: overlay_cursor,
+            geometry,
         })
         .map_err(|_| bridge_error("the selector window closed before it could hide"))?;
         self.receive(
@@ -865,8 +887,10 @@ impl ClientOverlayController {
         ctx: &egui::Context,
         native: &crate::gui::panel::BehaviorController,
     ) {
+        self.auxiliary_suppressed = false;
         native.set_cursor(OverlayCursor::Arrow);
         native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+        native.restore_suppressed_windows();
         if self.completion == Completion::CloseWindow {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -982,6 +1006,13 @@ impl ClientOverlayController {
         )
     }
 
+    /// Whether ordinary child windows must stay ordered out while the selector
+    /// temporarily activates Scrozz.
+    #[must_use]
+    pub const fn suppresses_auxiliary_windows(&self) -> bool {
+        self.auxiliary_suppressed
+    }
+
     fn advance(&mut self, ctx: &egui::Context, native: &crate::gui::panel::BehaviorController) {
         let phase = std::mem::replace(&mut self.phase, ControllerPhase::Cards);
         self.phase = match phase {
@@ -997,11 +1028,11 @@ impl ClientOverlayController {
                 id,
                 prepared,
                 decision,
-                saw_quiet_frame,
                 ready_since,
             } => {
                 let quiet = input_is_quiescent(ctx, egui::ViewportId::ROOT);
-                if quiet && saw_quiet_frame {
+                if quiet {
+                    consume_launch_release_events(ctx, egui::ViewportId::ROOT);
                     activate_selection(ctx, native, id, prepared, decision)
                 } else if ready_since.elapsed() >= INPUT_DRAIN_TIMEOUT {
                     tracing::warn!(
@@ -1020,7 +1051,6 @@ impl ClientOverlayController {
                         id,
                         prepared,
                         decision,
-                        saw_quiet_frame: quiet,
                         ready_since,
                     }
                 }
@@ -1098,11 +1128,18 @@ impl ClientOverlayController {
             } if matches!(self.phase, ControllerPhase::Cards) => {
                 let _ = hidden.send(());
             }
+            BridgeEvent::ArmCursor { cursor, .. }
+                if matches!(self.phase, ControllerPhase::Cards) =>
+            {
+                native.set_cursor(cursor);
+            }
             BridgeEvent::BeginCapture {
                 id,
                 hidden,
                 surface_can_remain_visible: false,
             } if matches!(self.phase, ControllerPhase::Cards) => {
+                self.auxiliary_suppressed = true;
+                native.suppress_auxiliary_windows();
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 native.set_visible(false);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
@@ -1115,7 +1152,9 @@ impl ClientOverlayController {
                 hidden,
                 surface_can_remain_visible: true,
                 cursor,
+                geometry: _,
             } if matches!(self.phase, ControllerPhase::Cards) => {
+                self.auxiliary_suppressed = true;
                 let _ = hidden.send(());
                 self.phase = ControllerPhase::PreparingWithCards { id, cursor };
             }
@@ -1124,14 +1163,18 @@ impl ClientOverlayController {
                 hidden,
                 surface_can_remain_visible: false,
                 cursor,
+                geometry,
             } if matches!(self.phase, ControllerPhase::Cards) => {
+                self.auxiliary_suppressed = true;
                 // Clear the cards for one frame but keep the transparent panel
                 // alive and interactive. A hidden click-through window cannot
                 // own the system cursor, so the application underneath can
                 // restore its arrow until preparation finishes.
-                native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
-                claim_macos_desktop(native);
                 native.set_cursor(cursor);
+                native.apply(&scrozz_shell::OverlayBehavior::selection_overlay());
+                if cfg!(target_os = "macos") {
+                    native.set_frame(logical_frame(geometry));
+                }
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
                 native.set_visible(true);
@@ -1152,7 +1195,6 @@ impl ClientOverlayController {
                     id,
                     prepared,
                     decision,
-                    saw_quiet_frame: false,
                     ready_since: Instant::now(),
                 };
             }
@@ -1169,7 +1211,6 @@ impl ClientOverlayController {
                     id,
                     prepared,
                     decision,
-                    saw_quiet_frame: false,
                     ready_since: Instant::now(),
                 };
             }
@@ -1195,6 +1236,7 @@ impl ClientOverlayController {
                     ControllerPhase::WaitingForPreparation { id: waiting, .. } if waiting == id
                 ) =>
             {
+                native.set_cursor(OverlayCursor::Arrow);
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 native.set_visible(false);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
@@ -1208,11 +1250,13 @@ impl ClientOverlayController {
                 ) =>
             {
                 native.set_cursor(OverlayCursor::Arrow);
+                self.auxiliary_suppressed = false;
                 self.phase = ControllerPhase::Cards;
             }
             BridgeEvent::PreparationFailed { id }
                 if matches!(self.phase, ControllerPhase::Cards) =>
             {
+                native.set_cursor(OverlayCursor::Arrow);
                 self.phase = ControllerPhase::AwaitingCapture { id };
             }
             BridgeEvent::CaptureFinished { id, restored }
@@ -1221,8 +1265,11 @@ impl ClientOverlayController {
                     ControllerPhase::AwaitingCapture { id: waiting } if waiting == id
                 ) =>
             {
+                self.auxiliary_suppressed = false;
+                native.set_cursor(OverlayCursor::Arrow);
+                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                native.restore_suppressed_windows();
                 if self.completion == Completion::CloseWindow {
-                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                     native.set_visible(false);
                     ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1233,7 +1280,6 @@ impl ClientOverlayController {
                     // Queuing card geometry or passthrough here can be delivered
                     // after its hidden first-card barrier and restore the stale
                     // selector viewport over the newly revealed card.
-                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                     native.set_visible(false);
                     ctx.request_repaint();
                     self.phase = ControllerPhase::RestoringCards { restored };
@@ -1242,17 +1288,25 @@ impl ClientOverlayController {
             BridgeEvent::CaptureFinished { id, restored }
                 if matches!(self.phase, ControllerPhase::Cards) =>
             {
+                let restore_auxiliary = self.auxiliary_suppressed;
+                self.auxiliary_suppressed = false;
+                native.set_cursor(OverlayCursor::Arrow);
+                if restore_auxiliary {
+                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                    native.restore_suppressed_windows();
+                }
                 self.cancelled_preparations
                     .retain(|cancelled| *cancelled != id);
                 if self.completion == Completion::CloseWindow {
-                    native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                     ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 let _ = restored.send(());
             }
             BridgeEvent::Cancel => {
+                self.auxiliary_suppressed = false;
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                native.restore_suppressed_windows();
                 native.set_visible(false);
                 match &self.phase {
                     ControllerPhase::Selecting { viewports, .. }
@@ -1689,6 +1743,25 @@ fn input_is_quiescent(ctx: &egui::Context, viewport: egui::ViewportId) -> bool {
     })
 }
 
+fn consume_launch_release_events(ctx: &egui::Context, viewport: egui::ViewportId) {
+    ctx.input_mut_for(viewport, |input| {
+        let released_pointer = input
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::PointerButton { pressed: false, .. }));
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::PointerButton { pressed: false, .. }
+                    | egui::Event::Key { pressed: false, .. }
+            )
+        });
+        if released_pointer {
+            input.pointer = egui::PointerState::default();
+        }
+    });
+}
+
 fn configure_viewport(
     ctx: &egui::Context,
     native: &crate::gui::panel::BehaviorController,
@@ -1725,20 +1798,6 @@ fn logical_frame(geometry: OverlayGeometry) -> LogicalRect {
         LogicalPoint::new(f64::from(viewport.min.x), f64::from(viewport.min.y)),
         LogicalSize::new(f64::from(viewport.width()), f64::from(viewport.height())),
     )
-}
-
-fn claim_macos_desktop(native: &crate::gui::panel::BehaviorController) {
-    #[cfg(all(target_os = "macos", not(test)))]
-    match scrozz_shell::macos::display::displays().and_then(|displays| desktop_geometry(&displays))
-    {
-        Ok(geometry) => native.set_frame(logical_frame(geometry)),
-        Err(error) => {
-            tracing::warn!(%error, "could not cover the desktop during selection startup")
-        }
-    }
-
-    #[cfg(any(not(target_os = "macos"), test))]
-    let _ = native;
 }
 
 fn bridge_error(detail: impl Into<String>) -> Error {
@@ -2666,6 +2725,64 @@ mod tests {
     }
 
     #[test]
+    fn region_cursor_arms_before_native_target_discovery_finishes() {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let snapshot_barrier = Arc::clone(&barrier);
+        let (started_tx, started_rx) = channel();
+        let snapshot: Arc<SnapshotFn> = Arc::new(move |_| {
+            started_tx.send(()).expect("snapshot start");
+            snapshot_barrier.wait();
+            Ok(test_target_snapshot(bounds))
+        });
+        let prepare: Arc<PrepareFn> =
+            Arc::new(|_, _, _| Err(Error::Platform("stop after discovery".to_owned())));
+        let (selector, mut controller) = ClientOverlaySelector::pair(
+            OverlayGeometry::default(),
+            Completion::RestoreCards,
+            snapshot,
+            prepare,
+        );
+        let worker_selector = Arc::clone(&selector);
+        let worker = std::thread::spawn(move || {
+            let result = worker_selector.select_for_capture(
+                &SelectionOptions::region(),
+                CursorMode::Hidden,
+                false,
+            );
+            worker_selector.capture_finished();
+            result
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot started");
+        let ctx = egui::Context::default();
+        let (native, _) = crate::gui::panel::BehaviorController::recording();
+
+        controller.logic(&ctx, &native);
+        assert_eq!(
+            native.recorded_cursors(),
+            [OverlayCursor::Crosshair],
+            "the user must get immediate capture feedback while discovery is still running"
+        );
+        assert!(
+            native.recorded_visibility().is_empty(),
+            "cursor arming must not present or activate a selector window before discovery"
+        );
+
+        barrier.wait();
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            !matches!(controller.phase, ControllerPhase::Cards)
+        });
+        wait_until(|| {
+            controller.logic(&ctx, &native);
+            matches!(controller.phase, ControllerPhase::Cards)
+        });
+        assert!(worker.join().expect("selection worker").is_err());
+    }
+
+    #[test]
     fn bridge_snapshots_before_picker_presentation_and_holds_the_gate_through_capture() {
         let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
         let timeline = Arc::new(Mutex::new(Vec::new()));
@@ -3327,6 +3444,7 @@ mod tests {
             controller.logic(&ctx, &native);
             matches!(&controller.phase, ControllerPhase::HideBeforeCapture { .. })
         });
+        assert!(controller.suppresses_auxiliary_windows());
         assert!(begun_rx.try_recv().is_err());
 
         controller.logic(&ctx, &native);
@@ -3347,12 +3465,14 @@ mod tests {
         controller.logic(&ctx, &native);
         worker.join().expect("fixed capture worker");
         assert!(matches!(&controller.phase, ControllerPhase::Cards));
+        assert!(!controller.suppresses_auxiliary_windows());
     }
 
     #[test]
     fn capture_completion_returns_card_root_authority_without_stale_viewport_commands() {
         let (selector, mut controller) = region_test_pair(Completion::RestoreCards);
         controller.phase = ControllerPhase::AwaitingCapture { id: 7 };
+        controller.auxiliary_suppressed = true;
         let (restored_tx, _restored_rx) = channel();
         selector
             .events
@@ -3378,6 +3498,30 @@ mod tests {
             Some(&scrozz_shell::OverlayBehavior::hidden_surface())
         );
         assert_eq!(native.recorded_visibility().last(), Some(&false));
+        assert!(
+            !controller.suppresses_auxiliary_windows(),
+            "finished capture must restore ordinary Settings and History windows"
+        );
+        let actions = native.recorded_actions();
+        let hidden = actions
+            .iter()
+            .position(|action| {
+                *action
+                    == crate::gui::panel::RecordedNativeAction::Behavior(
+                        scrozz_shell::OverlayBehavior::hidden_surface(),
+                    )
+            })
+            .expect("hidden behavior");
+        let restore = actions
+            .iter()
+            .position(|action| {
+                *action == crate::gui::panel::RecordedNativeAction::RestoreSuppressedWindows
+            })
+            .expect("auxiliary restoration");
+        assert!(
+            hidden < restore,
+            "selector presentation must be released before ordinary windows are restored"
+        );
         let commands = output
             .viewport_output
             .into_values()
@@ -3485,6 +3629,10 @@ mod tests {
             )
         });
         assert!(controller.owns_surface());
+        assert!(
+            controller.suppresses_auxiliary_windows(),
+            "selector activation must keep ordinary Settings and History windows ordered out"
+        );
         assert_eq!(
             *behavior_log.borrow(),
             vec![scrozz_shell::OverlayBehavior::selection_overlay()]
@@ -3537,14 +3685,16 @@ mod tests {
         );
         output.textures_delta.clear();
         controller.logic(&ctx, &native);
-        assert!(matches!(
-            &controller.phase,
-            ControllerPhase::ReadyToSelect {
-                saw_quiet_frame: true,
-                ..
-            }
-        ));
-        controller.logic(&ctx, &native);
+        assert!(
+            !ctx.input(|input| input.events.iter().any(|event| {
+                matches!(event, egui::Event::PointerButton { pressed: false, .. })
+            })),
+            "the launch release must be consumed before selector UI can treat it as a gesture"
+        );
+        assert!(
+            !ctx.input(|input| input.pointer.button_released(egui::PointerButton::Primary)),
+            "derived launch-release state must be cleared before selector UI"
+        );
         assert!(matches!(
             &controller.phase,
             ControllerPhase::Selecting { .. }
@@ -3559,6 +3709,7 @@ mod tests {
 
         selector.cancel();
         controller.logic(&ctx, &native);
+        assert!(!controller.suppresses_auxiliary_windows());
         assert!(worker.join().expect("selection worker").is_err());
     }
 

@@ -77,6 +77,12 @@ impl fmt::Display for PinId {
 pub struct Opacity(f64);
 
 impl Opacity {
+    /// Fully transparent.
+    ///
+    /// Reserved for native surface lifecycle transitions. User-controlled pin
+    /// opacity still goes through [`Self::new`] and remains recoverable.
+    pub const TRANSPARENT: Self = Self(0.0);
+
     /// Fully opaque.
     pub const OPAQUE: Self = Self(MAX_OPACITY);
 
@@ -1142,6 +1148,7 @@ mod tests {
 
     #[test]
     fn opacity_and_scale_are_never_trapping_values() {
+        assert_eq!(Opacity::TRANSPARENT.get(), 0.0);
         assert_eq!(Opacity::new(-4.0).get(), MIN_OPACITY);
         assert_eq!(Opacity::new(4.0).get(), MAX_OPACITY);
         assert_eq!(Opacity::new(f64::NAN), Opacity::OPAQUE);

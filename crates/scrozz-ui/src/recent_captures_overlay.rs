@@ -48,7 +48,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -1023,6 +1023,9 @@ struct Shared {
     close_requested: AtomicBool,
     scroll_passthrough_requested: AtomicBool,
     passthrough_applied: AtomicBool,
+    geometry_generation: AtomicU64,
+    painted_geometry_generation: AtomicU64,
+    painted_native_scale: AtomicU32,
     applied_settings: Mutex<RecentCapturesOverlaySettings>,
 }
 
@@ -1290,7 +1293,7 @@ impl RecentCapturesOverlayHandle {
         self.shared.ctx.lock().map(|c| c.is_some()).unwrap_or(false)
     }
 
-    /// Whether a card, departure animation, or dock is currently drawable.
+    /// Whether a card, departure animation, dock, or scrolling HUD is drawable.
     #[must_use]
     pub fn has_visible_content(&self) -> bool {
         self.shared.visible_content.load(Ordering::Acquire)
@@ -1300,6 +1303,37 @@ impl RecentCapturesOverlayHandle {
     #[must_use]
     pub fn visible_card_count(&self) -> usize {
         self.shared.visible_card_count.load(Ordering::Acquire)
+    }
+
+    /// Geometry generation the host most recently asked this renderer to use.
+    #[must_use]
+    pub fn geometry_generation(&self) -> u64 {
+        self.shared.geometry_generation.load(Ordering::Acquire)
+    }
+
+    /// Latest geometry generation that completed a full UI paint pass.
+    #[must_use]
+    pub fn painted_geometry_generation(&self) -> u64 {
+        self.shared
+            .painted_geometry_generation
+            .load(Ordering::Acquire)
+    }
+
+    /// Native pixels-per-point of the latest acknowledged geometry paint.
+    #[must_use]
+    pub fn painted_native_scale(&self) -> Option<f32> {
+        let scale = f32::from_bits(self.shared.painted_native_scale.load(Ordering::Acquire));
+        (scale.is_finite() && scale > 0.0).then_some(scale)
+    }
+
+    /// Invalidates the last painted frame before the host arms a native reveal.
+    ///
+    /// A selector can return to exactly the same card geometry, so geometry
+    /// equality alone cannot prove that a new card framebuffer was painted.
+    pub fn invalidate_geometry_paint(&self) {
+        self.shared
+            .painted_geometry_generation
+            .store(0, Ordering::Release);
     }
 
     /// Settings the renderer has safely applied to current card geometry.
@@ -1330,7 +1364,7 @@ impl RecentCapturesOverlayHandle {
     /// Whether the native card surface needs to be ordered in.
     #[must_use]
     pub fn needs_visible_surface(&self) -> bool {
-        self.has_pending_content() || self.has_visible_content()
+        self.has_pending_content() || self.has_visible_content() || self.scroll_hud_visible()
     }
 
     /// Ask the overlay to draw a frame, if it is running.
@@ -1739,6 +1773,7 @@ pub struct RecentCapturesOverlayApp {
     theme: Theme,
     icons: IconStore,
     geometry: RecentCapturesOverlayGeometry,
+    geometry_generation: u64,
     passthrough: Passthrough,
     probe: Option<PointerProbe>,
     native_passthrough: Option<NativePassthrough>,
@@ -1827,6 +1862,10 @@ impl RecentCapturesOverlayApp {
         if let Ok(mut slot) = handle.shared.applied_settings.lock() {
             *slot = options.settings;
         }
+        handle
+            .shared
+            .geometry_generation
+            .store(1, Ordering::Release);
 
         Self {
             stack: CaptureStack::configured(
@@ -1843,6 +1882,7 @@ impl RecentCapturesOverlayApp {
             theme,
             icons: IconStore::new(ctx),
             geometry: options.geometry,
+            geometry_generation: 1,
             passthrough: options.passthrough,
             probe: options.probe,
             native_passthrough,
@@ -1895,6 +1935,11 @@ impl RecentCapturesOverlayApp {
             return;
         }
         self.geometry = geometry;
+        self.geometry_generation = self.geometry_generation.wrapping_add(1).max(1);
+        self.handle
+            .shared
+            .geometry_generation
+            .store(self.geometry_generation, Ordering::Release);
         self.stack.resize(geometry.local(), m);
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(geometry.position()));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(geometry.size()));
@@ -3504,9 +3549,8 @@ impl eframe::App for RecentCapturesOverlayApp {
         let mut drag_start = None;
         let mut drag_to = None;
         let mut drag_end = false;
+        let mut cancel_drag_for_hud = false;
 
-        // Drawn before the cards so a long scrolling session never hides its own
-        // Stop control behind a capture that arrived while it was running.
         let scroll_hud = self
             .handle
             .shared
@@ -3514,14 +3558,6 @@ impl eframe::App for RecentCapturesOverlayApp {
             .lock()
             .ok()
             .and_then(|state| state.clone());
-        if let Some(state) = scroll_hud {
-            let response = ScrollingHud::draw(ui, &self.theme, &state, true);
-            hits.push(response.rect);
-            if let Some(action) = response.action {
-                self.emit(RecentCapturesOverlayEvent::Scrolling(action));
-            }
-        }
-
         for f in &frames {
             let Some(entry) = self.content.get(&f.id) else {
                 continue;
@@ -3557,9 +3593,30 @@ impl eframe::App for RecentCapturesOverlayApp {
         // unknown (no probe and no recent egui pointer event either).
         hovered = hovered_card(pointer, &card_hits).or(hovered);
 
-        let (dock_hit, dock_clicked) = self.draw_dock(ui, &surface, &m);
+        let (dock_hit, mut dock_clicked) = self.draw_dock(ui, &surface, &m);
         if let Some(rect) = dock_hit {
             hits.push(rect);
+        }
+
+        // The scrolling HUD is the active capture controller, so it paints and
+        // hit-tests after every card and dock element. A card arriving during a
+        // long scroll must never cover Stop/Keep/Discard or steal that click.
+        if let Some(state) = scroll_hud.as_ref() {
+            let response = ScrollingHud::draw(ui, &self.theme, state, true);
+            hits.push(response.rect);
+            if pointer.is_some_and(|pointer| response.rect.contains(pointer)) {
+                hovered = None;
+                action = None;
+                drag_start = None;
+                drag_to = None;
+                cancel_drag_for_hud =
+                    self.dragging.is_some() && ctx.input(|input| input.pointer.any_released());
+                drag_end = false;
+                dock_clicked = false;
+            }
+            if let Some(action) = response.action {
+                self.emit(RecentCapturesOverlayEvent::Scrolling(action));
+            }
         }
 
         // Gestures, applied after drawing so this frame's responses drive the
@@ -3601,7 +3658,11 @@ impl eframe::App for RecentCapturesOverlayApp {
                 ),
             });
         }
-        if drag_end {
+        if cancel_drag_for_hud {
+            self.stack.cancel_drag(&m);
+            self.dragging = None;
+            self.armed = None;
+        } else if drag_end {
             if self.armed.is_some() {
                 // The platform owns this gesture now. The card springs back to
                 // its slot and stays there; it leaves the pile only if the drop
@@ -3652,10 +3713,10 @@ impl eframe::App for RecentCapturesOverlayApp {
         }
 
         self.apply_passthrough(&ctx, &hits, pointer);
-        self.handle
-            .shared
-            .visible_content
-            .store(!frames.is_empty() || dock_hit.is_some(), Ordering::Release);
+        self.handle.shared.visible_content.store(
+            !frames.is_empty() || dock_hit.is_some() || scroll_hud.is_some(),
+            Ordering::Release,
+        );
         let previous_card_count = self
             .handle
             .shared
@@ -3686,6 +3747,16 @@ impl eframe::App for RecentCapturesOverlayApp {
             self.content.get(&id).is_some_and(|entry| entry.editing)
         });
         (self.stack.activity(&m) | glow).apply(&ctx);
+        if logical_size_matches(ui.max_rect().size(), self.geometry.size()) {
+            self.handle
+                .shared
+                .painted_native_scale
+                .store(ctx.pixels_per_point().to_bits(), Ordering::Release);
+            self.handle
+                .shared
+                .painted_geometry_generation
+                .store(self.geometry_generation, Ordering::Release);
+        }
         self.painted_a_frame = true;
     }
 }
@@ -3696,6 +3767,11 @@ fn save_chooses_destination(behavior: RecentCapturesSaveBehavior, alt_held: bool
 
 fn keep_after_accepted_drag(close_after_drag: bool, alt_held: bool) -> bool {
     !close_after_drag || alt_held
+}
+
+fn logical_size_matches(actual: Vec2, expected: Vec2) -> bool {
+    const TOLERANCE: f32 = 1.0;
+    (actual.x - expected.x).abs() <= TOLERANCE && (actual.y - expected.y).abs() <= TOLERANCE
 }
 
 /// The event `CardAction::Continue` resolves to for a given card.
@@ -4481,11 +4557,36 @@ mod tests {
     fn scroll_hud_state_round_trips_through_the_handle() {
         let handle = RecentCapturesOverlayHandle::new();
         assert!(!handle.scroll_hud_visible());
+        assert!(!handle.needs_visible_surface());
 
         handle.show_scroll_hud(ScrollHudState::choosing(scrozz_core::ScrollAxis::Vertical));
         assert!(handle.scroll_hud_visible());
+        assert!(
+            handle.needs_visible_surface(),
+            "the HUD must reveal the native root even when there are no cards"
+        );
 
         handle.hide_scroll_hud();
         assert!(!handle.scroll_hud_visible());
+    }
+
+    #[test]
+    fn geometry_paint_acknowledgement_requires_the_target_frame_size() {
+        assert!(logical_size_matches(
+            egui::vec2(420.5, 180.0),
+            egui::vec2(420.0, 180.0)
+        ));
+        assert!(
+            !logical_size_matches(egui::vec2(288.0, 180.0), egui::vec2(420.0, 180.0)),
+            "a repaint of the old compact framebuffer must not satisfy a resize barrier"
+        );
+
+        let handle = RecentCapturesOverlayHandle::new();
+        handle
+            .shared
+            .painted_geometry_generation
+            .store(9, Ordering::Release);
+        handle.invalidate_geometry_paint();
+        assert_eq!(handle.painted_geometry_generation(), 0);
     }
 }

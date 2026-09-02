@@ -363,6 +363,7 @@ pub(crate) enum RecordedNativeAction {
     Behavior(OverlayBehavior),
     Cursor(OverlayCursor),
     Visible(bool),
+    RestoreSuppressedWindows,
     ReturnToOwner,
 }
 
@@ -527,6 +528,51 @@ impl BehaviorController {
 
         #[cfg(all(not(target_os = "macos"), not(test)))]
         let _ = visible;
+    }
+
+    /// Restores ordinary windows that selector activation temporarily ordered
+    /// out, after the capture backend has finished acquiring pixels.
+    pub fn restore_suppressed_windows(&self) {
+        if self.teardown_started.get() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(overlay) = self.overlay.borrow_mut().as_mut()
+            && let Err(error) = overlay.restore_suppressed_windows()
+        {
+            tracing::warn!(%error, "could not restore windows suppressed during capture");
+        }
+        #[cfg(test)]
+        self.action_log
+            .borrow_mut()
+            .push(RecordedNativeAction::RestoreSuppressedWindows);
+    }
+
+    /// Orders out ordinary application windows without activating the app.
+    pub fn suppress_auxiliary_windows(&self) {
+        if self.teardown_started.get() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(overlay) = self.overlay.borrow_mut().as_mut()
+            && let Err(error) = overlay.suppress_auxiliary_windows()
+        {
+            tracing::warn!(%error, "could not suppress auxiliary windows during capture");
+        }
+    }
+
+    /// Keeps ordinary child windows ordered out while selector activation owns
+    /// the application, even if their viewport builders are serviced meanwhile.
+    pub fn keep_suppressed_windows_hidden(&self) {
+        if self.teardown_started.get() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(overlay) = self.overlay.borrow_mut().as_mut()
+            && let Err(error) = overlay.keep_suppressed_windows_hidden()
+        {
+            tracing::warn!(%error, "could not keep auxiliary windows suppressed");
+        }
     }
 
     /// Retries native behavior that had to wait for queued window commands.

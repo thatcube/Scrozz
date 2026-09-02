@@ -107,38 +107,108 @@ pub fn collection_behavior(behavior: &OverlayBehavior) -> NSWindowCollectionBeha
 pub struct MacOverlay {
     window: Retained<NSWindow>,
     presentation_lease: Option<PresentationLease>,
+    suppressed_windows: Option<SuppressedWindows>,
 }
 
 #[derive(Debug)]
 struct PresentationLease {
     previous_application: Option<Retained<NSRunningApplication>>,
     previous_options: NSApplicationPresentationOptions,
+    application_was_active: bool,
+}
+
+#[derive(Debug)]
+struct SuppressedWindow {
+    window: Retained<NSWindow>,
+    was_key: bool,
+}
+
+#[derive(Debug)]
+struct SuppressedWindows {
+    application_was_active: bool,
+    windows: Vec<SuppressedWindow>,
 }
 
 impl PresentationLease {
-    fn acquire(mtm: objc2::MainThreadMarker) -> Self {
+    fn acquire(mtm: objc2::MainThreadMarker, selector: &NSWindow) -> (Self, SuppressedWindows) {
         let app = NSApplication::sharedApplication(mtm);
         let previous_options = app.presentationOptions();
         let previous_application = NSWorkspace::sharedWorkspace().frontmostApplication();
+        let application_was_active = app.isActive();
+        let mut suppressed = SuppressedWindows {
+            application_was_active,
+            windows: Vec::new(),
+        };
+        suppressed.keep_hidden(mtm, selector);
         let mut selection_options = previous_options;
         selection_options.remove(NSApplicationPresentationOptions::AutoHideDock);
         selection_options.insert(NSApplicationPresentationOptions::HideDock);
         app.setPresentationOptions(selection_options);
         app.activate();
-        Self {
-            previous_application,
-            previous_options,
-        }
+        (
+            Self {
+                previous_application,
+                previous_options,
+                application_was_active,
+            },
+            suppressed,
+        )
     }
 
     fn release(self, mtm: objc2::MainThreadMarker) {
         let app = NSApplication::sharedApplication(mtm);
         app.setPresentationOptions(self.previous_options);
-        app.deactivate();
-        if let Some(previous) = self.previous_application
-            && !previous.isTerminated()
-        {
-            let _ = previous.activateWithOptions(NSApplicationActivationOptions::empty());
+        if !self.application_was_active {
+            app.deactivate();
+            if let Some(previous) = &self.previous_application
+                && !previous.isTerminated()
+            {
+                let _ = previous.activateWithOptions(NSApplicationActivationOptions::empty());
+            }
+        }
+    }
+}
+
+impl SuppressedWindows {
+    fn keep_hidden(&mut self, mtm: objc2::MainThreadMarker, selector: &NSWindow) {
+        let app = NSApplication::sharedApplication(mtm);
+        let selector_number = selector.windowNumber();
+        for window in app.windows().iter() {
+            if window.windowNumber() == selector_number
+                || !window.isVisible()
+                || window.level() != NSNormalWindowLevel
+            {
+                continue;
+            }
+            if !self
+                .windows
+                .iter()
+                .any(|suppressed| suppressed.window.windowNumber() == window.windowNumber())
+            {
+                self.windows.push(SuppressedWindow {
+                    was_key: window.isKeyWindow(),
+                    window: window.clone(),
+                });
+            }
+            window.orderOut(None);
+        }
+    }
+
+    fn restore(self, mtm: objc2::MainThreadMarker) {
+        let app = NSApplication::sharedApplication(mtm);
+        let live_windows = app.windows();
+        for suppressed in self.windows {
+            if !live_windows
+                .iter()
+                .any(|window| window.windowNumber() == suppressed.window.windowNumber())
+            {
+                continue;
+            }
+            if self.application_was_active && suppressed.was_key {
+                suppressed.window.makeKeyAndOrderFront(None);
+            } else {
+                suppressed.window.orderFront(None);
+            }
         }
     }
 }
@@ -179,6 +249,7 @@ impl MacOverlay {
             return Ok(Some(Self {
                 window,
                 presentation_lease: None,
+                suppressed_windows: None,
             }));
         }
         Ok(None)
@@ -217,6 +288,7 @@ impl MacOverlay {
         Ok(Self {
             window,
             presentation_lease: None,
+            suppressed_windows: None,
         })
     }
 
@@ -246,6 +318,7 @@ impl MacOverlay {
         Ok(Self {
             window,
             presentation_lease: None,
+            suppressed_windows: None,
         })
     }
 
@@ -266,7 +339,10 @@ impl MacOverlay {
 
         if behavior.suppress_system_ui {
             if self.presentation_lease.is_none() {
-                self.presentation_lease = Some(PresentationLease::acquire(mtm));
+                let (presentation, suppressed) =
+                    PresentationLease::acquire(mtm, self.window.as_ref());
+                self.presentation_lease = Some(presentation);
+                self.suppressed_windows = Some(suppressed);
             }
         } else if let Some(lease) = self.presentation_lease.take() {
             lease.release(mtm);
@@ -321,6 +397,49 @@ impl MacOverlay {
         })
     }
 
+    /// Restores ordinary windows hidden before selector activation.
+    ///
+    /// Kept separate from presentation-option release because capture pixels are
+    /// acquired after the selector disappears. Restoring Settings or an editor
+    /// before that capture finishes would put Scrozz back into its own output.
+    pub fn restore_suppressed_windows(&mut self) -> Result<()> {
+        let mtm = main_thread("restoring windows suppressed during capture")?;
+        if let Some(windows) = self.suppressed_windows.take() {
+            windows.restore(mtm);
+        }
+        Ok(())
+    }
+
+    /// Orders out ordinary application windows without activating Scrozz.
+    ///
+    /// Fixed fullscreen/all-display captures use this path when the backend
+    /// cannot exclude the current process. The windows stay suppressed until
+    /// [`Self::restore_suppressed_windows`] after pixel acquisition.
+    pub fn suppress_auxiliary_windows(&mut self) -> Result<()> {
+        let mtm = main_thread("suppressing windows during capture")?;
+        if self.suppressed_windows.is_none() {
+            let app = NSApplication::sharedApplication(mtm);
+            self.suppressed_windows = Some(SuppressedWindows {
+                application_was_active: app.isActive(),
+                windows: Vec::new(),
+            });
+        }
+        if let Some(windows) = self.suppressed_windows.as_mut() {
+            windows.keep_hidden(mtm, &self.window);
+        }
+        Ok(())
+    }
+
+    /// Re-applies selector suppression after eframe services ordinary child
+    /// viewport builders, including windows opened while a capture is active.
+    pub fn keep_suppressed_windows_hidden(&mut self) -> Result<()> {
+        let mtm = main_thread("keeping windows suppressed during capture")?;
+        if let Some(windows) = self.suppressed_windows.as_mut() {
+            windows.keep_hidden(mtm, &self.window);
+        }
+        Ok(())
+    }
+
     /// Stops native mutation before returning the window to winit.
     ///
     /// Winit removes its KVO observers while its delegate is deallocated. Scrozz
@@ -328,6 +447,9 @@ impl MacOverlay {
     /// presentation state without changing the runtime class or delegate.
     pub fn restore_native_class(&mut self) -> Result<()> {
         let mtm = main_thread("returning an overlay window to winit")?;
+        if let Some(windows) = self.suppressed_windows.take() {
+            windows.restore(mtm);
+        }
         self.window
             .setAnimationBehavior(NSWindowAnimationBehavior::None);
         self.window.setIgnoresMouseEvents(true);

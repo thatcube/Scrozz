@@ -315,6 +315,16 @@ impl OverlayBehavior {
         behavior
     }
 
+    /// A drawable but invisible card surface used while a resized backing frame
+    /// is being painted. Native visibility keeps the UI loop alive, while zero
+    /// opacity and click-through prevent stale pixels or invisible input capture.
+    #[must_use]
+    pub const fn preparing_capture_card() -> Self {
+        let mut behavior = Self::hidden_surface();
+        behavior.opacity = Opacity::TRANSPARENT;
+        behavior
+    }
+
     /// The behaviour of the fullscreen selection overlay.
     ///
     /// Above the menu bar, because a selection must be able to cover it, and

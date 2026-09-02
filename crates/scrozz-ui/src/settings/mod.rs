@@ -476,6 +476,17 @@ impl SettingsWindow {
     /// Returns the edits the user asked for this frame. Nothing is applied here:
     /// the host owns registration, so it decides whether a change survives.
     pub fn show(&mut self, ctx: &egui::Context, input: &SettingsInput<'_>) -> SettingsEdits {
+        self.show_visible(ctx, input, true)
+    }
+
+    /// Draws Settings while allowing a capture selector to preserve the window
+    /// in an ordered-out state without closing or resetting it.
+    pub fn show_visible(
+        &mut self,
+        ctx: &egui::Context,
+        input: &SettingsInput<'_>,
+        visible: bool,
+    ) -> SettingsEdits {
         let mut edits = SettingsEdits::default();
         if !self.open {
             self.forget_transient_edits();
@@ -495,8 +506,8 @@ impl SettingsWindow {
             .clone();
         self.icons.get_or_insert_with(|| IconStore::new(ctx));
         let mut open = true;
-        let focus_requested = std::mem::take(&mut self.focus_requested);
-        let builder = viewport_builder(focus_requested);
+        let focus_requested = visible && std::mem::take(&mut self.focus_requested);
+        let builder = viewport_builder(focus_requested).with_visible(visible);
         // The window, not the caller, decides which platform idiom to draw:
         // the host has no reason to know, and a golden overrides it directly.
         let input = SettingsInput {

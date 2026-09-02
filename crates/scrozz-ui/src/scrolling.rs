@@ -462,4 +462,52 @@ mod tests {
         assert!(chooser.top() < full.center().y);
         assert!(progress.top() > full.center().y);
     }
+
+    #[test]
+    fn axis_picker_emits_start_from_an_isolated_hud_surface() {
+        let ctx = egui::Context::default();
+        let state = ScrollHudState::choosing(ScrollAxis::Vertical);
+        let theme = Theme::for_appearance(crate::theme::Appearance::Light);
+        install_fonts(&ctx);
+        install_style(&ctx, &theme);
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1_024.0, 768.0));
+
+        let draw = |input| {
+            let mut response = None;
+            let mut output = ctx.run_ui(input, |ui| {
+                response = Some(ScrollingHud::draw(ui, &theme, &state, true));
+            });
+            output.textures_delta.clear();
+            response.expect("HUD response")
+        };
+        let empty = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let chooser = draw(empty).rect;
+        let content = chooser.shrink2(vec2(Space::XL, Space::LG));
+        let button = Rect::from_min_size(
+            pos2(content.left(), content.bottom() - 44.0),
+            vec2((content.width() - Space::SM) * 0.5, 38.0),
+        );
+        let input = |pressed| egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(button.center()),
+                egui::Event::PointerButton {
+                    pos: button.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(draw(input(true)).action, None);
+        assert_eq!(
+            draw(input(false)).action,
+            Some(ScrollHudAction::Start(ScrollAxis::Vertical))
+        );
+    }
 }
