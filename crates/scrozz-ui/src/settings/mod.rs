@@ -32,6 +32,8 @@ pub use self::{
 pub use crate::recording_settings::RecordingSettingsAction;
 
 const SETTINGS_VIEWPORT: &str = "scrozz-settings";
+/// Native title of the ordinary Settings window.
+pub const WINDOW_TITLE: &str = "Scrozz Settings";
 const WINDOW_SIZE: Vec2 = Vec2::new(760.0, 580.0);
 const MIN_WINDOW_SIZE: Vec2 = Vec2::new(640.0, 470.0);
 const APP_ICON_SIZE: f32 = 84.0;
@@ -634,7 +636,7 @@ fn settings_viewport_id() -> egui::ViewportId {
 
 fn viewport_builder(active: bool) -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
-        .with_title("Scrozz Settings")
+        .with_title(WINDOW_TITLE)
         .with_app_id("com.thatcube.Scrozz.settings")
         .with_inner_size(WINDOW_SIZE)
         .with_min_inner_size(MIN_WINDOW_SIZE)

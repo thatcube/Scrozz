@@ -626,6 +626,9 @@ impl Host for Windowed {
                     root_mode: RootSurfaceMode::Hidden,
                     parked_root_bootstrap_pending: false,
                     parked_root_ordered_out: false,
+                    parked_root_registration_passes: 0,
+                    settings_activation_pending: false,
+                    settings_activation_attempts: 0,
                     card_arm: None,
                     shown_card_target: None,
                     startup_rehide: true,
@@ -951,6 +954,12 @@ struct Driver {
     parked_root_bootstrap_pending: bool,
     /// The auxiliary viewport was registered before the parked root was ordered out.
     parked_root_ordered_out: bool,
+    /// Complete child-registration UI passes before the off-screen parent hides.
+    parked_root_registration_passes: u8,
+    /// An explicit Settings request waiting for AppKit to create and raise its viewport.
+    settings_activation_pending: bool,
+    /// Bounded retries while eframe materializes the native Settings window.
+    settings_activation_attempts: u8,
     /// Hidden resize/scale barrier before the next first visible card frame.
     card_arm: Option<CardArm>,
     /// Geometry and scale used by the currently visible card framebuffer.
@@ -1801,7 +1810,12 @@ impl Driver {
         self.card_arm = None;
         self.shown_card_target = None;
         let startup_rehide = self.startup_rehide && mode == RootSurfaceMode::Hidden;
-        if mode == self.root_mode && !startup_rehide {
+        let pending_settings_reveal = mode == RootSurfaceMode::Parked
+            && self.root_mode == RootSurfaceMode::Parked
+            && self.parked_root_ordered_out
+            && self.settings_activation_pending
+            && !self.selection.suppresses_auxiliary_windows();
+        if mode == self.root_mode && !startup_rehide && !pending_settings_reveal {
             return;
         }
 
@@ -1811,6 +1825,7 @@ impl Driver {
                 self.startup_rehide = false;
                 self.parked_root_bootstrap_pending = false;
                 self.parked_root_ordered_out = false;
+                self.parked_root_registration_passes = 0;
                 self.native.set_visible(true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.request_repaint();
@@ -1819,6 +1834,7 @@ impl Driver {
                 self.startup_rehide = false;
                 self.parked_root_bootstrap_pending = parked_root_requires_bootstrap(self.root_mode);
                 self.parked_root_ordered_out = false;
+                self.parked_root_registration_passes = 1;
                 self.native
                     .apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 let frame = scrozz_core::LogicalRect::new(
@@ -1845,6 +1861,7 @@ impl Driver {
             RootSurfaceMode::Hidden => {
                 self.parked_root_bootstrap_pending = false;
                 self.parked_root_ordered_out = false;
+                self.parked_root_registration_passes = 0;
                 self.native
                     .apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 self.native.set_cursor(scrozz_shell::OverlayCursor::Arrow);
@@ -1869,6 +1886,16 @@ impl Driver {
     #[cfg(target_os = "macos")]
     fn order_out_parked_root_after_auxiliary_registration(&mut self, ctx: &egui::Context) {
         if self.root_mode != RootSurfaceMode::Parked || self.parked_root_ordered_out {
+            return;
+        }
+        if self.settings_activation_pending && !self.selection.suppresses_auxiliary_windows() {
+            ctx.request_repaint();
+            return;
+        }
+        if self.parked_root_registration_passes > 0 {
+            self.parked_root_registration_passes -= 1;
+            ctx.request_repaint();
+            self.record_lifecycle("auxiliary-registration-frame-committed");
             return;
         }
         self.native.set_visible(false);
@@ -1962,6 +1989,41 @@ impl Driver {
         }
         if edits.open_sharing {
             self.app.request_sharing_settings();
+        }
+        self.activate_settings(ctx);
+    }
+
+    fn activate_settings(&mut self, ctx: &egui::Context) {
+        if !self.settings_activation_pending || self.selection.suppresses_auxiliary_windows() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            const RETRY_LIMIT: u8 = 60;
+            match scrozz_shell::macos::editor::activate(scrozz_ui::settings::WINDOW_TITLE) {
+                Ok(Some(_)) => {
+                    self.settings_activation_pending = false;
+                    self.settings_activation_attempts = 0;
+                    self.record_lifecycle("settings-window-activated");
+                }
+                Ok(None) if self.settings_activation_attempts < RETRY_LIMIT => {
+                    self.settings_activation_attempts += 1;
+                    ctx.request_repaint();
+                }
+                Ok(None) => {
+                    self.settings_activation_pending = false;
+                    tracing::warn!("Settings window did not materialize before the retry limit");
+                }
+                Err(error) => {
+                    self.settings_activation_pending = false;
+                    tracing::warn!(%error, "Settings window could not be foregrounded");
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = ctx;
+            self.settings_activation_pending = false;
         }
     }
 
@@ -2596,6 +2658,8 @@ impl eframe::App for Driver {
         }
         if self.app.take_settings_request() {
             self.settings.open();
+            self.settings_activation_pending = true;
+            self.settings_activation_attempts = 0;
             #[cfg(target_os = "macos")]
             self.record_lifecycle("settings-requested");
         }
@@ -4230,6 +4294,7 @@ mod tests {
         assert!(parked.contains("self.native.set_visible(true)"));
         assert!(parked.contains("ViewportCommand::Visible(true)"));
         assert!(parked.contains("parked_root_requires_bootstrap(self.root_mode)"));
+        assert!(parked.contains("self.parked_root_registration_passes = 1"));
         assert!(parked.contains("ctx.request_repaint()"));
         assert!(
             !parked.contains("ViewportCommand::Close"),
@@ -4244,6 +4309,16 @@ mod tests {
             .expect("post-registration root order-out");
         assert!(order_out.contains("self.native.set_visible(false)"));
         assert!(order_out.contains("ViewportCommand::Visible(false)"));
+        let grace = order_out
+            .find("self.parked_root_registration_passes > 0")
+            .expect("child-registration grace pass");
+        let hide = order_out
+            .find("self.native.set_visible(false)")
+            .expect("root order-out");
+        assert!(
+            grace < hide && order_out[grace..hide].contains("ctx.request_repaint()"),
+            "the child must receive a committed post-registration frame before its parent hides"
+        );
         assert!(
             !order_out.contains("ViewportCommand::Close"),
             "the registered child keeps the event loop alive while the root is ordered out"
