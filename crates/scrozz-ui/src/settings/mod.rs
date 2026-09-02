@@ -247,10 +247,10 @@ pub enum ShortcutEdit {
     ResetAll,
 }
 
-/// Desktop whose native Settings convention should be used.
+/// Desktop whose platform-specific Settings vocabulary should be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPlatform {
-    /// Icon categories in a top toolbar.
+    /// macOS vocabulary and shortcuts.
     MacOs,
     /// Left navigation, matching Windows Settings.
     Windows,
@@ -271,22 +271,23 @@ impl SettingsPlatform {
         }
     }
 
-    /// Where category navigation belongs on this desktop.
+    /// Where category navigation belongs.
+    ///
+    /// Scrozz deliberately uses one left rail on every desktop so switching
+    /// platforms does not move the window's primary navigation.
     #[must_use]
     pub const fn navigation(self) -> Navigation {
-        match self {
-            Self::MacOs => Navigation::TopToolbar,
-            Self::Windows | Self::Linux => Navigation::Sidebar,
-        }
+        let _ = self;
+        Navigation::Sidebar
     }
 }
 
-/// Placement selected by [`SettingsPlatform`].
+/// Settings navigation placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Navigation {
-    /// macOS preference-window toolbar.
+    /// Legacy top toolbar placement retained for compatibility.
     TopToolbar,
-    /// Windows and Linux left navigation.
+    /// Shared left navigation used on every platform.
     Sidebar,
 }
 
@@ -2150,8 +2151,8 @@ mod tests {
     }
 
     #[test]
-    fn platform_navigation_follows_native_conventions() {
-        assert_eq!(SettingsPlatform::MacOs.navigation(), Navigation::TopToolbar);
+    fn settings_navigation_stays_left_aligned_on_every_platform() {
+        assert_eq!(SettingsPlatform::MacOs.navigation(), Navigation::Sidebar);
         assert_eq!(SettingsPlatform::Windows.navigation(), Navigation::Sidebar);
         assert_eq!(SettingsPlatform::Linux.navigation(), Navigation::Sidebar);
     }
