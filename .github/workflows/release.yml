@@ -1,11 +1,8 @@
 # Scrozz release build.
 #
 # Triggered by a version tag. Builds release binaries for macOS, Windows and
-# Linux, checksums them, and opens a **draft** GitHub release.
-#
-# It never publishes. Decision D5 is explicit that agents implement and validate
-# but the maintainer gates shipping, so the last step is always a human pressing
-# "Publish release" after looking at what is in it.
+# Linux and checksums them. Stable tags open a draft for maintainer approval;
+# `-alpha.N` tags publish a clearly labelled GitHub prerelease for opt-in testing.
 #
 # ---------------------------------------------------------------------------
 # Signing policy
@@ -31,10 +28,10 @@
 # The bundle is assembled by tools/make-app-bundle.sh, signed and notarised as
 # a bundle, and stapled — which is only possible for a bundle.
 # macOS can emit an explicitly unsigned external-signing handoff when its
-# secrets are absent. Windows release artifacts fail closed: the executable,
-# Store identity (including its display name), and MSIX signature must agree.
-# No credential is invented, committed, or silently replaced by a development
-# identity.
+# secrets are absent. Stable Windows release artifacts fail closed: executable,
+# Store identity, and MSIX signature must agree. Alpha tags may publish only the
+# explicitly unsigned portable ZIP when all Windows identity secrets are absent;
+# they never invent or publish a development-identity MSIX.
 name: Release
 
 on:
@@ -74,6 +71,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       sha: ${{ steps.source.outputs.sha }}
+      is_alpha: ${{ steps.tag.outputs.is_alpha }}
     steps:
       - name: Validate release tag
         id: tag
@@ -96,6 +94,11 @@ jobs:
             done
           fi
           echo "tag=$RELEASE_TAG" >>"$GITHUB_OUTPUT"
+          if [[ "$RELEASE_TAG" =~ -alpha\.[1-9][0-9]*$ ]]; then
+            echo "is_alpha=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "is_alpha=false" >>"$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/checkout@v4
         with:
@@ -621,9 +624,14 @@ jobs:
         env:
           WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          IS_ALPHA: ${{ needs.resolve.outputs.is_alpha }}
         run: |
           set -euo pipefail
           if [[ -z "$WINDOWS_CERTIFICATE_PFX" ]]; then
+            if [[ "$IS_ALPHA" == "true" ]]; then
+              echo "::warning title=Unsigned Windows alpha::The alpha release will contain only an unsigned portable ZIP because no Windows signing certificate is configured."
+              exit 0
+            fi
             echo "::error title=Windows signing identity is required::Release packaging fails closed instead of publishing a weaker unsigned executable."
             exit 1
           fi
@@ -801,8 +809,38 @@ jobs:
           WINDOWS_MSIX_IDENTITY_NAME: ${{ secrets.WINDOWS_MSIX_IDENTITY_NAME }}
           WINDOWS_MSIX_PUBLISHER: ${{ secrets.WINDOWS_MSIX_PUBLISHER }}
           WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME }}
+          IS_ALPHA: ${{ needs.resolve.outputs.is_alpha }}
         run: |
           set -euo pipefail
+          CONFIGURED=0
+          for value in \
+            "$WINDOWS_CERTIFICATE_PFX" \
+            "$WINDOWS_MSIX_IDENTITY_NAME" \
+            "$WINDOWS_MSIX_PUBLISHER" \
+            "$WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME"; do
+            [[ -n "$value" ]] && CONFIGURED=$((CONFIGURED + 1))
+          done
+          if ((CONFIGURED == 0)) && [[ "$IS_ALPHA" == "true" ]]; then
+            export SCROZZ_WINDOWS_VERIFY_DETERMINISM=1
+            export SCROZZ_MSIX_IDENTITY_MODE=development
+            powershell.exe -NoLogo -NoProfile -NonInteractive \
+              -ExecutionPolicy Bypass \
+              -File tools/package-windows.ps1 \
+              -OutputDirectory release-artifacts \
+              -Binary dist/scrozz.exe \
+              -Version "${{ steps.version.outputs.version }}" \
+              -Stamp alpha \
+              -Architecture x86_64
+            rm -f release-artifacts/*.msix \
+              release-artifacts/*.msix.sha256 \
+              release-artifacts/*.msix.artifact.json
+            exit 0
+          fi
+          if ((CONFIGURED != 4)); then
+            echo "::error title=Partial Windows signing configuration::Configure all Windows certificate and Store identity secrets, or leave all of them empty for an unsigned portable alpha ZIP."
+            exit 1
+          fi
+
           export SCROZZ_WINDOWS_VERIFY_DETERMINISM=1
           export SCROZZ_MSIX_IDENTITY_MODE=store
           export SCROZZ_MSIX_IDENTITY_NAME="$WINDOWS_MSIX_IDENTITY_NAME"
@@ -811,13 +849,6 @@ jobs:
 
           PFX="$RUNNER_TEMP/scrozz-msix-signing.pfx"
           trap 'rm -f "$PFX"' EXIT
-          if [[ -z "$WINDOWS_CERTIFICATE_PFX" ||
-                -z "$WINDOWS_MSIX_IDENTITY_NAME" ||
-                -z "$WINDOWS_MSIX_PUBLISHER" ||
-                -z "$WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME" ]]; then
-            echo "::error title=Complete Store identity is required::WINDOWS_CERTIFICATE_PFX, WINDOWS_MSIX_IDENTITY_NAME, WINDOWS_MSIX_PUBLISHER, and WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME must all be configured. Development identity values are never a release fallback."
-            exit 1
-          fi
           echo "$WINDOWS_CERTIFICATE_PFX" | base64 --decode >"$PFX"
           export SCROZZ_MSIX_SIGN_PFX="$PFX"
           export SCROZZ_MSIX_SIGN_PFX_PASSWORD="$WINDOWS_CERTIFICATE_PASSWORD"
@@ -853,10 +884,10 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Assemble the checksums and open a DRAFT release.
+  # Assemble checksums, publish alpha prereleases, or open a stable draft.
   # ---------------------------------------------------------------------------
   checksums-and-draft:
-    name: Draft release
+    name: Publish alpha or draft release
     needs: [resolve, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -912,11 +943,35 @@ jobs:
             --passphrase "$GPG_PASSPHRASE" \
             --detach-sign --armor SHA256SUMS
 
-      - name: Create draft release
+      - name: Verify artifact metadata and checksums
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib
+          import json
+          import pathlib
+
+          root = pathlib.Path("artifacts")
+          metadata_paths = sorted(root.glob("*.artifact.json"))
+          if not metadata_paths:
+              raise SystemExit("release artifacts have no signing metadata")
+          for metadata_path in metadata_paths:
+              metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+              artifact = root / metadata["file"]
+              if not artifact.is_file():
+                  raise SystemExit(f"metadata references missing artifact: {artifact}")
+              digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+              if digest != metadata["sha256"]:
+                  raise SystemExit(f"metadata checksum mismatch: {artifact}")
+          PY
+          (cd artifacts && sha256sum -c SHA256SUMS)
+
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve.outputs.tag }}
           PINNED_SHA: ${{ needs.resolve.outputs.sha }}
+          IS_ALPHA: ${{ needs.resolve.outputs.is_alpha }}
         run: |
           set -euo pipefail
 
@@ -931,22 +986,31 @@ jobs:
             exit 1
           fi
 
-          # --draft is the point of this whole job. Decision D5: agents build
-          # and validate, the maintainer decides what ships. Nothing here is
-          # ever visible to the public until a human presses Publish.
-          #
           # --verify-tag refuses to invent a tag that does not exist, which
           # turns a typo in workflow_dispatch into an error rather than a
           # release built from the wrong commit.
           VERSION="${TAG#v}"
-          gh release create "$TAG" \
-            --draft \
-            --verify-tag \
-            --title "Scrozz $VERSION" \
-            --generate-notes \
-            artifacts/*
+          FLAGS=(
+            --verify-tag
+            --title "Scrozz $VERSION"
+            --generate-notes
+          )
+          if [[ "$IS_ALPHA" == "true" ]]; then
+            FLAGS+=(
+              --prerelease
+              --latest=false
+              --notes "⚠️ **Alpha software:** expect defects and breaking changes. Back up important captures and report reproducible problems."
+            )
+          else
+            FLAGS+=(--draft)
+          fi
+          gh release create "$TAG" "${FLAGS[@]}" artifacts/*
 
-          echo "::notice title=Draft release created::Review it, then publish by hand. Nothing has been made public."
+          if [[ "$IS_ALPHA" == "true" ]]; then
+            echo "::notice title=Alpha prerelease published::$TAG is public, downloadable, marked prerelease, and excluded from Latest."
+          else
+            echo "::notice title=Draft release created::Review it, then publish by hand. Nothing has been made public."
+          fi
 
       - name: Summarise what is and is not signed
         # Only the presence of each secret reaches the shell, and only through
@@ -977,7 +1041,11 @@ jobs:
             echo "Any artefact named \`-preview\` runs but cannot take a screenshot:"
             echo "its platform's capture gate is still closed. See its PREVIEW.txt."
             echo
-            echo "This release is a **draft**. Publishing it is a human decision (D5)."
+            if [[ "${{ needs.resolve.outputs.is_alpha }}" == "true" ]]; then
+              echo "This release is a public **alpha prerelease** for voluntary testing."
+            else
+              echo "This stable release remains a **draft** until maintainer approval."
+            fi
           } >>"$GITHUB_STEP_SUMMARY"
 
           # The table above says which secrets were configured. This one says

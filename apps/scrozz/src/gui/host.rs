@@ -270,21 +270,21 @@ pub trait Host {
     fn supports_permission_ui(&self) -> bool;
 }
 
-fn card_surface_geometry(
-    base: RecentCapturesOverlayGeometry,
-    card_count: usize,
-) -> RecentCapturesOverlayGeometry {
-    card_surface_geometry_with_settings(
-        base,
-        card_count,
-        scrozz_ui::RecentCapturesOverlaySettings::default(),
-    )
+fn card_surface_geometry(base: RecentCapturesOverlayGeometry) -> RecentCapturesOverlayGeometry {
+    card_surface_geometry_with_settings(base, scrozz_ui::RecentCapturesOverlaySettings::default())
 }
 
 fn card_surface_geometry_with_settings(
     base: RecentCapturesOverlayGeometry,
-    card_count: usize,
     settings: scrozz_ui::RecentCapturesOverlaySettings,
+) -> RecentCapturesOverlayGeometry {
+    card_surface_geometry_for_slots(base, settings, None)
+}
+
+fn card_surface_geometry_for_slots(
+    base: RecentCapturesOverlayGeometry,
+    settings: scrozz_ui::RecentCapturesOverlaySettings,
+    occupied_slots: Option<usize>,
 ) -> RecentCapturesOverlayGeometry {
     let metrics = scrozz_ui::stack::CardMetrics {
         width: settings.card_width,
@@ -293,7 +293,10 @@ fn card_surface_geometry_with_settings(
     };
     let layout =
         scrozz_ui::stack::StackLayout::with_placement(base.local(), metrics, settings.placement);
-    let last = card_count.saturating_sub(1).min(layout.slots() - 1);
+    let slots = occupied_slots
+        .unwrap_or_else(|| layout.slots())
+        .clamp(1, layout.slots());
+    let last = slots - 1;
     let occupied = layout.slot_rect(0).union(layout.slot_rect(last));
     let viewport = occupied
         .translate(base.position().to_vec2())
@@ -448,7 +451,7 @@ impl Windowed {
             tracing::warn!(%error, "native work area is not ready; deferring the required check until launch");
             (RecentCapturesOverlayGeometry::default(), None, None)
         });
-        let geometry = card_surface_geometry(base_geometry, 1);
+        let geometry = card_surface_geometry(base_geometry);
         let pointer_geometry = Arc::new(Mutex::new(geometry));
         let native = BehaviorController::default();
         let handle = RecentCapturesOverlayHandle::new();
@@ -500,7 +503,7 @@ impl Host for Windowed {
         } = *self;
         let (base_geometry, display_id, display_scale) = work_area()?;
         let overlay_settings = app.recent_captures_overlay_settings();
-        let geometry = card_surface_geometry_with_settings(base_geometry, 1, overlay_settings);
+        let geometry = card_surface_geometry_with_settings(base_geometry, overlay_settings);
         if let Ok(mut current) = pointer_geometry.lock() {
             *current = geometry;
         }
@@ -654,7 +657,6 @@ impl Host for Windowed {
                     parked_root_registration_passes: 0,
                     settings_activation_pending: false,
                     settings_activation_attempts: 0,
-                    visible_card_resize: None,
                     card_arm: None,
                     shown_card_target: None,
                     startup_rehide: true,
@@ -990,8 +992,6 @@ struct Driver {
     settings_activation_attempts: u8,
     /// Hidden resize/scale barrier before the next first visible card frame.
     card_arm: Option<CardArm>,
-    /// Visible macOS anchored resize settling without hiding resident cards.
-    visible_card_resize: Option<CardArm>,
     /// Geometry and scale used by the currently visible card framebuffer.
     shown_card_target: Option<CardSurfaceTarget>,
     /// Eframe orders the root in after its first rendered frame regardless of
@@ -1666,16 +1666,18 @@ impl Driver {
     }
 
     fn desired_card_target(&self) -> CardSurfaceTarget {
-        let count = self
-            .app
-            .showing()
-            .max(self.handle.visible_card_count())
-            .max(1);
+        let stable_column = self.handle.has_global_pointer_observation();
+        let occupied_slots = (!stable_column).then(|| {
+            self.app
+                .showing()
+                .max(self.handle.visible_card_count())
+                .max(1)
+        });
         CardSurfaceTarget {
-            geometry: card_surface_geometry_with_settings(
+            geometry: card_surface_geometry_for_slots(
                 self.base_geometry,
-                count,
                 self.handle.applied_settings(),
+                occupied_slots,
             ),
             scale: self.display_scale,
         }
@@ -1725,7 +1727,6 @@ impl Driver {
                 0
             },
         ));
-        self.visible_card_resize = None;
         self.shown_card_target = None;
         self.root_mode = RootSurfaceMode::ArmingCards;
         tracing::debug!(
@@ -1738,70 +1739,17 @@ impl Driver {
         ctx.request_repaint();
     }
 
-    fn resize_card_surface_in_place(&mut self, ctx: &egui::Context, target: CardSurfaceTarget) {
-        self.overlay.set_geometry(
-            target.geometry,
-            ctx,
-            &scrozz_ui::motion::Motion::from_context(ctx),
-        );
-        self.native.set_frame(logical_frame(target.geometry));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-            target.geometry.position(),
-        ));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.geometry.size()));
-        self.selection.set_cards_geometry(target.geometry);
-        if let Ok(mut current) = self.pointer_geometry.lock() {
-            *current = target.geometry;
-        }
-        self.card_arm = None;
-        self.visible_card_resize = Some(CardArm::new(target));
-        tracing::debug!(
-            position = ?target.geometry.position(),
-            size = ?target.geometry.size(),
-            "resizing visible card surface without hiding resident cards"
-        );
-        ctx.request_repaint();
-    }
-
     fn sync_card_visibility(&mut self, ctx: &egui::Context) {
         if self.handle.geometry_locked() && self.root_mode == RootSurfaceMode::Cards {
             return;
         }
 
         let target = self.desired_card_target();
-        if let Some(resize) = self.visible_card_resize.as_mut() {
-            if resize.target == target {
-                if resize.observe(root_viewport_measurement(ctx)) {
-                    let settled = resize.resolved_target();
-                    self.visible_card_resize = None;
-                    self.shown_card_target = Some(settled);
-                    tracing::debug!(
-                        position = ?settled.geometry.position(),
-                        size = ?settled.geometry.size(),
-                        "settled visible card-surface resize"
-                    );
-                } else {
-                    ctx.request_repaint();
-                }
-                return;
-            }
-            self.visible_card_resize = None;
-        }
         if self.root_mode == RootSurfaceMode::Cards
             && self.shown_card_target.is_some_and(|shown| {
                 shown_card_surface_matches(target, shown, root_viewport_measurement(ctx))
             })
         {
-            return;
-        }
-
-        if cfg!(target_os = "macos")
-            && self.root_mode == RootSurfaceMode::Cards
-            && self
-                .shown_card_target
-                .is_some_and(|shown| visible_card_surface_can_resize(shown, target))
-        {
-            self.resize_card_surface_in_place(ctx, target);
             return;
         }
 
@@ -1848,7 +1796,6 @@ impl Driver {
         ctx.request_repaint();
 
         self.card_arm = None;
-        self.visible_card_resize = None;
         self.shown_card_target = Some(resolved_target);
         self.root_mode = RootSurfaceMode::Cards;
         tracing::debug!(
@@ -1883,7 +1830,6 @@ impl Driver {
         );
         if mode != RootSurfaceMode::Cards {
             self.handle.suspend_global_pointer_wake();
-            self.visible_card_resize = None;
         }
         if display_refresh_requested(
             refresh_requested,
@@ -2372,18 +2318,6 @@ fn shown_card_surface_matches(
         cfg!(target_os = "linux") && shown.scale.is_none(),
         |measurement| viewport_matches(shown, measurement),
     )
-}
-
-fn visible_card_surface_can_resize(shown: CardSurfaceTarget, target: CardSurfaceTarget) -> bool {
-    if shown.scale != target.scale || shown.geometry.work_area != target.geometry.work_area {
-        return false;
-    }
-    let old = shown.geometry.viewport();
-    let new = target.geometry.viewport();
-    new.min.x == old.min.x
-        && new.max.x == old.max.x
-        && new.max.y == old.max.y
-        && new.min.y != old.min.y
 }
 
 fn reveal_card_surface(
@@ -3575,7 +3509,7 @@ mod tests {
             egui::Rect::from_min_size(origin, egui::vec2(1440.0, 1010.0)),
         );
         CardSurfaceTarget {
-            geometry: card_surface_geometry(base, 1),
+            geometry: card_surface_geometry(base),
             scale: Some(ScaleFactor::new(scale)),
         }
     }
@@ -4823,22 +4757,14 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(0.0, 33.0), egui::vec2(1728.0, 950.0)),
             egui::Rect::from_min_size(egui::pos2(0.0, 33.0), egui::vec2(1728.0, 1084.0)),
         );
-        let one = card_surface_geometry(base, 1);
-        let three = card_surface_geometry(base, 3);
+        let column = card_surface_geometry(base);
 
         // Bounded to the column the cards actually occupy, not to the whole
-        // work area: a single card plus the room its gestures, its shadow and
-        // its landing glow need. That last one is why the height bound is
-        // where it is — `card::SHADOW_BLEED` covers everything a card paints
-        // outside itself, and a card now casts light as well as shadow.
-        assert!(one.viewport().width() < 600.0);
-        assert!(one.viewport().height() < 560.0);
-        assert!(one.viewport().height() < base.viewport().height() / 2.0);
-        assert_eq!(one.viewport().width(), three.viewport().width());
-        assert!(three.viewport().height() > one.viewport().height());
-        assert!(three.viewport().height() < base.viewport().height());
-        assert_eq!(one.work_area, base.work_area);
-        assert_eq!(three.work_area, base.work_area);
+        // work area: one narrow stable column covering every possible slot plus
+        // gesture/shadow/glow bleed. Occupancy never changes this native frame.
+        assert!(column.viewport().width() < 600.0);
+        assert!(column.viewport().height() <= base.viewport().height());
+        assert_eq!(column.work_area, base.work_area);
 
         let layout = scrozz_ui::stack::StackLayout::new(
             base.local(),
@@ -4847,11 +4773,13 @@ mod tests {
         let resting = layout.slot_rect(0).translate(base.position().to_vec2());
         let gestures = scrozz_ui::stack::GestureConfig::default();
         assert!(
-            one.viewport()
+            column
+                .viewport()
                 .contains_rect(resting.translate(egui::vec2(gestures.dragout_dist, 0.0)))
         );
         assert!(
-            one.viewport()
+            column
+                .viewport()
                 .contains_rect(resting.translate(egui::vec2(0.0, gestures.collapse_dist)))
         );
     }
@@ -4862,7 +4790,7 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1200.0, 800.0)),
             egui::Rect::from_min_size(egui::pos2(120.0, 85.0), egui::vec2(1200.0, 848.0)),
         );
-        let compact = card_surface_geometry(base, 2);
+        let compact = card_surface_geometry(base);
         let metrics = scrozz_ui::stack::CardMetrics::default();
         let base_slot = scrozz_ui::stack::StackLayout::new(base.local(), metrics).slot_rect(1);
         let compact_slot =
@@ -4875,38 +4803,45 @@ mod tests {
     }
 
     #[test]
-    fn anchored_card_resize_keeps_residents_visible_and_globally_stationary() {
+    fn card_occupancy_never_changes_native_column_geometry() {
         let base = RecentCapturesOverlayGeometry::new(egui::Rect::from_min_size(
             egui::pos2(120.0, 85.0),
             egui::vec2(1200.0, 800.0),
         ));
-        let one = CardSurfaceTarget {
-            geometry: card_surface_geometry(base, 1),
-            scale: Some(ScaleFactor::new(2.0)),
-        };
-        let three = CardSurfaceTarget {
-            geometry: card_surface_geometry(base, 3),
-            scale: one.scale,
-        };
-
-        assert!(visible_card_surface_can_resize(one, three));
-        assert!(visible_card_surface_can_resize(three, one));
-        assert!(!visible_card_surface_can_resize(
-            one,
-            CardSurfaceTarget {
-                scale: Some(ScaleFactor::new(1.0)),
-                ..three
-            }
-        ));
+        let geometries = (0..=8)
+            .map(|_| card_surface_geometry(base))
+            .collect::<Vec<_>>();
+        assert!(
+            geometries.windows(2).all(|pair| pair[0] == pair[1]),
+            "card count must never participate in native geometry"
+        );
         let metrics = scrozz_ui::stack::CardMetrics::default();
-        let old_slot =
-            scrozz_ui::stack::StackLayout::new(one.geometry.local(), metrics).slot_rect(0);
-        let new_slot =
-            scrozz_ui::stack::StackLayout::new(three.geometry.local(), metrics).slot_rect(0);
-        assert_eq!(
-            old_slot.translate(one.geometry.position().to_vec2()),
-            new_slot.translate(three.geometry.position().to_vec2()),
-            "existing card globals must not move when the root grows upward"
+        let column = geometries[0];
+        let full = scrozz_ui::stack::StackLayout::new(base.local(), metrics);
+        let compact = scrozz_ui::stack::StackLayout::new(column.local(), metrics);
+        for slot in 0..full.slots() {
+            assert_eq!(
+                full.slot_rect(slot).translate(base.position().to_vec2()),
+                compact
+                    .slot_rect(slot)
+                    .translate(column.position().to_vec2()),
+                "slot {slot} must retain its global position"
+            );
+        }
+
+        let fallback_one = card_surface_geometry_for_slots(
+            base,
+            scrozz_ui::RecentCapturesOverlaySettings::default(),
+            Some(1),
+        );
+        let fallback_three = card_surface_geometry_for_slots(
+            base,
+            scrozz_ui::RecentCapturesOverlaySettings::default(),
+            Some(3),
+        );
+        assert!(
+            fallback_one.viewport().height() < fallback_three.viewport().height(),
+            "hosts without reversible pointer observation retain occupancy-bounded geometry"
         );
     }
 

@@ -79,9 +79,10 @@ has been used by the maintainer at least once.
 ## D5 — Agents implement and validate; the maintainer gates shipping
 
 **Decision.** Agents write the code and build the automated validation that
-proves it works. The maintainer verifies personally — by testing or by
-inspection — before anything ships. **Accessibility is a core acceptance
-criterion, not a later pass.**
+proves it works. Stable releases remain maintainer-gated drafts. Explicit
+`-alpha.N` tags are the opt-in exception: after the same release validation they
+publish automatically as GitHub prereleases, never as Latest. **Accessibility is
+a core acceptance criterion, not a later pass.**
 
 Pre-release, iteration speed wins: breaking changes are free, nothing is
 frozen, no migration burden. Post-release this inverts.
@@ -1157,15 +1158,16 @@ the corresponding Git tag is **`v2026.8.27`**. Same-day builds share the
 marketing version and are distinguished by a separate monotonically increasing
 numeric build number.
 
-The initial public builds may still be marked as pre-releases on GitHub while
-their maturity warrants it. "Pre-release" is a distribution-channel state, not
-part of the version string: there is no `alpha`, `beta` or `rc` suffix in the
-app's version.
+Opt-in alpha builds append `-alpha.N` to the tag and compiled display version,
+for example **`v2026.9.2-alpha.1`**. macOS keeps the required numeric
+`CFBundleShortVersionString` (`2026.9.2`) while Scrozz's About pane, archive
+names, and GitHub release retain the complete alpha label. Stable releases keep
+the unsuffixed `vYYYY.M.D` tag.
 
 **Why.** This is the established Plozz convention, needs no manual version
-bookkeeping, communicates recency directly, and sorts correctly because every
-component is numeric. Keeping maturity out of the version also avoids feeding
-Apple an invalid `CFBundleShortVersionString`.
+bookkeeping, communicates recency directly, and sorts correctly. The bundler
+separates Apple's numeric native version from the human-facing prerelease label,
+so alpha identity stays explicit without feeding Apple an invalid version.
 
 ## D33 — Capture Area is quiet by default; precision aids are one mode
 

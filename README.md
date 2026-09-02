@@ -135,6 +135,13 @@ build date `YYYY.M.D`, so a build made on August 27, 2026 is **`2026.8.27`** and
 its release tag is **`v2026.8.27`**. Same-day builds share that version and are
 distinguished by the separate numeric build number.
 
+Downloadable test builds use tags such as **`v2026.9.2-alpha.1`**. GitHub marks
+them as prereleases, excludes them from Latest, and publishes platform archives
+plus `SHA256SUMS` after the tagged release workflow succeeds. Alpha builds may
+break compatibility and should not be treated as stable. Unsigned platform
+archives clearly say so; macOS downloads need Developer ID signing/notarization
+configured in the repository before Gatekeeper provides the normal install flow.
+
 Recording interaction overlays are opt-in. `record.highlight-clicks` and
 `record.show-keystrokes` trigger Input Monitoring only when a recording starts;
 keystrokes default to `record.keystroke-scope=modifiers-only`. The `all` mode can

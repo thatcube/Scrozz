@@ -484,9 +484,18 @@ grep -q "metadata\\['payload_signed'\\]" "$RELEASE_WORKFLOW" ||
   fail "signing summary does not distinguish payload signatures"
 grep -q 'SCROZZ_MSIX_IDENTITY_MODE=store' "$RELEASE_WORKFLOW" ||
   fail "release packaging does not select the fail-closed Store identity mode"
-grep -q 'WINDOWS_MSIX_PUBLISHER_DISPLAY_NAME.*must all be configured' \
-  "$RELEASE_WORKFLOW" ||
-  fail "release packaging does not require the complete Store identity"
+grep -q 'Partial Windows signing configuration' "$RELEASE_WORKFLOW" ||
+  fail "release packaging does not reject partial Windows identity configuration"
+grep -q -- '-Stamp alpha' "$RELEASE_WORKFLOW" ||
+  fail "alpha releases have no unsigned portable Windows fallback"
+grep -q 'rm -f release-artifacts/\*.msix' "$RELEASE_WORKFLOW" ||
+  fail "alpha fallback can publish a development-identity MSIX"
+grep -q -- '--prerelease' "$RELEASE_WORKFLOW" ||
+  fail "alpha tags are not published as GitHub prereleases"
+grep -q -- '--latest=false' "$RELEASE_WORKFLOW" ||
+  fail "alpha releases can accidentally become Latest"
+grep -q 'is_alpha=true' "$RELEASE_WORKFLOW" ||
+  fail "release tag validation does not identify alpha tags"
 
 if ! ruby -ryaml - "$RELEASE_WORKFLOW" <<'RUBY'
 workflow = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)
@@ -497,7 +506,7 @@ raise "ruleset audit environment" unless
   resolve["environment"] == "release-ruleset-audit"
 raise "build does not depend on resolver" unless build["needs"] == "resolve"
 raise "signing environment" unless build["environment"] == "release-signing"
-raise "resolver outputs" unless resolve.fetch("outputs").keys.sort == %w[sha tag]
+raise "resolver outputs" unless resolve.fetch("outputs").keys.sort == %w[is_alpha sha tag]
 raise "build job secrets" if build.key?("env")
 raise "draft job secrets" if draft.key?("env")
 
