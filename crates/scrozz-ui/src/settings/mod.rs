@@ -35,7 +35,7 @@ const SETTINGS_VIEWPORT: &str = "scrozz-settings";
 const WINDOW_SIZE: Vec2 = Vec2::new(760.0, 580.0);
 const MIN_WINDOW_SIZE: Vec2 = Vec2::new(640.0, 470.0);
 const APP_ICON_SIZE: f32 = 84.0;
-const SIDEBAR_WIDTH: f32 = 168.0;
+const SIDEBAR_WIDTH: f32 = 184.0;
 const TOOLBAR_HEIGHT: f32 = 62.0;
 const NAV_ITEM_WIDTH: f32 = 68.0;
 
@@ -732,19 +732,19 @@ fn draw_settings(
             draw_body(&mut body, theme, icons, app_icon, input, state)
         }
         Navigation::Sidebar => {
+            let ink = kit::Ink::new(theme);
             let sidebar = egui::Rect::from_min_max(
                 ui.max_rect().min,
                 egui::pos2(ui.max_rect().left() + SIDEBAR_WIDTH, ui.max_rect().bottom()),
             );
-            ui.painter()
-                .rect_filled(sidebar, 0.0, theme.palette.card_fill);
+            ui.painter().rect_filled(sidebar, 0.0, ink.sidebar);
             ui.painter().line_segment(
                 [sidebar.right_top(), sidebar.right_bottom()],
                 egui::Stroke::new(1.0, kit::hairline(&theme.palette)),
             );
             let mut nav = ui.new_child(
                 egui::UiBuilder::new()
-                    .max_rect(sidebar.shrink2(Vec2::new(Space::SM, Space::MD)))
+                    .max_rect(sidebar.shrink2(Vec2::new(Space::LG, Space::XL)))
                     .layout(Layout::top_down(Align::LEFT)),
             );
             draw_sidebar_navigation(&mut nav, theme, icons, state);
@@ -805,14 +805,14 @@ fn draw_sidebar_navigation(
     icons: &IconStore,
     state: &mut PaneState<'_>,
 ) {
-    ui.add_space(Space::XS);
+    ui.add_space(Space::SM);
     ui.label(
         RichText::new("Settings")
             .font(theme.font(Text::Label))
             .color(theme.palette.text_muted),
     );
-    ui.add_space(Space::SM);
-    ui.spacing_mut().item_spacing.y = 1.0;
+    ui.add_space(Space::LG);
+    ui.spacing_mut().item_spacing.y = Space::XS;
     for (candidate, label, icon) in Pane::ALL {
         if navigation_button(
             ui,
@@ -859,14 +859,14 @@ fn navigation_button(
             TOOLBAR_HEIGHT - Space::SM * 2.0,
         )
     } else {
-        Vec2::new(ui.available_width(), 28.0)
+        Vec2::new(ui.available_width(), 36.0)
     };
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
     kit::activated(ui, &mut response);
     response
         .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
     let fill = if selected {
-        ink.accent
+        ink.navigation_selected
     } else if response.is_pointer_button_down_on() {
         ink.control_press
     } else if response.hovered() {
@@ -875,47 +875,46 @@ fn navigation_button(
         Color32::TRANSPARENT
     };
     ui.painter()
-        .rect_filled(rect, crate::theme::corner(7.0), fill);
-    let tint = if selected {
-        ink.on_accent
-    } else if response.hovered() {
+        .rect_filled(rect, crate::theme::corner(10.0), fill);
+    let text_tint = if selected || response.hovered() {
         ink.text
     } else {
         ink.muted
     };
+    let icon_tint = if selected { ink.accent } else { text_tint };
     if vertical {
         icons.draw(
             ui.painter(),
             icon,
             egui::pos2(rect.center().x, rect.top() + 15.0),
             17.0,
-            tint,
+            icon_tint,
         );
         ui.painter().text(
             egui::pos2(rect.center().x, rect.bottom() - 10.0),
             Align2::CENTER_CENTER,
             label,
             theme.font(Text::Caption),
-            tint,
+            text_tint,
         );
     } else {
         icons.draw(
             ui.painter(),
             icon,
-            egui::pos2(rect.left() + 15.0, rect.center().y),
+            egui::pos2(rect.left() + 17.0, rect.center().y),
             16.0,
-            tint,
+            icon_tint,
         );
         ui.painter().text(
-            egui::pos2(rect.left() + 30.0, rect.center().y),
+            egui::pos2(rect.left() + 38.0, rect.center().y),
             Align2::LEFT_CENTER,
             label,
             theme.font(Text::Label),
-            tint,
+            text_tint,
         );
     }
     if response.has_focus() {
-        crate::paint::focus_ring(ui.painter(), rect, 7.0, &theme.palette);
+        crate::paint::focus_ring(ui.painter(), rect, 10.0, &theme.palette);
     }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

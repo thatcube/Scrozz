@@ -42,7 +42,7 @@ impl Metrics {
     /// row's own padding is counted, which is why rows are taller than this.
     pub const CONTROL: f32 = 24.0;
     /// Minimum height of a labelled row, control included.
-    pub const ROW: f32 = 30.0;
+    pub const ROW: f32 = 34.0;
     /// Narrowest the right-aligned label gutter is allowed to get.
     pub const LABEL_COLUMN: f32 = 156.0;
     /// Widest the label gutter grows to in a roomy dialog.
@@ -60,17 +60,17 @@ impl Metrics {
     /// Gap between the label gutter and the control column.
     pub const LABEL_GAP: f32 = 12.0;
     /// Horizontal padding inside a section card.
-    pub const CARD_PAD_X: f32 = 12.0;
+    pub const CARD_PAD_X: f32 = 16.0;
     /// Vertical padding inside a section card.
-    pub const CARD_PAD_Y: f32 = 8.0;
+    pub const CARD_PAD_Y: f32 = 12.0;
     /// Gap between stacked sections.
-    pub const SECTION_GAP: f32 = 14.0;
+    pub const SECTION_GAP: f32 = 18.0;
     /// Page margin around the pane body.
-    pub const PAGE_PAD_X: f32 = 18.0;
+    pub const PAGE_PAD_X: f32 = 24.0;
     /// Page margin above and below the pane body.
-    pub const PAGE_PAD_Y: f32 = 14.0;
+    pub const PAGE_PAD_Y: f32 = 20.0;
     /// Corner radius of a section card.
-    pub const CARD_RADIUS: f32 = 10.0;
+    pub const CARD_RADIUS: f32 = 12.0;
     /// Corner radius of a control.
     pub const CONTROL_RADIUS: f32 = 6.0;
     /// Width of a compact dropdown.
@@ -117,6 +117,10 @@ pub struct Ink {
     pub faint: Color32,
     /// Fill of the page beneath the cards.
     pub page: Color32,
+    /// Quietly distinct fill behind the category rail.
+    pub sidebar: Color32,
+    /// Neutral fill behind the selected category.
+    pub navigation_selected: Color32,
     /// Fill of a section card.
     pub card: Color32,
     /// Fill of a resting control.
@@ -158,6 +162,16 @@ impl Ink {
                 Color32::from_rgb(0x14, 0x16, 0x1F)
             } else {
                 Color32::from_rgb(0xF2, 0xF4, 0xF9)
+            },
+            sidebar: if dark {
+                Color32::from_rgb(0x18, 0x1A, 0x23)
+            } else {
+                Color32::from_rgb(0xEA, 0xED, 0xF4)
+            },
+            navigation_selected: if dark {
+                Color32::from_rgb(0x2A, 0x2D, 0x38)
+            } else {
+                Color32::from_rgb(0xDA, 0xDE, 0xE8)
             },
             card: if dark {
                 Color32::from_rgb(0x1C, 0x1F, 0x2B)
@@ -1687,7 +1701,11 @@ mod tests {
     fn body_text_clears_aa_on_cards_and_controls() {
         for theme in [Theme::dark(), Theme::light()] {
             let ink = Ink::new(&theme);
-            for (name, background) in [("card", ink.card), ("control", ink.control)] {
+            for (name, background) in [
+                ("card", ink.card),
+                ("control", ink.control),
+                ("selected navigation", ink.navigation_selected),
+            ] {
                 let ratio = crate::theme::contrast_ratio(ink.text, background);
                 assert!(
                     ratio >= crate::theme::Contrast::AA_TEXT,
