@@ -925,9 +925,12 @@ are real, native, movable, resizable windows with normal chrome. They are opened
 deliberately, they are long-lived, and they must behave exactly like every other
 window on the system, including tiling, mission control, snapping and window
 management shortcuts. While one is open, the shared Recent Captures root parks
-off-screen and its cards remain in model state; closing the last ordinary window
-re-arms the compact card surface. Nothing is gained by letting a floating card
-root intercept the editor beneath it.
+only when it has no visible cards. Visible cards remain available above an
+editor, while the root's transparent envelope and inter-card gaps pass input
+through to that editor as if each card occupied its own small native surface.
+Global capture shortcuts remain registered while any ordinary Scrozz window owns
+keyboard focus; only an explicitly armed shortcut recorder temporarily releases
+the bindings so the replacement chord can reach Settings.
 
 **Consequence for development.** Any spike or debug build that creates a floating
 window starts at `WindowLevel::Normal`, makes always-on-top an explicit opt-in
@@ -1218,13 +1221,14 @@ stays capturable; window selection remains live because a native window capture
 cannot be reconstructed faithfully from a frozen display image. A magnifier may
 still require a prepared display frame even when the visible backdrop is live.
 
-Every successful still capture, including fullscreen, plays the configured
-screenshot sound immediately when valid pixels arrive, before Scene rendering,
-encoding, clipboard/export actions, history persistence, or card publication.
-The default is a shutter sound; settings offer bundled alternatives, Off, and a
-custom file. A broken custom file falls back to the default sound and warns once
-per app session. Failed captures make no shutter sound. The desktop itself does
-not flash, shake, zoom, or animate as capture feedback.
+Every committed still-capture action, including fullscreen, plays the configured
+screenshot sound before ScreenCaptureKit/portal acquisition, selector restoration,
+Scene rendering, encoding, clipboard/export actions, history persistence, or card
+publication. Cancellation before a target is committed remains silent; a later
+backend failure is still reported honestly but cannot delay the shutter cue. The
+default is a shutter sound; settings offer bundled alternatives, Off, and a custom
+file. A broken custom file falls back to the default sound and warns once per app
+session. The desktop itself does not flash, shake, zoom, or animate as feedback.
 
 **Why.** A native crosshair communicates region selection without filling the
 screen with motion before the user acts. Guides and a loupe are precision tools,

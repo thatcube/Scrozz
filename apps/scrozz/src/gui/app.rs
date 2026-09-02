@@ -2026,31 +2026,42 @@ impl App {
     /// runtime. Suspending the whole set is the only rule that stays true
     /// whatever either side is bound to.
     ///
-    /// Ownership is a set rather than a flag because the two overlap: opening
-    /// the editor from the settings window while a row is armed must not hand
-    /// the keyboard back when the editor closes. The keys return when *nobody*
-    /// holds them.
+    /// Ownership is a set because editor focus and shortcut recording can
+    /// overlap. Only the recorder suspends global capture bindings: an editor
+    /// must remain capturable while it owns ordinary typing and local commands.
     ///
     /// The bindings themselves are untouched throughout, so the menu-bar item
     /// keeps showing the right shortcut beside each command, and a shortcut
     /// edited while suspended is the one that comes back.
     pub fn set_keyboard_owner(&mut self, owner: KeyboardOwner, owns: bool) {
         let before = self.keyboard_owners;
+        let recorder_was_active = before & KeyboardOwner::ShortcutRecorder.bit() != 0;
         self.keyboard_owners = if owns {
             before | owner.bit()
         } else {
             before & !owner.bit()
         };
-        if self.keyboard_owners == before {
-            if before != 0 && !self.hotkeys.is_suspended() {
-                // A previous release was partial. The host calls this owner sync
-                // every frame, so keep retrying without repeating the warning.
-                let _ = self.hotkeys.suspend();
+        let should_suspend = self.keyboard_owners & KeyboardOwner::ShortcutRecorder.bit() != 0;
+        if should_suspend {
+            if self.hotkeys.is_suspended() {
+                return;
             }
-            return;
-        }
-
-        if self.keyboard_owners == 0 {
+            let report = self.hotkeys.suspend();
+            if !report.is_complete() {
+                for rejection in report.rejections() {
+                    tracing::warn!(
+                        action = %rejection.action,
+                        accelerator = %rejection.accelerator,
+                        reason = %rejection.reason,
+                        "a global hotkey remained active under the shortcut recorder"
+                    );
+                }
+                self.note(format!(
+                    "{} shortcut(s) could not be released for the active shortcut recorder",
+                    report.rejections().len()
+                ));
+            }
+        } else if recorder_was_active {
             match self.hotkeys.resume() {
                 Ok(()) => tracing::debug!("global hotkeys resumed"),
                 Err(rejections) => {
@@ -2070,22 +2081,6 @@ impl App {
                         rejections.len()
                     ));
                 }
-            }
-        } else {
-            let report = self.hotkeys.suspend();
-            if !report.is_complete() {
-                for rejection in report.rejections() {
-                    tracing::warn!(
-                        action = %rejection.action,
-                        accelerator = %rejection.accelerator,
-                        reason = %rejection.reason,
-                        "a global hotkey remained active under an in-app keyboard owner"
-                    );
-                }
-                self.note(format!(
-                    "{} shortcut(s) could not be released for the active keyboard owner",
-                    report.rejections().len()
-                ));
             }
         }
     }
@@ -2414,7 +2409,7 @@ impl App {
         while let Some(outcome) = self.pipeline.poll() {
             match outcome {
                 Outcome::Shutter { card, acknowledged } => {
-                    tracing::debug!(%card, "playing shutter feedback at pixel acquisition");
+                    tracing::debug!(%card, "playing feedback at shutter commitment");
                     self.play_shutter_sound();
                     let _ = acknowledged.send(());
                 }
@@ -2431,7 +2426,7 @@ impl App {
         {
             match outcome {
                 Outcome::Shutter { card, acknowledged } => {
-                    tracing::debug!(%card, "playing shutter feedback at pixel acquisition");
+                    tracing::debug!(%card, "playing feedback at shutter commitment");
                     self.play_shutter_sound();
                     let _ = acknowledged.send(());
                 }
@@ -4773,6 +4768,7 @@ impl App {
             }
         };
 
+        self.play_shutter_sound();
         let card = self.pipeline.allocate();
         self.scrolling_card = Some(card);
         let needs_passthrough = target.requires_overlay_passthrough();
@@ -5007,6 +5003,7 @@ impl App {
         pending: PendingCapture,
         capture: scrozz_capture::PickerCapture,
     ) {
+        self.play_shutter_sound();
         let card = self.pipeline.allocate();
         tracing::debug!(
             %card,
@@ -12495,19 +12492,27 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_editor_stands_the_hotkeys_down() {
+    fn opening_the_editor_keeps_capture_hotkeys_live() {
         let (mut app, _) = app();
 
         app.set_keyboard_owner(KeyboardOwner::Editor, true);
-        assert!(
-            app.hotkeys_suspended(),
-            "the editor's own accelerators must be the only ones that fire"
+        assert!(!app.hotkeys_suspended());
+        let accelerator = assign_known_default(&mut app);
+        let event = |state| HotkeyEvent {
+            action: ShortcutAction::CaptureRegion.id().to_owned(),
+            accelerator,
+            state,
+        };
+        assert_eq!(app.action_for_hotkey_event(event(KeyState::Released)), None);
+        assert_eq!(
+            app.action_for_hotkey_event(event(KeyState::Pressed)),
+            Some(Action::Capture(CaptureKind::Region))
         );
 
         app.set_keyboard_owner(KeyboardOwner::Editor, false);
         assert!(
             !app.hotkeys_suspended(),
-            "closing the editor gives the capture shortcuts back"
+            "closing the editor leaves capture shortcuts live"
         );
     }
 
@@ -12519,7 +12524,7 @@ mod tests {
         for _ in 0..3 {
             app.set_keyboard_owner(KeyboardOwner::Editor, true);
         }
-        assert!(app.hotkeys_suspended());
+        assert!(!app.hotkeys_suspended());
         for _ in 0..3 {
             app.set_keyboard_owner(KeyboardOwner::Editor, false);
         }
@@ -12540,10 +12545,10 @@ mod tests {
     }
 
     #[test]
-    fn two_owners_overlapping_keep_the_keyboard_until_both_let_go() {
+    fn recorder_suspension_ends_even_when_the_editor_remains_open() {
         // Settings can open the editor, so the two claims genuinely overlap.
-        // Releasing one while the other still holds it would hand the shortcuts
-        // back underneath whoever is left.
+        // Editor focus never owns global bindings, so ending shortcut recording
+        // must immediately restore capture shortcuts.
         let (mut app, _) = app();
 
         app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, true);
@@ -12551,12 +12556,12 @@ mod tests {
         assert!(app.hotkeys_suspended());
 
         app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, false);
-        assert!(app.hotkeys_suspended(), "the editor still has the keyboard");
+        assert!(!app.hotkeys_suspended());
 
         app.set_keyboard_owner(KeyboardOwner::Editor, false);
         assert!(
             !app.hotkeys_suspended(),
-            "nobody is left holding it, so the shortcuts come back"
+            "editor close keeps the already-restored shortcuts live"
         );
     }
 
@@ -12597,8 +12602,8 @@ mod tests {
             app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, false);
         }
         assert!(
-            app.hotkeys_suspended(),
-            "a release from a non-owner released somebody else's claim"
+            !app.hotkeys_suspended(),
+            "editor ownership must never suspend capture shortcuts"
         );
     }
 
@@ -12607,7 +12612,7 @@ mod tests {
         let (mut app, _) = app();
         let before = app.config.bindings.len();
 
-        app.set_keyboard_owner(KeyboardOwner::Editor, true);
+        app.set_keyboard_owner(KeyboardOwner::ShortcutRecorder, true);
 
         assert_eq!(
             app.config.bindings.len(),

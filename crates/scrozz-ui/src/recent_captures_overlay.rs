@@ -1389,6 +1389,14 @@ impl RecentCapturesOverlayHandle {
             .store(available, Ordering::Release);
     }
 
+    /// Whether transparent card-root gaps can be reversed on pointer entry.
+    #[must_use]
+    pub fn has_global_pointer_observation(&self) -> bool {
+        self.shared
+            .global_pointer_observation
+            .load(Ordering::Acquire)
+    }
+
     /// Ask the overlay to draw a frame, if it is running.
     pub fn wake(&self) {
         if let Ok(ctx) = self.shared.ctx.lock()
@@ -2956,12 +2964,11 @@ impl RecentCapturesOverlayApp {
                 Passthrough::Never => false,
                 Passthrough::Always => true,
                 Passthrough::Auto
-                    if cfg!(not(target_os = "macos"))
-                        || self
-                            .handle
-                            .shared
-                            .global_pointer_observation
-                            .load(Ordering::Acquire) =>
+                    if self
+                        .handle
+                        .shared
+                        .global_pointer_observation
+                        .load(Ordering::Acquire) =>
                 {
                     passes_through(pointer, hits)
                 }

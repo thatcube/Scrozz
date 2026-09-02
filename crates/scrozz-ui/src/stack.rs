@@ -1325,6 +1325,19 @@ impl CaptureStack {
     /// Shrinking retires from the bottom, oldest first, exactly as overflow
     /// does, so the invariant survives a display change.
     pub fn resize(&mut self, work_area: Rect, m: &Motion) {
+        let translation = work_area.min - self.layout.work_area.min;
+        let pure_translation = work_area.size() == self.layout.work_area.size();
+        if pure_translation && translation != Vec2::ZERO {
+            for card in &mut self.cards {
+                if let Some(returning) = &mut card.ret {
+                    returning.from = returning.from.translate(translation);
+                }
+            }
+            for departing in &mut self.departing {
+                departing.from = departing.from.translate(translation);
+                departing.to = departing.to.translate(translation);
+            }
+        }
         self.layout = StackLayout::with_placement(
             work_area,
             self.layout.requested_metrics,

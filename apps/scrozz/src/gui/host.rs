@@ -539,6 +539,8 @@ impl Host for Windowed {
         };
         #[cfg(target_os = "macos")]
         handle.set_global_pointer_observation(pointer_motion_monitor.is_some());
+        #[cfg(not(target_os = "macos"))]
+        handle.set_global_pointer_observation(scrozz_shell::pointer_location().is_ok());
         #[cfg(target_os = "macos")]
         let native_activity_start = scrozz_shell::macos::activity::snapshot();
         #[cfg(target_os = "macos")]
@@ -652,6 +654,7 @@ impl Host for Windowed {
                     parked_root_registration_passes: 0,
                     settings_activation_pending: false,
                     settings_activation_attempts: 0,
+                    visible_card_growth: None,
                     card_arm: None,
                     shown_card_target: None,
                     startup_rehide: true,
@@ -987,6 +990,8 @@ struct Driver {
     settings_activation_attempts: u8,
     /// Hidden resize/scale barrier before the next first visible card frame.
     card_arm: Option<CardArm>,
+    /// Visible macOS growth settling without hiding already-painted cards.
+    visible_card_growth: Option<CardArm>,
     /// Geometry and scale used by the currently visible card framebuffer.
     shown_card_target: Option<CardSurfaceTarget>,
     /// Eframe orders the root in after its first rendered frame regardless of
@@ -1720,6 +1725,7 @@ impl Driver {
                 0
             },
         ));
+        self.visible_card_growth = None;
         self.shown_card_target = None;
         self.root_mode = RootSurfaceMode::ArmingCards;
         tracing::debug!(
@@ -1732,17 +1738,70 @@ impl Driver {
         ctx.request_repaint();
     }
 
+    fn grow_card_surface_in_place(&mut self, ctx: &egui::Context, target: CardSurfaceTarget) {
+        self.overlay.set_geometry(
+            target.geometry,
+            ctx,
+            &scrozz_ui::motion::Motion::from_context(ctx),
+        );
+        self.native.set_frame(logical_frame(target.geometry));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+            target.geometry.position(),
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.geometry.size()));
+        self.selection.set_cards_geometry(target.geometry);
+        if let Ok(mut current) = self.pointer_geometry.lock() {
+            *current = target.geometry;
+        }
+        self.card_arm = None;
+        self.visible_card_growth = Some(CardArm::new(target));
+        tracing::debug!(
+            position = ?target.geometry.position(),
+            size = ?target.geometry.size(),
+            "growing visible card surface without hiding resident cards"
+        );
+        ctx.request_repaint();
+    }
+
     fn sync_card_visibility(&mut self, ctx: &egui::Context) {
         if self.handle.geometry_locked() && self.root_mode == RootSurfaceMode::Cards {
             return;
         }
 
         let target = self.desired_card_target();
+        if let Some(growth) = self.visible_card_growth.as_mut() {
+            if growth.target == target {
+                if growth.observe(root_viewport_measurement(ctx)) {
+                    let settled = growth.resolved_target();
+                    self.visible_card_growth = None;
+                    self.shown_card_target = Some(settled);
+                    tracing::debug!(
+                        position = ?settled.geometry.position(),
+                        size = ?settled.geometry.size(),
+                        "settled visible card-surface growth"
+                    );
+                } else {
+                    ctx.request_repaint();
+                }
+                return;
+            }
+            self.visible_card_growth = None;
+        }
         if self.root_mode == RootSurfaceMode::Cards
             && self.shown_card_target.is_some_and(|shown| {
                 shown_card_surface_matches(target, shown, root_viewport_measurement(ctx))
             })
         {
+            return;
+        }
+
+        if cfg!(target_os = "macos")
+            && self.root_mode == RootSurfaceMode::Cards
+            && self
+                .shown_card_target
+                .is_some_and(|shown| visible_card_surface_can_grow(shown, target))
+        {
+            self.grow_card_surface_in_place(ctx, target);
             return;
         }
 
@@ -1789,6 +1848,7 @@ impl Driver {
         ctx.request_repaint();
 
         self.card_arm = None;
+        self.visible_card_growth = None;
         self.shown_card_target = Some(resolved_target);
         self.root_mode = RootSurfaceMode::Cards;
         tracing::debug!(
@@ -1819,9 +1879,11 @@ impl Driver {
             self.selection.allows_card_surface(),
             self.handle.needs_visible_surface(),
             auxiliary_open,
+            self.handle.has_global_pointer_observation(),
         );
         if mode != RootSurfaceMode::Cards {
             self.handle.suspend_global_pointer_wake();
+            self.visible_card_growth = None;
         }
         if display_refresh_requested(
             refresh_requested,
@@ -2000,7 +2062,7 @@ impl Driver {
         );
         self.app.set_keyboard_owner(
             KeyboardOwner::ShortcutRecorder,
-            self.settings.is_recording() || self.settings.is_editing_text(),
+            self.settings.is_recording(),
         );
         self.app.edit_shortcuts(&edits.shortcuts);
         self.app.edit_after_capture(&edits.after_capture);
@@ -2312,6 +2374,18 @@ fn shown_card_surface_matches(
     )
 }
 
+fn visible_card_surface_can_grow(shown: CardSurfaceTarget, target: CardSurfaceTarget) -> bool {
+    if shown.scale != target.scale || shown.geometry.work_area != target.geometry.work_area {
+        return false;
+    }
+    let old = shown.geometry.viewport();
+    let new = target.geometry.viewport();
+    new.min.x == old.min.x
+        && new.max.x == old.max.x
+        && new.max.y == old.max.y
+        && new.min.y < old.min.y
+}
+
 fn reveal_card_surface(
     native: &BehaviorController,
     ctx: &egui::Context,
@@ -2365,13 +2439,16 @@ const fn root_surface_mode(
     cards_allowed: bool,
     card_content: bool,
     auxiliary_open: bool,
+    reversible_card_passthrough: bool,
 ) -> RootSurfaceMode {
     if selector_visible {
         RootSurfaceMode::Selector
-    } else if auxiliary_open {
+    } else if auxiliary_open && (!card_content || !reversible_card_passthrough) {
         RootSurfaceMode::Parked
     } else if cards_allowed && card_content {
         RootSurfaceMode::Cards
+    } else if auxiliary_open {
+        RootSurfaceMode::Parked
     } else {
         RootSurfaceMode::Hidden
     }
@@ -2645,7 +2722,7 @@ impl eframe::App for Driver {
             }
         }
         self.announce_panel();
-        // Pixel acquisition and selector restoration can wake the same native
+        // Shutter commitment and selector restoration can wake the same native
         // turn. Play the shutter before `CaptureFinished` restores ordinary
         // windows or starts any post-processing-visible lifecycle transition.
         self.app.drain_capture_feedback();
@@ -3821,7 +3898,7 @@ mod tests {
             .expect("Driver logic pass");
         let shutter = logic
             .find("self.app.drain_capture_feedback()")
-            .expect("acquisition feedback drain");
+            .expect("shutter feedback drain");
         let restoration = logic
             .find("self.selection.logic(ctx, &self.native)")
             .expect("selector lifecycle");
@@ -4097,31 +4174,36 @@ mod tests {
     #[test]
     fn root_surface_mode_is_content_and_lifecycle_bounded() {
         assert_eq!(
-            root_surface_mode(false, true, false, false),
+            root_surface_mode(false, true, false, false, true),
             RootSurfaceMode::Hidden
         );
         assert_eq!(
-            root_surface_mode(true, false, false, false),
+            root_surface_mode(true, false, false, false, true),
             RootSurfaceMode::Selector
         );
         assert_eq!(
-            root_surface_mode(false, true, true, false),
+            root_surface_mode(false, true, true, false, true),
             RootSurfaceMode::Cards
         );
         assert_eq!(
-            root_surface_mode(false, false, true, false),
+            root_surface_mode(false, false, true, false, true),
             RootSurfaceMode::Hidden,
             "cards stay hidden during capture even if old cards still exist"
         );
         assert_eq!(
-            root_surface_mode(false, true, false, true),
+            root_surface_mode(false, true, false, true, true),
             RootSurfaceMode::Parked,
             "an auxiliary child gets an off-screen parent without exposing it"
         );
         assert_eq!(
-            root_surface_mode(false, true, true, true),
+            root_surface_mode(false, true, true, true, true),
+            RootSurfaceMode::Cards,
+            "visible cards coexist with editors because transparent root space passes through"
+        );
+        assert_eq!(
+            root_surface_mode(false, true, true, true, false),
             RootSurfaceMode::Parked,
-            "ordinary editors and Settings must not sit beneath a blocking card root"
+            "without reversible pointer observation, editor input outranks visible cards"
         );
     }
 
@@ -4449,7 +4531,7 @@ mod tests {
         assert_eq!(builder.inner_size, Some(egui::vec2(1180.0, 820.0)));
 
         assert_eq!(
-            root_surface_mode(false, true, false, true),
+            root_surface_mode(false, true, false, true, true),
             RootSurfaceMode::Parked,
             "an open video editor parks the shared root rather than hiding it"
         );
@@ -4789,6 +4871,42 @@ mod tests {
         assert_eq!(
             base_slot.translate(base.position().to_vec2()),
             compact_slot.translate(compact.position().to_vec2())
+        );
+    }
+
+    #[test]
+    fn upward_card_growth_keeps_residents_visible_and_globally_stationary() {
+        let base = RecentCapturesOverlayGeometry::new(egui::Rect::from_min_size(
+            egui::pos2(120.0, 85.0),
+            egui::vec2(1200.0, 800.0),
+        ));
+        let one = CardSurfaceTarget {
+            geometry: card_surface_geometry(base, 1),
+            scale: Some(ScaleFactor::new(2.0)),
+        };
+        let three = CardSurfaceTarget {
+            geometry: card_surface_geometry(base, 3),
+            scale: one.scale,
+        };
+
+        assert!(visible_card_surface_can_grow(one, three));
+        assert!(!visible_card_surface_can_grow(three, one));
+        assert!(!visible_card_surface_can_grow(
+            one,
+            CardSurfaceTarget {
+                scale: Some(ScaleFactor::new(1.0)),
+                ..three
+            }
+        ));
+        let metrics = scrozz_ui::stack::CardMetrics::default();
+        let old_slot =
+            scrozz_ui::stack::StackLayout::new(one.geometry.local(), metrics).slot_rect(0);
+        let new_slot =
+            scrozz_ui::stack::StackLayout::new(three.geometry.local(), metrics).slot_rect(0);
+        assert_eq!(
+            old_slot.translate(one.geometry.position().to_vec2()),
+            new_slot.translate(three.geometry.position().to_vec2()),
+            "existing card globals must not move when the root grows upward"
         );
     }
 

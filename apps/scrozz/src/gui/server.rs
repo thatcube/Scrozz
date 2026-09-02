@@ -184,7 +184,7 @@ impl Request {
         waker: Option<&SurfaceWaker>,
         stop: &AtomicBool,
     ) -> Option<Command> {
-        let mut announce_acquisition = || {
+        let mut announce_shutter = || {
             let (acknowledged, acknowledgement) = channel();
             shutters.send(acknowledged).map_err(|_| {
                 CliError::ipc("the running instance stopped before shutter feedback")
@@ -192,17 +192,21 @@ impl Request {
             if let Some(waker) = waker {
                 waker();
             }
-            acknowledgement
+            if acknowledgement
                 .recv_timeout(Duration::from_secs(2))
-                .map_err(|_| {
-                    CliError::ipc("the running instance did not acknowledge shutter feedback")
-                })
+                .is_err()
+            {
+                // Audio feedback must never veto the screenshot. The bounded
+                // wait preserves ordinary ordering while a stalled UI fails open.
+                tracing::warn!("the running instance did not acknowledge shutter feedback in time");
+            }
+            Ok(())
         };
         let (command, response, captured) = run_with_selector(
             &self.argv,
             self.cwd.as_deref(),
             Some(selector),
-            &mut announce_acquisition,
+            &mut announce_shutter,
         );
         self.finish(command, response, captured, |command, captured| {
             admit_on_main_thread(admissions, waker, stop, command, captured)
@@ -302,7 +306,7 @@ fn run_with_selector(
     argv: &[String],
     cwd: Option<&Path>,
     selector: Option<&dyn CaptureSelector>,
-    acquired: &mut dyn FnMut() -> CliResult<()>,
+    shutter: &mut dyn FnMut() -> CliResult<()>,
 ) -> (Option<Command>, Response, Option<ForwardedCapture>) {
     use clap::Parser as _;
 
@@ -344,11 +348,11 @@ fn run_with_selector(
 
     let mut captured = None;
     let result = cli.validate().and_then(|()| match selector {
-        Some(selector) => commands::dispatch_observed_with_selector_and_acquisition(
+        Some(selector) => commands::dispatch_observed_with_selector_and_shutter(
             &command,
             selector,
             &mut |kind, capture| retain_capture(&mut captured, kind, capture),
-            acquired,
+            shutter,
         ),
         None => commands::dispatch_observed(&command, &mut |kind, capture| {
             retain_capture(&mut captured, kind, capture)
@@ -578,7 +582,7 @@ impl Forwarder {
         self.admissions.try_recv().ok()
     }
 
-    /// Drains acquisition notices that must play on the GUI's main thread.
+    /// Drains shutter notices that must play on the GUI's main thread.
     pub fn drain_shutters(&self) -> Vec<Sender<()>> {
         self.shutters.try_iter().collect()
     }

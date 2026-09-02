@@ -816,6 +816,58 @@ fn growing_the_display_moves_nothing() {
 }
 
 #[test]
+fn local_geometry_rebase_preserves_active_card_frames() {
+    let mut s = stack();
+    let returning = s.push(&at(0));
+    let departing = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let gesture = at(SETTLED + 10);
+    let origin = frame_of(&s.frame(&gesture), returning).rect.center();
+    s.begin_drag(returning, origin, &gesture);
+    s.drag_to(origin + vec2(24.0, 0.0), &gesture);
+    let _ = s.release_drag(&gesture);
+    s.dismiss(departing, &gesture);
+
+    let frame = at(SETTLED + 50);
+    let before = s.frame(&frame);
+    let translation = vec2(0.0, 220.0);
+    s.resize(mbp16().translate(translation), &frame);
+    let after = s.frame(&frame);
+
+    for id in [returning, departing] {
+        assert_rect_eq(
+            frame_of(&after, id).rect,
+            frame_of(&before, id).rect.translate(translation),
+            "active animation must rebase without a global jump",
+        );
+    }
+}
+
+#[test]
+fn work_area_resize_does_not_misapply_a_coordinate_rebase() {
+    let mut s = stack();
+    let id = s.push(&at(0));
+    s.advance(&at(SETTLED));
+    let gesture = at(SETTLED + 10);
+    let origin = frame_of(&s.frame(&gesture), id).rect.center();
+    s.begin_drag(id, origin, &gesture);
+    s.drag_to(origin + vec2(24.0, 0.0), &gesture);
+    let _ = s.release_drag(&gesture);
+
+    let frame = at(SETTLED + 50);
+    let before = frame_of(&s.frame(&frame), id).rect;
+    let resized = Rect::from_min_max(pos2(0.0, 137.0), mbp16().max);
+    s.resize(resized, &frame);
+    let after = frame_of(&s.frame(&frame), id).rect;
+
+    assert_rect_eq(
+        after,
+        before,
+        "changing work-area size with a stable bottom anchor is not a local-coordinate translation",
+    );
+}
+
+#[test]
 fn shrinking_the_display_retires_from_the_bottom() {
     let mut s = CaptureStack::for_work_area(work_area(1400.0));
     let ids: Vec<_> = (0..s.capacity()).map(|_| s.push(&at(0))).collect();

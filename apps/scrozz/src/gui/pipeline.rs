@@ -772,7 +772,7 @@ impl RememberedShare {
 /// What the capture thread produced.
 #[derive(Debug)]
 pub enum Outcome {
-    /// Capture pixels were acquired; expensive rendering and persistence follow.
+    /// The user committed a shutter action; acquisition and processing follow.
     Shutter {
         /// In-flight card correlated with the later ready/failure outcome.
         card: CardId,
@@ -2286,10 +2286,7 @@ impl Worker {
     ) {
         let result = picker_capture.into_capture().map_err(CliError::Core);
         let result = match result {
-            Ok(capture) => {
-                self.announce_shutter(card);
-                self.finish_capture(kind, card, capture, policy)
-            }
+            Ok(capture) => self.finish_capture(kind, card, capture, policy),
             Err(error) => Err(error),
         };
 
@@ -2345,7 +2342,6 @@ impl Worker {
             if !self.scrolling_cancellation.seal_output() {
                 return Err(CliError::Core(CoreError::Cancelled));
             }
-            self.announce_shutter(card);
             lifecycle.finish();
             return self.finish_capture(kind, card, capture, policy);
         }
@@ -2405,6 +2401,7 @@ impl Worker {
             include_window_shadow,
         };
 
+        self.announce_shutter(card);
         let capture = match self.selector.take_frozen_capture(&request) {
             Some(capture) => capture,
             None => crate::gui::selection::capture_selected(
@@ -2413,7 +2410,6 @@ impl Worker {
                 selection_outcome.as_ref(),
             )?,
         };
-        self.announce_shutter(card);
         lifecycle.finish();
         if let Some(outcome) = selection_outcome.as_ref()
             && outcome.mode == SelectionMode::Region
@@ -4053,6 +4049,8 @@ impl Worker {
             .recv_timeout(Duration::from_secs(2))
             .is_err()
         {
+            // Audio feedback cannot veto capture. Bound the ordering handshake
+            // so a stalled or shutting-down main thread fails open.
             tracing::warn!(%card, "main thread did not acknowledge shutter feedback in time");
         }
     }
@@ -5074,7 +5072,7 @@ mod tests {
             acknowledged,
         } = received(&outcomes)
         else {
-            panic!("pixel acquisition must be the first outcome");
+            panic!("shutter commitment must be the first outcome");
         };
         assert_eq!(announced, card);
         acknowledged.send(()).expect("acknowledge shutter");

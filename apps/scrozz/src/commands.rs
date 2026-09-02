@@ -132,29 +132,29 @@ pub fn dispatch_observed_with_selector(
     selector: &dyn CaptureSelector,
     observed: CaptureSink<'_>,
 ) -> CliResult<Report> {
-    dispatch_observed_with_selector_and_acquisition(command, selector, observed, &mut || Ok(()))
+    dispatch_observed_with_selector_and_shutter(command, selector, observed, &mut || Ok(()))
 }
 
-/// Runs a forwarded command and announces the pixel-acquisition boundary before
-/// rendering, sinks, and main-thread capture admission.
-pub fn dispatch_observed_with_selector_and_acquisition(
+/// Runs a forwarded command and announces the committed shutter before
+/// acquisition, rendering, sinks, and main-thread capture admission.
+pub fn dispatch_observed_with_selector_and_shutter(
     command: &Command,
     selector: &dyn CaptureSelector,
     observed: CaptureSink<'_>,
-    acquired: &mut dyn FnMut() -> CliResult<()>,
+    shutter: &mut dyn FnMut() -> CliResult<()>,
 ) -> CliResult<Report> {
-    dispatch_inner(command, Some(selector), observed, acquired, false)
+    dispatch_inner(command, Some(selector), observed, shutter, false)
 }
 
 fn dispatch_inner(
     command: &Command,
     selector: Option<&dyn CaptureSelector>,
     observed: CaptureSink<'_>,
-    acquired: &mut dyn FnMut() -> CliResult<()>,
+    shutter: &mut dyn FnMut() -> CliResult<()>,
     sound_at_source: bool,
 ) -> CliResult<Report> {
     match command {
-        Command::Capture(args) => capture(args, selector, observed, acquired, sound_at_source),
+        Command::Capture(args) => capture(args, selector, observed, shutter, sound_at_source),
         Command::Record(args) => record(args, selector),
         Command::List(args) => list(args.what),
         Command::History(args) => history(&args.command),
@@ -277,7 +277,7 @@ fn capture(
     args: &CaptureArgs,
     selector: Option<&dyn CaptureSelector>,
     observed: CaptureSink<'_>,
-    acquired: &mut dyn FnMut() -> CliResult<()>,
+    shutter: &mut dyn FnMut() -> CliResult<()>,
     sound_at_source: bool,
 ) -> CliResult<Report> {
     args.validate()?;
@@ -384,6 +384,7 @@ fn capture(
     {
         selector.begin_capture(backend.excludes_current_process(&request.target))?;
     }
+    announce_shutter(shutter, sound_at_source, &screenshot_sound)?;
 
     // Scrolling is the only acquisition that outlives a single call, so it is
     // also the only one that installs a terminal cancellation contract: one
@@ -406,11 +407,7 @@ fn capture(
             (capture, None)
         }
     };
-    acquired()?;
     fail_if_terminal_abort(&mut terminal_cancel)?;
-    if sound_at_source && let Err(error) = scrozz_shell::play_screenshot_sound(&screenshot_sound) {
-        tracing::warn!(%error, "the screenshot succeeded but its sound could not play");
-    }
     lifecycle.finish();
     if let Some(outcome) = selection_outcome.as_ref() {
         remember_selection(outcome, backend.as_ref());
@@ -532,6 +529,18 @@ fn capture(
     let mut report = Report::new(data, human);
     report.raw = raw;
     Ok(report)
+}
+
+fn announce_shutter(
+    shutter: &mut dyn FnMut() -> CliResult<()>,
+    sound_at_source: bool,
+    sound: &scrozz_shell::ScreenshotSound,
+) -> CliResult<()> {
+    shutter()?;
+    if sound_at_source && let Err(error) = scrozz_shell::play_screenshot_sound(sound) {
+        tracing::warn!(%error, "the screenshot shutter sound could not play");
+    }
+    Ok(())
 }
 
 struct SelectorLifecycle<'a> {
