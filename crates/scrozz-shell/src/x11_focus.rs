@@ -7,7 +7,7 @@
 
 use scrozz_core::{Error, Result};
 use x11rb::{
-    connection::{Connection as _, RequestConnection as _},
+    connection::Connection as _,
     errors::ReplyError,
     protocol::xproto::{ConnectionExt as _, InputFocus, MapState, Window},
     rust_connection::RustConnection,

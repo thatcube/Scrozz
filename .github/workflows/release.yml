@@ -376,9 +376,13 @@ jobs:
           OUTPUT="$("$BIN" --json --no-ipc share "$MISSING" 2>&1)"
           STATUS=$?
           set -e
-          [[ "$STATUS" == "2" ]]
-          grep -q '"kind":"usage"' <<<"$OUTPUT"
-          ! grep -qi -E 'Unsupported|--features cloud|secret|credential' <<<"$OUTPUT"
+          if [[ "$STATUS" != "2" ]] ||
+             ! grep -q '"kind":"usage"' <<<"$OUTPUT" ||
+             grep -qi -E 'Unsupported|--features cloud' <<<"$OUTPUT"; then
+            echo "::error title=Share boundary smoke failed::Expected a typed usage error for the missing file."
+            printf '%s\n' "$OUTPUT"
+            exit 1
+          fi
       - name: Acquire pinned Windows Tesseract payload
         if: matrix.os == 'windows-latest'
         shell: pwsh

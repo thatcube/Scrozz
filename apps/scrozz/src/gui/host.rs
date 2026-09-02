@@ -12,10 +12,11 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write as _,
+    path::PathBuf,
 };
 use std::{
     future::Future,
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     sync::{Arc, Mutex, mpsc::channel},
     task::{Context as TaskContext, Poll, Waker},

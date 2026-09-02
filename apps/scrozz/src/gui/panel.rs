@@ -831,9 +831,10 @@ pub fn hook_with_controller(controller: BehaviorController) -> scrozz_ui::PanelH
             };
             let setup = PanelSetup::new(PanelReport::unsupported(detail));
             match handle.as_raw() {
-                RawWindowHandle::Xlib(xlib) => u32::try_from(xlib.window).map_or(setup, |window| {
-                    setup.with_passthrough(x11_passthrough(window))
-                }),
+                RawWindowHandle::Xlib(xlib) => match u32::try_from(xlib.window) {
+                    Ok(window) => setup.with_passthrough(x11_passthrough(window)),
+                    Err(_) => setup,
+                },
                 RawWindowHandle::Xcb(xcb) => {
                     setup.with_passthrough(x11_passthrough(xcb.window.get()))
                 }
@@ -898,7 +899,6 @@ fn x11_passthrough(window: u32) -> scrozz_ui::NativePassthrough {
         },
     };
 
-    let mut applied = false;
     Box::new(move |requested| {
         let (connection, _) = x11rb::connect(None)
             .map_err(|error| format!("the X11 overlay connection failed: {error}"))?;
@@ -931,8 +931,7 @@ fn x11_passthrough(window: u32) -> scrozz_ui::NativePassthrough {
         connection
             .flush()
             .map_err(|error| format!("the X11 input shape could not be flushed: {error}"))?;
-        applied = requested;
-        Ok(applied == requested)
+        Ok(true)
     })
 }
 
