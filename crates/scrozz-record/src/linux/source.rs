@@ -673,9 +673,7 @@ async fn open_portal(
     let sources = match plan.types {
         portal_source_type::MONITOR => SourceType::Monitor.into(),
         portal_source_type::WINDOW => SourceType::Window.into(),
-        types
-            if types == portal_source_type::MONITOR | portal_source_type::VIRTUAL =>
-        {
+        types if types == portal_source_type::MONITOR | portal_source_type::VIRTUAL => {
             SourceType::Monitor | SourceType::Virtual
         }
         _ => {
