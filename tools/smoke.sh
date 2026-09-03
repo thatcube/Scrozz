@@ -101,7 +101,11 @@ SMOKE_TMP="$(mktemp -d 2>/dev/null || mktemp -d -t scrozz-smoke)"
 cleanup() { rm -rf "$SMOKE_TMP"; }
 trap cleanup EXIT
 
-export SCROZZ_IPC_SOCKET="$SMOKE_TMP/scrozz.sock"
+if [[ "$OS" == "windows" ]]; then
+  export SCROZZ_IPC_SOCKET='\\.\pipe\scrozz-smoke-'"$$-$RANDOM"
+else
+  export SCROZZ_IPC_SOCKET="$SMOKE_TMP/scrozz.sock"
+fi
 export HOME="$SMOKE_TMP/home"
 export XDG_CONFIG_HOME="$SMOKE_TMP/config"
 export XDG_DATA_HOME="$SMOKE_TMP/data"
