@@ -41,11 +41,15 @@ pub use linux::session::{
 };
 #[cfg(target_os = "linux")]
 pub use linux::wayland::portal::{
-    cursor_mode as portal_cursor_mode, source_type as portal_source_type,
+    cursor_mode as portal_cursor_mode,
+    is_restore_token_rejection as is_portal_restore_token_rejection,
+    source_type as portal_source_type,
 };
 #[cfg(target_os = "linux")]
 pub use linux::wayland::restore::{
-    TokenKey as PortalTokenKey, TokenStore as PortalTokenStore, token_path as portal_token_path,
+    TokenFileLock as PortalTokenFileLock, TokenKey as PortalTokenKey,
+    TokenStore as PortalTokenStore, load as load_portal_tokens,
+    persist_fail_closed as persist_portal_tokens, token_path as portal_token_path,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{

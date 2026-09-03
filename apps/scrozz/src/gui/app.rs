@@ -8338,6 +8338,23 @@ mod tests {
         (app, handle)
     }
 
+    fn install_mock_recording_engine(app: &mut App) {
+        let settings = app.recording.settings();
+        let plan = scrozz_record::engine::MockSessionPlan::complete(
+            std::env::temp_dir().join(format!("scrozz-recording-mock-{}", std::process::id())),
+            1.0,
+        )
+        .expect("valid mock recording");
+        app.recording.machine = Some(
+            RecordingMachine::with_engine(
+                Box::new(scrozz_record::engine::MockEngine::fully_capable(plan)),
+                settings,
+            )
+            .expect("mock recording machine"),
+        );
+        app.recording.unavailable = None;
+    }
+
     fn forwarded_capture(kind: CaptureKind) -> ForwardedCapture {
         let (provenance, target) = match kind {
             // A scrolling capture is never forwarded as a one-shot; the test
@@ -8472,6 +8489,7 @@ mod tests {
         }
 
         let (mut app, _) = app();
+        install_mock_recording_engine(&mut app);
         let stopped = Arc::new(AtomicBool::new(false));
         app.camera_preview = Some(Box::new(Preview {
             stopped: Arc::clone(&stopped),
@@ -8499,6 +8517,7 @@ mod tests {
             false,
         )
         .expect("app");
+        install_mock_recording_engine(&mut app);
         let mut first = app.recording.settings().camera;
         first.size = 0.25;
         let mut latest = first;
@@ -8539,6 +8558,7 @@ mod tests {
     #[test]
     fn open_camera_window_tracks_authoritative_recording_settings() {
         let (mut app, _) = app();
+        install_mock_recording_engine(&mut app);
         let mut stale = app.recording.settings().camera;
         stale.enabled = true;
         app.camera_settings_window = Some(scrozz_ui::CameraSettingsSnapshot {
@@ -8625,6 +8645,7 @@ mod tests {
         }
 
         let (mut app, _) = app();
+        install_mock_recording_engine(&mut app);
         let stopped = Arc::new(AtomicBool::new(false));
         app.camera_preview = Some(Box::new(Preview {
             stopped: Arc::clone(&stopped),
@@ -8641,6 +8662,7 @@ mod tests {
     #[test]
     fn camera_composition_during_selection_is_staged_for_the_next_recording() {
         let (mut app, _) = app();
+        install_mock_recording_engine(&mut app);
         app.recording
             .machine
             .as_mut()
@@ -8684,6 +8706,7 @@ mod tests {
         }
 
         let (mut app, _) = app();
+        install_mock_recording_engine(&mut app);
         let updates = Arc::new(Mutex::new(Vec::new()));
         app.camera_preview = Some(Box::new(Preview {
             updates: Arc::clone(&updates),
@@ -12110,10 +12133,9 @@ mod tests {
             Access::NotGranted,
         );
         assert!(!app.permission.has_pending_action());
+        let remedy = scrozz_shell::permissions::remedy(Capability::ScreenRecording);
         assert!(
-            app.notes()
-                .iter()
-                .any(|note| note.contains("System Settings")),
+            app.notes().iter().any(|note| note.contains(remedy)),
             "the headless refusal must remain actionable"
         );
     }

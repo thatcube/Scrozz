@@ -17,9 +17,10 @@ use pw::properties::{PropertiesBox, properties};
 use pw::spa;
 use pw::spa::pod::Pod;
 use scrozz_capture::{
-    LinuxSessionEnv, LinuxSessionKind, PortalTokenKey, PortalTokenStore, detect_linux_compositor,
-    detect_linux_session, linux_portal_capabilities, portal_cursor_mode, portal_source_type,
-    portal_token_path,
+    LinuxSessionEnv, LinuxSessionKind, PortalTokenFileLock, PortalTokenKey, PortalTokenStore,
+    WAYLAND_PORTAL_PICKER_WINDOW_ID, detect_linux_compositor, detect_linux_session,
+    is_portal_restore_token_rejection, linux_portal_capabilities, load_portal_tokens,
+    persist_portal_tokens, portal_cursor_mode, portal_source_type, portal_token_path,
 };
 use scrozz_core::{
     CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, DisplayId, Error, PixelFormat,
@@ -34,21 +35,23 @@ struct RecordingPortalPlan {
     types: u32,
     cursor: u32,
     multiple: bool,
-    restore_key: PortalTokenKey,
+    restore_key: Option<PortalTokenKey>,
 }
 
 impl RecordingPortalPlan {
     fn for_target(target: &CaptureTarget, show_cursor: bool) -> Self {
         let (types, restore_key) = match target {
-            CaptureTarget::Window(_) => (portal_source_type::WINDOW, PortalTokenKey::Window),
+            CaptureTarget::Window(id) if id.0 == WAYLAND_PORTAL_PICKER_WINDOW_ID => {
+                (portal_source_type::WINDOW, Some(PortalTokenKey::Window))
+            }
+            CaptureTarget::Window(_) => (portal_source_type::WINDOW, None),
             CaptureTarget::AllDisplays => (
                 portal_source_type::MONITOR | portal_source_type::VIRTUAL,
-                PortalTokenKey::AllDisplays,
+                None,
             ),
-            CaptureTarget::Display(id) => {
-                (portal_source_type::MONITOR, PortalTokenKey::display(id))
+            CaptureTarget::Display(_) | CaptureTarget::Region(_) => {
+                (portal_source_type::MONITOR, None)
             }
-            CaptureTarget::Region(_) => (portal_source_type::MONITOR, PortalTokenKey::Monitor),
         };
         Self {
             types,
@@ -218,8 +221,21 @@ struct PortalStream {
 struct PortalResponse {
     streams: Vec<PortalStream>,
     fd: OwnedFd,
-    restore_token: Option<String>,
     session: Session<Screencast>,
+}
+
+struct PortalOpenFailure {
+    error: Error,
+    restore_rejected: bool,
+}
+
+impl From<Error> for PortalOpenFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            restore_rejected: false,
+        }
+    }
 }
 
 struct PortalLifetime {
@@ -342,14 +358,40 @@ impl PortalVideoSource {
             std::env::var("XDG_STATE_HOME").ok().as_deref(),
             std::env::var("HOME").ok().as_deref(),
         );
-        let mut tokens = token_path
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map_or_else(PortalTokenStore::new, |text| PortalTokenStore::parse(&text));
+        let token_lock = token_path
+            .as_deref()
+            .filter(|_| plan.restore_key.is_some())
+            .map(PortalTokenFileLock::acquire)
+            .transpose()
+            .map_err(|error| {
+                Error::Platform(format!(
+                    "could not lock the Wayland portal restore-token store: {error}"
+                ))
+            })?;
+        let mut tokens = match token_path.as_deref().filter(|_| plan.restore_key.is_some()) {
+            Some(path) => match load_portal_tokens(path) {
+                Ok(tokens) => tokens,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    PortalTokenStore::new()
+                }
+                Err(error) => {
+                    return Err(Error::Platform(format!(
+                        "could not load the Wayland portal restore-token store: {error}"
+                    )));
+                }
+            },
+            None => PortalTokenStore::new(),
+        };
         let stored_token = capabilities
             .restore_tokens
-            .then(|| tokens.get(&plan.restore_key).map(str::to_owned))
+            .then(|| {
+                plan.restore_key
+                    .as_ref()
+                    .and_then(|key| tokens.get(key))
+                    .map(str::to_owned)
+            })
             .flatten();
+        let persist_restore = capabilities.restore_tokens && plan.restore_key.is_some();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -357,42 +399,61 @@ impl PortalVideoSource {
             .map_err(|error| {
                 Error::Platform(format!("could not create the portal runtime: {error}"))
             })?;
-        let response = match runtime.block_on(open_portal(
+        let first = runtime.block_on(open_portal(
             target,
             show_cursor,
-            capabilities.restore_tokens,
+            persist_restore,
             stored_token.as_deref(),
-        )) {
-            Ok(response) => response,
-            Err(error) if stored_token.is_some() && !error.is_cancellation() => {
-                tokens.invalidate(&plan.restore_key);
-                persist_tokens(token_path.as_deref(), &tokens);
-                runtime.block_on(open_portal(
+            |streams, restore_token| {
+                accept_portal_start(
                     target,
-                    show_cursor,
-                    capabilities.restore_tokens,
-                    None,
-                ))?
+                    &plan,
+                    token_path.as_deref(),
+                    &mut tokens,
+                    stored_token.is_some(),
+                    streams,
+                    restore_token,
+                )
+            },
+        ));
+        let (response, resolved_target) = match first {
+            Ok(opened) => opened,
+            Err(failure) if stored_token.is_some() && failure.restore_rejected => {
+                let key = plan
+                    .restore_key
+                    .as_ref()
+                    .expect("a stored token has a restore key");
+                tokens.invalidate(key);
+                persist_tokens(token_path.as_deref(), &tokens)?;
+                runtime
+                    .block_on(open_portal(
+                        target,
+                        show_cursor,
+                        persist_restore,
+                        None,
+                        |streams, restore_token| {
+                            accept_portal_start(
+                                target,
+                                &plan,
+                                token_path.as_deref(),
+                                &mut tokens,
+                                false,
+                                streams,
+                                restore_token,
+                            )
+                        },
+                    ))
+                    .map_err(|failure| failure.error)?
             }
-            Err(error) => return Err(error),
+            Err(failure) => return Err(failure.error),
         };
         let PortalResponse {
             streams: descriptors,
             fd,
-            restore_token,
             session,
         } = response;
+        drop(token_lock);
         let portal = PortalLifetime::new(runtime, session)?;
-        if let Some(token) = restore_token.as_deref() {
-            tokens.set(&plan.restore_key, token);
-            persist_tokens(token_path.as_deref(), &tokens);
-        }
-        if descriptors.is_empty() {
-            return Err(Error::Platform(
-                "the screen-cast portal returned no PipeWire streams".into(),
-            ));
-        }
-        let resolved_target = validate_portal_selection(target, &descriptors)?;
         if descriptors.len() > 1
             && descriptors
                 .iter()
@@ -647,7 +708,8 @@ async fn open_portal(
     show_cursor: bool,
     persist: bool,
     restore_token: Option<&str>,
-) -> Result<PortalResponse> {
+    on_started: impl FnOnce(&[PortalStream], Option<&str>) -> Result<Option<CaptureTarget>>,
+) -> std::result::Result<(PortalResponse, Option<CaptureTarget>), PortalOpenFailure> {
     let proxy = Screencast::new().await.map_err(map_portal_error)?;
     let available_sources = proxy
         .available_source_types()
@@ -705,7 +767,18 @@ async fn open_portal(
         proxy
             .select_sources(&session, options)
             .await
-            .map_err(map_portal_error)?;
+            .map_err(|error| {
+                let restore_rejected = restore_token.is_some()
+                    && matches!(
+                        &error,
+                        ashpd::Error::Portal(ashpd::PortalError::InvalidArgument(detail))
+                            if is_portal_restore_token_rejection(detail)
+                    );
+                PortalOpenFailure {
+                    error: map_portal_error(error),
+                    restore_rejected,
+                }
+            })?;
         let response = proxy
             .start(&session, None, Default::default())
             .await
@@ -725,20 +798,23 @@ async fn open_portal(
             })
             .collect();
         let restore_token = response.restore_token().map(str::to_owned);
+        let resolved_target = on_started(&streams, restore_token.as_deref())?;
         let fd = proxy
             .open_pipe_wire_remote(&session, Default::default())
             .await
             .map_err(map_portal_error)?;
-        Ok::<_, Error>((streams, fd, restore_token))
+        Ok::<_, PortalOpenFailure>((streams, fd, resolved_target))
     }
     .await;
     match opened {
-        Ok((streams, fd, restore_token)) => Ok(PortalResponse {
-            streams,
-            fd,
-            restore_token,
-            session,
-        }),
+        Ok((streams, fd, resolved_target)) => Ok((
+            PortalResponse {
+                streams,
+                fd,
+                session,
+            },
+            resolved_target,
+        )),
         Err(error) => {
             if let Err(close_error) = session.close().await {
                 tracing::warn!(
@@ -751,10 +827,51 @@ async fn open_portal(
     }
 }
 
+fn accept_portal_start(
+    target: &CaptureTarget,
+    plan: &RecordingPortalPlan,
+    token_path: Option<&std::path::Path>,
+    tokens: &mut PortalTokenStore,
+    consumed_stored_token: bool,
+    streams: &[PortalStream],
+    restore_token: Option<&str>,
+) -> Result<Option<CaptureTarget>> {
+    let resolved_target = match validate_portal_selection(target, streams) {
+        Ok(target) => target,
+        Err(error) => {
+            if let Some(key) = plan.restore_key.as_ref() {
+                tokens.invalidate(key);
+                persist_tokens(token_path, tokens)?;
+            }
+            return Err(error);
+        }
+    };
+
+    if let Some(key) = plan.restore_key.as_ref() {
+        match restore_token {
+            Some(token) => {
+                tokens.set(key, token);
+                persist_tokens(token_path, tokens)?;
+            }
+            None if consumed_stored_token => {
+                tokens.invalidate(key);
+                persist_tokens(token_path, tokens)?;
+            }
+            None => {}
+        }
+    }
+    Ok(resolved_target)
+}
+
 fn validate_portal_selection(
     requested: &CaptureTarget,
     streams: &[PortalStream],
 ) -> Result<Option<CaptureTarget>> {
+    if streams.is_empty() {
+        return Err(Error::Platform(
+            "the screen-cast portal returned no PipeWire streams".into(),
+        ));
+    }
     if !matches!(requested, CaptureTarget::AllDisplays) && streams.len() != 1 {
         return Err(Error::Platform(format!(
             "the desktop portal returned {} sources for a single-source request",
@@ -926,21 +1043,12 @@ fn map_portal_error(error: ashpd::Error) -> Error {
     }
 }
 
-fn persist_tokens(path: Option<&std::path::Path>, tokens: &PortalTokenStore) {
-    let Some(path) = path else {
-        return;
-    };
-    let result = path
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| std::fs::write(path, tokens.serialise()));
-    if let Err(error) = result {
-        tracing::warn!(
-            %error,
-            path = %path.display(),
-            "could not persist the portal restore token"
-        );
-    }
+fn persist_tokens(path: Option<&std::path::Path>, tokens: &PortalTokenStore) -> Result<()> {
+    persist_portal_tokens(path, tokens).map_err(|error| {
+        Error::Platform(format!(
+            "could not persist the Wayland portal restore-token store: {error}"
+        ))
+    })
 }
 
 fn video_format_parameter() -> Result<Vec<u8>> {
@@ -1369,8 +1477,8 @@ mod tests {
     use scrozz_core::{CaptureTarget, WindowId};
 
     use super::{
-        PackedFrame, PackedPixelFormat, PortalGeometry, PortalStream, nanoseconds_to_audio_frames,
-        portal_pixel_layout, validate_portal_selection,
+        PackedFrame, PackedPixelFormat, PortalGeometry, PortalStream, RecordingPortalPlan,
+        nanoseconds_to_audio_frames, portal_pixel_layout, validate_portal_selection,
     };
 
     fn frame(width: u32, height: u32) -> PackedFrame {
@@ -1392,6 +1500,33 @@ mod tests {
             id: id.map(str::to_owned),
             mapping_id: None,
         }
+    }
+
+    #[test]
+    fn only_advisory_window_recording_reuses_an_unverified_portal_grant() {
+        let display =
+            CaptureTarget::Display(scrozz_core::DisplayId("wayland-output:DP-1".to_owned()));
+        let region = CaptureTarget::Region(scrozz_core::LogicalRect::new(
+            scrozz_core::LogicalPoint::new(0.0, 0.0),
+            scrozz_core::LogicalSize::new(100.0, 100.0),
+        ));
+        let exact_window = CaptureTarget::Window(WindowId("native-window-id".to_owned()));
+        for target in [display, region, exact_window, CaptureTarget::AllDisplays] {
+            assert!(
+                RecordingPortalPlan::for_target(&target, false)
+                    .restore_key
+                    .is_none(),
+                "an unverified exact or composite target must prompt rather than silently restore"
+            );
+        }
+
+        let picker = CaptureTarget::Window(WindowId(
+            scrozz_capture::WAYLAND_PORTAL_PICKER_WINDOW_ID.to_owned(),
+        ));
+        assert_eq!(
+            RecordingPortalPlan::for_target(&picker, false).restore_key,
+            Some(scrozz_capture::PortalTokenKey::Window)
+        );
     }
 
     #[test]
@@ -1417,6 +1552,11 @@ mod tests {
         let requested = CaptureTarget::Window(WindowId("requested-window".into()));
         let selected = portal_stream(Some(SourceType::Monitor), Some("monitor"));
         assert!(validate_portal_selection(&requested, &[selected]).is_err());
+    }
+
+    #[test]
+    fn portal_selection_rejects_an_empty_all_displays_response() {
+        assert!(validate_portal_selection(&CaptureTarget::AllDisplays, &[]).is_err());
     }
 
     #[test]

@@ -4485,6 +4485,7 @@ struct UploadWorker {
     cancellation: crate::cloud::ShareCancellation,
     history: Sender<Job>,
     links: HashMap<CardId, CachedShare>,
+    copy_link: fn(&str) -> scrozz_core::Result<()>,
 }
 
 struct CachedShare {
@@ -4528,7 +4529,13 @@ impl UploadWorker {
             cancellation,
             history,
             links: HashMap::new(),
+            copy_link: |url| scrozz_export::SystemClipboard::new().write_text(url),
         }
+    }
+
+    #[cfg(test)]
+    fn use_test_clipboard(&mut self) {
+        self.copy_link = |_| Ok(());
     }
 
     /// Sends `outcome` and, only once it actually landed, wakes the
@@ -4612,7 +4619,7 @@ impl UploadWorker {
             });
             return;
         };
-        let outcome = match scrozz_export::SystemClipboard::new().write_text(&shared.shared.url) {
+        let outcome = match (self.copy_link)(&shared.shared.url) {
             Ok(()) => Outcome::UploadDone {
                 card,
                 detail: "uploaded and copied the private share link".to_owned(),
@@ -6871,6 +6878,7 @@ mod tests {
             crate::cloud::ShareCancellation::default(),
             history,
         );
+        worker.use_test_clipboard();
         worker.links.insert(
             CardId(50),
             CachedShare {
@@ -6945,6 +6953,7 @@ mod tests {
             crate::cloud::ShareCancellation::default(),
             history,
         );
+        worker.use_test_clipboard();
         worker.links.insert(
             CardId(60),
             CachedShare {

@@ -1444,19 +1444,31 @@ mod tests {
         assert!(!token.contains('.'), "{token}");
     }
 
+    fn missing_endpoint() -> PathBuf {
+        #[cfg(target_os = "windows")]
+        {
+            PathBuf::from(format!(
+                r"\\.\pipe\scrozz-test-missing-{}",
+                std::process::id()
+            ))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            PathBuf::from(format!(
+                "/nonexistent/scrozz-test-{}/instance.sock",
+                std::process::id()
+            ))
+        }
+    }
+
     #[test]
     fn probing_a_path_that_does_not_exist_reports_not_running() {
-        let missing = Path::new("/nonexistent/scrozz-test/instance.sock");
-        assert_eq!(probe_at(missing), Status::NotRunning);
+        assert_eq!(probe_at(&missing_endpoint()), Status::NotRunning);
     }
 
     #[test]
     fn forwarding_to_a_dead_endpoint_is_an_ipc_error() {
-        let err = forward_to(
-            Path::new("/nonexistent/scrozz-test/instance.sock"),
-            &argv(&["capture"]),
-        )
-        .unwrap_err();
+        let err = forward_to(&missing_endpoint(), &argv(&["capture"])).unwrap_err();
         assert_eq!(err.exit(), crate::exit::Exit::IpcFailed);
     }
 }

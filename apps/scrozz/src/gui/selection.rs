@@ -545,6 +545,9 @@ impl ClientOverlaySelector {
                     return Err(Error::Cancelled);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) if self.is_stopped() => {
+                    return Err(Error::Cancelled);
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(bridge_error(disconnected));
                 }
