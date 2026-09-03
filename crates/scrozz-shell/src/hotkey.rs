@@ -2019,7 +2019,10 @@ const STRANDED: &str = "Scrozz can no longer release this combination; \
 fn refusal(detail: &str) -> Conflict {
     if !cfg!(target_os = "macos") {
         return Conflict::Refused {
-            detail: detail.to_owned(),
+            detail: format!(
+                "{detail}. The system did not identify an owner; another application or enabled \
+                 system shortcut may be handling this combination, so choose another"
+            ),
         };
     }
 
