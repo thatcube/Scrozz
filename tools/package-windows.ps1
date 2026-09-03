@@ -1167,6 +1167,9 @@ try {
                     "Authenticode signer after SignTool verification failed"
                 )
             }
+            # The expected self-signed trust failure must not become this
+            # otherwise-successful script's process exit code.
+            $global:LASTEXITCODE = 0
         }
         $Signed = $true
     } else {

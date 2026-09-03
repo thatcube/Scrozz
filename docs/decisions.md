@@ -277,9 +277,9 @@ another application** — above copy, above save. Swipe-to-dismiss is a primary
 gesture. Clipboard remains essential but is no longer described as "first".
 
 **Layout.** Fixed slots anchored at the configured bottom-left or bottom-right
-edge; a new capture slides in from that edge into the next empty slot upward,
-building a tower with the oldest at the bottom. **Existing cards do not move on
-arrival.** Nothing ever covers
+edge; a new capture appears fully formed in the next empty slot upward, building
+a tower with the oldest at the bottom. **Existing cards do not move on arrival.**
+Nothing ever covers
 anything — zero overlap, full size and opacity, consistent gaps. Each card is
 independently hoverable, draggable and dismissable; hovering one reveals only its
 own chrome. Full layout, overflow and gesture rules are in D21.
@@ -289,10 +289,12 @@ own chrome. Full layout, overflow and gesture rules are in D21.
 > overlapping or occluding. Earlier drafts described both an overlapping
 > card-stack and a reflowing list; both were wrong.
 
-**Motion (see D19).** A new capture slides in from the anchored screen edge and
-takes the slot nearest the anchor corner; existing cards shift away with a spring
-settle. Dismissing a card lets its neighbours close the gap. The list reflows —
-it never re-stacks.
+**Motion (see D19).** Arrival and resident reflow are atomic: a new capture is
+complete on its first visible frame, and dismissing a card closes the gap without
+walking the remaining thumbnails through intermediate rows. This avoids
+compositor-dependent one-frame jumps in the always-on-top overlay. Direct
+gestures, an explicitly dismissed card's departure, hover chrome, and dock
+collapse/expand retain deliberate motion.
 
 **Why.** Maintainer, on the behaviour that defines the app: *"you can swipe the
 screenshots that stack in the bottom right down, and also drag them into a chat

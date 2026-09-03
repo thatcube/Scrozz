@@ -4771,8 +4771,17 @@ pub fn golden_plan() -> Vec<GoldenCase> {
     for &scenario in Scenario::all() {
         let fixture = scenario.fixture();
         for instant in fixture.key_instants {
+            let platform_suffix = if !cfg!(target_os = "macos")
+                && matches!(
+                    scenario,
+                    Scenario::PinnedCaptureHover | Scenario::PinnedCaptureLocked
+                ) {
+                "-non-macos"
+            } else {
+                ""
+            };
             cases.push(GoldenCase {
-                name: format!("{}--{}", scenario.slug(), instant.name),
+                name: format!("{}--{}{platform_suffix}", scenario.slug(), instant.name),
                 spec: RenderSpec::golden(scenario, instant.clock()),
                 expectation: instant.expectation.to_owned(),
             });

@@ -12205,7 +12205,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     fn assign_known_default(app: &mut App) -> Accelerator {
         let accelerator = Accelerator::parse("Cmd+Shift+4").expect("known default parses");
         app.edit_shortcuts(&[ShortcutEdit::Set {

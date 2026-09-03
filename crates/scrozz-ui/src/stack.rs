@@ -683,6 +683,22 @@ impl Default for Timing {
 }
 
 impl Timing {
+    /// Keeps live Recent Captures residents fixed while retaining deliberate
+    /// gestures, departure, hover, and dock transitions.
+    ///
+    /// Arrival and gap-closing used to schedule whole-stack repaints around
+    /// native overlay updates. On composited desktops that could present a
+    /// one-frame vertical bounce even though the closed-form geometry itself
+    /// never moved upward.
+    #[must_use]
+    pub fn stable_residents() -> Self {
+        Self {
+            enter: Duration::ZERO,
+            fall: Duration::ZERO,
+            ..Self::default()
+        }
+    }
+
     /// Every duration collapsed to zero (D13/D19).
     ///
     /// Rarely needed — [`Motion::with_reduce_motion`] is the real choke point,
@@ -1067,7 +1083,7 @@ impl CaptureStack {
         };
         Self::new(
             StackLayout::with_placement(work_area, metrics, placement),
-            Timing::default(),
+            Timing::stable_residents(),
         )
     }
 

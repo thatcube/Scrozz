@@ -3258,6 +3258,7 @@ mod tests {
         Capture, CaptureTarget, ColorSpace, Frame, LogicalPoint, LogicalRect, LogicalSize,
         PhysicalSize, PixelFormat, Provenance, ScaleFactor,
     };
+    use std::path::PathBuf;
 
     fn editing_with_preset(
         card: crate::gui::card::CardId,

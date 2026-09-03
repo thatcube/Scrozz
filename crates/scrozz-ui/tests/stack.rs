@@ -233,6 +233,7 @@ fn runtime_size_change_reflows_current_cards_and_reapplies_capacity() {
     for _ in 0..stack.capacity() {
         stack.push(&at(0));
     }
+
     let compact_capacity = stack.capacity();
 
     assert!(
@@ -252,6 +253,37 @@ fn runtime_size_change_reflows_current_cards_and_reapplies_capacity() {
     assert_eq!(stack.len(), stack.capacity());
     assert_eq!(stack.layout().placement(), RecentCapturesPlacement::Right);
     assert_eq!(stack.layout().metrics().width, CardMetrics::MAX_WIDTH);
+}
+
+#[test]
+fn configured_stack_never_animates_arrival_or_resident_reflow() {
+    let mut s = CaptureStack::configured(
+        mbp16(),
+        RecentCapturesPlacement::Left,
+        CardMetrics::default().width,
+    );
+
+    let first = s.push(&at(0));
+    let first_frame = s.frame_of(first, &at(0)).unwrap();
+    assert_eq!(first_frame.state, CardState::Resting);
+    assert_rect_eq(
+        first_frame.rect,
+        s.layout().slot_rect(0),
+        "a live card is fully formed on its first frame",
+    );
+
+    while s.len() < s.capacity() {
+        s.push(&at(0));
+    }
+    let survivor = s.cards()[1].id();
+    assert!(s.dismiss(first, &at(1)));
+    let survivor_frame = s.frame_of(survivor, &at(1)).unwrap();
+    assert_eq!(survivor_frame.state, CardState::Resting);
+    assert_rect_eq(
+        survivor_frame.rect,
+        s.layout().slot_rect(0),
+        "remaining cards compact atomically instead of traversing intermediate rows",
+    );
 }
 
 #[test]
