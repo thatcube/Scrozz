@@ -774,7 +774,7 @@ fn validate_draft(draft: &CloudSettingsDraft) -> Result<(), String> {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err("Viewer accent must be a six-digit color such as #7c3aed.".to_owned());
+        return Err("Viewer accent must be a six-digit color such as #f05a28.".to_owned());
     }
     Ok(())
 }
@@ -814,7 +814,7 @@ mod tests {
             tags: String::new(),
             protection_mode: "none".to_owned(),
             viewer_title: "Scrozz share".to_owned(),
-            viewer_accent: "#7c3aed".to_owned(),
+            viewer_accent: "#f05a28".to_owned(),
         }
     }
 

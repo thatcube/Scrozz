@@ -23,18 +23,18 @@ pixel grid, `zz` eyes and smile as Mozz, Plozz, Hozz and Twozz. The corners are
 what make it specifically a *screenshot* app: they read as a selection region
 before you have consciously identified them.
 
-The plate is near-black with a faint purple cast (`#191622` → `#0D0B14`) and the
-mark is lit from within by a wide, soft radial halo. **That glow is the family
-signature** — Mozz's ghost emits light the same way — so it is not decoration and
-should not be flattened away.
+The plate is near-black with a faint ember cast (`#20130E` → `#0E0B0A`) and the
+`#F05A28` mark is lit from within by a wide, soft radial halo. **That glow is the
+family signature** — Mozz's ghost emits light the same way — so it is not
+decoration and should not be flattened away.
 
 One thing to preserve if the mark is ever redrawn: the crop corners are thin
 strokes, so as they spread toward the edges the centre of the icon empties out.
 The face is scaled up slightly (×1.06) about the centre to compensate. Push the
 corners further without also growing the face and the icon reads hollow.
 
-Purple was tried as a plate colour and rejected — purple-on-purple loses the mark,
-and the contrast collapses at 16px.
+Orange-on-orange was rejected for the same reason: the dark plate keeps the mark
+legible at 16px while the ember halo carries the brand color.
 
 ### Small representations are separate artwork
 
@@ -82,7 +82,7 @@ tile in Finder list view and System Settings—the same visual defect the Tahoe
 asset was meant to remove. System mode may change the surrounding UI; Scrozz's
 identity stays dark.
 
-The original purple mark is scaled to 120% inside the system-shaped plate so it
+The ember mark is scaled to 120% inside the system-shaped plate so it
 does not read as a small icon nested inside another icon. Neutral shadow and
 specular treatments are disabled to prevent a gray rim. The foreground halo
 peaks at 16.5% opacity—exactly 25% below the first version—so it reads as ambient

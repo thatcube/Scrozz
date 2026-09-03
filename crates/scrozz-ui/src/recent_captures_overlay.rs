@@ -917,6 +917,11 @@ enum Command {
         id: CardId,
         status: Option<String>,
     },
+    FinalizeCapture {
+        id: CardId,
+        pin_id: Option<PinId>,
+        name: Option<String>,
+    },
     SetUploadAvailability {
         id: CardId,
         available: bool,
@@ -1125,6 +1130,11 @@ impl RecentCapturesOverlayHandle {
     /// Shows or clears the action status line on one card.
     pub fn set_status(&self, id: CardId, status: Option<String>) {
         self.command(Command::SetStatus { id, status });
+    }
+
+    /// Backfills durable identity and any automatic-export file name.
+    pub fn finalize_capture(&self, id: CardId, pin_id: Option<PinId>, name: Option<String>) {
+        self.command(Command::FinalizeCapture { id, pin_id, name });
     }
 
     /// Updates what Upload can do for one card.
@@ -1758,6 +1768,9 @@ impl Entry {
         content.accent = self.accent;
         content.upload_enabled = self.upload_available;
         content.upload_unavailable_reason = self.upload_unavailable_reason.as_deref();
+        content.pin_enabled = self.pin_id.is_some();
+        content.pin_unavailable_reason = (!content.pin_enabled)
+            .then_some("Pin to Screen needs a durable history copy of this capture.");
         content.status = self.status.as_deref();
         if let Some(texture) = &self.texture {
             content.texture = Some(texture.id());
@@ -2214,6 +2227,14 @@ impl RecentCapturesOverlayApp {
                 Command::SetStatus { id, status } => {
                     if let Some(entry) = self.content.get_mut(&id) {
                         entry.status = status;
+                    }
+                }
+                Command::FinalizeCapture { id, pin_id, name } => {
+                    if let Some(entry) = self.content.get_mut(&id) {
+                        entry.pin_id = pin_id;
+                        if let Some(name) = name {
+                            entry.name = name;
+                        }
                     }
                 }
                 Command::SetUploadAvailability {
@@ -4100,6 +4121,8 @@ mod tests {
         let content = entry.card_content();
         assert_eq!(content.accent, Some(accent));
         assert!(content.editing);
+        assert!(!content.pin_enabled);
+        assert!(content.pin_unavailable_reason.is_some());
     }
 
     #[test]

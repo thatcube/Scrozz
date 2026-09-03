@@ -3,6 +3,7 @@
 use std::{
     sync::{
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender, channel},
     },
     thread::{self, ThreadId},
@@ -34,6 +35,12 @@ const INPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// app adds the lifecycle notifications the platform-neutral contract cannot
 /// know.
 pub trait CaptureSelector: RegionSelector {
+    /// Queues non-activating cursor feedback at successful action admission.
+    fn prime_cursor(&self, _cursor: OverlayCursor) {}
+
+    /// Revokes feedback when admission fails before acquisition starts.
+    fn cancel_cursor_prime(&self) {}
+
     /// Reserves the app surface for a capture that needs no picker.
     ///
     /// `surface_can_remain_visible` is true only when the capture backend
@@ -247,6 +254,10 @@ impl SelectorViewports {
 }
 
 enum BridgeEvent {
+    PrimeCursor {
+        cursor: OverlayCursor,
+    },
+    CancelPrime,
     ArmCursor {
         id: u64,
         cursor: OverlayCursor,
@@ -280,6 +291,8 @@ enum BridgeEvent {
 impl BridgeEvent {
     const fn name(&self) -> &'static str {
         match self {
+            Self::PrimeCursor { .. } => "prime-cursor",
+            Self::CancelPrime => "cancel-prime",
             Self::ArmCursor { .. } => "arm-cursor",
             Self::BeginCapture { .. } => "begin-capture",
             Self::Begin { .. } => "begin-selection",
@@ -292,13 +305,13 @@ impl BridgeEvent {
 
     const fn id(&self) -> Option<u64> {
         match self {
+            Self::PrimeCursor { .. } | Self::CancelPrime | Self::Cancel => None,
             Self::ArmCursor { id, .. }
             | Self::BeginCapture { id, .. }
             | Self::Begin { id, .. }
             | Self::Prepared { id, .. }
             | Self::PreparationFailed { id }
             | Self::CaptureFinished { id, .. } => Some(*id),
-            Self::Cancel => None,
         }
     }
 }
@@ -317,6 +330,8 @@ pub struct ClientOverlayController {
     completion: Completion,
     cancelled_preparations: Vec<u64>,
     auxiliary_suppressed: bool,
+    pointer_wake: Arc<AtomicBool>,
+    armed_cursor: Option<OverlayCursor>,
 }
 
 enum ControllerPhase {
@@ -365,9 +380,6 @@ enum ControllerPhase {
     AwaitingCapture {
         id: u64,
     },
-    RestoringCards {
-        restored: Sender<()>,
-    },
 }
 
 impl ControllerPhase {
@@ -383,7 +395,6 @@ impl ControllerPhase {
             Self::ReleaseBeforeHide { .. } => "release-before-hide",
             Self::HideAfterDecision { .. } => "hide-after-decision",
             Self::AwaitingCapture { .. } => "awaiting-capture",
-            Self::RestoringCards { .. } => "restoring-cards",
         }
     }
 
@@ -457,6 +468,8 @@ impl ClientOverlaySelector {
             completion,
             cancelled_preparations: Vec::new(),
             auxiliary_suppressed: false,
+            pointer_wake: Arc::new(AtomicBool::new(false)),
+            armed_cursor: None,
         };
         (selector, controller)
     }
@@ -473,17 +486,17 @@ impl ClientOverlaySelector {
     }
 
     fn acquire(&self) -> Result<u64> {
-        let (lock, changed) = &*self.gate;
+        let (lock, _) = &*self.gate;
         let mut gate = lock
             .lock()
             .map_err(|_| bridge_error("the selector lifecycle lock was poisoned"))?;
-        while gate.active.is_some() && !gate.stopped {
-            gate = changed
-                .wait(gate)
-                .map_err(|_| bridge_error("the selector lifecycle lock was poisoned"))?;
-        }
         if gate.stopped {
             return Err(Error::Cancelled);
+        }
+        if gate.active.is_some() {
+            return Err(Error::InvalidRequest(
+                "a capture or recording selection is already in progress".to_owned(),
+            ));
         }
         gate.next_id = gate.next_id.wrapping_add(1).max(1);
         let id = gate.next_id;
@@ -677,6 +690,14 @@ impl RegionSelector for ClientOverlaySelector {
 }
 
 impl CaptureSelector for ClientOverlaySelector {
+    fn prime_cursor(&self, cursor: OverlayCursor) {
+        let _ = self.send_event(BridgeEvent::PrimeCursor { cursor });
+    }
+
+    fn cancel_cursor_prime(&self) {
+        let _ = self.send_event(BridgeEvent::CancelPrime);
+    }
+
     fn begin_capture(&self, surface_can_remain_visible: bool) -> Result<()> {
         let id = self.acquire()?;
         let (hidden_tx, hidden_rx) = channel();
@@ -770,6 +791,12 @@ impl CaptureSelector for ClientOverlaySelector {
 }
 
 impl ClientOverlayController {
+    /// Event-driven wake flag for keeping a pending native cursor pinned.
+    #[must_use]
+    pub fn pointer_wake_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.pointer_wake)
+    }
+
     /// Whether the native fullscreen selector must currently be ordered in.
     #[must_use]
     pub fn wants_visible_selector(&self) -> bool {
@@ -814,8 +841,31 @@ impl ClientOverlayController {
         if before != after {
             tracing::debug!(from = before, to = after, "selector lifecycle advanced");
         }
+        self.refresh_pending_cursor(ctx, native);
+    }
+
+    /// Drains cursor/admission events created later in the host's same callback.
+    pub fn service_pending_events(
+        &mut self,
+        ctx: &egui::Context,
+        native: &crate::gui::panel::BehaviorController,
+    ) {
+        while let Ok(event) = self.events.try_recv() {
+            self.handle_event(ctx, native, event);
+        }
+        self.refresh_pending_cursor(ctx, native);
+    }
+
+    fn refresh_pending_cursor(
+        &self,
+        ctx: &egui::Context,
+        native: &crate::gui::panel::BehaviorController,
+    ) {
         native.refresh();
-        if let Some(cursor) = self.pending_selection_cursor() {
+        let pending_cursor = self.pending_selection_cursor();
+        self.pointer_wake
+            .store(pending_cursor.is_some(), Ordering::Release);
+        if let Some(cursor) = pending_cursor {
             native.set_cursor(cursor);
             ctx.request_repaint();
         }
@@ -877,6 +927,7 @@ impl ClientOverlayController {
         native: &crate::gui::panel::BehaviorController,
     ) {
         self.auxiliary_suppressed = false;
+        self.armed_cursor = None;
         native.set_cursor(OverlayCursor::Arrow);
         native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
         native.restore_suppressed_windows();
@@ -893,6 +944,7 @@ impl ClientOverlayController {
 
     fn pending_selection_cursor(&self) -> Option<OverlayCursor> {
         let cursor = match &self.phase {
+            ControllerPhase::Cards => self.armed_cursor?,
             ControllerPhase::HideBeforePreparation { cursor, .. }
             | ControllerPhase::WaitingForPreparation { cursor, .. }
             | ControllerPhase::PreparingWithCards { cursor, .. } => *cursor,
@@ -915,7 +967,6 @@ impl ClientOverlayController {
             ControllerPhase::ReleaseBeforeHide { .. } => "release-before-hide",
             ControllerPhase::HideAfterDecision { .. } => "hide-after-decision",
             ControllerPhase::AwaitingCapture { .. } => "awaiting-capture",
-            ControllerPhase::RestoringCards { .. } => "restoring-cards",
         }
     }
 
@@ -1089,10 +1140,6 @@ impl ClientOverlayController {
                 let _ = decision.send(result);
                 ControllerPhase::AwaitingCapture { id }
             }
-            ControllerPhase::RestoringCards { restored } => {
-                let _ = restored.send(());
-                ControllerPhase::Cards
-            }
             other => other,
         };
     }
@@ -1110,6 +1157,14 @@ impl ClientOverlayController {
             "selector lifecycle event"
         );
         match event {
+            BridgeEvent::PrimeCursor { cursor } if matches!(self.phase, ControllerPhase::Cards) => {
+                self.armed_cursor = Some(cursor);
+                native.set_cursor(cursor);
+            }
+            BridgeEvent::CancelPrime if matches!(self.phase, ControllerPhase::Cards) => {
+                self.armed_cursor = None;
+                native.set_cursor(OverlayCursor::Arrow);
+            }
             BridgeEvent::BeginCapture {
                 id,
                 hidden,
@@ -1120,6 +1175,7 @@ impl ClientOverlayController {
             BridgeEvent::ArmCursor { cursor, .. }
                 if matches!(self.phase, ControllerPhase::Cards) =>
             {
+                self.armed_cursor = Some(cursor);
                 native.set_cursor(cursor);
             }
             BridgeEvent::BeginCapture {
@@ -1127,6 +1183,7 @@ impl ClientOverlayController {
                 hidden,
                 surface_can_remain_visible: false,
             } if matches!(self.phase, ControllerPhase::Cards) => {
+                self.armed_cursor = None;
                 self.auxiliary_suppressed = true;
                 native.suppress_auxiliary_windows();
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
@@ -1141,7 +1198,9 @@ impl ClientOverlayController {
                 hidden,
                 surface_can_remain_visible: true,
                 cursor,
+                ..
             } if matches!(self.phase, ControllerPhase::Cards) => {
+                self.armed_cursor = None;
                 self.auxiliary_suppressed = true;
                 let _ = hidden.send(());
                 self.phase = ControllerPhase::PreparingWithCards { id, cursor };
@@ -1152,14 +1211,19 @@ impl ClientOverlayController {
                 surface_can_remain_visible: false,
                 cursor,
             } if matches!(self.phase, ControllerPhase::Cards) => {
+                self.armed_cursor = None;
                 self.auxiliary_suppressed = true;
                 native.suppress_auxiliary_windows();
-                native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
+                // Keep the existing root alive at zero alpha and click-through.
+                // A hidden eframe root can be throttled to ~9 Hz after idle;
+                // this click-through preparation surface keeps lifecycle
+                // handshakes frame-paced without creating a fullscreen shield.
+                native.apply(&scrozz_shell::OverlayBehavior::preparing_capture_card());
                 native.set_cursor(cursor);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
-                native.set_visible(false);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                native.set_visible(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.request_repaint();
                 self.phase = ControllerPhase::HideBeforePreparation { id, hidden, cursor };
             }
@@ -1217,6 +1281,7 @@ impl ClientOverlayController {
                     ControllerPhase::WaitingForPreparation { id: waiting, .. } if waiting == id
                 ) =>
             {
+                self.armed_cursor = None;
                 native.set_cursor(OverlayCursor::Arrow);
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 native.set_visible(false);
@@ -1230,6 +1295,7 @@ impl ClientOverlayController {
                     ControllerPhase::PreparingWithCards { id: waiting, .. } if waiting == id
                 ) =>
             {
+                self.armed_cursor = None;
                 native.set_cursor(OverlayCursor::Arrow);
                 self.auxiliary_suppressed = false;
                 self.phase = ControllerPhase::Cards;
@@ -1237,6 +1303,7 @@ impl ClientOverlayController {
             BridgeEvent::PreparationFailed { id }
                 if matches!(self.phase, ControllerPhase::Cards) =>
             {
+                self.armed_cursor = None;
                 native.set_cursor(OverlayCursor::Arrow);
                 self.phase = ControllerPhase::AwaitingCapture { id };
             }
@@ -1246,6 +1313,7 @@ impl ClientOverlayController {
                     ControllerPhase::AwaitingCapture { id: waiting } if waiting == id
                 ) =>
             {
+                self.armed_cursor = None;
                 self.auxiliary_suppressed = false;
                 native.set_cursor(OverlayCursor::Arrow);
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
@@ -1263,13 +1331,15 @@ impl ClientOverlayController {
                     // selector viewport over the newly revealed card.
                     native.set_visible(false);
                     ctx.request_repaint();
-                    self.phase = ControllerPhase::RestoringCards { restored };
+                    let _ = restored.send(());
+                    self.phase = ControllerPhase::Cards;
                 }
             }
             BridgeEvent::CaptureFinished { id, restored }
                 if matches!(self.phase, ControllerPhase::Cards) =>
             {
                 let restore_auxiliary = self.auxiliary_suppressed;
+                self.armed_cursor = None;
                 self.auxiliary_suppressed = false;
                 native.set_cursor(OverlayCursor::Arrow);
                 if restore_auxiliary {
@@ -1285,6 +1355,7 @@ impl ClientOverlayController {
                 let _ = restored.send(());
             }
             BridgeEvent::Cancel => {
+                self.armed_cursor = None;
                 self.auxiliary_suppressed = false;
                 native.apply(&scrozz_shell::OverlayBehavior::hidden_surface());
                 native.restore_suppressed_windows();
@@ -1517,14 +1588,18 @@ fn frozen_capture_for_outcome(
 ///
 /// A Windows mixed-DPI desktop can contain overlapping public logical display
 /// rectangles. Re-inferring a monitor from a region rectangle can therefore
-/// choose a different display than the viewport the user dragged on. Capturing
-/// that measured display and cropping it keeps the existing backend contract
-/// while preserving the selector's unambiguous result.
+/// choose a different display than the viewport the user dragged on, so Windows
+/// captures that measured display and crops it. Other platforms keep the native
+/// region target: on macOS that reaches `captureImageInRect:` directly instead
+/// of allocating and encoding the entire Retina display.
 pub(crate) fn capture_selected(
     backend: &dyn CaptureBackend,
     request: &CaptureRequest,
     outcome: Option<&SelectionOutcome>,
 ) -> Result<Capture> {
+    if !cfg!(target_os = "windows") {
+        return backend.capture(request);
+    }
     let Some(outcome) =
         outcome.filter(|outcome| outcome.mode == scrozz_core::SelectionMode::Region)
     else {
@@ -1755,6 +1830,7 @@ fn configure_viewport(
     if selection {
         native.set_frame(logical_frame(geometry));
     }
+
     #[cfg(not(target_os = "macos"))]
     let _ = native;
     // Keep winit's geometry in sync even when AppKit is authoritative. The
@@ -1893,6 +1969,28 @@ mod tests {
             .expect("controller receiver");
 
         assert_eq!(wake_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn admitted_region_cursor_is_serviced_in_the_same_host_callback() {
+        let (selector, mut controller) = region_test_pair(Completion::RestoreCards);
+        let ctx = egui::Context::default();
+        let (native, _) = crate::gui::panel::BehaviorController::recording();
+
+        selector.prime_cursor(OverlayCursor::Crosshair);
+        controller.service_pending_events(&ctx, &native);
+
+        assert_eq!(controller.armed_cursor, Some(OverlayCursor::Crosshair));
+        assert!(
+            controller.pointer_wake_flag().load(Ordering::Acquire),
+            "pointer motion must keep the prime pinned until real selection begins"
+        );
+        assert!(
+            native
+                .recorded_cursors()
+                .iter()
+                .all(|cursor| *cursor == OverlayCursor::Crosshair)
+        );
     }
 
     fn prepare_test_snapshot(
@@ -2117,8 +2215,8 @@ mod tests {
         });
         assert_eq!(
             native.recorded_visibility(),
-            [false],
-            "{origin:?} must keep the selector hidden while preparation runs"
+            [true],
+            "{origin:?} must keep the transparent click-through root frame-paced while preparation runs"
         );
         assert_eq!(snapshots.load(Ordering::SeqCst), 1);
         controller.logic(&ctx, &native);
@@ -2193,20 +2291,12 @@ mod tests {
         controller.logic(&ctx, &native);
         assert!(matches!(
             &controller.phase,
-            ControllerPhase::AwaitingCapture { .. }
-                | ControllerPhase::RestoringCards { .. }
-                | ControllerPhase::Cards
+            ControllerPhase::AwaitingCapture { .. } | ControllerPhase::Cards
         ));
         wait_until(|| {
             controller.logic(&ctx, &native);
-            matches!(
-                &controller.phase,
-                ControllerPhase::RestoringCards { .. } | ControllerPhase::Cards
-            )
+            matches!(&controller.phase, ControllerPhase::Cards)
         });
-        if matches!(&controller.phase, ControllerPhase::RestoringCards { .. }) {
-            controller.logic(&ctx, &native);
-        }
         assert!(matches!(&controller.phase, ControllerPhase::Cards));
         assert_eq!(
             native.recorded_visibility().last(),
@@ -2231,7 +2321,7 @@ mod tests {
             2,
             "{origin:?} must permit an immediate second invocation"
         );
-        assert_eq!(native.recorded_visibility().last(), Some(&false));
+        assert_eq!(native.recorded_visibility().last(), Some(&true));
 
         selector.cancel();
         controller.logic(&ctx, &native);
@@ -2606,6 +2696,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn live_region_capture_uses_the_selected_display_in_ambiguous_geometry() {
         let bounds = LogicalRect::new(LogicalPoint::new(50.0, 0.0), LogicalSize::new(100.0, 80.0));
@@ -2653,6 +2744,40 @@ mod tests {
         assert_eq!(capture.frame.width(), 40);
         assert_eq!(capture.frame.height(), 30);
         assert!(capture.frame.data.iter().all(|byte| *byte == 2));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn live_region_capture_preserves_the_native_region_fast_path() {
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(200.0, 100.0));
+        let backend = RecordingBackend {
+            displays: vec![Display {
+                id: DisplayId("primary".to_owned()),
+                name: "Primary".to_owned(),
+                bounds,
+                work_area: bounds,
+                scale: ScaleFactor::new(2.0),
+                is_primary: true,
+            }],
+            targets: Mutex::new(Vec::new()),
+        };
+        let rect = LogicalRect::new(LogicalPoint::new(60.0, 10.0), LogicalSize::new(20.0, 15.0));
+        let request = CaptureRequest::new(CaptureTarget::Region(rect));
+        let outcome = SelectionOutcome::region(
+            rect,
+            Some(DisplayId("primary".to_owned())),
+            ScaleFactor::new(2.0),
+            scrozz_core::SelectionSource::ClientOverlay,
+        );
+
+        let capture = capture_selected(&backend, &request, Some(&outcome)).unwrap();
+
+        assert_eq!(
+            backend.targets.into_inner().unwrap(),
+            vec![CaptureTarget::Region(rect)]
+        );
+        assert_eq!(capture.frame.width(), 20);
+        assert_eq!(capture.frame.height(), 15);
     }
 
     #[test]
@@ -2737,10 +2862,17 @@ mod tests {
         let (native, _) = crate::gui::panel::BehaviorController::recording();
 
         controller.logic(&ctx, &native);
-        assert_eq!(
-            native.recorded_cursors(),
-            [OverlayCursor::Crosshair],
-            "the user must get immediate capture feedback while discovery is still running"
+        let cursors = native.recorded_cursors();
+        assert!(
+            !cursors.is_empty()
+                && cursors
+                    .iter()
+                    .all(|cursor| *cursor == OverlayCursor::Crosshair),
+            "the user must get immediate, pinned capture feedback while discovery is still running"
+        );
+        assert!(
+            controller.pointer_wake_flag().load(Ordering::Acquire),
+            "global pointer motion must keep waking the hidden root until selection owns the cursor"
         );
         assert!(
             native.recorded_visibility().is_empty(),
@@ -2756,11 +2888,15 @@ mod tests {
             controller.logic(&ctx, &native);
             matches!(controller.phase, ControllerPhase::Cards)
         });
+        assert!(
+            !controller.pointer_wake_flag().load(Ordering::Acquire),
+            "terminal cleanup must retire the selector cursor wake lease"
+        );
         assert!(worker.join().expect("selection worker").is_err());
     }
 
     #[test]
-    fn bridge_snapshots_before_picker_presentation_and_holds_the_gate_through_capture() {
+    fn bridge_snapshots_before_picker_presentation_and_refuses_overlapping_selection() {
         let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
         let timeline = Arc::new(Mutex::new(Vec::new()));
         let snapshot_timeline = Arc::clone(&timeline);
@@ -2822,8 +2958,15 @@ mod tests {
         );
         assert_eq!(
             native.recorded_visibility(),
-            [false],
-            "target snapshot completion must not create a blank fullscreen input shield"
+            [true],
+            "target snapshot completion keeps only the existing click-through root alive"
+        );
+        assert!(
+            !native
+                .recorded_actions()
+                .iter()
+                .any(|action| matches!(action, crate::gui::panel::RecordedNativeAction::Frame(_))),
+            "preparation must not resize the existing root into an input shield"
         );
 
         controller.logic(&ctx, &native);
@@ -2836,7 +2979,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::preparing_capture_card(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
             "selection becomes fullscreen and interactive only after preparation"
@@ -2896,7 +3039,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::preparing_capture_card(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
             "focus must remain owned until the decision handshake advances"
@@ -2905,7 +3048,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::preparing_capture_card(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
             ],
             "focus must remain owned until the committing key is released"
@@ -2942,7 +3085,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::preparing_capture_card(),
                 scrozz_shell::OverlayBehavior::selection_overlay(),
                 scrozz_shell::OverlayBehavior::hidden_surface(),
             ],
@@ -2971,17 +3114,17 @@ mod tests {
             CaptureTarget::Region(options.remembered.unwrap())
         );
 
-        let (second_tx, second_rx) = channel();
-        let second = Arc::clone(&selector);
-        let second_options = options;
-        let second_worker = std::thread::spawn(move || {
-            let _ = second_tx.send(second.select(&second_options));
-        });
-        std::thread::sleep(Duration::from_millis(30));
+        let second_error = selector
+            .select(&options)
+            .expect_err("an overlapping selection must be refused");
         controller.logic(&ctx, &native);
         assert!(
-            second_rx.try_recv().is_err(),
-            "a second selection must wait through the first capture"
+            matches!(
+                second_error,
+                Error::InvalidRequest(message)
+                    if message == "a capture or recording selection is already in progress"
+            ),
+            "an overlapping selection must fail immediately instead of appearing later"
         );
         assert_eq!(preparations.load(Ordering::SeqCst), 1);
 
@@ -2996,14 +3139,18 @@ mod tests {
             "a different worker must not complete the active selection"
         );
         assert!(
-            second_rx.try_recv().is_err(),
-            "a different worker must not release the selector gate"
+            matches!(
+                selector.select(&options),
+                Err(Error::InvalidRequest(message))
+                    if message == "a capture or recording selection is already in progress"
+            ),
+            "a different worker must not release selector admission"
         );
 
         finish_owner_tx.send(()).expect("finish owner signal");
         wait_until(|| {
             controller.logic(&ctx, &native);
-            matches!(&controller.phase, ControllerPhase::RestoringCards { .. })
+            matches!(&controller.phase, ControllerPhase::Cards)
         });
         assert!(
             behavior_log
@@ -3012,19 +3159,15 @@ mod tests {
                 .is_some_and(|behavior| behavior.click_through),
             "restoration must stay fail-open until the card renderer paints"
         );
-        controller.logic(&ctx, &native);
         owner_finished_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("capture finish should wait for restored cards");
+            .expect("capture finish should acknowledge native order-out");
         first_worker.join().expect("first selector worker");
         assert_eq!(
             native.recorded_visibility().last(),
             Some(&false),
             "restoring the card state must not reveal an empty fullscreen root"
         );
-
-        selector.cancel();
-        second_worker.join().expect("second selector worker");
     }
 
     #[test]
@@ -3177,9 +3320,7 @@ mod tests {
         controller.logic(&ctx, &native);
         assert!(matches!(
             &controller.phase,
-            ControllerPhase::AwaitingCapture { .. }
-                | ControllerPhase::RestoringCards { .. }
-                | ControllerPhase::Cards
+            ControllerPhase::AwaitingCapture { .. } | ControllerPhase::Cards
         ));
         wait_until(|| {
             controller.logic(&ctx, &native);
@@ -3314,9 +3455,7 @@ mod tests {
         controller.logic(&ctx, &native);
         assert!(matches!(
             &controller.phase,
-            ControllerPhase::AwaitingCapture { .. }
-                | ControllerPhase::RestoringCards { .. }
-                | ControllerPhase::Cards
+            ControllerPhase::AwaitingCapture { .. } | ControllerPhase::Cards
         ));
         wait_until(|| {
             controller.logic(&ctx, &native);
@@ -3437,9 +3576,8 @@ mod tests {
         finish_tx.send(()).expect("finish signal");
         wait_until(|| {
             controller.logic(&ctx, &native);
-            matches!(&controller.phase, ControllerPhase::RestoringCards { .. })
+            matches!(&controller.phase, ControllerPhase::Cards)
         });
-        controller.logic(&ctx, &native);
         worker.join().expect("fixed capture worker");
         assert!(matches!(&controller.phase, ControllerPhase::Cards));
         assert!(!controller.suppresses_auxiliary_windows());
@@ -3450,7 +3588,7 @@ mod tests {
         let (selector, mut controller) = region_test_pair(Completion::RestoreCards);
         controller.phase = ControllerPhase::AwaitingCapture { id: 7 };
         controller.auxiliary_suppressed = true;
-        let (restored_tx, _restored_rx) = channel();
+        let (restored_tx, restored_rx) = channel();
         selector
             .events
             .send(BridgeEvent::CaptureFinished {
@@ -3466,10 +3604,10 @@ mod tests {
         });
         output.textures_delta.clear();
 
-        assert!(matches!(
-            &controller.phase,
-            ControllerPhase::RestoringCards { .. }
-        ));
+        assert!(matches!(&controller.phase, ControllerPhase::Cards));
+        restored_rx
+            .try_recv()
+            .expect("capture completion is acknowledged with native root hidden");
         assert_eq!(
             behavior_log.borrow().last(),
             Some(&scrozz_shell::OverlayBehavior::hidden_surface())
@@ -3612,7 +3750,7 @@ mod tests {
         );
         assert_eq!(
             *behavior_log.borrow(),
-            vec![scrozz_shell::OverlayBehavior::hidden_surface()]
+            vec![scrozz_shell::OverlayBehavior::preparing_capture_card()]
         );
         assert!(
             native
@@ -3679,7 +3817,7 @@ mod tests {
         assert_eq!(
             *behavior_log.borrow(),
             vec![
-                scrozz_shell::OverlayBehavior::hidden_surface(),
+                scrozz_shell::OverlayBehavior::preparing_capture_card(),
                 scrozz_shell::OverlayBehavior::selection_overlay()
             ]
         );

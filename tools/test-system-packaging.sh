@@ -477,10 +477,69 @@ grep -q 'macOS) BIN="dist/Scrozz.app/Contents/MacOS/Scrozz"' \
   fail "macOS DMG builder is absent or not executable"
 grep -q 'tools/make-dmg.sh dist/Scrozz.app "\$ASSET"' "$RELEASE_WORKFLOW" ||
   fail "macOS release does not package the signed app as a DMG"
-grep -q 'ln -s /Applications' tools/make-dmg.sh ||
+grep -Fq 'symlinks = {"Applications": "/Applications"}' \
+  packaging/macos/dmg-settings.py ||
   fail "macOS DMG does not provide a drag-to-Applications target"
 grep -q 'PACKAGE_KIND="disk-image"' tools/package.sh ||
   fail "macOS package metadata does not identify the disk image"
+grep -q 'Sign and notarise macOS disk image' "$RELEASE_WORKFLOW" ||
+  fail "the final macOS DMG is not signed and notarized"
+grep -q 'xcrun stapler staple "\$ASSET"' "$RELEASE_WORKFLOW" ||
+  fail "the final macOS DMG does not receive its notarization ticket"
+grep -q 'spctl --assess --type open' "$RELEASE_WORKFLOW" ||
+  fail "the final macOS DMG is not assessed by Gatekeeper"
+grep -q 'python3 tools/run-dmgbuild.py' tools/make-dmg.sh ||
+  fail "macOS DMG does not use the pinned Finder metadata builder"
+grep -q 'atexit.register(cleanup_attached_devices)' tools/run-dmgbuild.py ||
+  fail "interrupted DMG builds do not clean their owned writable mount"
+PYTHONPATH="packaging/macos/vendor/dmgbuild-1.6.7-py3-none-any.whl:packaging/macos/vendor/ds_store-1.3.3-py3-none-any.whl:packaging/macos/vendor/mac_alias-2.2.3-py3-none-any.whl" \
+  python3 tools/test-dmgbuild-wrapper.py >/dev/null ||
+  fail "dmgbuild wrapper lifecycle checks failed"
+python3 tools/test-verify-dmg.py >/dev/null ||
+  fail "completed-DMG verification lifecycle checks failed"
+grep -q 'python3 tools/verify-dmg.py "\$OUTPUT" "\$MOUNT" "\$VOLUME_NAME"' tools/make-dmg.sh ||
+  fail "macOS DMG does not signal-safely verify its mounted result"
+grep -q 'mount | grep -Fq " on \$MOUNT "' tools/make-dmg.sh ||
+  fail "macOS DMG cleanup does not retain a still-mounted verification directory"
+grep -q 'WORK="$(cd "\$WORK" && pwd -P)"' tools/make-dmg.sh ||
+  fail "macOS DMG verification does not canonicalize its guarded mount path"
+[[ -f packaging/macos/dmg-settings.py ]] ||
+  fail "macOS DMG Finder settings are absent"
+[[ -x tools/render-dmg-background.sh ]] ||
+  fail "macOS DMG background renderer is absent or not executable"
+grep -q 'font-family="Inter, sans-serif"' packaging/macos/dmg-background.svg ||
+  fail "macOS DMG artwork no longer uses the website/app typeface"
+[[ -f packaging/macos/dmg-background.png ]] ||
+  fail "macOS DMG background is absent"
+[[ -f packaging/macos/dmg-background@2x.png ]] ||
+  fail "macOS Retina DMG background is absent"
+python3 - <<'PY' || fail "macOS DMG backgrounds have unexpected dimensions"
+import pathlib
+import struct
+
+for name, expected in (
+    ("dmg-background.png", (720, 460)),
+    ("dmg-background@2x.png", (1440, 920)),
+):
+    data = (pathlib.Path("packaging/macos") / name).read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", data[16:24]) == expected
+PY
+[[ -f packaging/macos/vendor/dmgbuild-1.6.7-py3-none-any.whl ]] ||
+  fail "pinned dmgbuild dependency is absent"
+[[ -f packaging/macos/vendor/ds_store-1.3.3-py3-none-any.whl ]] ||
+  fail "pinned DS_Store dependency is absent"
+[[ -f packaging/macos/vendor/mac_alias-2.2.3-py3-none-any.whl ]] ||
+  fail "pinned alias dependency is absent"
+[[ "$(shasum -a 256 packaging/macos/vendor/dmgbuild-1.6.7-py3-none-any.whl | awk '{print $1}')" == \
+  "37ee5771c377beb3203d9164aae8046ffed8531c06edf9227f5788b3c599b1bf" ]] ||
+  fail "pinned dmgbuild dependency checksum changed"
+[[ "$(shasum -a 256 packaging/macos/vendor/ds_store-1.3.3-py3-none-any.whl | awk '{print $1}')" == \
+  "b92a371efbf1b4ccce2a04d1ed13fceacc4736c81ba09cf5aefb74c088160a35" ]] ||
+  fail "pinned DS_Store dependency checksum changed"
+[[ "$(shasum -a 256 packaging/macos/vendor/mac_alias-2.2.3-py3-none-any.whl | awk '{print $1}')" == \
+  "7362b521d2132ef92f606a37abfed5fcd849ceb2f28b6f9743e014b02af92f0d" ]] ||
+  fail "pinned alias dependency checksum changed"
 grep -q 'NATIVE_PACKAGE_VERSION="${VERSION%%-\*}"' "$RELEASE_WORKFLOW" ||
   fail "macOS artifact metadata does not report the app bundle version"
 grep -q -- '--sign "\$MACOS_SIGN_IDENTITY" dist/Scrozz.app' \

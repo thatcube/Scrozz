@@ -156,22 +156,64 @@ pub fn offer(frame: &Frame, platform: ClipboardPlatform) -> Result<Vec<Flavour>>
     preferred_kinds(platform)
         .iter()
         .map(|&kind| {
-            let bytes = match kind {
-                FlavourKind::Png => {
-                    encoder.encode_rgba(&image, frame.color_space, ImageFormat::Png)?
-                }
-                FlavourKind::Tiff => tiff(&image, profile.as_deref()),
-                FlavourKind::DibV5 => dib_v5(&image, profile.as_deref()),
-                FlavourKind::Dib => dib_24(&image, [255, 255, 255]),
-                FlavourKind::Bmp => bmp(&image, profile.as_deref()),
-            };
-            Ok(Flavour {
+            encode_flavour_from_image(
+                &image,
+                frame.color_space,
+                profile.as_deref(),
+                platform,
                 kind,
-                platform_type: kind.platform_type(platform),
-                bytes,
-            })
+                &encoder,
+            )
         })
         .collect()
+}
+
+/// Builds one requested native clipboard representation.
+///
+/// This is used by a native backend that already owns the preferred PNG and
+/// needs only a compatibility fallback. Calling [`offer`] there would encode a
+/// second PNG merely to discard it.
+pub fn encode_flavour(
+    frame: &Frame,
+    platform: ClipboardPlatform,
+    kind: FlavourKind,
+) -> Result<Flavour> {
+    let image = to_straight_rgba8(frame)?;
+    let profile = profile_for(frame.color_space);
+    let encoder = FrameEncoder::with_options(EncodeOptions {
+        png_effort: PngEffort::Fast,
+        ..EncodeOptions::default()
+    });
+    encode_flavour_from_image(
+        &image,
+        frame.color_space,
+        profile.as_deref(),
+        platform,
+        kind,
+        &encoder,
+    )
+}
+
+fn encode_flavour_from_image(
+    image: &RgbaImage,
+    color_space: ColorSpace,
+    profile: Option<&[u8]>,
+    platform: ClipboardPlatform,
+    kind: FlavourKind,
+    encoder: &FrameEncoder,
+) -> Result<Flavour> {
+    let bytes = match kind {
+        FlavourKind::Png => encoder.encode_rgba(image, color_space, ImageFormat::Png)?,
+        FlavourKind::Tiff => tiff(image, profile),
+        FlavourKind::DibV5 => dib_v5(image, profile),
+        FlavourKind::Dib => dib_24(image, [255, 255, 255]),
+        FlavourKind::Bmp => bmp(image, profile),
+    };
+    Ok(Flavour {
+        kind,
+        platform_type: kind.platform_type(platform),
+        bytes,
+    })
 }
 
 // ---------------------------------------------------------------------------

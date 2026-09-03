@@ -256,7 +256,7 @@ fn runtime_size_change_reflows_current_cards_and_reapplies_capacity() {
 }
 
 #[test]
-fn configured_stack_never_animates_arrival_or_resident_reflow() {
+fn configured_stack_animates_arrival_without_animating_resident_reflow() {
     let mut s = CaptureStack::configured(
         mbp16(),
         RecentCapturesPlacement::Left,
@@ -265,19 +265,23 @@ fn configured_stack_never_animates_arrival_or_resident_reflow() {
 
     let first = s.push(&at(0));
     let first_frame = s.frame_of(first, &at(0)).unwrap();
-    assert_eq!(first_frame.state, CardState::Resting);
+    assert_eq!(first_frame.state, CardState::Entering);
+    assert!(
+        first_frame.rect.max.x <= s.layout().slot_rect(0).min.x,
+        "a new live card must begin outside the selected edge"
+    );
     assert_rect_eq(
-        first_frame.rect,
+        s.frame_of(first, &at(500)).unwrap().rect,
         s.layout().slot_rect(0),
-        "a live card is fully formed on its first frame",
+        "the new card lands exactly in its slot",
     );
 
     while s.len() < s.capacity() {
         s.push(&at(0));
     }
     let survivor = s.cards()[1].id();
-    assert!(s.dismiss(first, &at(1)));
-    let survivor_frame = s.frame_of(survivor, &at(1)).unwrap();
+    assert!(s.dismiss(first, &at(500)));
+    let survivor_frame = s.frame_of(survivor, &at(500)).unwrap();
     assert_eq!(survivor_frame.state, CardState::Resting);
     assert_rect_eq(
         survivor_frame.rect,

@@ -397,7 +397,7 @@ pub struct Palette {
     /// on any platform.
     pub over_material: bool,
 
-    /// The signature accent (Scrozz iris — deliberately not CleanShot blue).
+    /// The signature accent (Scrozz ember — deliberately not CleanShot blue).
     pub accent: Color32,
     /// Accent, brightened: hover and inner lighting.
     pub accent_hi: Color32,
@@ -451,6 +451,9 @@ pub struct Palette {
     pub divider: Color32,
 }
 
+/// Scrozz's canonical ember accent.
+pub const BRAND_ACCENT: Color32 = Color32::from_rgb(0xF0, 0x5A, 0x28);
+
 impl Palette {
     /// The dark palette.
     #[must_use]
@@ -459,18 +462,13 @@ impl Palette {
             appearance: Appearance::Dark,
             over_material: false,
 
-            // A periwinkle accent light enough to glow against a near-black
-            // canvas cannot also carry white text: white on `#7C7AFF` is only
-            // 3.4:1, and on the hover tint 2.8:1 — below AA either way. So the
-            // dark theme inverts the pairing and puts near-black ink on the
-            // accent, which reaches 4.7:1 or better across all three states
-            // without dulling the accent itself. The press state is only
-            // slightly deeper than rest for the same reason: any darker and it
-            // drops back under 4.5:1.
-            accent: Color32::from_rgb(0x7C, 0x7A, 0xFF),
-            accent_hi: Color32::from_rgb(0x9A, 0x97, 0xFF),
-            accent_press: Color32::from_rgb(0x6F, 0x6C, 0xF2),
-            on_accent: Color32::from_rgb(0x0E, 0x0D, 0x18),
+            // Ember is bright enough to glow against the carbon canvas but
+            // cannot carry white text at AA. Near-black ink clears 4.5:1 on
+            // every state without muddying the new #F05A28 brand color.
+            accent: BRAND_ACCENT,
+            accent_hi: Color32::from_rgb(0xFF, 0x8A, 0x5F),
+            accent_press: Color32::from_rgb(0xD8, 0x4A, 0x1C),
+            on_accent: Color32::from_rgb(0x1A, 0x08, 0x02),
 
             text: Color32::from_rgb(0xF3, 0xF4, 0xFB),
             text_muted: Color32::from_rgba_unmultiplied_const(0xEB, 0xEE, 0xF8, 160),
@@ -485,7 +483,7 @@ impl Palette {
 
             hover: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 20),
             active: Color32::from_rgba_unmultiplied_const(0xFF, 0xFF, 0xFF, 36),
-            focus_ring: Color32::from_rgb(0xA8, 0xA4, 0xFF),
+            focus_ring: Color32::from_rgb(0xFF, 0x9B, 0x76),
 
             recording: Color32::from_rgb(0xFF, 0x68, 0x75),
             warning: Color32::from_rgb(0xFF, 0xC4, 0x5C),
@@ -507,10 +505,10 @@ impl Palette {
             appearance: Appearance::Light,
             over_material: false,
 
-            accent: Color32::from_rgb(0x4B, 0x46, 0xE0),
-            accent_hi: Color32::from_rgb(0x5B, 0x57, 0xF0),
-            accent_press: Color32::from_rgb(0x3B, 0x37, 0xC4),
-            on_accent: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            accent: BRAND_ACCENT,
+            accent_hi: Color32::from_rgb(0xF3, 0x74, 0x49),
+            accent_press: Color32::from_rgb(0xD8, 0x4A, 0x1C),
+            on_accent: Color32::from_rgb(0x1A, 0x08, 0x02),
 
             text: Color32::from_rgb(0x1A, 0x1C, 0x24),
             text_muted: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x24, 170),
@@ -524,7 +522,7 @@ impl Palette {
 
             hover: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x24, 16),
             active: Color32::from_rgba_unmultiplied_const(0x1A, 0x1C, 0x24, 30),
-            focus_ring: Color32::from_rgb(0x3B, 0x37, 0xC4),
+            focus_ring: Color32::from_rgb(0xC1, 0x3F, 0x15),
 
             recording: Color32::from_rgb(0xB8, 0x1F, 0x38),
             warning: Color32::from_rgb(0x8A, 0x51, 0x00),
@@ -636,7 +634,7 @@ impl Palette {
         if self.is_dark() {
             self.accent_hi
         } else {
-            self.accent_press
+            Color32::from_rgb(0xA7, 0x35, 0x10)
         }
     }
 }

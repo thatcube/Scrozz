@@ -1099,7 +1099,7 @@ pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "cloud.viewer-accent",
         kind: Kind::Text { allow_empty: false },
-        default: "#7c3aed",
+        default: "#f05a28",
         description: "Six-digit CSS accent color for encrypted share viewers.",
     },
     Setting {

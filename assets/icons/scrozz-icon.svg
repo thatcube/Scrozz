@@ -1,13 +1,18 @@
 <svg width="1024" height="1024" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
 <defs>
+<style>
+[fill="#C0B5FF"] { fill: #FFB08F !important; }
+[fill="#A292FF"] { fill: #F05A28 !important; }
+[fill="#8873FF"] { fill: #C74418 !important; }
+</style>
 <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-<stop offset="0" stop-color="#191622"/><stop offset="1" stop-color="#0D0B14"/></linearGradient>
+<stop offset="0" stop-color="#20130E"/><stop offset="1" stop-color="#0E0B0A"/></linearGradient>
 <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
-<stop offset="0" stop-color="#A292FF" stop-opacity="0.26"/>
-<stop offset="0.30" stop-color="#A292FF" stop-opacity="0.187"/>
-<stop offset="0.55" stop-color="#A292FF" stop-opacity="0.104"/>
-<stop offset="0.78" stop-color="#A292FF" stop-opacity="0.042"/>
-<stop offset="1" stop-color="#A292FF" stop-opacity="0"/></radialGradient>
+<stop offset="0" stop-color="#F05A28" stop-opacity="0.28"/>
+<stop offset="0.30" stop-color="#F05A28" stop-opacity="0.20"/>
+<stop offset="0.55" stop-color="#F05A28" stop-opacity="0.11"/>
+<stop offset="0.78" stop-color="#F05A28" stop-opacity="0.045"/>
+<stop offset="1" stop-color="#F05A28" stop-opacity="0"/></radialGradient>
 <filter id="bloom" x="-70%" y="-70%" width="240%" height="240%"><feGaussianBlur stdDeviation="1.5"/></filter>
 </defs>
 <rect width="32" height="32" rx="7.2" fill="url(#bg)"/>

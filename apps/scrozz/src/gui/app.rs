@@ -86,6 +86,7 @@ use scrozz_ui::history::{HistoryAction, HistoryViewModel};
 use scrozz_ui::settings::RecordingSettingsAction;
 use scrozz_ui::{ScrollHudAction, ScrollHudState, ScrollHudStatus};
 
+use crate::gui::pipeline::ClipboardTurn;
 use crate::{
     after_capture::{
         ActionEffect, AfterCaptureAction, AfterCaptureSettings, AfterCaptureStore, MediaKind,
@@ -106,8 +107,8 @@ use crate::{
             PickerAvailability, PickerMode, Response as PermissionResponse,
         },
         pipeline::{
-            CaptureBytes, DragGeometry, DragSubject, HistoryOperation, Job, Outcome,
-            PinEditorSnapshot, Pipeline, PreparedHistoryDrag, ReadyCapture,
+            CaptureBytes, DragGeometry, DragSubject, FinalizedCapture, HistoryOperation, Job,
+            Outcome, PinEditorSnapshot, Pipeline, PreparedHistoryDrag, ReadyCapture,
         },
         recording::{
             ActiveVideoEditor, ArmedStart, Completion, FinalisedRecording, PendingSelection,
@@ -722,6 +723,8 @@ pub struct App {
     next_output_action: u64,
     /// Whether each live card has another retained artifact and a visible export.
     card_retention: HashMap<CardId, (bool, bool)>,
+    /// Cards already usable in the UI whose ambient durability is still queued.
+    finalizing_cards: HashSet<CardId>,
     /// Per-generation output-staleness fate recorded for each card with any
     /// retired (committed or cancelled) editing session that might still
     /// matter (round 5, Finding #2; round 9, Finding #1; round 10,
@@ -775,6 +778,8 @@ pub struct App {
     pending_retention_overflow: HashSet<CardId>,
     /// Cleanup actions that expired while the card's editor owned the live revision.
     deferred_auto_close: HashMap<CardId, RecentCapturesAutoCloseAction>,
+    /// Explicit Save presses waiting for initial automatic actions to settle.
+    deferred_save: HashSet<CardId>,
     /// Capacity retirement deferred while the card's editor owns the live revision.
     deferred_overflow: HashSet<CardId>,
     /// Rendered recovery exports held while overflow retention is verified.
@@ -1184,20 +1189,31 @@ impl CardOutput {
             Self::Copy(action) | Self::Save(_, action) | Self::Upload(action) => *action,
         }
     }
+
+    const fn uses_clipboard(&self) -> bool {
+        matches!(self, Self::Copy(_) | Self::Upload(_))
+    }
 }
 
 #[cfg(target_os = "macos")]
 struct PickerSurfaceReservation {
     mode: PickerMode,
+    policy: AfterCaptureSettings,
     ready: std::sync::mpsc::Receiver<scrozz_core::Result<()>>,
     release: Option<std::sync::mpsc::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    clipboard: Option<ClipboardTurn>,
     presented: bool,
 }
 
 #[cfg(target_os = "macos")]
 impl PickerSurfaceReservation {
-    fn start(mode: PickerMode, selector: Arc<dyn CaptureSelector>) -> CliResult<Self> {
+    fn start(
+        mode: PickerMode,
+        selector: Arc<dyn CaptureSelector>,
+        policy: AfterCaptureSettings,
+        clipboard: Option<ClipboardTurn>,
+    ) -> CliResult<Self> {
         let (ready_tx, ready) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
         let worker = std::thread::Builder::new()
@@ -1218,11 +1234,17 @@ impl PickerSurfaceReservation {
             })?;
         Ok(Self {
             mode,
+            policy,
             ready,
             release: Some(release),
             worker: Some(worker),
+            clipboard,
             presented: false,
         })
+    }
+
+    fn take_capture_context(&mut self) -> (AfterCaptureSettings, Option<ClipboardTurn>) {
+        (self.policy.clone(), self.clipboard.take())
     }
 
     fn poll_ready(&mut self) -> Option<scrozz_core::Result<PickerMode>> {
@@ -1598,11 +1620,13 @@ impl App {
             current_upload_action: HashMap::new(),
             next_output_action: 0,
             card_retention: HashMap::new(),
+            finalizing_cards: HashSet::new(),
             card_generation_fates: HashMap::new(),
             card_capture_ids: HashMap::new(),
             pending_retention_close: HashSet::new(),
             pending_retention_overflow: HashSet::new(),
             deferred_auto_close: HashMap::new(),
+            deferred_save: HashSet::new(),
             deferred_overflow: HashSet::new(),
             pending_overflow_recovery: HashMap::new(),
             overflow_recovery_in_flight: HashSet::new(),
@@ -2450,6 +2474,7 @@ impl App {
                     }
                     self.handle_ready(*ready);
                 }
+                Outcome::Finalized(finalized) => self.handle_finalized(*finalized),
                 Outcome::Progress { card, progress } => {
                     self.update_scroll_hud(card, &progress);
                     self.note(format!("{card} {}", describe_scroll_progress(&progress)));
@@ -2699,6 +2724,9 @@ impl App {
                 Outcome::Refused { card, error } => {
                     if self.opening_cards.remove(&card) {
                         self.surface.set_editing(card, false);
+                        if self.editor_only_cards.remove(&card) {
+                            self.pipeline.post(Job::Release(card));
+                        }
                         // The open that a deferred auto-close or overflow was
                         // waiting on never produced an editor to close later,
                         // so nothing will ever call `editor_closed` for it.
@@ -3130,6 +3158,15 @@ impl App {
                     card,
                     choose_destination,
                 } => {
+                    if !choose_destination && self.finalizing_cards.contains(&card) {
+                        self.deferred_save.insert(card);
+                        self.surface
+                            .set_status(card, Some("Finishing capture...".to_owned()));
+                        self.note(format!(
+                            "{card} save will resume after initial capture actions finish"
+                        ));
+                        continue;
+                    }
                     if self.card_has_outstanding_card_level_output(card) {
                         self.note(format!("{card} already has an action in progress"));
                         continue;
@@ -3160,6 +3197,13 @@ impl App {
                     }
                 }
                 CardEvent::AutoClose(id, action) => {
+                    if self.finalizing_cards.contains(&id) {
+                        self.deferred_auto_close.insert(id, action);
+                        self.note(format!(
+                            "{id} stayed visible while capture durability finishes"
+                        ));
+                        continue;
+                    }
                     if self.card_has_outstanding_card_level_output(id) {
                         self.note(format!(
                             "{id} stayed visible while its output action finishes"
@@ -3217,7 +3261,6 @@ impl App {
                         ));
                         continue;
                     }
-                    self.visible_cards.remove(&id);
                     self.dismiss_recent_capture(id, "dismissed");
                     self.note(format!("{id} dismissed"));
                 }
@@ -3233,10 +3276,13 @@ impl App {
                     // above, the deferral this inserts resolves correctly
                     // either way -- against the editor once it opens, or
                     // against no editor at all if the open fails instead).
-                    if editors.for_card(id).is_some() || self.opening_cards.contains(&id) {
+                    if self.finalizing_cards.contains(&id)
+                        || editors.for_card(id).is_some()
+                        || self.opening_cards.contains(&id)
+                    {
                         self.deferred_overflow.insert(id);
                         self.note(format!(
-                            "{id} overflow cleanup was deferred while its editor is open"
+                            "{id} overflow cleanup was deferred while its capture is still owned"
                         ));
                     } else {
                         self.handle_overflow(id, editors);
@@ -4041,6 +4087,9 @@ impl App {
         editors: EditorSnapshots<'_>,
     ) -> bool {
         let label = output.label();
+        let clipboard = output
+            .uses_clipboard()
+            .then(|| self.pipeline.reserve_clipboard());
         let job = match Self::card_output_job(card, output, editors) {
             Ok(job) => job,
             Err(error) => {
@@ -4050,6 +4099,13 @@ impl App {
                 ));
                 return false;
             }
+        };
+        let job = match clipboard {
+            Some(turn) => Job::OrderedClipboard {
+                turn,
+                job: Box::new(job),
+            },
+            None => job,
         };
 
         if !self.pipeline.post(job) {
@@ -4201,7 +4257,14 @@ impl App {
     }
 
     fn dismiss_recent_capture(&mut self, card: CardId, reason: &str) {
-        let editor_owns_card = self.active_editor_cards.contains(&card);
+        if self.deferred_save.contains(&card) {
+            self.note(format!(
+                "{card} stayed visible while its requested save finishes"
+            ));
+            return;
+        }
+        let editor_owns_card =
+            self.active_editor_cards.contains(&card) || self.opening_cards.contains(&card);
         let save_dialog_owns_card = self
             .pending_save_dialog
             .as_ref()
@@ -4237,6 +4300,7 @@ impl App {
         self.pending_retention_close.remove(&card);
         self.pending_retention_overflow.remove(&card);
         self.deferred_auto_close.remove(&card);
+        self.deferred_save.remove(&card);
         self.deferred_overflow.remove(&card);
         self.pending_overflow_recovery.remove(&card);
         if !save_dialog_owns_card {
@@ -4626,6 +4690,8 @@ impl App {
     /// Split out of the pipeline drain so a scrolling capture can be held for
     /// one pass and then published through exactly the same path as any other.
     fn handle_ready(&mut self, ready: ReadyCapture) {
+        let finalization_pending = ready.finalization_pending;
+        let finalization_ack = ready.finalization_ack;
         if self.scrolling_card == Some(ready.card.id) {
             self.finish_scrolling_hud();
         }
@@ -4666,14 +4732,15 @@ impl App {
             .actions
             .has_effect(&ActionEffect::ShowRecentCapturesOverlay);
         let open_editor = ready.actions.has_effect(&ActionEffect::OpenEditor);
-        let mut retained = false;
+        if finalization_pending {
+            self.finalizing_cards.insert(card_id);
+        }
         if show_overlay {
             if let Err(err) = self.surface.present(card) {
                 self.note(format!(
                     "{card_id} could not be shown in Recent Captures Overlay: {err}"
                 ));
             } else {
-                retained = true;
                 self.visible_cards.insert(card_id);
                 self.card_retention
                     .insert(card_id, (retained_elsewhere, exported));
@@ -4687,7 +4754,6 @@ impl App {
         }
         if open_editor {
             if self.pipeline.post(Job::Open(card_id)) {
-                retained = true;
                 self.opening_cards.insert(card_id);
                 self.surface.set_editing(card_id, true);
                 if !show_overlay {
@@ -4699,11 +4765,96 @@ impl App {
                 ));
             }
         }
-        if !retained {
+        if !finalization_pending && !show_overlay && !open_editor {
             self.pipeline.post(Job::Release(card_id));
         }
         if history_changed {
             self.with_history(|history| history.refresh_from_start(Timestamp::now()));
+        }
+        if let Some(acknowledged) = finalization_ack {
+            let _ = acknowledged.send(());
+        }
+    }
+
+    fn handle_finalized(&mut self, finalized: FinalizedCapture) {
+        let FinalizedCapture {
+            card,
+            capture_id,
+            actions,
+            written,
+            retained_elsewhere,
+            exported,
+        } = finalized;
+        self.finalizing_cards.remove(&card);
+
+        for (action, error) in actions.failures() {
+            self.note(format!("{card} {} failed: {error}", action.label()));
+        }
+        for step in &actions.steps {
+            match &step.outcome {
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Completed)
+                    if step.action == AfterCaptureAction::CopyToClipboard =>
+                {
+                    self.note(format!("{card} copied to the clipboard"));
+                }
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Saved(path)) => {
+                    self.note(format!("{card} saved to {}", path.display()));
+                }
+                crate::after_capture::ActionOutcome::Succeeded(ActionEffect::Uploaded(url)) => {
+                    self.note(format!("{card} uploaded to {url}"));
+                }
+                _ => {}
+            }
+        }
+
+        let owned = self.visible_cards.contains(&card)
+            || self.opening_cards.contains(&card)
+            || self.active_editor_cards.contains(&card)
+            || self.editor_only_cards.contains(&card)
+            || self.deferred_save.contains(&card);
+        if owned {
+            if self.visible_cards.contains(&card) {
+                self.card_retention
+                    .insert(card, (retained_elsewhere, exported));
+                self.surface
+                    .finalize_capture(card, capture_id.clone(), written.first().cloned());
+            }
+            if let Some(capture_id) = capture_id.clone() {
+                self.card_capture_ids.insert(card, capture_id);
+            }
+        } else {
+            self.pipeline.post(Job::Release(card));
+        }
+
+        if capture_id.is_some() {
+            self.with_history(|history| history.refresh_from_start(Timestamp::now()));
+        }
+
+        if self.deferred_save.remove(&card) {
+            if exported {
+                self.dismiss_recent_capture(card, "used its completed automatic export");
+                self.note(format!("{card} was already saved to Export Location"));
+            } else {
+                let action = self.allocate_output_action();
+                if self.post_card_output(
+                    card,
+                    CardOutput::Save(None, action),
+                    EditorSnapshots::EMPTY,
+                ) {
+                    self.register_output_action(card, action, OutputActionKind::CardOutput, true);
+                }
+            }
+        }
+
+        if !self.active_editor_cards.contains(&card) && !self.opening_cards.contains(&card) {
+            if !self.card_has_outstanding_card_level_output(card)
+                && let Some(action) = self.deferred_auto_close.remove(&card)
+            {
+                self.handle_auto_close(card, action, EditorSnapshots::EMPTY);
+            }
+            if self.deferred_overflow.remove(&card) {
+                self.handle_overflow(card, EditorSnapshots::EMPTY);
+            }
         }
     }
 
@@ -4986,13 +5137,13 @@ impl App {
             origin = pending.origin.label(),
             "capture job queued"
         );
-        if !self.pipeline.post(Job::Capture {
-            kind: pending.kind,
-            origin: pending.origin,
+        if let Err(error) = self.pipeline.post_capture(
+            pending.kind,
+            pending.origin,
             card,
-            policy: self.config.after_capture.clone(),
-        }) {
-            self.note("the capture worker has gone");
+            self.config.after_capture.clone(),
+        ) {
+            self.note(format!("{card} could not start: {error}"));
         }
     }
 
@@ -5001,6 +5152,8 @@ impl App {
         &mut self,
         pending: PendingCapture,
         capture: scrozz_capture::PickerCapture,
+        policy: AfterCaptureSettings,
+        clipboard: Option<ClipboardTurn>,
     ) {
         self.play_shutter_sound();
         let card = self.pipeline.allocate();
@@ -5015,7 +5168,8 @@ impl App {
             origin: pending.origin,
             card,
             capture,
-            policy: self.config.after_capture.clone(),
+            policy,
+            clipboard,
         }) {
             self.note("the capture worker has gone");
         }
@@ -5052,9 +5206,14 @@ impl App {
                 .and_then(scrozz_capture::AppleContentPicker::poll);
             match event {
                 Some(scrozz_capture::ApplePickerEvent::Captured(capture)) => {
+                    let (policy, clipboard) = self
+                        .picker_surface
+                        .as_mut()
+                        .map(PickerSurfaceReservation::take_capture_context)
+                        .unwrap_or_else(|| (self.config.after_capture.clone(), None));
                     self.finish_picker_surface();
                     if let Some(pending) = self.permission.apple_picker_captured() {
-                        self.queue_apple_picker_capture(pending, capture);
+                        self.queue_apple_picker_capture(pending, capture, policy, clipboard);
                     } else {
                         tracing::warn!(
                             "discarding an Apple picker selection with no pending action"
@@ -5142,7 +5301,14 @@ impl App {
                 self.note("Apple's content picker is already being prepared");
                 return;
             }
-            match PickerSurfaceReservation::start(mode, Arc::clone(&self.selector)) {
+            let policy = self.config.after_capture.clone();
+            let clipboard = self.pipeline.reserve_capture_clipboard(&policy);
+            match PickerSurfaceReservation::start(
+                mode,
+                Arc::clone(&self.selector),
+                policy,
+                clipboard,
+            ) {
                 Ok(reservation) => {
                     self.picker_surface = Some(reservation);
                 }
@@ -6289,6 +6455,11 @@ impl App {
         self.editor_close_results.pop_front()
     }
 
+    /// Reserves the clipboard intent before the editor begins a potentially slow render.
+    pub fn reserve_clipboard_intent(&self) -> ClipboardTurn {
+        self.pipeline.reserve_clipboard()
+    }
+
     /// Copies an image the editor has flattened.
     ///
     /// Routed through the worker so the PNG encode and the clipboard write stay
@@ -6306,13 +6477,22 @@ impl App {
     /// "current" against nothing left to compare it to. `close_after` is
     /// always `false`: an in-editor export must never dismiss the overlay
     /// card out from under the user mid-edit.
-    pub fn copy_rendered(&mut self, card: CardId, generation: u64, rendered: RevisionedFrame) {
+    pub fn copy_rendered(
+        &mut self,
+        card: CardId,
+        generation: u64,
+        rendered: RevisionedFrame,
+        clipboard: ClipboardTurn,
+    ) {
         let action = self.allocate_output_action();
-        if self.pipeline.post(Job::CopyImage {
-            card,
-            generation,
-            rendered: Box::new(rendered),
-            action,
+        if self.pipeline.post(Job::OrderedClipboard {
+            turn: clipboard,
+            job: Box::new(Job::CopyImage {
+                card,
+                generation,
+                rendered: Box::new(rendered),
+                action,
+            }),
         }) {
             self.register_output_action(card, action, OutputActionKind::EditorOutput, false);
         }
@@ -8813,6 +8993,125 @@ mod tests {
     }
 
     #[test]
+    fn overflow_waits_for_initial_capture_finalization() {
+        let (mut app, surface) = app();
+        let card = CardId(40);
+        let actions = crate::after_capture::ExecutionReport {
+            steps: vec![crate::after_capture::ActionStep {
+                action: AfterCaptureAction::ShowRecentCapturesOverlay,
+                outcome: crate::after_capture::ActionOutcome::Succeeded(
+                    ActionEffect::ShowRecentCapturesOverlay,
+                ),
+            }],
+        };
+        app.pipeline
+            .inject_outcome_for_test(Outcome::Ready(Box::new(ReadyCapture {
+                card: Card::placeholder(card, CaptureKind::Region),
+                actions,
+                retained_elsewhere: false,
+                exported: false,
+                finalization_pending: true,
+                finalization_ack: None,
+            })));
+        app.drain_pipeline();
+        assert!(app.finalizing_cards.contains(&card));
+
+        surface.inject(CardEvent::Overflow(card));
+        app.drain_cards(EditorSnapshots::EMPTY);
+        assert!(app.deferred_overflow.contains(&card));
+        assert!(
+            !surface
+                .trace()
+                .contains(&crate::gui::card::SurfaceCall::Dismiss(card)),
+            "capacity cleanup must not guess before history/save results exist"
+        );
+
+        app.pipeline
+            .inject_outcome_for_test(Outcome::Finalized(Box::new(FinalizedCapture {
+                card,
+                capture_id: None,
+                actions: crate::after_capture::ExecutionReport::default(),
+                written: Vec::new(),
+                retained_elsewhere: true,
+                exported: false,
+            })));
+        app.drain_pipeline();
+
+        assert!(!app.finalizing_cards.contains(&card));
+        assert!(!app.deferred_overflow.contains(&card));
+        assert!(
+            surface
+                .trace()
+                .contains(&crate::gui::card::SurfaceCall::Dismiss(card)),
+            "deferred cleanup must resume against finalized retention truth"
+        );
+    }
+
+    #[test]
+    fn save_during_initial_finalization_reuses_the_automatic_export() {
+        let (mut app, surface) = app();
+        let card = CardId(41);
+        let actions = crate::after_capture::ExecutionReport {
+            steps: vec![crate::after_capture::ActionStep {
+                action: AfterCaptureAction::ShowRecentCapturesOverlay,
+                outcome: crate::after_capture::ActionOutcome::Succeeded(
+                    ActionEffect::ShowRecentCapturesOverlay,
+                ),
+            }],
+        };
+        app.pipeline
+            .inject_outcome_for_test(Outcome::Ready(Box::new(ReadyCapture {
+                card: Card::placeholder(card, CaptureKind::Region),
+                actions,
+                retained_elsewhere: false,
+                exported: false,
+                finalization_pending: true,
+                finalization_ack: None,
+            })));
+        app.drain_pipeline();
+        surface.inject(CardEvent::Save {
+            card,
+            choose_destination: false,
+        });
+        app.drain_cards(EditorSnapshots::EMPTY);
+        assert!(app.deferred_save.contains(&card));
+        assert!(!app.card_has_outstanding_card_level_output(card));
+        surface.inject(CardEvent::Dismiss(card));
+        app.drain_cards(EditorSnapshots::EMPTY);
+        assert!(
+            !surface
+                .trace()
+                .contains(&crate::gui::card::SurfaceCall::Dismiss(card)),
+            "closing must not discard an explicit deferred Save"
+        );
+        app.opening_cards.insert(card);
+
+        app.pipeline
+            .inject_outcome_for_test(Outcome::Finalized(Box::new(FinalizedCapture {
+                card,
+                capture_id: None,
+                actions: crate::after_capture::ExecutionReport::default(),
+                written: vec!["/tmp/Scrozz Capture.png".to_owned()],
+                retained_elsewhere: true,
+                exported: true,
+            })));
+        app.drain_pipeline();
+
+        assert!(!app.deferred_save.contains(&card));
+        assert!(!app.card_has_outstanding_card_level_output(card));
+        assert!(
+            app.editor_only_cards.contains(&card),
+            "automatic export may hide the card but must preserve its opening editor source"
+        );
+        assert!(
+            surface
+                .trace()
+                .contains(&crate::gui::card::SurfaceCall::Dismiss(card)),
+            "the explicit Save intent should consume the completed automatic export"
+        );
+    }
+
+    #[test]
     fn auto_close_never_removes_the_only_retained_artifact() {
         let (mut app, surface) = app();
         let card = CardId(41);
@@ -10567,7 +10866,8 @@ mod tests {
         let generation = 1;
         let rendered =
             RevisionedFrame::from_document(editor.document(), 1).expect("render revision 1");
-        app.copy_rendered(card, generation, rendered);
+        let clipboard = app.reserve_clipboard_intent();
+        app.copy_rendered(card, generation, rendered, clipboard);
 
         let action = *app
             .outstanding_output_actions
@@ -10712,7 +11012,8 @@ mod tests {
         // The editor's own in-toolbar Copy.
         let editor_rendered =
             RevisionedFrame::from_document(editor.document(), 1).expect("render revision 1");
-        app.copy_rendered(card, generation, editor_rendered);
+        let clipboard = app.reserve_clipboard_intent();
+        app.copy_rendered(card, generation, editor_rendered, clipboard);
         let editor_action = *app
             .outstanding_output_actions
             .get(&card)
@@ -12095,8 +12396,13 @@ mod tests {
             resume: std::sync::Mutex::new(resume_rx),
             done: done_tx,
         });
-        let mut reservation =
-            PickerSurfaceReservation::start(PickerMode::Window, selector).expect("start");
+        let mut reservation = PickerSurfaceReservation::start(
+            PickerMode::Window,
+            selector,
+            AfterCaptureSettings::default(),
+            None,
+        )
+        .expect("start");
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if let Some(result) = reservation.poll_ready() {

@@ -289,11 +289,13 @@ own chrome. Full layout, overflow and gesture rules are in D21.
 > overlapping or occluding. Earlier drafts described both an overlapping
 > card-stack and a reflowing list; both were wrong.
 
-**Motion (see D19).** Arrival and resident reflow are atomic: a new capture is
-complete on its first visible frame, and dismissing a card closes the gap without
-walking the remaining thumbnails through intermediate rows. This avoids
-compositor-dependent one-frame jumps in the always-on-top overlay. Direct
-gestures, an explicitly dismissed card's departure, hover chrome, and dock
+**Motion (see D19).** A new capture glides in from the configured screen edge;
+that motion belongs only to the arriving card. Resident reflow remains atomic:
+dismissing a card closes the gap without walking remaining thumbnails through
+intermediate rows. Keeping those two cases separate preserves the capture's
+visible arrival without reintroducing compositor-dependent one-frame jumps in
+the always-on-top overlay. Direct gestures, an explicitly dismissed card's
+departure, hover chrome, and dock
 collapse/expand retain deliberate motion.
 
 **Why.** Maintainer, on the behaviour that defines the app: *"you can swipe the
@@ -1273,6 +1275,25 @@ fallback. Save and upload consume the retained encoded artifact. Overlay, editor
 and pin receive that same artifact and metadata. Each action records its own
 success or failure and the sequence never short-circuits, so one destination
 cannot suppress unrelated enabled actions.
+
+**Latency boundary.** Selector acquisition and usable-card preparation run on a
+dedicated lane; ordered history, retention, and card mutations retain one writer.
+The default clipboard copy remains readiness-critical so it can never overwrite
+something the user copied after seeing the card. Every GUI clipboard intent reserves
+its place when the user dispatches it -- before picker acquisition, editor rendering,
+or upload -- and native writes are mutually exclusive. A newer intent retires older
+work that has not begun, while an in-flight write finishes before the newer one, so a
+slow render or upload can neither overwrite nor block the latest copy.
+
+Once exact PNG/drag bytes and a bounded thumbnail are in the live vault, the
+finalization job is queued *before* the card is published. A publication fence
+prevents that job from completing until Ready is already on the outcome queue; it
+then waits for the main-thread readiness acknowledgement before automatic save and
+history work. Card interactions therefore queue behind the revision-zero durability
+fence, while history I/O can neither delay the cursor nor hide a completed card. Pin
+to Screen remains disabled until finalization supplies the durable capture identity.
+A second capture shortcut while any shared selector owner is active is refused rather
+than queued: one delayed gesture must never turn into two surprise selectors later.
 
 An explicit CLI/JSON/IPC capture is not an ambient GUI capture. Its requested
 sinks and destinations are the whole policy, and forwarded requests carry the

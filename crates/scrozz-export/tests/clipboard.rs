@@ -11,7 +11,9 @@ use common::{decode, pixel_at, rgba, solid};
 use scrozz_core::{ColorSpace, PixelFormat};
 use scrozz_export::{
     ClipboardPlatform, FlavourKind, ImageFormat, RgbaImage,
-    clipboard::{arboard_delivers, bmp, dib_24, dib_v5, gaps, offer, preferred_kinds, tiff},
+    clipboard::{
+        arboard_delivers, bmp, dib_24, dib_v5, encode_flavour, gaps, offer, preferred_kinds, tiff,
+    },
     profile_for, to_straight_rgba8,
 };
 
@@ -119,6 +121,20 @@ fn every_offered_flavour_carries_bytes_and_the_right_name() {
             assert_eq!(flavour.platform_type, flavour.kind.platform_type(platform));
         }
     }
+}
+
+#[test]
+fn one_requested_fallback_matches_the_full_offer_without_encoding_the_rest() {
+    let frame = rgba(5, 3, common::pattern);
+    let only_tiff = encode_flavour(&frame, ClipboardPlatform::MacOs, FlavourKind::Tiff)
+        .expect("builds one TIFF");
+    let offered = offer(&frame, ClipboardPlatform::MacOs).expect("builds full offer");
+    let full_tiff = offered
+        .iter()
+        .find(|flavour| flavour.kind == FlavourKind::Tiff)
+        .expect("macOS offer includes TIFF");
+
+    assert_eq!(only_tiff, *full_tiff);
 }
 
 #[test]

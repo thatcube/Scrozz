@@ -267,6 +267,10 @@ pub struct CardContent<'a> {
     pub upload_enabled: bool,
     /// Accessible explanation for a disabled Upload control.
     pub upload_unavailable_reason: Option<&'a str>,
+    /// Whether durable identity exists for Pin to Screen.
+    pub pin_enabled: bool,
+    /// Accessible explanation while Pin to Screen is unavailable.
+    pub pin_unavailable_reason: Option<&'a str>,
     /// Latest action status, shown in the caption.
     pub status: Option<&'a str>,
 }
@@ -285,6 +289,8 @@ impl<'a> CardContent<'a> {
             accent: None,
             upload_enabled: true,
             upload_unavailable_reason: None,
+            pin_enabled: true,
+            pin_unavailable_reason: None,
             status: None,
         }
     }
@@ -813,7 +819,9 @@ fn draw_chrome(
         // A control that is drawn and then always fails is worse than one that
         // was never offered — but Upload keeps its slot so the reason can be
         // read on hover instead of the button silently vanishing.
-        let state = if action == CardAction::Upload && !content.upload_enabled {
+        let state = if (action == CardAction::Upload && !content.upload_enabled)
+            || (action == CardAction::Pin && !content.pin_enabled)
+        {
             ControlState::disabled()
         } else {
             ControlState::new()
@@ -830,6 +838,10 @@ fn draw_chrome(
         );
         if action == CardAction::Upload
             && let Some(reason) = content.upload_unavailable_reason
+        {
+            resp = resp.on_disabled_hover_text(reason);
+        } else if action == CardAction::Pin
+            && let Some(reason) = content.pin_unavailable_reason
         {
             resp = resp.on_disabled_hover_text(reason);
         }

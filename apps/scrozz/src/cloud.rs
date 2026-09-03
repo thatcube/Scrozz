@@ -804,7 +804,7 @@ fn stored_overrides_from(
                 .to_owned(),
             accent: settings
                 .value("cloud.viewer-accent")
-                .unwrap_or("#7c3aed")
+                .unwrap_or("#f05a28")
                 .to_owned(),
         });
     }

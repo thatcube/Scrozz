@@ -529,8 +529,11 @@ impl Host for Windowed {
         #[cfg(target_os = "macos")]
         let pointer_motion_monitor = {
             let pointer_waker = handle.clone();
+            let selector_pointer_wake = selection.pointer_wake_flag();
             match scrozz_shell::macos::display::PointerMotionMonitor::new(Arc::new(move || {
-                if pointer_waker.needs_global_pointer_wake() {
+                if pointer_waker.needs_global_pointer_wake()
+                    || selector_pointer_wake.load(std::sync::atomic::Ordering::Acquire)
+                {
                     pointer_waker.wake();
                 }
             })) {
@@ -1320,14 +1323,20 @@ impl Driver {
                     exit = window.request_close(editor.state().is_dirty());
                 }
                 Intent::Close => {}
-                Intent::Copy | Intent::Save => match editor.render() {
-                    Ok(rendered) => {
-                        if intent == Intent::Copy {
-                            self.app.copy_rendered(card, generation, rendered);
-                        } else {
-                            self.app.save_rendered(card, generation, rendered);
+                Intent::Copy => {
+                    let clipboard = self.app.reserve_clipboard_intent();
+                    match editor.render() {
+                        Ok(rendered) => {
+                            self.app
+                                .copy_rendered(card, generation, rendered, clipboard);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "the annotated image could not be rendered");
                         }
                     }
+                }
+                Intent::Save => match editor.render() {
+                    Ok(rendered) => self.app.save_rendered(card, generation, rendered),
                     Err(error) => {
                         tracing::warn!(%error, "the annotated image could not be rendered");
                     }
@@ -2694,6 +2703,13 @@ impl eframe::App for Driver {
 
         let snapshots = Self::editor_snapshots(&self.editors);
         let tick = self.app.tick_with_editor(EditorSnapshots::new(&snapshots));
+        // App::tick is where hotkey/tray admission occurs. Drain its cursor
+        // prime now, in this same native callback, instead of waiting for a
+        // hidden-root wake that AppKit may defer after a long idle.
+        self.selection.service_pending_events(ctx, &self.native);
+        if self.selection.owns_surface() != selector_owns_the_window {
+            self.overlay.invalidate_passthrough_cache();
+        }
         if self.app.has_pending_save_dialog() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }

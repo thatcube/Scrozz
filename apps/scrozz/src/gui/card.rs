@@ -585,6 +585,15 @@ pub trait CardSurface {
     /// Shows or clears action status on a card.
     fn set_status(&mut self, _id: CardId, _status: Option<String>) {}
 
+    /// Applies durability metadata that became available after card readiness.
+    fn finalize_capture(
+        &mut self,
+        _id: CardId,
+        _capture: Option<CaptureId>,
+        _written: Option<String>,
+    ) {
+    }
+
     /// Shows or updates the scrolling-capture HUD.
     ///
     /// Defaulted so a surface with no HUD is silently correct rather than

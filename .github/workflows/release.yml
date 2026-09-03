@@ -271,9 +271,11 @@ jobs:
             echo "::error title=Release version mismatch::Tag $REF names $VERSION, but the Cargo workspace package version is $CARGO_VERSION."
             exit 1
           fi
-          echo "cargo_version=$CARGO_VERSION" >>"$GITHUB_OUTPUT"
-          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
-          echo "build_number=${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" >>"$GITHUB_OUTPUT"
+          {
+            echo "cargo_version=$CARGO_VERSION"
+            echo "version=$VERSION"
+            echo "build_number=${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          } >>"$GITHUB_OUTPUT"
           echo "Building version $VERSION from $REF"
 
       - name: Select monotonic MSIX version
@@ -786,6 +788,79 @@ jobs:
           PY
           cat "${ASSET}.sha256"
           echo "asset=$ASSET" >>"$GITHUB_OUTPUT"
+
+      - name: Sign and notarise macOS disk image (when configured)
+        if: matrix.os == 'macos-latest'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MACOS_CERTIFICATE_P12" ]]; then
+            exit 0
+          fi
+          ASSET="${{ steps.package.outputs.asset }}"
+          KEYCHAIN="$RUNNER_TEMP/scrozz-dmg-signing.keychain-db"
+          CERTIFICATE="$RUNNER_TEMP/scrozz-dmg-signing.p12"
+          NOTARY_KEY="$RUNNER_TEMP/scrozz-dmg-notary.p8"
+          cleanup_dmg_signing() {
+            rm -f "$CERTIFICATE" "$NOTARY_KEY"
+            security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+          }
+          trap cleanup_dmg_signing EXIT
+
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode >"$CERTIFICATE"
+          security import "$CERTIFICATE" \
+            -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          codesign --force --timestamp --sign "$MACOS_SIGN_IDENTITY" "$ASSET"
+          codesign --verify --verbose=2 "$ASSET"
+          echo "$MACOS_NOTARY_KEY" | base64 --decode >"$NOTARY_KEY"
+          xcrun notarytool submit "$ASSET" \
+            --key "$NOTARY_KEY" \
+            --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$ASSET"
+          xcrun stapler validate "$ASSET"
+          hdiutil verify "$ASSET" >/dev/null
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=4 "$ASSET"
+
+          shasum -a 256 "$ASSET" >"${ASSET}.sha256"
+          python3 - "$ASSET" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          asset = pathlib.Path(sys.argv[1])
+          metadata_path = pathlib.Path(f"{asset}.artifact.json")
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          metadata.update(
+              sha256=hashlib.sha256(asset.read_bytes()).hexdigest(),
+              size=asset.stat().st_size,
+              signed=True,
+              payload_signed=True,
+              notarized=True,
+          )
+          metadata_path.write_text(
+              json.dumps(metadata, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Package portable ZIP and MSIX
         if: matrix.os == 'windows-latest'

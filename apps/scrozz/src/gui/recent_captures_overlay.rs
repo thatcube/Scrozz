@@ -52,6 +52,8 @@ pub struct RecentCapturesOverlayCards {
     mapped: HashMap<u64, CardId>,
     /// Ours to the overlay's, so a dismissal we initiate can be addressed.
     reverse: HashMap<CardId, u64>,
+    /// Durability that completed before the overlay acknowledged its push.
+    pending_finalization: HashMap<CardId, (Option<CaptureId>, Option<String>)>,
     /// Durable pin identity to the card that created it.
     pinned: HashMap<String, CardId>,
     /// Translated events beyond the one this poll returned.
@@ -77,6 +79,7 @@ impl RecentCapturesOverlayCards {
             pending: VecDeque::new(),
             mapped: HashMap::new(),
             reverse: HashMap::new(),
+            pending_finalization: HashMap::new(),
             pinned: HashMap::new(),
             queued: VecDeque::new(),
             scroll_actions: VecDeque::new(),
@@ -97,6 +100,7 @@ impl RecentCapturesOverlayCards {
     }
 
     fn forget(&mut self, ours: CardId) {
+        self.pending_finalization.remove(&ours);
         if let Some(theirs) = self.reverse.remove(&ours) {
             self.mapped.remove(&theirs);
         }
@@ -130,6 +134,27 @@ impl CardSurface for RecentCapturesOverlayCards {
         if let Some(theirs) = self.reverse.get(&id).copied() {
             self.handle
                 .set_status(scrozz_ui::stack::CardId(theirs), status);
+        }
+    }
+
+    fn finalize_capture(
+        &mut self,
+        id: CardId,
+        capture: Option<CaptureId>,
+        written: Option<String>,
+    ) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle.finalize_capture(
+                scrozz_ui::stack::CardId(theirs),
+                capture.map(|capture| scrozz_core::PinId(capture.0)),
+                written.and_then(|path| {
+                    std::path::Path::new(&path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }),
+            );
+        } else {
+            self.pending_finalization.insert(id, (capture, written));
         }
     }
 
@@ -341,6 +366,9 @@ impl RecentCapturesOverlayCards {
                     if let Some(ours) = self.pending.pop_front() {
                         self.mapped.insert(id.0, ours);
                         self.reverse.insert(ours, id.0);
+                        if let Some((capture, written)) = self.pending_finalization.remove(&ours) {
+                            self.finalize_capture(ours, capture, written);
+                        }
                     } else {
                         tracing::warn!(
                             overlay_card = id.0,

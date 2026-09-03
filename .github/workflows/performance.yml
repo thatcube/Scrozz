@@ -1,0 +1,45 @@
+name: Capture performance lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.98.0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  capture-readiness:
+    name: Capture readiness — ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Apple Silicon
+            os: macos-26
+          - name: Intel
+            os: macos-26-intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: capture-performance-${{ matrix.os }}
+      - name: Measure normal and constrained readiness
+        run: |
+          {
+            tools/benchmark-capture-readiness.sh
+            tools/benchmark-capture-readiness.sh --constrained
+          } 2>&1 | tee capture-performance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capture-performance-${{ matrix.os }}
+          path: capture-performance.txt
+          if-no-files-found: error

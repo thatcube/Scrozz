@@ -139,7 +139,7 @@ pub fn render_viewer(payload: &EncryptedPayload, branding: &Branding) -> Result<
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src blob: data:; media-src blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'none'; base-uri 'none'">
 <title>{title}</title>
 <style>
-:root{{--accent:{accent};color-scheme:light dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#111217;color:#f7f7fa;font:16px system-ui,sans-serif}}main{{width:min(92vw,64rem);text-align:center}}form{{width:min(100%,28rem);margin:auto;padding:2rem;border:1px solid #343641;border-radius:1rem;background:#1b1d24}}input,button{{width:100%;padding:.85rem 1rem;border-radius:.6rem;font:inherit}}input{{border:1px solid #555968;background:#101116;color:inherit}}button{{margin-top:.8rem;border:0;background:var(--accent);color:white;font-weight:700;cursor:pointer}}small{{display:block;margin-top:1rem;color:#b8bac4}}#error{{min-height:1.4em;color:#ff9b9b}}img,video{{display:none;max-width:100%;max-height:92vh;margin:auto;border-radius:.75rem;box-shadow:0 1.5rem 5rem #0008}}
+:root{{--accent:{accent};--on-accent:{accent_ink};color-scheme:light dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#111217;color:#f7f7fa;font:16px system-ui,sans-serif}}main{{width:min(92vw,64rem);text-align:center}}form{{width:min(100%,28rem);margin:auto;padding:2rem;border:1px solid #343641;border-radius:1rem;background:#1b1d24}}input,button{{width:100%;padding:.85rem 1rem;border-radius:.6rem;font:inherit}}input{{border:1px solid #555968;background:#101116;color:inherit}}button{{margin-top:.8rem;border:0;background:var(--accent);color:var(--on-accent);font-weight:700;cursor:pointer}}small{{display:block;margin-top:1rem;color:#b8bac4}}#error{{min-height:1.4em;color:#ff9b9b}}img,video{{display:none;max-width:100%;max-height:92vh;margin:auto;border-radius:.75rem;box-shadow:0 1.5rem 5rem #0008}}
 </style>
 </head>
 <body>
@@ -182,6 +182,7 @@ document.getElementById("unlock").addEventListener("submit",async event=>{{
 </html>
 "#,
         accent = branding.accent,
+        accent_ink = branding.accent_ink(),
         salt = base64(&payload.salt),
         nonce = base64(&payload.nonce),
         ciphertext = base64(&payload.ciphertext),

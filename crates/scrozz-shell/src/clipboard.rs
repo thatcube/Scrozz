@@ -33,16 +33,9 @@ fn write_platform(frame: &Frame, png: &[u8]) -> Result<ClipboardReport> {
         NSPasteboardWriting,
     };
     use objc2_foundation::{NSArray, NSData};
-    use scrozz_export::{ClipboardPlatform, FlavourKind, clipboard::offer};
+    use scrozz_export::{ClipboardPlatform, FlavourKind, clipboard::encode_flavour};
 
-    let tiff = offer(frame, ClipboardPlatform::MacOs)?
-        .into_iter()
-        .find(|flavour| flavour.kind == FlavourKind::Tiff)
-        .ok_or_else(|| {
-            scrozz_core::Error::Codec(
-                "the macOS clipboard offer produced no TIFF fallback".to_owned(),
-            )
-        })?;
+    let tiff = encode_flavour(frame, ClipboardPlatform::MacOs, FlavourKind::Tiff)?;
 
     // SAFETY: AppKit's pasteboard-type globals are immortal NSString constants.
     let (png_type, tiff_type) = unsafe { (NSPasteboardTypePNG, NSPasteboardTypeTIFF) };

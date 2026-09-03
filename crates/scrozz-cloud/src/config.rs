@@ -22,7 +22,7 @@ impl Default for Branding {
     fn default() -> Self {
         Self {
             title: "Scrozz share".to_owned(),
-            accent: "#7c3aed".to_owned(),
+            accent: "#f05a28".to_owned(),
         }
     }
 }
@@ -42,10 +42,30 @@ impl Branding {
                 .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(Error::Config(
-                "viewer accent must be a six-digit CSS color such as #7c3aed".to_owned(),
+                "viewer accent must be a six-digit CSS color such as #f05a28".to_owned(),
             ));
         }
         Ok(())
+    }
+
+    /// Black or white button ink with the stronger WCAG contrast on `accent`.
+    pub(crate) fn accent_ink(&self) -> &'static str {
+        let channel = |offset| {
+            u8::from_str_radix(&self.accent[offset..offset + 2], 16).unwrap_or_default() as f64
+                / 255.0
+        };
+        let linear = |value: f64| {
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance =
+            0.2126 * linear(channel(1)) + 0.7152 * linear(channel(3)) + 0.0722 * linear(channel(5));
+        let black = (luminance + 0.05) / 0.05;
+        let white = 1.05 / (luminance + 0.05);
+        if black >= white { "#000000" } else { "#ffffff" }
     }
 }
 
@@ -264,6 +284,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::{Credentials, Secret};
+
+    #[test]
+    fn viewer_button_ink_adapts_to_the_configured_accent() {
+        assert_eq!(Branding::default().accent_ink(), "#000000");
+        assert_eq!(
+            Branding {
+                title: "Dark".to_owned(),
+                accent: "#24102f".to_owned(),
+            }
+            .accent_ink(),
+            "#ffffff"
+        );
+    }
 
     use super::*;
 

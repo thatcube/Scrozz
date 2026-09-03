@@ -1037,6 +1037,33 @@ fn text_on_the_accent_fill_meets_wcag_aa() {
 }
 
 #[test]
+fn both_appearances_use_the_canonical_ember_accent() {
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        assert_eq!(
+            Palette::for_appearance(appearance).accent,
+            theme::BRAND_ACCENT
+        );
+    }
+}
+
+#[test]
+fn accent_wash_text_and_links_meet_wcag_aa() {
+    for palette in [Palette::dark(), Palette::light()] {
+        let ink = palette.on_accent_wash();
+        assert!(
+            theme::contrast_ratio(ink, palette.accent_wash()) >= Contrast::AA_TEXT,
+            "{:?} accent-wash text fails AA",
+            palette.appearance
+        );
+        assert!(
+            theme::contrast_ratio(ink, palette.canvas()) >= Contrast::AA_TEXT,
+            "{:?} hyperlink text fails AA on the canvas",
+            palette.appearance
+        );
+    }
+}
+
+#[test]
 fn the_focus_ring_is_visible_against_what_it_surrounds() {
     // A focus ring nobody can see is not a focus ring (D13).
     for appearance in [Appearance::Dark, Appearance::Light] {

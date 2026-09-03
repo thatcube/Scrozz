@@ -683,17 +683,15 @@ impl Default for Timing {
 }
 
 impl Timing {
-    /// Keeps live Recent Captures residents fixed while retaining deliberate
-    /// gestures, departure, hover, and dock transitions.
+    /// Keeps live Recent Captures residents fixed while retaining the new
+    /// card's deliberate left-to-slot arrival and every direct interaction.
     ///
-    /// Arrival and gap-closing used to schedule whole-stack repaints around
-    /// native overlay updates. On composited desktops that could present a
-    /// one-frame vertical bounce even though the closed-form geometry itself
-    /// never moved upward.
+    /// Only gap-closing resident motion is suppressed. Arrival affects the new
+    /// card alone, so restoring it cannot reintroduce the one-frame vertical
+    /// bounce caused by moving already-visible residents.
     #[must_use]
     pub fn stable_residents() -> Self {
         Self {
-            enter: Duration::ZERO,
             fall: Duration::ZERO,
             ..Self::default()
         }

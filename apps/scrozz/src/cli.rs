@@ -1667,7 +1667,7 @@ impl ShareArgs {
                 || !accent[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
         }) {
             return Err(CliError::usage(
-                "--accent must be a six-digit CSS color such as #7c3aed",
+                "--accent must be a six-digit CSS color such as #f05a28",
             ));
         }
         Ok(())

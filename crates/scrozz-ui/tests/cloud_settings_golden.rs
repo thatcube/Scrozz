@@ -49,7 +49,7 @@ fn model(configured: bool) -> CloudSettingsModel {
             tags: "team=design,source=scrozz".to_owned(),
             protection_mode: "vault".to_owned(),
             viewer_title: "Design review".to_owned(),
-            viewer_accent: "#7c3aed".to_owned(),
+            viewer_accent: "#f05a28".to_owned(),
         },
         credentials: CloudCredentialView {
             backend: if configured {
