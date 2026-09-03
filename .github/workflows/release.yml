@@ -20,13 +20,11 @@
 # ---------------------------------------------------------------------------
 # macOS ships a bundle, not a binary
 # ---------------------------------------------------------------------------
-# The macOS artefact is Scrozz.app. That is a functional requirement, not a
-# packaging taste: macOS attaches a Screen Recording grant to a code identity,
-# and a bare executable has none, so the grant lands on whatever launched it
-# and never follows the binary. A screenshot tool shipped as a loose executable
-# is a screenshot tool that can never be given permission to take a screenshot.
-# The bundle is assembled by tools/make-app-bundle.sh, signed and notarised as
-# a bundle, and stapled — which is only possible for a bundle.
+# The macOS artefact is a conventional drag-to-Applications DMG containing
+# Scrozz.app. The bundle identity is a functional requirement: macOS attaches a
+# Screen Recording grant to that identity, not to a loose executable. The app is
+# assembled by tools/make-app-bundle.sh, signed, notarised and stapled before
+# tools/make-dmg.sh puts it in the disk image.
 # macOS can emit an explicitly unsigned external-signing handoff when its
 # secrets are absent. Stable Windows release artifacts fail closed: executable,
 # Store identity, and MSIX signature must agree. Alpha tags may publish only the
@@ -712,30 +710,8 @@ jobs:
           cp LICENSE TRADEMARK.md README.md dist/
 
           if [[ "${{ runner.os }}" == "macOS" ]]; then
-            # ditto, not zip or tar: it is the only archiver that round-trips a
-            # signed, stapled bundle intact. --keepParent over a staging
-            # directory gives an archive that expands to one folder holding the
-            # app and its licence, rather than scattering files into whatever
-            # the user had selected in Finder.
-            STAGE="$RUNNER_TEMP/$NAME"
-            rm -rf "$STAGE"
-            mkdir -p "$STAGE"
-            ditto dist/Scrozz.app "$STAGE/Scrozz.app"
-            for f in LICENSE TRADEMARK.md README.md PREVIEW.txt; do
-              [[ -f "dist/$f" ]] && cp "dist/$f" "$STAGE/"
-            done
-            ditto -c -k --sequesterRsrc --keepParent "$STAGE" "${NAME}.zip"
-            ASSET="${NAME}.zip"
-
-            # Prove the archive survived the round trip. A signature that only
-            # verifies before packaging is worth nothing to the person
-            # downloading it.
-            VERIFY="$RUNNER_TEMP/verify"
-            rm -rf "$VERIFY"
-            mkdir -p "$VERIFY"
-            ditto -x -k "${NAME}.zip" "$VERIFY"
-            codesign --verify --strict --verbose=2 "$VERIFY/$NAME/Scrozz.app"
-            "$VERIFY/$NAME/Scrozz.app/Contents/MacOS/Scrozz" --version
+            ASSET="${NAME}.dmg"
+            tools/make-dmg.sh dist/Scrozz.app "$ASSET"
           elif [[ "${{ matrix.archive }}" == "zip" ]]; then
             cd dist
             7z a "../${NAME}.zip" ./* >/dev/null
@@ -762,7 +738,7 @@ jobs:
           PACKAGE_IDENTITY=""
           NATIVE_PACKAGE_VERSION="$VERSION"
           if [[ "${{ runner.os }}" == "macOS" ]]; then
-            PACKAGE_KIND=app-bundle-archive
+            PACKAGE_KIND=disk-image
             PACKAGE_IDENTITY=com.thatcube.Scrozz
             NATIVE_PACKAGE_VERSION="${VERSION%%-*}"
             if [[ "${SCROZZ_MACOS_PAYLOAD_SIGNED:-0}" == "1" ]]; then
@@ -1035,7 +1011,7 @@ jobs:
             echo
             echo "| Platform | Signed | Secret that enables it |"
             echo "|---|---|---|"
-            echo "| macOS (Scrozz.app) | $MACOS_SIGNING_STATUS | \`MACOS_CERTIFICATE_P12\` (+ password, identity, notary key/ID/issuer) |"
+            echo "| macOS (.dmg containing Scrozz.app) | $MACOS_SIGNING_STATUS | \`MACOS_CERTIFICATE_P12\` (+ password, identity, notary key/ID/issuer) |"
             echo "| Windows | $WINDOWS_SIGNING_STATUS | \`WINDOWS_CERTIFICATE_PFX\` (+ password) |"
             echo "| Checksums (GPG) | $CHECKSUM_SIGNING_STATUS | \`GPG_PRIVATE_KEY\` (+ passphrase) |"
             echo

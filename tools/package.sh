@@ -16,7 +16,8 @@
 #
 # # What each platform gets, and why
 #
-#   macOS    Scrozz.app, zipped with `ditto`. Not a bare binary: a CLI
+#   macOS    A drag-to-Applications DMG containing Scrozz.app. Not a bare binary:
+#            a CLI
 #            executable has no bundle identity for macOS to attach a TCC grant
 #            to, so Screen Recording is refused no matter how often it is
 #            approved (the whole reason tools/make-app-bundle.sh exists). An
@@ -156,25 +157,26 @@ write_preview_notice() {
 
 case "$OS" in
   macos)
-    STAGE="$DIST/stage"
-    mkdir -p "$STAGE"
+    APP="$DIST/Scrozz.app"
     # Reuse the real bundler rather than reimplementing it, so the artifact and
     # a developer's local build are the same thing. It builds through cargo, so
     # point it at the target directory the release binary already lives in and
     # the build is a no-op rebuild rather than a second full compile.
     if ! CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" \
       SCROZZ_PREBUILT_BIN="$BIN" \
-      tools/make-app-bundle.sh "$STAGE/Scrozz.app"; then
+      tools/make-app-bundle.sh "$APP"; then
       echo "package: make-app-bundle.sh failed" >&2
       exit 1
     fi
-    ARCHIVE="$DIST/$NAME.zip"
-    # --keepParent so the archive expands to Scrozz.app, not its contents.
-    if ! ditto -c -k --keepParent "$STAGE/Scrozz.app" "$ARCHIVE"; then
-      echo "package: ditto failed" >&2
+    if [[ "$PREVIEW" -eq 1 ]]; then
+      write_preview_notice "$DIST"
+    fi
+    ARCHIVE="$DIST/$NAME.dmg"
+    if ! tools/make-dmg.sh "$APP" "$ARCHIVE"; then
+      echo "package: make-dmg.sh failed" >&2
       exit 1
     fi
-    rm -rf "$STAGE"
+    rm -rf "$APP"
     ;;
 
   windows)
@@ -312,7 +314,7 @@ PACKAGE_IDENTITY=""
 IDENTITY_MODE="${SCROZZ_SIGNING_MODE:-none}"
 PAYLOAD_SIGNED=false
 if [[ "$OS" == "macos" ]]; then
-  PACKAGE_KIND="app-bundle-archive"
+  PACKAGE_KIND="disk-image"
   PACKAGE_IDENTITY="com.thatcube.Scrozz"
   # The bundler always leaves a signature on macOS unless a caller explicitly
   # took ownership of that step.

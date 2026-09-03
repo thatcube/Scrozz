@@ -110,10 +110,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
       arm64|aarch64) PACKAGE_ARCH=arm64 ;;
       *) PACKAGE_ARCH=x86_64 ;;
     esac
-    PACKAGE_METADATA="$PACKAGE_OUT/scrozz-1.2.3-beta.4-fixture-macos-$PACKAGE_ARCH.zip.artifact.json"
+    PACKAGE_METADATA="$PACKAGE_OUT/scrozz-1.2.3-beta.4-fixture-macos-$PACKAGE_ARCH.dmg.artifact.json"
   ruby -rjson -e '
     metadata = JSON.parse(File.read(ARGV.fetch(0)))
     raise "native version" unless metadata["native_package_version"] == "1.2.3"
+    raise "package kind" unless metadata["package_kind"] == "disk-image"
     raise "container signature" unless metadata["signed"] == false
     raise "payload signature" unless metadata["payload_signed"] == true
     raise "identity mode" unless metadata["identity_mode"] == "ad-hoc-dev"
@@ -469,6 +470,14 @@ fi
 grep -q 'tools/make-app-bundle.sh "\$PWD/dist/Scrozz.app"' \
   "$RELEASE_WORKFLOW" ||
   fail "macOS release does not assemble Scrozz.app with the bundle script"
+[[ -x tools/make-dmg.sh ]] ||
+  fail "macOS DMG builder is absent or not executable"
+grep -q 'tools/make-dmg.sh dist/Scrozz.app "\$ASSET"' "$RELEASE_WORKFLOW" ||
+  fail "macOS release does not package the signed app as a DMG"
+grep -q 'ln -s /Applications' tools/make-dmg.sh ||
+  fail "macOS DMG does not provide a drag-to-Applications target"
+grep -q 'PACKAGE_KIND="disk-image"' tools/package.sh ||
+  fail "macOS package metadata does not identify the disk image"
 grep -q 'NATIVE_PACKAGE_VERSION="${VERSION%%-\*}"' "$RELEASE_WORKFLOW" ||
   fail "macOS artifact metadata does not report the app bundle version"
 grep -q -- '--sign "\$MACOS_SIGN_IDENTITY" dist/Scrozz.app' \
