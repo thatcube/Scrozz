@@ -50,6 +50,23 @@ fn clean_settings(path: &std::path::Path) {
     }
 }
 
+fn absent_ipc_endpoint() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(format!(
+            r"\\.\pipe\scrozz-cli-test-missing-{}",
+            std::process::id()
+        ))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from(format!(
+            "/nonexistent/scrozz-cli-test-{}/instance.sock",
+            std::process::id()
+        ))
+    }
+}
+
 /// Runs the binary and returns everything the shell would have seen.
 fn scrozz<I, S>(args: I) -> Output
 where
@@ -909,7 +926,7 @@ fn a_command_that_needs_the_running_app_says_so_rather_than_hanging() {
         .args(["record", "--stop"])
         .env_remove("SCROZZ_SIMULATE_ERROR")
         .env("SCROZZ_SETTINGS_FILE", &settings)
-        .env("SCROZZ_IPC_SOCKET", "/nonexistent/scrozz-test/absent.sock")
+        .env("SCROZZ_IPC_SOCKET", absent_ipc_endpoint())
         .output()
         .expect("the binary should run");
     clean_settings(&settings);
@@ -936,7 +953,7 @@ fn a_dry_run_recording_resolves_its_whole_plan_without_recording() {
         ])
         .env_remove("SCROZZ_SIMULATE_ERROR")
         .env("SCROZZ_SETTINGS_FILE", &settings)
-        .env("SCROZZ_IPC_SOCKET", "/nonexistent/scrozz-test/absent.sock")
+        .env("SCROZZ_IPC_SOCKET", absent_ipc_endpoint())
         .output()
         .expect("the binary should run");
     clean_settings(&settings);
@@ -962,7 +979,7 @@ fn recording_never_reports_itself_as_unimplemented() {
         .args(["record", "--dry-run"])
         .env_remove("SCROZZ_SIMULATE_ERROR")
         .env("SCROZZ_SETTINGS_FILE", &settings)
-        .env("SCROZZ_IPC_SOCKET", "/nonexistent/scrozz-test/absent.sock")
+        .env("SCROZZ_IPC_SOCKET", absent_ipc_endpoint())
         .output()
         .expect("the binary should run");
     clean_settings(&settings);
