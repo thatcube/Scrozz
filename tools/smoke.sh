@@ -335,6 +335,8 @@ else
       *'"kind":"not-implemented"'* | *'"kind":"unsupported"'*)
         if [[ "$OS" == "linux" ]]; then
           skip "decode-ocr" "no OCR engine on Linux (SystemOcr::is_available() is macOS/Windows only); refusal was clean, exit $STATUS"
+        elif [[ "$OS" == "windows" ]]; then
+          skip "decode-ocr" "the pre-package binary has neither MSIX identity nor the portable Tesseract payload; tools/test-windows-packaging.ps1 verifies both packaged OCR paths"
         else
           fail "decode-ocr" "$OS has an OCR engine but the binary refused: $(echo "$OUT" | head -c 160)"
         fi
