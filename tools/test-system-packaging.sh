@@ -470,6 +470,9 @@ fi
 grep -q 'tools/make-app-bundle.sh "\$PWD/dist/Scrozz.app"' \
   "$RELEASE_WORKFLOW" ||
   fail "macOS release does not assemble Scrozz.app with the bundle script"
+grep -q 'macOS) BIN="dist/Scrozz.app/Contents/MacOS/Scrozz"' \
+  "$RELEASE_WORKFLOW" ||
+  fail "macOS release smoke does not run the binary inside its app bundle"
 [[ -x tools/make-dmg.sh ]] ||
   fail "macOS DMG builder is absent or not executable"
 grep -q 'tools/make-dmg.sh dist/Scrozz.app "\$ASSET"' "$RELEASE_WORKFLOW" ||
