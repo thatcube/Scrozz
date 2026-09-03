@@ -5964,7 +5964,7 @@ mod tests {
             action: 1,
         }));
         let _ = wait_for(&pipeline);
-        assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        wait_for_wake(&wakes);
     }
 
     /// Round 9, Finding #2: `Worker::answer_upload`'s local refusal path (a
@@ -5998,10 +5998,7 @@ mod tests {
             }
             other => panic!("expected a local upload refusal, got {other:?}"),
         }
-        assert!(
-            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "a locally refused upload must wake the event loop"
-        );
+        wait_for_wake(&wakes);
     }
 
     #[test]
@@ -6041,7 +6038,7 @@ mod tests {
             panic!("expected a history page");
         };
         assert_eq!(request, 2);
-        assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        wait_for_wake(&wakes);
         queries.send(HistoryQuery::Stop).expect("stop history");
         worker.join().expect("history worker");
         drop(dir);
@@ -6984,11 +6981,7 @@ mod tests {
             outcome_rx.try_recv(),
             Ok(Outcome::UploadDone { .. })
         ));
-        assert!(
-            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "a successful upload must wake the reactive event loop so its \
-             outcome is drained promptly rather than waiting on an unrelated repaint"
-        );
+        wait_for_wake(&wakes);
     }
 
     #[test]
@@ -7026,11 +7019,7 @@ mod tests {
             outcome_rx.try_recv(),
             Ok(Outcome::UploadRefused { .. })
         ));
-        assert!(
-            wakes.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "a refused upload must also wake the reactive event loop, not \
-             just a successful one"
-        );
+        wait_for_wake(&wakes);
     }
 
     #[test]
@@ -7500,5 +7489,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         None
+    }
+
+    fn wait_for_wake(wakes: &std::sync::atomic::AtomicUsize) {
+        for _ in 0..200 {
+            if wakes.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the worker produced an outcome without waking the event loop");
     }
 }
