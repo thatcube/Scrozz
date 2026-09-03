@@ -83,14 +83,15 @@ PACKAGES=(
 
   # PipeWire, for Wayland screen capture.
   #
-  # This is the *runtime* library only, deliberately not `libpipewire-0.3-dev`.
-  # scrozz-capture dlopens `libpipewire-0.3.so.0` rather than linking it, so
-  # there are no headers to compile against and no pkg-config module to resolve
-  # — which is exactly what keeps `cargo check --target x86_64-unknown-linux-gnu`
-  # working from a Mac, and what lets an X11-only machine run Scrozz at all
-  # instead of failing at load time with an unresolved DT_NEEDED.
+  # The default capture path dlopens PipeWire, but scrozz-record's opt-in
+  # `linux-native` feature links the PipeWire and FFmpeg APIs. CI exercises
+  # `--all-features`, so the development metadata must be present on Linux.
+  # Foreign-target checks still omit that native feature and need no sysroot.
+  libpipewire-0.3-dev
+  libavcodec-dev
+  libavutil-dev
   #
-  # Two things are NOT installed here because they cannot be made to work in a
+  # Two runtime services are NOT installed here because they cannot be used in a
   # headless CI container, and installing them would imply otherwise:
   #
   #   pipewire                  the daemon; needs a user session bus

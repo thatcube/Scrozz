@@ -827,6 +827,15 @@ pub trait OverlaySource: Send {
 }
 
 /// A live signal emitted by a platform recording session.
+//
+// Windows recording metadata makes `Recording` substantially larger than the
+// streaming status variants. This one-shot event is never accumulated, and
+// keeping the terminal payload owned avoids heap indirection throughout the
+// public recording API.
+#[cfg_attr(
+    target_os = "windows",
+    allow(clippy::large_enum_variant, reason = "one-shot owned terminal payload")
+)]
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     /// The encoder accepted its first video frame.
