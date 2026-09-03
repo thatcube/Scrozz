@@ -1971,6 +1971,7 @@ mod tests {
         worker.join().expect("reply worker");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_request_that_finds_the_queue_full_is_told_the_instance_is_busy() {
         use std::io::{Read as _, Write as _};

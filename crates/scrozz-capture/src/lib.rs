@@ -39,6 +39,14 @@ pub use linux::session::{
     describe as describe_linux_session, detect_compositor as detect_linux_compositor,
     detect_session as detect_linux_session,
 };
+#[cfg(target_os = "linux")]
+pub use linux::wayland::portal::{
+    cursor_mode as portal_cursor_mode, source_type as portal_source_type,
+};
+#[cfg(target_os = "linux")]
+pub use linux::wayland::restore::{
+    TokenKey as PortalTokenKey, TokenStore as PortalTokenStore, token_path as portal_token_path,
+};
 #[cfg(target_os = "macos")]
 pub use macos::{
     AppleContentPicker, ApplePickerAvailability, ApplePickerEvent, ApplePickerMode, PickerCapture,

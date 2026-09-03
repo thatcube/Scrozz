@@ -17,8 +17,9 @@ use pw::properties::{PropertiesBox, properties};
 use pw::spa;
 use pw::spa::pod::Pod;
 use scrozz_capture::{
-    LinuxSessionEnv, LinuxSessionKind, PortalSessionPlan, PortalTokenStore, detect_compositor,
-    detect_session, portal_capabilities, portal_token_path,
+    LinuxSessionEnv, LinuxSessionKind, PortalTokenKey, PortalTokenStore, detect_linux_compositor,
+    detect_linux_session, linux_portal_capabilities, portal_cursor_mode, portal_source_type,
+    portal_token_path,
 };
 use scrozz_core::{
     CaptureBackend, CaptureRequest, CaptureTarget, CursorMode, DisplayId, Error, PixelFormat,
@@ -27,6 +28,51 @@ use scrozz_core::{
 
 use crate::audio::AudioBuffer;
 use crate::format::{PackedFrame, PackedPixelFormat, PlacedFrame, compose_placed_frames, crop};
+
+#[derive(Debug, Clone)]
+struct RecordingPortalPlan {
+    types: u32,
+    cursor: u32,
+    multiple: bool,
+    restore_key: PortalTokenKey,
+}
+
+impl RecordingPortalPlan {
+    fn for_target(target: &CaptureTarget, show_cursor: bool) -> Self {
+        let (types, restore_key) = match target {
+            CaptureTarget::Window(_) => (portal_source_type::WINDOW, PortalTokenKey::Window),
+            CaptureTarget::AllDisplays => (
+                portal_source_type::MONITOR | portal_source_type::VIRTUAL,
+                PortalTokenKey::AllDisplays,
+            ),
+            CaptureTarget::Display(id) => {
+                (portal_source_type::MONITOR, PortalTokenKey::display(id))
+            }
+            CaptureTarget::Region(_) => (portal_source_type::MONITOR, PortalTokenKey::Monitor),
+        };
+        Self {
+            types,
+            cursor: if show_cursor {
+                portal_cursor_mode::EMBEDDED
+            } else {
+                portal_cursor_mode::HIDDEN
+            },
+            multiple: matches!(target, CaptureTarget::AllDisplays),
+            restore_key,
+        }
+    }
+
+    fn narrow(mut self, available_types: u32, available_cursors: u32) -> Option<Self> {
+        self.types &= available_types;
+        if self.types == 0 {
+            return None;
+        }
+        if self.cursor & available_cursors == 0 {
+            self.cursor = portal_cursor_mode::HIDDEN;
+        }
+        Some(self)
+    }
+}
 
 pub(super) trait VideoSource {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<PackedFrame>>;
@@ -40,7 +86,7 @@ pub(super) fn open_video_source(
     show_cursor: bool,
 ) -> Result<Box<dyn VideoSource>> {
     let env = LinuxSessionEnv::from_env();
-    match detect_session(&env) {
+    match detect_linux_session(&env) {
         LinuxSessionKind::X11 => Ok(Box::new(X11Source::new(target, show_cursor)?)),
         LinuxSessionKind::Wayland | LinuxSessionKind::XWayland => {
             Ok(Box::new(PortalVideoSource::new(target, show_cursor, &env)?))
@@ -289,9 +335,9 @@ struct PortalVideoSource {
 
 impl PortalVideoSource {
     fn new(target: &CaptureTarget, show_cursor: bool, env: &LinuxSessionEnv) -> Result<Self> {
-        let compositor = detect_compositor(env);
-        let capabilities = portal_capabilities(&compositor);
-        let plan = PortalSessionPlan::for_target(target, show_cursor);
+        let compositor = detect_linux_compositor(env);
+        let capabilities = linux_portal_capabilities(&compositor);
+        let plan = RecordingPortalPlan::for_target(target, show_cursor);
         let token_path = portal_token_path(
             std::env::var("XDG_STATE_HOME").ok().as_deref(),
             std::env::var("HOME").ok().as_deref(),
@@ -302,7 +348,7 @@ impl PortalVideoSource {
             .map_or_else(PortalTokenStore::new, |text| PortalTokenStore::parse(&text));
         let stored_token = capabilities
             .restore_tokens
-            .then(|| tokens.get(plan.restore_key).map(str::to_owned))
+            .then(|| tokens.get(&plan.restore_key).map(str::to_owned))
             .flatten();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -319,7 +365,7 @@ impl PortalVideoSource {
         )) {
             Ok(response) => response,
             Err(error) if stored_token.is_some() && !error.is_cancellation() => {
-                tokens.invalidate(plan.restore_key);
+                tokens.invalidate(&plan.restore_key);
                 persist_tokens(token_path.as_deref(), &tokens);
                 runtime.block_on(open_portal(
                     target,
@@ -338,7 +384,7 @@ impl PortalVideoSource {
         } = response;
         let portal = PortalLifetime::new(runtime, session)?;
         if let Some(token) = restore_token.as_deref() {
-            tokens.set(plan.restore_key, token);
+            tokens.set(&plan.restore_key, token);
             persist_tokens(token_path.as_deref(), &tokens);
         }
         if descriptors.is_empty() {
@@ -618,16 +664,20 @@ async fn open_portal(
                 .into(),
         });
     }
-    let plan = PortalSessionPlan::for_target(target, show_cursor)
+    let plan = RecordingPortalPlan::for_target(target, show_cursor)
         .narrow(available_sources.bits(), available_cursors.bits())
         .ok_or_else(|| Error::Unsupported {
             what: "the requested portal recording source".into(),
             why: "the desktop portal reports no compatible source or cursor mode".into(),
         })?;
     let sources = match plan.types {
-        1 => SourceType::Monitor.into(),
-        2 => SourceType::Window.into(),
-        5 => SourceType::Monitor | SourceType::Virtual,
+        portal_source_type::MONITOR => SourceType::Monitor.into(),
+        portal_source_type::WINDOW => SourceType::Window.into(),
+        types
+            if types == portal_source_type::MONITOR | portal_source_type::VIRTUAL =>
+        {
+            SourceType::Monitor | SourceType::Virtual
+        }
         _ => {
             return Err(Error::Unsupported {
                 what: "the requested portal source combination".into(),
@@ -641,7 +691,7 @@ async fn open_portal(
         .map_err(map_portal_error)?;
     let mut options = SelectSourcesOptions::default().set_sources(sources);
     options = options
-        .set_cursor_mode(if plan.cursor == 2 {
+        .set_cursor_mode(if plan.cursor == portal_cursor_mode::EMBEDDED {
             PortalCursorMode::Embedded
         } else {
             PortalCursorMode::Hidden

@@ -2448,7 +2448,7 @@ impl App {
                         self.scrolling_ready = Some(ready);
                         continue;
                     }
-                    self.handle_ready(ready);
+                    self.handle_ready(*ready);
                 }
                 Outcome::Progress { card, progress } => {
                     self.update_scroll_hud(card, &progress);
@@ -4625,12 +4625,11 @@ impl App {
     ///
     /// Split out of the pipeline drain so a scrolling capture can be held for
     /// one pass and then published through exactly the same path as any other.
-    fn handle_ready(&mut self, ready: Box<ReadyCapture>) {
+    fn handle_ready(&mut self, ready: ReadyCapture) {
         if self.scrolling_card == Some(ready.card.id) {
             self.finish_scrolling_hud();
         }
         self.captures += 1;
-        let ready = *ready;
         let mut card = ready.card;
         // The card is told what Upload can do the moment it is
         // built, so a control that cannot work is never offered as
@@ -4812,7 +4811,7 @@ impl App {
 
     fn drain_scrolling_ready(&mut self) {
         if let Some(ready) = self.scrolling_ready.take() {
-            self.handle_ready(ready);
+            self.handle_ready(*ready);
         }
     }
 
