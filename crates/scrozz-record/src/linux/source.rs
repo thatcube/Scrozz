@@ -724,7 +724,8 @@ async fn open_portal(
             what: "recording the cursor on Wayland".into(),
             why: "the desktop portal does not provide embedded cursor capture for this session"
                 .into(),
-        });
+        }
+        .into());
     }
     let plan = RecordingPortalPlan::for_target(target, show_cursor)
         .narrow(available_sources.bits(), available_cursors.bits())
@@ -742,7 +743,8 @@ async fn open_portal(
             return Err(Error::Unsupported {
                 what: "the requested portal source combination".into(),
                 why: format!("unsupported ScreenCast source mask {}", plan.types),
-            });
+            }
+            .into());
         }
     };
     let session = proxy
@@ -785,7 +787,7 @@ async fn open_portal(
             .map_err(map_portal_error)?
             .response()
             .map_err(map_portal_error)?;
-        let streams = response
+        let streams: Vec<PortalStream> = response
             .streams()
             .iter()
             .map(|stream| PortalStream {
