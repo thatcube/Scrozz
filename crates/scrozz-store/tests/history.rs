@@ -893,8 +893,11 @@ fn recording_insert_rejects_relative_path() {
 #[test]
 fn recording_insert_rejects_nonexistent_path() {
     let (_dir, mut store) = store("recording-missing-path");
+    let missing =
+        std::env::temp_dir().join(format!("scrozz-missing-video-{}.mov", std::process::id()));
+    let _ = std::fs::remove_file(&missing);
     let meta = VideoMetadata {
-        path: "/definitely/not/a/real/file.mov".into(),
+        path: missing,
         duration_secs: 1.0,
         engine: "test".into(),
         completion: VideoCompletion::Complete,
