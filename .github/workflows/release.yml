@@ -188,12 +188,10 @@ jobs:
           - os: macos-latest
             name: macOS (universal)
             slug: macos-universal
-            # zip, not tar.gz: the macOS artefact is an .app bundle, and `ditto
-            # -c -k` is the archiver that preserves the code signature, the
-            # stapled notarisation ticket and the extended attributes a bundle
-            # carries. tar drops enough of that to make Gatekeeper reject the
-            # result on the far side.
-            archive: zip
+            # The release surface is a conventional drag-to-Applications disk
+            # image. tools/make-dmg.sh verifies the app's signature after mounting
+            # the image and never launches it.
+            archive: dmg
           - os: ubuntu-latest
             name: Linux (x86_64)
             slug: linux-x86_64
