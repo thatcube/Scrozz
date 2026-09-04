@@ -98,7 +98,7 @@ jobs:
             echo "is_alpha=false" >>"$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ format('refs/tags/{0}', steps.tag.outputs.tag) }}
           fetch-depth: 0
@@ -208,7 +208,7 @@ jobs:
           # on the difference between "it builds" and "it works".
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
@@ -925,7 +925,7 @@ jobs:
 
       - name: Upload artefact
         if: matrix.os != 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.slug }}
           path: |
@@ -937,7 +937,7 @@ jobs:
 
       - name: Upload Windows artifacts
         if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.slug }}
           path: release-artifacts/*
@@ -956,12 +956,12 @@ jobs:
       # The one job that needs write access, and only for creating the release.
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true

@@ -25,7 +25,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -38,7 +38,7 @@ jobs:
             tools/benchmark-capture-readiness.sh
             tools/benchmark-capture-readiness.sh --constrained
           } 2>&1 | tee capture-performance.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: capture-performance-${{ matrix.os }}
           path: capture-performance.txt
