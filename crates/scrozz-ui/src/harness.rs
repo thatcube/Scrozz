@@ -330,7 +330,7 @@ pub enum Scenario {
     RecordingPresenter,
     /// Camera preferences before any permission prompt or preview.
     CameraSettings,
-    /// The scrolling HUD choosing an axis and reporting stitched progress.
+    /// The scrolling HUD choosing a control mode and showing a steady capture state.
     ScrollingCapture,
     /// Possible sensitive information shown for explicit review before redaction.
     SensitiveReview,
@@ -825,12 +825,12 @@ mod instants {
         KeyInstant {
             name: "vertical-progress",
             at_ms: 180,
-            expectation: "the HUD reports a measured vertical seam and the stitched height",
+            expectation: "one steady capture status and Finish/Discard controls without polling diagnostics",
         },
         KeyInstant {
             name: "horizontal-progress",
             at_ms: 360,
-            expectation: "the same HUD reports horizontal progress in width rather than height",
+            expectation: "horizontal and vertical routes share the same minimal, stable capture controls",
         },
     ];
 }

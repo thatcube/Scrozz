@@ -5190,7 +5190,7 @@ impl App {
         self.scrolling_card = Some(card);
         let needs_passthrough =
             control == ScrollControl::Automatic && target.requires_overlay_passthrough();
-        let mut hud = ScrollHudState::prepared(control);
+        let mut hud = ScrollHudState::starting(control);
         if let Some((selection, work_area, scale)) = target.overlay_surface() {
             hud = hud.with_surface(selection, work_area, scale);
         }
@@ -5361,13 +5361,11 @@ impl App {
                 }
             }
             Progress::FrameCaptured { frame } => {
-                state.status = ScrollHudStatus::Capturing;
                 state.frame = *frame;
+                self.scroll_hud = Some(state);
+                return;
             }
-            Progress::WaitingForManualScroll => {
-                state.status = ScrollHudStatus::WaitingForManualScroll;
-                state.automatic = state.control == ScrollControl::Automatic;
-            }
+            Progress::WaitingForManualScroll | Progress::Stalled { .. } => return,
             Progress::DirectionDetected { direction } => {
                 state = state.with_direction(*direction);
                 state.status = ScrollHudStatus::Capturing;
@@ -5378,16 +5376,22 @@ impl App {
                 output_extent,
                 ..
             } => {
+                let already_capturing =
+                    state.status == ScrollHudStatus::Capturing && state.delta.is_some();
                 state.status = ScrollHudStatus::Capturing;
                 state.frame = *frame;
                 state.delta = Some(*delta);
                 state.output_extent = *output_extent;
-            }
-            Progress::Stalled { count } => {
-                state.status = ScrollHudStatus::Stalled(*count);
+                if already_capturing {
+                    self.scroll_hud = Some(state);
+                    return;
+                }
             }
             Progress::Interrupted { .. } => {}
             Progress::WaitingForOverlap { .. } => {
+                if state.status == ScrollHudStatus::WaitingForOverlap {
+                    return;
+                }
                 state.status = ScrollHudStatus::WaitingForOverlap;
             }
             Progress::AwaitingFinish { reason } => {
@@ -14360,7 +14364,7 @@ mod tests {
         finish_scrolling_area_selection(&mut app);
 
         let hud = surface.scrolling_hud().expect("scrolling progress");
-        assert_eq!(hud.status, ScrollHudStatus::Prepared);
+        assert_eq!(hud.status, ScrollHudStatus::Starting);
         assert_eq!(hud.control, ScrollControl::Manual);
         assert!(
             app.scrolling_card.is_some() && app.scrolling_start_pending.is_some(),
@@ -14487,10 +14491,66 @@ mod tests {
             assert!(!app.scrolling_keep_pending);
             assert!(surface.presented().is_empty());
         }
+
         assert!(matches!(
             surface.scrolling_hud().expect("HUD").status,
             ScrollHudStatus::AwaitingFinish(_)
         ));
+    }
+
+    #[test]
+    fn scrolling_poll_events_never_replace_the_visible_instruction() {
+        let (mut app, surface) = scrolling_app();
+        let card = CardId(172);
+        app.scrolling_card = Some(card);
+        app.set_scroll_hud(ScrollHudState::starting(ScrollControl::Manual));
+        app.update_scroll_hud(card, &Progress::FrameCaptured { frame: 1 });
+        assert_eq!(
+            surface.scrolling_hud().expect("HUD").status,
+            ScrollHudStatus::Starting
+        );
+        app.update_scroll_hud(
+            card,
+            &Progress::Prepared {
+                driver: "fixture".into(),
+                automatic: false,
+                manual_reason: None,
+            },
+        );
+        for status in [
+            ScrollHudStatus::Prepared,
+            ScrollHudStatus::Capturing,
+            ScrollHudStatus::WaitingForOverlap,
+        ] {
+            let mut state = ScrollHudState::prepared(ScrollControl::Manual);
+            state.status = status.clone();
+            app.set_scroll_hud(state);
+            for progress in [
+                Progress::WaitingForManualScroll,
+                Progress::FrameCaptured { frame: 999 },
+                Progress::Stalled { count: 900 },
+            ] {
+                app.update_scroll_hud(card, &progress);
+                assert_eq!(surface.scrolling_hud().expect("HUD").status, status);
+            }
+        }
+        app.update_scroll_hud(
+            card,
+            &Progress::Advanced {
+                frame: 1_000,
+                delta: 30,
+                output_extent: 1_230,
+                output_height: 1_230,
+                seam: scrozz_stitch::SeamQuality {
+                    mean_absolute_error: 0,
+                    confidence: 255,
+                },
+            },
+        );
+        assert_eq!(
+            surface.scrolling_hud().expect("HUD").status,
+            ScrollHudStatus::Capturing
+        );
     }
 
     #[test]

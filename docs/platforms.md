@@ -354,6 +354,15 @@ append-only stitching and flipped back for a naturally ordered final image. A
 failed automatic attempt keeps setup visible so the same area can be retried
 manually.
 
+Setup and capture share a compact control bar, including detached controls and
+the portal fallback. **Getting ready** remains visible until the worker has
+captured its first viewport; only then does **Scroll to begin** appear, so cold
+capture startup does not invite scrolling before a baseline exists.
+The status changes only when the user needs to do something
+different: prepare, begin scrolling, reconnect, or finish. Frame counts, seam
+measurements, direction prompts, and idle probes stay out of the visible UI.
+Routine polling never replaces the status or repeatedly redraws the control bar.
+
 Input delivery is per-platform and never global:
 
 * **macOS** synthesizes small, line-based target-bound wheel gestures. The selected window is

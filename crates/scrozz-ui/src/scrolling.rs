@@ -9,7 +9,7 @@ use egui::{
     Align2, Color32, Id, Rect, Response, Sense, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType,
     pos2, vec2,
 };
-use scrozz_core::{LogicalRect, ScaleFactor, ScrollAxis, ScrollControl, ScrollDirection};
+use scrozz_core::{LogicalRect, ScaleFactor, ScrollControl, ScrollDirection};
 
 use crate::{
     crop_chrome::draw_resize_guides,
@@ -23,6 +23,8 @@ use crate::{
 pub enum ScrollHudStatus {
     /// Waiting for the user to configure and explicitly start capture.
     Configuring,
+    /// The first viewport is still being acquired; scrolling is not ready yet.
+    Starting,
     /// The platform input path is ready.
     Prepared,
     /// A frame was captured or stitched.
@@ -106,6 +108,15 @@ impl ScrollHudState {
         }
     }
 
+    /// No readiness hint until the capture worker has a baseline.
+    #[must_use]
+    pub fn starting(control: ScrollControl) -> Self {
+        Self {
+            status: ScrollHudStatus::Starting,
+            ..Self::prepared(control)
+        }
+    }
+
     /// Anchors setup and progress to the selected scrolling area.
     #[must_use]
     pub const fn with_selection(mut self, selection: Option<LogicalRect>) -> Self {
@@ -169,27 +180,28 @@ impl ScrollingHud {
             state.status,
             ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_)
         );
+        let size = toolbar_size(
+            full.width(),
+            matches!(state.status, ScrollHudStatus::Failed(_)),
+        );
         if let Some(selection) = state
             .selection
             .and_then(|selection| local_selection_rect(full, selection))
         {
-            let preferred_width: f32 = if setup { 420.0 } else { 440.0 };
-            let width = bounded_panel_width(full, preferred_width);
-            let compact = width < if setup { 380.0 } else { 400.0 };
-            let height = if compact {
-                94.0
-            } else if setup {
-                46.0
-            } else {
-                54.0
-            };
-            return anchored_panel_rect(full, selection, width, height);
+            return anchored_panel_rect(full, selection, size.x, size.y);
         }
-
-        let preferred_width: f32 = if setup { 600.0 } else { 440.0 };
-        let width = preferred_width.min((full.width() - Space::HUGE).max(280.0));
-        let height = if setup { 164.0 } else { 150.0 };
-        hud_rect(full, width, height, state)
+        let selection = Rect::from_center_size(
+            pos2(
+                full.center().x,
+                if setup {
+                    full.top() + Space::XXL
+                } else {
+                    full.bottom()
+                },
+            ),
+            vec2(1.0, 1.0),
+        );
+        anchored_panel_rect(full, selection, size.x, size.y)
     }
 
     /// Size of a detached interactive control island.
@@ -198,16 +210,12 @@ impl ScrollingHud {
         state: &ScrollHudState,
         available_width: f32,
     ) -> egui::Vec2 {
-        let setup = matches!(
-            state.status,
-            ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_)
+        let viewport_width = (420.0 + Space::LG * 2.0).min(available_width.max(1.0));
+        let size = toolbar_size(
+            viewport_width,
+            matches!(state.status, ScrollHudStatus::Failed(_)),
         );
-        let content_width: f32 = if setup { 420.0 } else { 440.0 };
-        let content_height = if setup { 46.0 } else { 54.0 };
-        vec2(
-            (content_width + Space::LG * 2.0).min(available_width.max(1.0)),
-            content_height + Space::SM * 2.0,
-        )
+        vec2(viewport_width, size.y + Space::SM * 2.0)
     }
 
     /// Draws only the persistent region boundary into the click-through root.
@@ -234,20 +242,18 @@ impl ScrollingHud {
         interactive: bool,
     ) -> ScrollHudResponse {
         let full = ui.max_rect();
-        let fake_selection = Rect::from_min_size(
-            pos2(
-                full.center().x - 1.0,
-                full.top() + Space::SM - Space::MD - 1.0,
-            ),
-            vec2(2.0, 1.0),
+        let size = toolbar_size(
+            full.width(),
+            matches!(state.status, ScrollHudStatus::Failed(_)),
         );
+        let rect = Rect::from_center_size(full.center(), size);
         if matches!(
             state.status,
             ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_)
         ) {
-            draw_scrolling_selection_toolbar(ui, theme, fake_selection, state.control, interactive)
+            draw_setup_toolbar(ui, theme, rect, state, interactive)
         } else {
-            draw_scrolling_progress_toolbar(ui, theme, fake_selection, state, interactive)
+            draw_scrolling_progress_toolbar(ui, theme, rect, state, interactive)
         }
     }
 
@@ -268,219 +274,12 @@ impl ScrollingHud {
             ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_)
         );
         let rect = Self::control_rect(full, state);
-        let palette = &theme.palette;
-
         Self::draw_boundary(ui, state);
-        if setup
-            && let Some(selection) = state
-                .selection
-                .and_then(|selection| local_selection_rect(full, selection))
-        {
-            return draw_scrolling_selection_toolbar(
-                ui,
-                theme,
-                selection,
-                state.control,
-                interactive,
-            );
-        }
-        if !setup
-            && let Some(selection) = state
-                .selection
-                .and_then(|selection| local_selection_rect(full, selection))
-        {
-            return draw_scrolling_progress_toolbar(ui, theme, selection, state, interactive);
-        }
-        let painter = ui.painter();
-        paint::glass_panel(painter, rect, Radius::BAR, palette, true);
-        if !setup && let Some(direction) = state.direction {
-            Self::axis_rail(
-                painter,
-                rect,
-                direction.axis(),
-                palette.accent,
-                palette.chip_fill,
-            );
-        }
-
-        let content = rect.shrink2(vec2(Space::XL, Space::LG));
-        painter.text(
-            content.left_top(),
-            Align2::LEFT_TOP,
-            "Scrolling capture",
-            theme.font(Text::Title),
-            palette.text,
-        );
-
-        let action = if setup {
-            let instruction = match &state.status {
-                ScrollHudStatus::Failed(reason) => reason.as_str(),
-                _ => "Choose Manual or Auto. After Start, scroll once in any direction.",
-            };
-            painter.text(
-                pos2(content.left(), content.top() + 25.0),
-                Align2::LEFT_TOP,
-                instruction,
-                theme.font(Text::Caption),
-                if matches!(state.status, ScrollHudStatus::Failed(_)) {
-                    palette.warning
-                } else {
-                    palette.text_muted
-                },
-            );
-            let controls_y = content.top() + 52.0;
-            let gap = Space::SM;
-            let button_w = (content.width() - gap) * 0.5;
-            let manual =
-                Rect::from_min_size(pos2(content.left(), controls_y), vec2(button_w, 34.0));
-            let automatic =
-                Rect::from_min_size(pos2(manual.right() + gap, controls_y), manual.size());
-            let manual_response = text_button(
-                ui,
-                theme,
-                manual,
-                Id::new("scrozz.scroll.manual"),
-                "Manual",
-                if state.control == ScrollControl::Manual {
-                    ButtonTone::Selected
-                } else {
-                    ButtonTone::Neutral
-                },
-                true,
-                interactive,
-            );
-            let automatic_response = text_button(
-                ui,
-                theme,
-                automatic,
-                Id::new("scrozz.scroll.automatic"),
-                "Auto",
-                if state.control == ScrollControl::Automatic {
-                    ButtonTone::Selected
-                } else {
-                    ButtonTone::Neutral
-                },
-                true,
-                interactive,
-            );
-            let actions_y = content.bottom() - 34.0;
-            let cancel = Rect::from_min_size(pos2(content.left(), actions_y), vec2(92.0, 34.0));
-            let start =
-                Rect::from_min_size(pos2(content.right() - 132.0, actions_y), vec2(132.0, 34.0));
-            let cancel_response = text_button(
-                ui,
-                theme,
-                cancel,
-                Id::new("scrozz.scroll.cancel"),
-                "Cancel",
-                ButtonTone::Neutral,
-                true,
-                interactive,
-            );
-            let start_response = text_button(
-                ui,
-                theme,
-                start,
-                Id::new("scrozz.scroll.start"),
-                "Start capture",
-                ButtonTone::Primary,
-                true,
-                interactive,
-            );
-
-            if manual_response.clicked() {
-                Some(ScrollHudAction::SetControl(ScrollControl::Manual))
-            } else if automatic_response.clicked() {
-                Some(ScrollHudAction::SetControl(ScrollControl::Automatic))
-            } else if start_response.clicked() {
-                Some(ScrollHudAction::Start)
-            } else if cancel_response.clicked() {
-                Some(ScrollHudAction::Cancel)
-            } else {
-                None
-            }
+        if setup {
+            draw_setup_toolbar(ui, theme, rect, state, interactive)
         } else {
-            let status = status_line(state);
-            painter.text(
-                pos2(content.left(), content.top() + 25.0),
-                Align2::LEFT_TOP,
-                status,
-                theme.font(Text::Body),
-                palette.text_muted,
-            );
-            let detail = detail_line(state);
-            painter.text(
-                pos2(content.left(), content.top() + 48.0),
-                Align2::LEFT_TOP,
-                detail,
-                theme.font(Text::Caption),
-                palette.text_faint,
-            );
-
-            let buttons_y = content.bottom() - 36.0;
-            let discard =
-                Rect::from_min_size(pos2(content.right() - 88.0, buttons_y), vec2(88.0, 32.0));
-            let keep = Rect::from_min_size(
-                pos2(discard.left() - Space::SM - 104.0, buttons_y),
-                vec2(104.0, 32.0),
-            );
-            let can_keep = state.delta.is_some() && state.output_extent > 0;
-            let keep_response = text_button(
-                ui,
-                theme,
-                keep,
-                Id::new("scrozz.scroll.keep"),
-                "Finish",
-                ButtonTone::Primary,
-                can_keep,
-                interactive,
-            );
-            let abort_response = text_button(
-                ui,
-                theme,
-                discard,
-                Id::new("scrozz.scroll.abort"),
-                "Discard",
-                ButtonTone::Neutral,
-                true,
-                interactive,
-            );
-            if keep_response.clicked() {
-                Some(ScrollHudAction::Keep)
-            } else if abort_response.clicked() {
-                Some(ScrollHudAction::Abort)
-            } else {
-                None
-            }
-        };
-
-        ScrollHudResponse { rect, action }
-    }
-
-    fn axis_rail(
-        painter: &egui::Painter,
-        panel: Rect,
-        axis: ScrollAxis,
-        accent: Color32,
-        track: Color32,
-    ) {
-        let anchor = pos2(
-            panel.right() - Space::XL - 24.0,
-            panel.top() + Space::XL + 5.0,
-        );
-        let (from, to) = match axis {
-            ScrollAxis::Vertical => (
-                pos2(anchor.x, anchor.y - 10.0),
-                pos2(anchor.x, anchor.y + 10.0),
-            ),
-            ScrollAxis::Horizontal => (
-                pos2(anchor.x - 10.0, anchor.y),
-                pos2(anchor.x + 10.0, anchor.y),
-            ),
-        };
-        painter.line_segment([from, to], Stroke::new(5.0, track));
-        painter.line_segment([from, to], Stroke::new(2.0, accent));
-        painter.circle_filled(to, 3.5, accent);
+            draw_scrolling_progress_toolbar(ui, theme, rect, state, interactive)
+        }
     }
 }
 
@@ -564,13 +363,29 @@ pub(crate) fn draw_scrolling_selection_toolbar(
     interactive: bool,
 ) -> ScrollHudResponse {
     let layout = selection_toolbar_layout(ui.max_rect(), selection);
-    paint::glass_panel(
-        ui.painter(),
-        layout.options,
-        Radius::BAR,
-        &theme.palette,
-        true,
-    );
+    let mut state = ScrollHudState::configuring();
+    state.control = control;
+    draw_setup_toolbar(ui, theme, layout.rect, &state, interactive)
+}
+
+fn draw_setup_toolbar(
+    ui: &mut Ui,
+    theme: &Theme,
+    rect: Rect,
+    state: &ScrollHudState,
+    interactive: bool,
+) -> ScrollHudResponse {
+    paint::glass_panel(ui.painter(), rect, Radius::BAR, &theme.palette, true);
+    let mut controls = rect;
+    if let ScrollHudStatus::Failed(reason) = &state.status {
+        let notice = Rect::from_min_size(
+            rect.min + vec2(Space::SM, Space::XS),
+            vec2(rect.width() - Space::SM * 2.0, 24.0),
+        );
+        draw_status_text(ui, theme, notice, reason, reason, theme.palette.warning);
+        controls.min.y += 28.0;
+    }
+    let layout = SelectionToolbarLayout::in_rect(controls);
 
     let manual_response = text_button(
         ui,
@@ -578,28 +393,30 @@ pub(crate) fn draw_scrolling_selection_toolbar(
         layout.manual,
         Id::new("scrozz.scroll.selection.manual"),
         "Manual",
-        if control == ScrollControl::Manual {
+        if state.control == ScrollControl::Manual {
             ButtonTone::Selected
         } else {
             ButtonTone::Neutral
         },
         true,
         interactive,
-    );
+    )
+    .on_hover_text("You scroll. Scrozz follows until you choose Finish.");
     let automatic_response = text_button(
         ui,
         theme,
         layout.automatic,
         Id::new("scrozz.scroll.selection.automatic"),
         "Auto",
-        if control == ScrollControl::Automatic {
+        if state.control == ScrollControl::Automatic {
             ButtonTone::Selected
         } else {
             ButtonTone::Neutral
         },
         true,
         interactive,
-    );
+    )
+    .on_hover_text("Scroll once. Scrozz continues in that direction until you choose Finish.");
     let cancel_response = text_button(
         ui,
         theme,
@@ -615,15 +432,12 @@ pub(crate) fn draw_scrolling_selection_toolbar(
         theme,
         layout.start,
         Id::new("scrozz.scroll.selection.start"),
-        if layout.compact && layout.start.width() < 100.0 {
-            "Start"
-        } else {
-            "Start capture"
-        },
-        ButtonTone::LightPrimary,
+        "Start",
+        ButtonTone::Primary,
         true,
         interactive,
     );
+    start_response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Start capture"));
 
     let action = if manual_response.clicked() {
         Some(ScrollHudAction::SetControl(ScrollControl::Manual))
@@ -636,160 +450,165 @@ pub(crate) fn draw_scrolling_selection_toolbar(
     } else {
         None
     };
-    ScrollHudResponse {
-        rect: layout.rect,
-        action,
-    }
+    ScrollHudResponse { rect, action }
 }
 
 #[derive(Clone, Copy)]
 struct SelectionToolbarLayout {
     rect: Rect,
-    options: Rect,
     manual: Rect,
     automatic: Rect,
     cancel: Rect,
     start: Rect,
-    compact: bool,
 }
 
 fn selection_toolbar_layout(full: Rect, selection: Rect) -> SelectionToolbarLayout {
-    let width = bounded_panel_width(full, 420.0);
-    let compact = width < 380.0;
-    let height = if compact { 94.0 } else { 46.0 };
-    let rect = anchored_panel_rect(full, selection, width, height);
-    let gap = Space::XS;
-    let group_gap = Space::SM;
-    let row_height = if compact {
-        (rect.height() - gap) * 0.5
-    } else {
-        rect.height()
-    };
-    let start_width = 148.0_f32.min(rect.width() * 0.3);
-    let options_width = if compact {
-        rect.width()
-    } else {
-        rect.width() - start_width - group_gap
-    };
-    let options = Rect::from_min_size(rect.min, vec2(options_width.max(1.0), row_height));
-    let inner = options.shrink2(vec2(Space::XS, Space::XS));
-    let cancel_width = 72.0_f32.min(inner.width());
-    let choice_width = if compact {
-        ((inner.width() - gap) * 0.5).max(1.0)
-    } else {
-        ((inner.width() - cancel_width - gap - group_gap) * 0.5).max(1.0)
-    };
-    let manual = Rect::from_min_size(inner.min, vec2(choice_width, inner.height().max(1.0)));
-    let automatic = Rect::from_min_size(pos2(manual.right() + gap, inner.top()), manual.size());
-    let (cancel, start) = if compact {
-        let action_width = ((rect.width() - gap) * 0.5).max(1.0);
-        let top = rect.bottom() - row_height;
-        (
-            Rect::from_min_size(pos2(rect.left(), top), vec2(action_width, row_height)),
-            Rect::from_min_size(
-                pos2(rect.left() + action_width + gap, top),
-                vec2(action_width, row_height),
+    let size = toolbar_size(full.width(), false);
+    SelectionToolbarLayout::in_rect(anchored_panel_rect(full, selection, size.x, size.y))
+}
+
+impl SelectionToolbarLayout {
+    fn in_rect(rect: Rect) -> Self {
+        let compact = rect.width() < 380.0;
+        let inner = rect.shrink(Space::XS);
+        let gap = Space::XS;
+        let height = if compact {
+            (inner.height() - gap) * 0.5
+        } else {
+            inner.height()
+        };
+        let choice_width = if compact {
+            (inner.width() - gap) * 0.5
+        } else {
+            80.0
+        };
+        let manual = Rect::from_min_size(inner.min, vec2(choice_width, height));
+        let automatic = Rect::from_min_size(pos2(manual.right() + gap, inner.top()), manual.size());
+        let action_left = if compact {
+            inner.left()
+        } else {
+            automatic.right() + Space::MD
+        };
+        let action_top = if compact {
+            automatic.bottom() + gap
+        } else {
+            inner.top()
+        };
+        let action_width = (inner.right() - action_left - gap) * 0.5;
+        let cancel = Rect::from_min_size(pos2(action_left, action_top), vec2(action_width, height));
+        let start = Rect::from_min_size(pos2(cancel.right() + gap, action_top), cancel.size());
+        Self {
+            rect,
+            manual,
+            automatic,
+            cancel,
+            start,
+        }
+    }
+}
+
+fn toolbar_size(available_width: f32, failed: bool) -> egui::Vec2 {
+    let width = 420.0_f32.min((available_width - Space::SM * 2.0).max(1.0));
+    let height = if width < 380.0 { 88.0 } else { 48.0 };
+    vec2(width, height + if failed { 28.0 } else { 0.0 })
+}
+
+#[derive(Clone, Copy)]
+struct ProgressToolbarLayout {
+    status: Rect,
+    discard: Rect,
+    finish: Rect,
+}
+
+impl ProgressToolbarLayout {
+    fn in_rect(rect: Rect) -> Self {
+        let compact = rect.width() < 380.0;
+        let content = rect.shrink(Space::XS);
+        let gap = Space::XS;
+        let height = if compact {
+            (content.height() - gap) * 0.5
+        } else {
+            content.height()
+        };
+        let button_width = if compact {
+            (content.width() - gap) * 0.5
+        } else {
+            80.0
+        };
+        let top = content.bottom() - height;
+        let finish = Rect::from_min_size(
+            pos2(content.right() - button_width, top),
+            vec2(button_width, height),
+        );
+        let discard =
+            Rect::from_min_size(pos2(finish.left() - gap - button_width, top), finish.size());
+        let status = Rect::from_min_max(
+            content.min,
+            pos2(
+                if compact {
+                    content.right()
+                } else {
+                    discard.left() - Space::SM
+                },
+                content.top() + height,
             ),
-        )
-    } else {
-        (
-            Rect::from_min_size(
-                pos2(automatic.right() + group_gap, inner.top()),
-                vec2(cancel_width, inner.height().max(1.0)),
-            ),
-            Rect::from_min_size(
-                pos2(options.right() + group_gap, rect.top()),
-                vec2(start_width.max(1.0), rect.height()),
-            ),
-        )
-    };
-    SelectionToolbarLayout {
-        rect,
-        options,
-        manual,
-        automatic,
-        cancel,
-        start,
-        compact,
+        );
+        Self {
+            status,
+            discard,
+            finish,
+        }
     }
 }
 
 fn draw_scrolling_progress_toolbar(
     ui: &mut Ui,
     theme: &Theme,
-    selection: Rect,
+    rect: Rect,
     state: &ScrollHudState,
     interactive: bool,
 ) -> ScrollHudResponse {
-    let full = ui.max_rect();
-    let width = bounded_panel_width(full, 440.0);
-    let compact = width < 400.0;
-    let height = if compact { 94.0 } else { 54.0 };
-    let rect = anchored_panel_rect(full, selection, width, height);
     paint::glass_panel(ui.painter(), rect, Radius::BAR, &theme.palette, true);
-    let content = rect.shrink2(vec2(Space::SM, Space::XS));
-    let gap = Space::XS;
-    let (finish_width, discard_width) = if compact {
-        let available = (content.width() - gap).max(2.0);
-        (available * 0.55, available * 0.45)
-    } else {
-        (104.0, 88.0)
-    };
-    let row_height = if compact {
-        (content.height() - gap) * 0.5
-    } else {
-        content.height()
-    };
-    let buttons_width = finish_width + discard_width + gap;
-    let buttons_left = if compact {
-        content.center().x - buttons_width * 0.5
-    } else {
-        content.right() - buttons_width
-    };
-    let buttons_top = if compact {
-        content.bottom() - row_height
-    } else {
-        content.top()
-    };
-    let finish = Rect::from_min_size(
-        pos2(buttons_left, buttons_top),
-        vec2(finish_width, row_height),
+    let layout = ProgressToolbarLayout::in_rect(rect);
+    let warning = matches!(
+        state.status,
+        ScrollHudStatus::WaitingForOverlap | ScrollHudStatus::AwaitingFinish(_)
     );
-    let discard = Rect::from_min_size(
-        pos2(finish.right() + gap, buttons_top),
-        vec2(discard_width, row_height),
+    let dot = pos2(layout.status.left() + Space::MD, layout.status.center().y);
+    ui.painter().circle_filled(
+        dot,
+        3.0,
+        if warning {
+            theme.palette.warning
+        } else {
+            theme.palette.text_muted
+        },
     );
-    let info_width = if compact {
-        content.width()
-    } else {
-        (buttons_left - Space::SM - content.left()).max(80.0)
-    };
-    let info = Rect::from_min_size(content.min, vec2(info_width, row_height));
-    let status = status_line(state);
-    ui.painter().text(
-        pos2(info.left(), info.top() + 2.0),
-        Align2::LEFT_TOP,
-        status,
-        theme.font(Text::Body),
+    let status_rect = Rect::from_min_max(
+        pos2(dot.x + Space::MD, layout.status.top()),
+        layout.status.max,
+    );
+    draw_status_text(
+        ui,
+        theme,
+        status_rect,
+        status_line(state),
+        status_hint(state),
         theme.palette.text,
-    );
-    ui.painter().text(
-        pos2(info.left(), info.top() + 24.0),
-        Align2::LEFT_TOP,
-        detail_line(state),
-        theme.font(Text::Caption),
-        theme.palette.text_muted,
     );
 
     let keep_enabled = state.delta.is_some()
         && !matches!(
             state.status,
-            ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_) | ScrollHudStatus::Finalizing
+            ScrollHudStatus::Starting
+                | ScrollHudStatus::Configuring
+                | ScrollHudStatus::Failed(_)
+                | ScrollHudStatus::Finalizing
         );
     let finish_response = text_button(
         ui,
         theme,
-        finish,
+        layout.finish,
         Id::new("scrozz.scroll.progress.finish"),
         "Finish",
         ButtonTone::Primary,
@@ -799,7 +618,7 @@ fn draw_scrolling_progress_toolbar(
     let discard_response = text_button(
         ui,
         theme,
-        discard,
+        layout.discard,
         Id::new("scrozz.scroll.progress.discard"),
         "Discard",
         ButtonTone::Neutral,
@@ -864,10 +683,6 @@ fn local_selection_rect(full: Rect, selection: LogicalRect) -> Option<Rect> {
     rect.is_positive().then_some(rect)
 }
 
-fn bounded_panel_width(full: Rect, preferred: f32) -> f32 {
-    preferred.min((full.width() - Space::SM * 2.0).max(1.0))
-}
-
 fn anchored_panel_rect(full: Rect, selection: Rect, width: f32, height: f32) -> Rect {
     let gap = Space::MD;
     let horizontal_margin = Space::SM.min((full.width() * 0.5).max(0.0));
@@ -891,101 +706,74 @@ fn anchored_panel_rect(full: Rect, selection: Rect, width: f32, height: f32) -> 
     Rect::from_min_size(pos2(left, top), vec2(width, height))
 }
 
-fn hud_rect(full: Rect, width: f32, height: f32, state: &ScrollHudState) -> Rect {
-    if let Some(selected) = state
-        .selection
-        .and_then(|selection| local_selection_rect(full, selection))
-    {
-        return anchored_panel_rect(full, selected, width, height);
-    }
-
-    let top = if matches!(
-        state.status,
-        ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_)
-    ) {
-        full.top() + Space::XXL
-    } else {
-        full.bottom() - Space::XXL - height
-    };
-    Rect::from_min_size(
-        pos2(full.center().x - width * 0.5, top),
-        vec2(width, height),
-    )
-}
-
-fn status_line(state: &ScrollHudState) -> String {
+fn status_line(state: &ScrollHudState) -> &'static str {
     match &state.status {
-        ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_) => String::new(),
-        ScrollHudStatus::Prepared if state.automatic => {
-            "Scroll once. Scrozz will continue.".to_owned()
-        }
-        ScrollHudStatus::Prepared => "Scroll in any direction.".to_owned(),
-        ScrollHudStatus::Capturing if state.automatic => match state.direction {
-            Some(direction) => format!("Scrolling {}…", direction_word(direction)),
-            None => "Waiting for your first scroll…".to_owned(),
-        },
-        ScrollHudStatus::Capturing => "Following your scroll…".to_owned(),
-        ScrollHudStatus::WaitingForManualScroll if state.direction.is_none() && state.automatic => {
-            "Scroll once. Scrozz will continue.".to_owned()
-        }
-        ScrollHudStatus::WaitingForManualScroll if state.direction.is_none() => {
-            "Scroll in any direction.".to_owned()
-        }
-        ScrollHudStatus::WaitingForManualScroll => format!(
-            "Keep scrolling {}.",
-            direction_word(state.direction.expect("checked above"))
-        ),
-        ScrollHudStatus::Stalled(_) if state.delta.is_some() => "No new movement.".to_owned(),
-        ScrollHudStatus::Stalled(_) => "Scroll once or discard.".to_owned(),
-        ScrollHudStatus::WaitingForOverlap => "Scroll back slowly to reconnect.".to_owned(),
-        ScrollHudStatus::AwaitingFinish(_) => "Paused. Finish or discard.".to_owned(),
-        ScrollHudStatus::Finalizing => "Finalizing the stitched image…".to_owned(),
+        ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_) => "",
+        ScrollHudStatus::Starting => "Getting ready",
+        ScrollHudStatus::WaitingForOverlap => "Scroll back a little",
+        ScrollHudStatus::AwaitingFinish(_) => "Capture paused",
+        ScrollHudStatus::Finalizing => "Finishing",
+        _ if state.delta.is_some() => "Capturing",
+        _ => "Scroll to begin",
     }
 }
 
-fn detail_line(state: &ScrollHudState) -> String {
-    if let ScrollHudStatus::AwaitingFinish(reason) = &state.status {
-        return reason.clone();
+fn status_hint(state: &ScrollHudState) -> &str {
+    match &state.status {
+        ScrollHudStatus::Starting => "Preparing the first frame. Wait before scrolling.",
+        ScrollHudStatus::WaitingForOverlap => {
+            "Scroll back slowly until capture reconnects, or Finish to keep what was captured."
+        }
+        ScrollHudStatus::AwaitingFinish(reason) | ScrollHudStatus::Failed(reason) => reason,
+        ScrollHudStatus::Finalizing => "Preparing your screenshot.",
+        _ if state.delta.is_some() => "Finish when you have everything. Discard keeps nothing.",
+        _ if state.automatic => "Scroll once in any direction. Scrozz will continue for you.",
+        _ => "Scroll slowly in one direction. Finish when you have everything.",
     }
-    let route = match state.direction {
-        Some(direction) => direction_label(direction),
-        None => "Detecting direction",
-    };
-    let extent = match state.direction.map(ScrollDirection::axis) {
-        Some(ScrollAxis::Horizontal) => "wide",
-        _ => "tall",
-    };
-    let delta = state.delta.map_or_else(
-        || "measuring overlap".to_owned(),
-        |delta| format!("Δ {delta} px"),
+}
+
+fn draw_status_text(
+    ui: &mut Ui,
+    theme: &Theme,
+    rect: Rect,
+    text: &str,
+    hint: &str,
+    color: Color32,
+) {
+    let response = ui.interact(rect, Id::new("scrozz.scroll.status"), Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    response.on_hover_text(hint);
+    draw_fitted_text(
+        ui,
+        rect,
+        text,
+        theme.font(Text::Body),
+        color,
+        Align2::LEFT_CENTER,
     );
-    let stall = match &state.status {
-        ScrollHudStatus::Stalled(count) => format!(" · idle probe {count}"),
-        _ => String::new(),
+}
+
+fn draw_fitted_text(
+    ui: &Ui,
+    rect: Rect,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    align: Align2,
+) {
+    let mut job =
+        egui::text::LayoutJob::simple(text.to_owned(), font, color, rect.width().max(1.0));
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    let at = if align == Align2::LEFT_CENTER {
+        pos2(rect.left(), rect.center().y - galley.size().y * 0.5)
+    } else {
+        rect.center() - galley.size() * 0.5
     };
-    format!(
-        "{route} · frame {} · {delta} · {} px {extent}{stall}",
-        state.frame.max(1),
-        state.output_extent
-    )
-}
-
-const fn direction_label(direction: ScrollDirection) -> &'static str {
-    match direction {
-        ScrollDirection::Up => "Up",
-        ScrollDirection::Down => "Down",
-        ScrollDirection::Left => "Left",
-        ScrollDirection::Right => "Right",
-    }
-}
-
-const fn direction_word(direction: ScrollDirection) -> &'static str {
-    match direction {
-        ScrollDirection::Up => "up",
-        ScrollDirection::Down => "down",
-        ScrollDirection::Left => "left",
-        ScrollDirection::Right => "right",
-    }
+    ui.painter()
+        .with_clip_rect(rect.intersect(ui.clip_rect()))
+        .galley(at, galley, color);
 }
 
 #[derive(Clone, Copy)]
@@ -993,7 +781,6 @@ enum ButtonTone {
     Neutral,
     Selected,
     Primary,
-    LightPrimary,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1013,18 +800,19 @@ fn text_button(
         Sense::hover()
     };
     let response = ui.interact(rect, id, sense);
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    response.widget_info(|| {
+        WidgetInfo::selected(
+            WidgetType::Button,
+            enabled,
+            matches!(tone, ButtonTone::Selected),
+            label,
+        )
+    });
 
     let palette = &theme.palette;
     let hovered = interactive && enabled && response.hovered();
     let fill = if !enabled {
         palette.chip_fill
-    } else if matches!(tone, ButtonTone::LightPrimary) {
-        if hovered {
-            Color32::WHITE
-        } else {
-            palette.text
-        }
     } else if matches!(tone, ButtonTone::Primary) {
         if hovered {
             palette.accent_hi
@@ -1032,52 +820,42 @@ fn text_button(
             palette.accent
         }
     } else if matches!(tone, ButtonTone::Selected) {
-        if hovered {
-            palette.hover
-        } else {
-            palette.card_fill_raised
-        }
+        palette.text
     } else if hovered {
         palette.hover
     } else {
-        palette.chip_fill
+        Color32::TRANSPARENT
     };
     let foreground = if !enabled {
         palette.text_faint
-    } else if matches!(tone, ButtonTone::LightPrimary) {
-        palette.card_fill
     } else if matches!(tone, ButtonTone::Primary) {
         palette.on_accent
     } else if matches!(tone, ButtonTone::Selected) {
-        palette.accent_hi
+        if palette.is_dark() {
+            palette.on_accent
+        } else {
+            Color32::WHITE
+        }
     } else {
         palette.text
     };
     let radius = Radius::pill(rect.height());
     ui.painter().rect_filled(rect, corner(radius), fill);
-    ui.painter().rect_stroke(
-        rect,
-        corner(radius),
-        Stroke::new(
-            if matches!(tone, ButtonTone::Selected) {
-                1.5
-            } else {
-                1.0
-            },
-            if matches!(tone, ButtonTone::Selected) {
-                palette.accent
-            } else {
-                palette.hairline
-            },
-        ),
-        StrokeKind::Inside,
-    );
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
+    if response.has_focus() && enabled {
+        ui.painter().rect_stroke(
+            rect.shrink(2.0),
+            corner(radius),
+            Stroke::new(2.0, palette.focus_ring),
+            StrokeKind::Inside,
+        );
+    }
+    draw_fitted_text(
+        ui,
+        rect.shrink2(vec2(Space::XS, 0.0)),
         label,
         theme.font(Text::Button),
         foreground,
+        Align2::CENTER_CENTER,
     );
     response
 }
@@ -1095,16 +873,40 @@ mod tests {
     }
 
     #[test]
-    fn detail_names_the_detected_route_and_output_dimension() {
-        let mut state = ScrollHudState::prepared(ScrollControl::Automatic)
-            .with_direction(ScrollDirection::Down);
-        state.frame = 3;
-        state.output_extent = 2_400;
-        assert!(detail_line(&state).contains("tall"));
-        assert!(detail_line(&state).contains("Down"));
-        state = state.with_direction(ScrollDirection::Right);
-        assert!(detail_line(&state).contains("wide"));
-        assert!(detail_line(&state).contains("Right"));
+    fn polling_and_direction_changes_do_not_change_normal_status_text() {
+        for control in [ScrollControl::Manual, ScrollControl::Automatic] {
+            let mut state = ScrollHudState::prepared(control);
+            for delta in [None, Some(612)] {
+                state.delta = delta;
+                let expected = if delta.is_some() {
+                    "Capturing"
+                } else {
+                    "Scroll to begin"
+                };
+                for status in [
+                    ScrollHudStatus::Prepared,
+                    ScrollHudStatus::Capturing,
+                    ScrollHudStatus::WaitingForManualScroll,
+                    ScrollHudStatus::Stalled(1),
+                    ScrollHudStatus::Stalled(999),
+                ] {
+                    state.status = status;
+                    for direction in [
+                        ScrollDirection::Up,
+                        ScrollDirection::Down,
+                        ScrollDirection::Left,
+                        ScrollDirection::Right,
+                    ] {
+                        state.direction = Some(direction);
+                        assert_eq!(status_line(&state), expected);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            status_line(&ScrollHudState::starting(ScrollControl::Manual)),
+            "Getting ready"
+        );
     }
 
     #[test]
@@ -1112,8 +914,8 @@ mod tests {
         let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(1_024.0, 768.0));
         let chooser_state = ScrollHudState::configuring();
         let progress_state = ScrollHudState::prepared(ScrollControl::Automatic);
-        let chooser = hud_rect(full, 600.0, 164.0, &chooser_state);
-        let progress = hud_rect(full, 440.0, 150.0, &progress_state);
+        let chooser = ScrollingHud::control_rect(full, &chooser_state);
+        let progress = ScrollingHud::control_rect(full, &progress_state);
 
         assert!(!chooser.intersects(progress));
         assert!(chooser.top() < full.center().y);
@@ -1142,11 +944,7 @@ mod tests {
             ..Default::default()
         };
         let chooser = draw(empty).rect;
-        let content = chooser.shrink2(vec2(Space::XL, Space::LG));
-        let button = Rect::from_min_size(
-            pos2(content.right() - 132.0, content.bottom() - 34.0),
-            vec2(132.0, 34.0),
-        );
+        let button = SelectionToolbarLayout::in_rect(chooser).start;
         let input = |pressed| egui::RawInput {
             screen_rect: Some(screen),
             events: vec![
@@ -1167,14 +965,13 @@ mod tests {
 
     #[test]
     fn anchored_controls_stay_inside_a_narrow_surface() {
-        for width in [120.0, 180.0] {
+        for width in [120.0, 180.0, 360.0, 420.0, 800.0] {
             let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 120.0));
             let selection =
                 Rect::from_min_size(pos2(20.0, 30.0), vec2((width - 40.0).max(1.0), 50.0));
             let controls = selection_toolbar_layout(full, selection);
             for rect in [
                 controls.rect,
-                controls.options,
                 controls.manual,
                 controls.automatic,
                 controls.cancel,
@@ -1187,6 +984,138 @@ mod tests {
                 ScrollingHud::detached_viewport_size(&ScrollHudState::configuring(), width).x
                     <= width
             );
+            let state = ScrollHudState::prepared(ScrollControl::Manual);
+            let size = ScrollingHud::detached_viewport_size(&state, width);
+            let viewport = Rect::from_min_size(pos2(0.0, 0.0), size);
+            let rail = Rect::from_center_size(viewport.center(), toolbar_size(size.x, false));
+            let progress = ProgressToolbarLayout::in_rect(rail);
+            for control in [progress.status, progress.finish, progress.discard] {
+                assert!(rail.contains_rect(control), "{control:?} escaped {rail:?}");
+            }
+            assert!(!progress.finish.intersects(progress.discard));
+            assert!(!progress.status.intersects(progress.finish));
+        }
+    }
+
+    #[test]
+    fn normal_polling_is_pixel_identical_without_flashing_counters_or_labels() {
+        use crate::harness::{
+            Background, RenderSpec, Scenario, SceneRegistry, SoftwareRenderer, VirtualClock,
+        };
+
+        struct Rail(ScrollHudState);
+        impl Scene for Rail {
+            fn name(&self) -> &str {
+                "scroll-rail"
+            }
+            fn setup(&self, ctx: &egui::Context) {
+                install_fonts(ctx);
+            }
+            fn ui(&self, ui: &mut Ui, _ctx: &SceneCtx<'_>) {
+                let theme = Theme::dark();
+                install_style(ui.ctx(), &theme);
+                let _ = ScrollingHud::draw_detached(ui, &theme, &self.0, false);
+            }
+        }
+        let render = |state, millis| {
+            let mut registry = SceneRegistry::empty();
+            registry.register(Scenario::ScrollingCapture, Box::new(Rail(state)));
+            SoftwareRenderer::new(registry)
+                .render(
+                    &RenderSpec::golden(
+                        Scenario::ScrollingCapture,
+                        VirtualClock::from_millis(millis),
+                    )
+                    .with_size_pt((452.0, 64.0))
+                    .with_background(Background::Transparent),
+                )
+                .expect("render rail")
+                .fingerprint()
+        };
+        for started in [false, true] {
+            let mut state = ScrollHudState::prepared(ScrollControl::Manual);
+            state.delta = started.then_some(100);
+            let baseline = render(state.clone(), 0);
+            for (frame, status) in [
+                (1, ScrollHudStatus::WaitingForManualScroll),
+                (2, ScrollHudStatus::Capturing),
+                (999, ScrollHudStatus::Stalled(900)),
+            ] {
+                state.status = status;
+                state.frame = frame;
+                state.output_extent = 20_000;
+                state.direction = Some(ScrollDirection::Up);
+                assert_eq!(render(state.clone(), 8_000), baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn paused_controls_remain_actionable_and_finalizing_controls_do_not() {
+        use egui::accesskit::{Action, ActionRequest};
+        for detached in [false, true] {
+            for status in [
+                ScrollHudStatus::Starting,
+                ScrollHudStatus::WaitingForOverlap,
+                ScrollHudStatus::AwaitingFinish("Capture limit reached".into()),
+                ScrollHudStatus::Finalizing,
+            ] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                install_fonts(&ctx);
+                let theme = Theme::dark();
+                install_style(&ctx, &theme);
+                let mut state = ScrollHudState::prepared(ScrollControl::Manual);
+                state.status = status.clone();
+                state.delta = Some(10);
+                let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(452.0, 180.0));
+                let draw = |events| {
+                    let mut action = None;
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            action = if detached {
+                                ScrollingHud::draw_detached(ui, &theme, &state, true)
+                            } else {
+                                ScrollingHud::draw(ui, &theme, &state, true)
+                            }
+                            .action;
+                        },
+                    );
+                    output.textures_delta.clear();
+                    (output, action)
+                };
+                draw(vec![]);
+                let (output, _) = draw(vec![]);
+                let update = output.platform_output.accesskit_update.expect("controls");
+                for (label, expected) in [
+                    ("Finish", ScrollHudAction::Keep),
+                    ("Discard", ScrollHudAction::Abort),
+                ] {
+                    let node = update
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label))
+                        .expect("button");
+                    let disabled = status == ScrollHudStatus::Finalizing
+                        || (label == "Finish" && status == ScrollHudStatus::Starting);
+                    assert_eq!(node.1.is_disabled(), disabled);
+                    if !disabled {
+                        let (_, action) =
+                            draw(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                                action: Action::Click,
+                                target_tree: update.tree_id,
+                                target_node: node.0,
+                                data: None,
+                            })]);
+                        assert_eq!(action, Some(expected));
+                    }
+                }
+            }
         }
     }
 }

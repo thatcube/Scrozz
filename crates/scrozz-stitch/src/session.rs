@@ -161,7 +161,11 @@ impl CancelSignal for AtomicCancellation {
 /// A meaningful update suitable for a HUD, CLI log or test recorder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
-    /// The platform input path is ready.
+    /// The baseline viewport is captured and the platform input path is ready.
+    ///
+    /// Interactive callers must not invite the user to scroll before this
+    /// event: movement that happens before the baseline capture cannot be
+    /// observed by direction detection.
     Prepared {
         /// Driver diagnostic name.
         driver: String,
@@ -1659,6 +1663,36 @@ mod tests {
             .run(&mut NeverCancel, |_| {})
             .expect_err("an unavailable frame source");
         assert!(error.to_string().contains("ran out"), "{error}");
+    }
+
+    #[test]
+    fn prepared_is_emitted_only_after_the_baseline_frame_is_captured() {
+        let document: Vec<u8> = (0..14).map(|value| value * 10).collect();
+        let source = Frames {
+            frames: VecDeque::from([frame(&document[0..8]), frame(&document[3..11])]),
+        };
+        let (_, events) = finish_after_frame(
+            ScrollSession::new(
+                source,
+                Box::<Driver>::default(),
+                NoopPacer,
+                config(2)
+                    .with_control(ScrollControl::Manual)
+                    .with_direction_detection(3.0, 3.0),
+            ),
+            2,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Progress::FrameCaptured { frame: 1 },
+                Progress::Prepared { .. },
+                Progress::WaitingForManualScroll,
+                Progress::FrameCaptured { frame: 2 },
+                ..
+            ]
+        ));
     }
 
     #[test]
