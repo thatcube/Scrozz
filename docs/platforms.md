@@ -349,11 +349,21 @@ and remain discardable until then. Stationary frames do not consume the capture
 budget; Automatic keeps sending paced wheel steps through stationary frames
 rather than going permanently idle after a delayed repaint. Lost overlap
 waits for the user to scroll back and reconnect, without saving a partial image.
+Auto allows four observations for the page to settle without sending more input; a transient
+repaint does not ask for manual recovery. Persistent loss is shown as **Auto
+paused**, with Finish and Discard still available.
 Capture limits or later acquisition failures hold the valid pixels in memory
 and keep **Finish** and **Discard** available. Reverse routes are normalized before
 append-only stitching and flipped back for a naturally ordered final image. A
 failed automatic attempt keeps setup visible so the same area can be retried
 manually.
+
+Interactive alignment requires at least 33% of the analyzed viewport to
+overlap. This prevents a tiny repeated strip at a distant offset from competing
+with the real, substantially overlapping seam; genuinely repeated content still
+must pass the same ambiguity checks.
+The configuration directory's `last-scroll-rejection.json` records the latest
+rejection reason and dimensions for diagnosis, without pixels or page content.
 
 Setup and capture share a compact control bar, including detached controls and
 the portal fallback. **Getting ready** remains visible until the worker has
@@ -378,12 +388,17 @@ The preview avoids the selected region and controls; macOS's isolated-window
 capture can use a corner when a full-screen selection leaves no outside space.
 Unknown portal capture regions do not show a preview, avoiding recursive capture.
 
-Input delivery is per-platform and never global:
+Input delivery is guarded per platform:
 
-* **macOS** synthesizes small, line-based target-bound wheel gestures. The selected window is
-  resolved against CoreGraphics' documented front-to-back list before a gesture
-  is posted, so a window that moved behind another after selection is an error
-  rather than a scroll delivered to whatever is now on top. One retained
+* **macOS** uses ordinary WindowServer wheel delivery because process-only events
+  can be ignored by browser scroll views. The pointer must remain inside the
+  selected area; leaving it pauses Auto without finishing the capture, and
+  returning resumes it. The selected window must own that point in CoreGraphics'
+  front-to-back list. Only Scrozz windows confirmed natively mouse-transparent
+  are skipped; settings, editors, and other covering windows block delivery.
+  Steps use precise pixel deltas capped at 48 logical points (and at one fifth
+  of the selected viewport) rather than coarse three-line jumps. The cursor is
+  never moved and keyboard modifiers are not inherited. One retained
   ScreenCaptureKit filter/configuration supplies every frame, and its own
   point-to-pixel scale is carried into frame metadata.
 * **Windows** does not use global `SendInput`: wheel input normally follows

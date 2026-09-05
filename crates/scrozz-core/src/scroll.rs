@@ -28,7 +28,7 @@
 
 use crate::{
     DisplayId, WindowId,
-    geometry::{LogicalPoint, ScaleFactor},
+    geometry::{LogicalPoint, LogicalRect, ScaleFactor},
 };
 
 /// The direction content is gathered in.
@@ -186,6 +186,8 @@ pub struct ScrollGesture {
     /// Carrying its stable id lets the driver reject recycled handles and prove
     /// the target at [`Self::at`] still belongs to the selected window.
     pub window: Option<WindowId>,
+    /// Selected capture area. Pointer-bound drivers must not inject outside it.
+    pub area: Option<LogicalRect>,
     /// How far to scroll, in logical points.
     ///
     /// Positive moves the viewport *down* the document, which is what makes
@@ -204,6 +206,7 @@ impl ScrollGesture {
             at,
             display: None,
             window: None,
+            area: None,
             amount,
         }
     }
@@ -216,6 +219,7 @@ impl ScrollGesture {
             at,
             display: None,
             window: None,
+            area: None,
             amount: -amount,
         }
     }
@@ -228,6 +232,7 @@ impl ScrollGesture {
             at,
             display: None,
             window: None,
+            area: None,
             amount,
         }
     }
@@ -240,6 +245,7 @@ impl ScrollGesture {
             at,
             display: None,
             window: None,
+            area: None,
             amount: -amount,
         }
     }
@@ -272,11 +278,27 @@ impl ScrollGesture {
         self
     }
 
+    /// Bounds pointer-dependent input to the selected capture area.
+    #[must_use]
+    pub const fn within(mut self, area: LogicalRect) -> Self {
+        self.area = Some(area);
+        self
+    }
+
     /// Whether this gesture asks for no movement at all.
     #[must_use]
     pub fn is_noop(&self) -> bool {
         !self.amount.is_finite() || self.amount == 0.0
     }
+}
+
+/// Whether a nudge was submitted or is waiting for safe pointer placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDelivery {
+    /// The platform accepted the event; captured pixels still prove movement.
+    Submitted,
+    /// No event was sent because the pointer is outside the selected area.
+    PointerOutside,
 }
 
 /// Something that can move a foreign window's scroll position.
@@ -328,6 +350,12 @@ pub trait ScrollDriver: Send {
     /// mid-session, or [`crate::Error::Platform`] if the event could not be
     /// posted.
     fn scroll(&mut self, gesture: &ScrollGesture) -> crate::Result<()>;
+
+    /// Attempts a nudge, allowing pointer-bound drivers to pause without
+    /// claiming input was delivered or treating pointer movement as failure.
+    fn try_scroll(&mut self, gesture: &ScrollGesture) -> crate::Result<ScrollDelivery> {
+        self.scroll(gesture).map(|()| ScrollDelivery::Submitted)
+    }
 
     /// Human-readable driver name for diagnostics, e.g. "CGEvent".
     fn name(&self) -> &str;

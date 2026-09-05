@@ -31,6 +31,8 @@ pub enum ScrollHudStatus {
     Capturing,
     /// Automatic input is unavailable and the user should scroll the target.
     WaitingForManualScroll,
+    /// Automatic input is paused while the pointer is outside the capture area.
+    WaitingForPointer,
     /// The viewport has not moved for this many probes.
     Stalled(u32),
     /// The last accepted viewport is intact; scrolling back can reconnect it.
@@ -639,7 +641,7 @@ fn draw_setup_toolbar(
         true,
         interactive,
     )
-    .on_hover_text("Scroll once. Scrozz continues in that direction until you choose Finish.");
+    .on_hover_text("Scroll once. Scrozz continues until Finish. On macOS, keep the pointer inside the capture area.");
     let cancel_response = text_button(
         ui,
         theme,
@@ -795,7 +797,9 @@ fn draw_scrolling_progress_toolbar(
     let layout = ProgressToolbarLayout::in_rect(rect);
     let warning = matches!(
         state.status,
-        ScrollHudStatus::WaitingForOverlap | ScrollHudStatus::AwaitingFinish(_)
+        ScrollHudStatus::WaitingForOverlap
+            | ScrollHudStatus::WaitingForPointer
+            | ScrollHudStatus::AwaitingFinish(_)
     );
     let dot = pos2(layout.status.left() + Space::MD, layout.status.center().y);
     ui.painter().circle_filled(
@@ -933,6 +937,8 @@ fn status_line(state: &ScrollHudState) -> &'static str {
     match &state.status {
         ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_) => "",
         ScrollHudStatus::Starting => "Getting ready",
+        ScrollHudStatus::WaitingForPointer => "Keep pointer inside area",
+        ScrollHudStatus::WaitingForOverlap if state.automatic => "Auto paused",
         ScrollHudStatus::WaitingForOverlap if state.selection.is_some() => {
             "Return to outlined area"
         }
@@ -949,6 +955,12 @@ fn status_line(state: &ScrollHudState) -> &'static str {
 fn status_hint(state: &ScrollHudState) -> &str {
     match &state.status {
         ScrollHudStatus::Starting => "Preparing the first frame. Wait before scrolling.",
+        ScrollHudStatus::WaitingForPointer => {
+            "Auto is paused. Move the pointer inside the selected capture area to resume. Scrozz will not move your cursor."
+        }
+        ScrollHudStatus::WaitingForOverlap if state.automatic => {
+            "This section still does not align after waiting for the page to settle. Finish keeps the captured portion. Returning to the amber outlined view can resume Auto."
+        }
         ScrollHudStatus::WaitingForOverlap if state.selection.is_some() => {
             "The last matched view is outlined in amber in the preview. Scroll until that section matches your capture area. Capture resumes on a match; Finish keeps what was captured."
         }

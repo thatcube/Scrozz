@@ -1390,6 +1390,10 @@ fn describe_scroll_progress(progress: &Progress) -> String {
         }
         Progress::FrameCaptured { frame } => format!("captured scrolling frame {frame}"),
         Progress::WaitingForManualScroll => "is waiting for the page to scroll".to_owned(),
+        Progress::WaitingForPointer => {
+            "paused Auto until the pointer is inside the capture area".to_owned()
+        }
+        Progress::PointerReady => "resumed Auto at the pointer".to_owned(),
         Progress::DirectionDetected { direction } => {
             format!("detected {direction:?} movement from the page")
         }
@@ -1421,6 +1425,44 @@ fn describe_scroll_progress(progress: &Progress) -> String {
             ..
         } => format!("finished after {frames} frames, {output_extent} px ({reason:?})"),
     }
+}
+
+#[cfg(not(test))]
+fn persist_scroll_rejection(state: &ScrollHudState, reason: &str) -> scrozz_core::Result<()> {
+    use std::io::Write as _;
+    let root = dirs::config_dir()
+        .or_else(dirs::data_dir)
+        .ok_or_else(|| CoreError::Storage("no scrolling diagnostic directory is available".into()))?
+        .join("Scrozz");
+    std::fs::create_dir_all(&root)?;
+    // Metadata only: no captured pixels, page text, URLs, or window titles.
+    let document = serde_json::json!({
+        "schema": 1,
+        "pid": std::process::id(),
+        "control": format!("{:?}", state.control),
+        "direction": state.direction.map(|direction| format!("{direction:?}")),
+        "frame": state.frame,
+        "last_delta": state.delta,
+        "output_extent": state.output_extent,
+        "viewport_size": state.selection.map(|rect| [rect.size.width, rect.size.height]),
+        "reason": reason,
+    });
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
+        CoreError::Storage(format!("could not encode scrolling diagnostic: {error}"))
+    })?;
+    let temporary = root.join(format!("last-scroll-rejection.{}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    scrozz_shell::replace_file(&temporary, &root.join("last-scroll-rejection.json"))
 }
 
 impl App {
@@ -5405,6 +5447,14 @@ impl App {
                 return;
             }
             Progress::WaitingForManualScroll | Progress::Stalled { .. } => return,
+            Progress::WaitingForPointer => state.status = ScrollHudStatus::WaitingForPointer,
+            Progress::PointerReady => {
+                state.status = if state.delta.is_some() {
+                    ScrollHudStatus::Capturing
+                } else {
+                    ScrollHudStatus::Prepared
+                };
+            }
             Progress::DirectionDetected { direction } => {
                 state = state.with_direction(*direction);
                 state.status = ScrollHudStatus::Capturing;
@@ -5427,10 +5477,16 @@ impl App {
                 }
             }
             Progress::Interrupted { .. } => {}
-            Progress::WaitingForOverlap { .. } => {
+            Progress::WaitingForOverlap { reason } => {
                 if state.status == ScrollHudStatus::WaitingForOverlap {
                     return;
                 }
+                #[cfg(not(test))]
+                if let Err(error) = persist_scroll_rejection(&state, reason) {
+                    self.note(format!("could not record the scrolling rejection: {error}"));
+                }
+                #[cfg(test)]
+                let _ = reason;
                 state.status = ScrollHudStatus::WaitingForOverlap;
             }
             Progress::OverlapRestored => {
@@ -14545,6 +14601,28 @@ mod tests {
             surface.scrolling_hud().expect("HUD").status,
             ScrollHudStatus::AwaitingFinish(_)
         ));
+    }
+
+    #[test]
+    fn pointer_placement_pauses_and_resumes_without_finishing_the_capture() {
+        let (mut app, surface) = scrolling_app();
+        let card = CardId(175);
+        app.scrolling_card = Some(card);
+        let mut state = ScrollHudState::prepared(ScrollControl::Automatic);
+        state.delta = Some(40);
+        app.set_scroll_hud(state);
+        app.update_scroll_hud(card, &Progress::WaitingForPointer);
+        assert_eq!(
+            surface.scrolling_hud().unwrap().status,
+            ScrollHudStatus::WaitingForPointer
+        );
+        app.update_scroll_hud(card, &Progress::PointerReady);
+        assert_eq!(
+            surface.scrolling_hud().unwrap().status,
+            ScrollHudStatus::Capturing
+        );
+        assert_eq!(app.scrolling_card, Some(card));
+        assert!(surface.presented().is_empty());
     }
 
     #[test]

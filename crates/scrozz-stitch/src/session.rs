@@ -10,12 +10,14 @@ use std::{
 
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, Error, Frame, Provenance, Result,
-    ScrollControl, ScrollDirection, ScrollDriver, ScrollGesture, ScrollSynthesis,
+    ScrollControl, ScrollDelivery, ScrollDirection, ScrollDriver, ScrollGesture, ScrollSynthesis,
 };
 
 use crate::{
     PushOutcome, ScrollStitcher, SeamQuality, StitchConfig, StopReason, detect_scroll_direction,
 };
+
+const AUTO_OVERLAP_SETTLE_PROBES: u32 = 4;
 
 /// Supplies successive viewport frames from one long-lived capture context.
 ///
@@ -183,6 +185,10 @@ pub enum Progress {
     },
     /// The manual flow is waiting for the user to move the target.
     WaitingForManualScroll,
+    /// No input is being sent until the pointer returns to the selected area.
+    WaitingForPointer,
+    /// Pointer placement is safe and automatic input has resumed.
+    PointerReady,
     /// Real frame movement established the axis and sign for this session.
     DirectionDetected {
         /// Direction subsequent manual or automatic movement follows.
@@ -605,6 +611,8 @@ where
         }
 
         let mut waiting_for_overlap = false;
+        let mut waiting_for_pointer = false;
+        let mut auto_overlap_probes = 0u32;
         loop {
             let mut finish_after_frame =
                 matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
@@ -634,7 +642,20 @@ where
 
             if !finish_after_frame {
                 if capabilities.is_automatic() && !waiting_for_overlap {
-                    if let Err(error) = self.driver.scroll(&self.config.gesture) {
+                    let delivery = self.driver.try_scroll(&self.config.gesture);
+                    if matches!(&delivery, Ok(ScrollDelivery::PointerOutside)) {
+                        if !waiting_for_pointer {
+                            progress(Progress::WaitingForPointer);
+                            waiting_for_pointer = true;
+                        }
+                        self.pacer.wait(self.config.manual_poll_interval);
+                        continue;
+                    }
+                    if waiting_for_pointer && delivery.is_ok() {
+                        progress(Progress::PointerReady);
+                        waiting_for_pointer = false;
+                    }
+                    if let Err(error) = delivery {
                         if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
                             return finish_checked(
                                 stitcher,
@@ -692,7 +713,12 @@ where
                     self.pacer.wait(self.config.settle_delay);
                 } else {
                     progress(Progress::WaitingForManualScroll);
-                    self.pacer.wait(self.config.manual_poll_interval);
+                    self.pacer
+                        .wait(if capabilities.is_automatic() && waiting_for_overlap {
+                            self.config.settle_delay
+                        } else {
+                            self.config.manual_poll_interval
+                        });
                 }
             }
 
@@ -777,6 +803,7 @@ where
                 )
             {
                 waiting_for_overlap = false;
+                auto_overlap_probes = 0;
                 progress(Progress::OverlapRestored);
             }
             match outcome {
@@ -793,6 +820,7 @@ where
                 } => {
                     has_advanced = true;
                     waiting_for_overlap = false;
+                    auto_overlap_probes = 0;
                     stitcher.set_expected_delta(Some(delta));
                     progress(Progress::Advanced {
                         frame: captured_frames,
@@ -871,6 +899,12 @@ where
                 PushOutcome::InsufficientOverlap { reason } => {
                     if self.config.control.is_some() && !finish_after_frame {
                         waiting_for_overlap = true;
+                        if self.config.control == Some(ScrollControl::Automatic) {
+                            auto_overlap_probes = auto_overlap_probes.saturating_add(1);
+                            if auto_overlap_probes < AUTO_OVERLAP_SETTLE_PROBES {
+                                continue;
+                            }
+                        }
                         progress(Progress::WaitingForOverlap { reason });
                         continue;
                     }
@@ -1619,10 +1653,12 @@ mod tests {
                 5,
             );
             assert_eq!(output.frame.height(), 17);
-            assert!(
+            assert_eq!(
                 events
                     .iter()
-                    .any(|event| matches!(event, Progress::WaitingForOverlap { .. }))
+                    .any(|event| matches!(event, Progress::WaitingForOverlap { .. })),
+                control == ScrollControl::Manual,
+                "Auto should let a transient frame settle without asking for manual recovery"
             );
         }
     }
@@ -1699,7 +1735,7 @@ mod tests {
                 .expect("matched anchor");
             let lost = events
                 .iter()
-                .position(|event| matches!(event, Progress::WaitingForOverlap { .. }))
+                .position(|event| matches!(event, Progress::FrameCaptured { frame: 3 }))
                 .unwrap();
             assert!(restored > lost);
             assert_eq!(
@@ -1744,6 +1780,157 @@ mod tests {
         );
         assert_eq!(output.seams, 1);
         assert_eq!(output.frame.height(), 11);
+    }
+
+    #[test]
+    fn auto_waits_for_settling_before_reporting_persistent_overlap_loss() {
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        let source = Frames {
+            frames: VecDeque::from([
+                frame(&document[0..8]),
+                frame(&document[3..11]),
+                frame(&[255; 8]),
+                frame(&[255; 8]),
+                frame(&[255; 8]),
+                frame(&[255; 8]),
+                frame(&[255; 8]),
+            ]),
+        };
+        let gestures = Arc::new(Mutex::new(Vec::new()));
+        let (output, events) = finish_after_frame(
+            ScrollSession::new(
+                source,
+                Box::new(RecordingDriver {
+                    gestures: Arc::clone(&gestures),
+                }),
+                NoopPacer,
+                config(8)
+                    .with_control(ScrollControl::Automatic)
+                    .with_direction_detection(3.0, 3.0),
+            ),
+            7,
+        );
+        let warning = events
+            .iter()
+            .position(|event| matches!(event, Progress::WaitingForOverlap { .. }))
+            .unwrap();
+        let fourth_probe = events
+            .iter()
+            .position(|event| matches!(event, Progress::FrameCaptured { frame: 6 }))
+            .unwrap();
+        assert!(warning > fourth_probe);
+        assert_eq!(
+            gestures.lock().unwrap().len(),
+            1,
+            "no further nudges while overlap is uncertain"
+        );
+        assert_eq!(output.frame.height(), 11);
+    }
+
+    #[test]
+    fn pointer_pause_is_not_a_capture_failure_and_resumes_without_extra_frames() {
+        struct PointerDriver {
+            attempts: usize,
+        }
+        impl ScrollDriver for PointerDriver {
+            fn capabilities(&self) -> ScrollCapabilities {
+                ScrollCapabilities::automatic(true)
+            }
+            fn prepare(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn scroll(&mut self, _: &ScrollGesture) -> Result<()> {
+                panic!("use guarded attempt");
+            }
+            fn try_scroll(&mut self, _: &ScrollGesture) -> Result<ScrollDelivery> {
+                self.attempts += 1;
+                Ok(if self.attempts <= 2 {
+                    ScrollDelivery::PointerOutside
+                } else {
+                    ScrollDelivery::Submitted
+                })
+            }
+            fn name(&self) -> &str {
+                "pointer fixture"
+            }
+        }
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        let source = Frames {
+            frames: VecDeque::from([
+                frame(&document[0..8]),
+                frame(&document[3..11]),
+                frame(&document[6..14]),
+            ]),
+        };
+        let (output, events) = finish_after_frame(
+            ScrollSession::new(
+                source,
+                Box::new(PointerDriver { attempts: 0 }),
+                NoopPacer,
+                config(8)
+                    .with_control(ScrollControl::Automatic)
+                    .with_direction_detection(3.0, 3.0),
+            ),
+            3,
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Progress::WaitingForPointer))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Progress::PointerReady))
+                .count(),
+            1
+        );
+        assert_eq!(output.captured_frames, 3);
+        assert_eq!(output.frame.height(), 14);
+    }
+
+    #[test]
+    fn discard_still_works_while_waiting_for_pointer_placement() {
+        struct Outside;
+        impl ScrollDriver for Outside {
+            fn capabilities(&self) -> ScrollCapabilities {
+                ScrollCapabilities::automatic(true)
+            }
+            fn prepare(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn scroll(&mut self, _: &ScrollGesture) -> Result<()> {
+                panic!("must not post");
+            }
+            fn try_scroll(&mut self, _: &ScrollGesture) -> Result<ScrollDelivery> {
+                Ok(ScrollDelivery::PointerOutside)
+            }
+            fn name(&self) -> &str {
+                "outside fixture"
+            }
+        }
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        let source = Frames {
+            frames: VecDeque::from([frame(&document[0..8]), frame(&document[3..11])]),
+        };
+        let request = AtomicCancellation::default();
+        let mut cancel = request.clone();
+        let result = ScrollSession::new(
+            source,
+            Box::new(Outside),
+            NoopPacer,
+            config(8)
+                .with_control(ScrollControl::Automatic)
+                .with_direction_detection(3.0, 3.0),
+        )
+        .run(&mut cancel, |progress| {
+            if matches!(progress, Progress::WaitingForPointer) {
+                request.cancel(CancelAction::Abort);
+            }
+        });
+        assert!(result.unwrap_err().is_cancellation());
     }
 
     #[test]

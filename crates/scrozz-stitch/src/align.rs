@@ -81,6 +81,10 @@ impl AnalysisSpan {
 pub struct AlignmentConfig {
     /// Minimum number of content rows or columns two frames must share.
     pub min_overlap: u32,
+    /// Minimum percentage of the analyzed viewport that must overlap. Zero
+    /// retains the absolute-only policy; interactive capture uses a larger floor
+    /// so a tiny repeated edge cannot compete with a well-supported seam.
+    pub min_overlap_percent: u32,
     /// Largest displacement to consider. `None` means every displacement that
     /// leaves [`Self::min_overlap`] pixels along the movement axis.
     pub max_delta: Option<u32>,
@@ -114,6 +118,7 @@ impl Default for AlignmentConfig {
     fn default() -> Self {
         Self {
             min_overlap: 32,
+            min_overlap_percent: 0,
             max_delta: None,
             row_buckets: 32,
             top_k: 6,
@@ -418,7 +423,13 @@ fn align_axis_search(
         )));
     }
 
-    let min_overlap = config.min_overlap.min(span.len()).max(1);
+    let relative_overlap =
+        (u64::from(span.len()) * u64::from(config.min_overlap_percent)).div_ceil(100) as u32;
+    let min_overlap = config
+        .min_overlap
+        .max(relative_overlap)
+        .min(span.len())
+        .max(1);
     let largest = span
         .len()
         .saturating_sub(min_overlap)
@@ -778,6 +789,11 @@ fn validate(
     if config.min_overlap == 0 {
         return Err(AlignError::Incompatible(
             "minimum overlap must be at least one pixel".to_owned(),
+        ));
+    }
+    if config.min_overlap_percent > 100 {
+        return Err(AlignError::Incompatible(
+            "minimum overlap percentage cannot exceed 100".to_owned(),
         ));
     }
     Ok(())
@@ -1203,6 +1219,53 @@ mod tests {
         assert_eq!(aligned.delta, 4);
         assert_eq!(aligned.score, 0);
         assert_eq!(aligned.overlap, 6);
+    }
+
+    #[test]
+    fn a_tiny_repeated_edge_does_not_compete_with_a_full_viewport_match() {
+        let mut document: Vec<u8> = (0u32..548)
+            .map(|value| {
+                let mixed = value.wrapping_mul(747_796_405).rotate_left(13)
+                    ^ value.wrapping_mul(2_891_336_453);
+                (mixed ^ (mixed >> 16)) as u8
+            })
+            .collect();
+        let repeated = document[48..84].to_vec();
+        document[464..500].copy_from_slice(&repeated);
+        let first = plane(&document[..500], 16);
+        let second = plane(&document[48..548], 16);
+        let mut config = AlignmentConfig::default();
+        assert!(
+            matches!(
+                align_vertical(&first, &second, Some(48), &config),
+                Err(AlignError::Ambiguous { .. })
+            ),
+            "absolute-only overlap admits the 36-pixel edge echo"
+        );
+        config.min_overlap_percent = 33;
+        let aligned = align_vertical(&first, &second, Some(48), &config).unwrap();
+        assert_eq!(aligned.delta, 48);
+        assert_eq!(aligned.overlap, 452);
+        assert_eq!(aligned.score, 0);
+        let first_horizontal = LumaPlane::from_raw(500, 16, document[..500].repeat(16));
+        let second_horizontal = LumaPlane::from_raw(500, 16, document[48..548].repeat(16));
+        let horizontal =
+            align_horizontal(&first_horizontal, &second_horizontal, Some(48), &config).unwrap();
+        assert_eq!(horizontal.delta, 48);
+        assert_eq!(horizontal.overlap, 452);
+    }
+
+    #[test]
+    fn substantial_repeated_content_still_requires_real_disambiguation() {
+        let document: Vec<u8> = (0..30).map(|v| if v % 4 < 2 { 20 } else { 220 }).collect();
+        let first = plane(&document[..12], 8);
+        let second = plane(&document[4..16], 8);
+        let mut config = small();
+        config.min_overlap_percent = 33;
+        assert!(matches!(
+            align_vertical(&first, &second, Some(4), &config),
+            Err(AlignError::Ambiguous { .. })
+        ));
     }
 
     #[test]

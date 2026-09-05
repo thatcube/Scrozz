@@ -56,8 +56,8 @@ pub use pin::{
 };
 pub use revision::ContentRevision;
 pub use scroll::{
-    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollControl, ScrollDirection,
-    ScrollDriver, ScrollGesture, ScrollSynthesis,
+    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollControl, ScrollDelivery,
+    ScrollDirection, ScrollDriver, ScrollGesture, ScrollSynthesis,
 };
 pub use selection::{
     AspectLock, CrosshairMode, DEFAULT_MAGNIFIER_ZOOM, DimensionLabelMode, MIN_SELECTION,

@@ -223,6 +223,12 @@ pub(crate) fn report_terminal_scroll_progress(progress: Progress) {
         Progress::WaitingForManualScroll => {
             eprintln!("scrozz: waiting for one scroll in any direction");
         }
+        Progress::WaitingForPointer => {
+            eprintln!("scrozz: move the pointer inside the capture area to resume Auto")
+        }
+        Progress::PointerReady => {
+            eprintln!("scrozz: pointer is inside the capture area; Auto resumed")
+        }
         Progress::DirectionDetected { direction } => {
             eprintln!("scrozz: following {direction:?} movement");
         }
@@ -508,6 +514,7 @@ impl ScrollingTarget {
             .with_direction_detection(vertical_amount, horizontal_amount);
         config.max_frames = 400;
         config.preview = self.overlay_surface().is_some();
+        config.stitch.alignment.min_overlap_percent = 33;
         Ok(config)
     }
 }
@@ -1084,7 +1091,8 @@ pub(crate) fn scroll_session_config(
         ScrollAxis::Horizontal => ScrollGesture::right(at, area.size.width * 0.65),
     }
     .on_display(display.id.clone())
-    .in_window(window);
+    .in_window(window)
+    .within(area);
     Ok(ScrollSessionConfig::new(gesture))
 }
 
@@ -1204,6 +1212,7 @@ mod tests {
         assert_eq!(amounts.horizontal, 455.0);
         assert_eq!(detecting.max_frames, 400);
         assert!(detecting.preview);
+        assert_eq!(detecting.stitch.alignment.min_overlap_percent, 33);
     }
 
     #[cfg(target_os = "macos")]
@@ -1228,6 +1237,7 @@ mod tests {
 
         assert_eq!(config.settle_delay, Duration::from_millis(280));
         assert_eq!(config.manual_poll_interval, Duration::from_millis(150));
+        assert_eq!(config.gesture.area, Some(viewport));
     }
 
     #[test]
