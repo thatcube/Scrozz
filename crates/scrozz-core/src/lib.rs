@@ -56,12 +56,12 @@ pub use pin::{
 };
 pub use revision::ContentRevision;
 pub use scroll::{
-    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollDriver, ScrollGesture,
-    ScrollSynthesis,
+    ManualScrollDriver, ScrollAxis, ScrollCapabilities, ScrollControl, ScrollDirection,
+    ScrollDriver, ScrollGesture, ScrollSynthesis,
 };
 pub use selection::{
     AspectLock, CrosshairMode, DEFAULT_MAGNIFIER_ZOOM, DimensionLabelMode, MIN_SELECTION,
-    RegionSelector, SelectionCapabilities, SelectionHost, SelectionMode, SelectionOptions,
-    SelectionOutcome, SelectionSource, SessionFacts, SizeConstraint, host_for,
+    RegionSelector, ScrollSelection, SelectionCapabilities, SelectionHost, SelectionMode,
+    SelectionOptions, SelectionOutcome, SelectionSource, SessionFacts, SizeConstraint, host_for,
 };
 pub use target::{CaptureTarget, Display, DisplayId, TargetEnumerator, Window, WindowId};

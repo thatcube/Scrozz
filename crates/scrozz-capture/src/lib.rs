@@ -329,6 +329,10 @@ pub fn frame_session(request: CaptureRequest) -> Result<Box<dyn FrameSession>> {
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
+        #[cfg(target_os = "macos")]
+        if request.target.is_window() {
+            return macos::window_frame_session(request, None);
+        }
         Ok(backend_frame_session(backend()?, request, None))
     }
 
@@ -361,6 +365,9 @@ pub fn frame_session_with_cancellation(
     #[cfg(target_os = "macos")]
     {
         cancellation.check()?;
+        if request.target.is_window() {
+            return macos::window_frame_session(request, Some(cancellation));
+        }
         Ok(backend_frame_session(
             Box::new(macos::ScreenCaptureKitBackend::with_cancellation(
                 cancellation,

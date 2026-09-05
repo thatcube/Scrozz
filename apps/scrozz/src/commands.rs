@@ -290,7 +290,8 @@ fn capture(
         _ => None,
     };
     let sinks = args.sinks();
-    let selection = args.selection_options(None)?;
+    let freeze_screen = settings::freeze_screen_read_only()?;
+    let selection = selection_options_with_freeze_default(args, None, freeze_screen)?;
     let beautification = resolve_beautification(args)?;
 
     let plan = Json::obj([
@@ -328,6 +329,7 @@ fn capture(
     // settings document must not turn a completed file/clipboard write into a
     // failure-shaped command after the side effect already happened.
     let (persisted, _) = settings::stored_settings()?;
+    let freeze_screen = settings::freeze_screen(&persisted)?;
     let screenshot_sound = settings::screenshot_sound(&persisted)?;
 
     // Check before interactive preparation: freezing or magnifying the desktop
@@ -355,8 +357,7 @@ fn capture(
             } else {
                 None
             };
-            let options = args
-                .selection_options(remembered)?
+            let options = selection_options_with_freeze_default(args, remembered, freeze_screen)?
                 .expect("an interactive target has selection options");
             let (outcome, frozen) = select_target(&options, args, selector, false)?;
             (outcome.target.clone(), Some(outcome), frozen)
@@ -529,6 +530,22 @@ fn capture(
     let mut report = Report::new(data, human);
     report.raw = raw;
     Ok(report)
+}
+
+fn selection_options_with_freeze_default(
+    args: &CaptureArgs,
+    remembered: Option<(scrozz_core::LogicalRect, Option<scrozz_core::DisplayId>)>,
+    freeze_default: bool,
+) -> CliResult<Option<SelectionOptions>> {
+    let mut options = args.selection_options(remembered)?;
+    if args.freeze.is_none()
+        && let Some(options) = options
+            .as_mut()
+            .filter(|options| options.mode != scrozz_core::SelectionMode::Window)
+    {
+        options.freeze = freeze_default;
+    }
+    Ok(options)
 }
 
 fn announce_shutter(
@@ -3158,6 +3175,92 @@ mod tests {
         ] {
             assert!(run(&argv).is_ok(), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn stored_freeze_is_the_interactive_default_but_an_explicit_flag_wins() {
+        let args = match Cli::try_parse_from(["scrozz", "capture", "--interactive"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Capture(args) => args,
+            command => panic!("expected capture command, got {command:?}"),
+        };
+        assert!(
+            selection_options_with_freeze_default(&args, None, true)
+                .unwrap()
+                .unwrap()
+                .freeze
+        );
+
+        let args =
+            match Cli::try_parse_from(["scrozz", "capture", "--interactive", "--freeze=false"])
+                .unwrap()
+                .command
+                .unwrap()
+            {
+                Command::Capture(args) => args,
+                command => panic!("expected capture command, got {command:?}"),
+            };
+        assert!(
+            !selection_options_with_freeze_default(&args, None, true)
+                .unwrap()
+                .unwrap()
+                .freeze
+        );
+
+        let args = match Cli::try_parse_from(["scrozz", "capture", "--interactive", "window"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Capture(args) => args,
+            command => panic!("expected capture command, got {command:?}"),
+        };
+        assert!(
+            !selection_options_with_freeze_default(&args, None, true)
+                .unwrap()
+                .unwrap()
+                .freeze
+        );
+    }
+
+    #[test]
+    fn capture_plan_reports_the_persisted_freeze_value_it_will_use() {
+        let _settings = isolated_settings("freeze-plan");
+        run(&[
+            "scrozz",
+            "settings",
+            "set",
+            crate::settings::FREEZE_SCREEN_KEY,
+            "true",
+        ])
+        .unwrap();
+
+        let rendered = json_of(&["scrozz", "capture", "--interactive", "--dry-run"]);
+        assert!(rendered.contains(r#""freeze":true"#), "{rendered}");
+
+        let overridden = json_of(&[
+            "scrozz",
+            "capture",
+            "--interactive",
+            "--freeze=false",
+            "--dry-run",
+        ]);
+        assert!(overridden.contains(r#""freeze":false"#), "{overridden}");
+    }
+
+    #[test]
+    fn capture_dry_run_reads_defaults_without_creating_a_settings_document() {
+        let settings = isolated_settings("freeze-plan-read-only");
+        let path = settings.root.join("settings.json");
+        assert!(!path.exists());
+
+        let rendered = json_of(&["scrozz", "capture", "--interactive", "--dry-run"]);
+
+        assert!(rendered.contains(r#""freeze":false"#), "{rendered}");
+        assert!(!path.exists(), "dry-run must not create user settings");
     }
 
     #[test]

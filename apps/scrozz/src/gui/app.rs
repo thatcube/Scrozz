@@ -31,7 +31,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, channel},
+        mpsc::{Receiver, Sender, channel},
     },
     task::{Context, Poll, Waker},
     thread::JoinHandle,
@@ -66,8 +66,8 @@ use scrozz_annotate::{
     AnalysisCancellation, Document, DocumentData, SmartFrameAnalysis, SmartFramePreset,
 };
 use scrozz_core::{
-    CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, LockEscape, ScrollAxis,
-    SelectionCapabilities, SelectionMode,
+    CaptureRequest, CaptureTarget, CursorMode, Error as CoreError, LockEscape, ScrollControl,
+    SelectionCapabilities, SelectionMode, SelectionOptions, SelectionOutcome,
 };
 use scrozz_record::{
     CameraDevice, CameraDeviceId, CameraPermission, CameraPreviewSession, CameraRequest,
@@ -346,6 +346,7 @@ impl Config {
             "window" => Some(CaptureKind::Window),
             "1" | "fullscreen" => Some(CaptureKind::Fullscreen),
             "all-displays" => Some(CaptureKind::AllDisplays),
+            "scrolling" => Some(CaptureKind::Scrolling),
             _ => None,
         }
     }
@@ -723,6 +724,8 @@ pub struct App {
     next_output_action: u64,
     /// Whether each live card has another retained artifact and a visible export.
     card_retention: HashMap<CardId, (bool, bool)>,
+    /// Successful exports keyed by the exact editor lifetime and revision.
+    saved_capture_paths: HashMap<CardId, SavedCapturePaths>,
     /// Cards already usable in the UI whose ambient durability is still queued.
     finalizing_cards: HashSet<CardId>,
     /// Per-generation output-staleness fate recorded for each card with any
@@ -791,6 +794,7 @@ pub struct App {
         Option<(scrozz_ui::RecentCapturesOverlaySettings, Instant)>,
     pin_lock_escapes: Vec<LockEscape>,
     pin_intents: HashMap<CaptureId, PinIntent>,
+    surface_waker: Option<SurfaceWaker>,
     input_wake_monitor: Option<InputWakeMonitor>,
     suppress_locked_restores: bool,
     started: Instant,
@@ -883,9 +887,11 @@ pub struct App {
     visible_cards: BTreeSet<CardId>,
     /// The scrolling HUD as this coordinator last published it.
     scroll_hud: Option<ScrollHudState>,
+    /// Region selector result waiting to become an explicit scrolling setup.
+    scrolling_selection: Option<Receiver<scrozz_core::Result<SelectionOutcome>>>,
     /// The card a running scrolling capture will become.
     scrolling_card: Option<CardId>,
-    /// The window/display chosen when the axis picker opened.
+    /// The window/display chosen while the adjustable region was visible.
     scrolling_target: Option<ScrollingTarget>,
     /// A finished scrolling capture held back one pass, so an abort that raced
     /// the last frame still wins.
@@ -897,7 +903,12 @@ pub struct App {
     /// Whether a keep has already been asked for, so a second invocation means
     /// discard rather than a second keep.
     scrolling_keep_pending: bool,
-    scrolling_target_resolver: Box<dyn Fn() -> CliResult<ScrollingTarget>>,
+    scrolling_target_resolver: Box<
+        dyn Fn(
+            scrozz_core::LogicalRect,
+            Option<scrozz_core::DisplayId>,
+        ) -> CliResult<ScrollingTarget>,
+    >,
     scrolling_target_refresher: Box<dyn Fn(ScrollingTarget) -> CliResult<ScrollingTarget>>,
 }
 
@@ -907,9 +918,10 @@ pub struct App {
 /// window has *confirmed* it is mouse-transparent; until then the wheel event
 /// would land on Scrozz's own window.
 struct PendingScrollingStart {
-    axis: ScrollAxis,
+    control: ScrollControl,
     card: CardId,
     target: Box<ScrollingTarget>,
+    policy: AfterCaptureSettings,
     needs_passthrough: bool,
     passthrough_requested_at: Instant,
 }
@@ -1152,6 +1164,8 @@ enum CardOutput {
     Upload(u64),
 }
 
+type SavedCapturePaths = HashMap<Option<(u64, u64)>, PathBuf>;
+
 struct PendingSaveDialog {
     card: CardId,
     /// Editor lifetime that produced `rendered`, so the eventual save can be
@@ -1314,7 +1328,10 @@ pub struct PendingDrag {
 }
 
 /// Chooses the window a scrolling capture will follow, as it is right now.
-fn snapshot_scrolling_target() -> CliResult<ScrollingTarget> {
+fn snapshot_scrolling_target(
+    region: scrozz_core::LogicalRect,
+    display: Option<scrozz_core::DisplayId>,
+) -> CliResult<ScrollingTarget> {
     let backend = platform::capture_backend()?;
     if crate::commands::is_wayland() {
         // Wayland never names a window, so the portal picker is the selection.
@@ -1327,19 +1344,29 @@ fn snapshot_scrolling_target() -> CliResult<ScrollingTarget> {
             },
         );
     }
-    let display = backend.active_display()?;
-    let request = CaptureRequest {
-        target: CaptureTarget::Display(display.id),
-        cursor: CursorMode::Hidden,
-        include_window_shadow: false,
-    };
-    crate::commands::resolve_scrolling_target(backend.as_ref(), request)
+    crate::scrolling::resolve_scrolling_region_target_on_display(
+        backend.as_ref(),
+        region,
+        display.as_ref(),
+    )
 }
 
 /// Re-resolves a snapshotted target immediately before capture starts.
 fn refresh_scrolling_target(target: ScrollingTarget) -> CliResult<ScrollingTarget> {
     let backend = platform::capture_backend()?;
     target.refresh(backend.as_ref())
+}
+
+fn publish_scrolling_selection(
+    send: Sender<scrozz_core::Result<SelectionOutcome>>,
+    waker: Option<SurfaceWaker>,
+    selected: scrozz_core::Result<SelectionOutcome>,
+) {
+    if send.send(selected).is_ok()
+        && let Some(wake) = waker
+    {
+        wake();
+    }
 }
 
 fn describe_scroll_progress(progress: &Progress) -> String {
@@ -1362,6 +1389,9 @@ fn describe_scroll_progress(progress: &Progress) -> String {
         }
         Progress::FrameCaptured { frame } => format!("captured scrolling frame {frame}"),
         Progress::WaitingForManualScroll => "is waiting for the page to scroll".to_owned(),
+        Progress::DirectionDetected { direction } => {
+            format!("detected {direction:?} movement from the page")
+        }
         Progress::Advanced {
             frame,
             delta,
@@ -1415,7 +1445,12 @@ impl App {
         surface: Box<dyn CardSurface>,
         selector: Arc<dyn CaptureSelector>,
         permission_ui_available: bool,
-        scrolling_target_resolver: Box<dyn Fn() -> CliResult<ScrollingTarget>>,
+        scrolling_target_resolver: Box<
+            dyn Fn(
+                scrozz_core::LogicalRect,
+                Option<scrozz_core::DisplayId>,
+            ) -> CliResult<ScrollingTarget>,
+        >,
     ) -> CliResult<Self> {
         Self::new_with_scrolling_target_handlers(
             config,
@@ -1432,7 +1467,12 @@ impl App {
         surface: Box<dyn CardSurface>,
         selector: Arc<dyn CaptureSelector>,
         permission_ui_available: bool,
-        scrolling_target_resolver: Box<dyn Fn() -> CliResult<ScrollingTarget>>,
+        scrolling_target_resolver: Box<
+            dyn Fn(
+                scrozz_core::LogicalRect,
+                Option<scrozz_core::DisplayId>,
+            ) -> CliResult<ScrollingTarget>,
+        >,
         scrolling_target_refresher: Box<dyn Fn(ScrollingTarget) -> CliResult<ScrollingTarget>>,
     ) -> CliResult<Self> {
         let waker = surface.waker();
@@ -1474,7 +1514,7 @@ impl App {
         };
         let forwarder = server
             .as_ref()
-            .map(|_| Forwarder::start(Arc::clone(&selector), waker))
+            .map(|_| Forwarder::start(Arc::clone(&selector), waker.clone()))
             .transpose()?;
 
         let tray = if config.tray {
@@ -1620,6 +1660,7 @@ impl App {
             current_upload_action: HashMap::new(),
             next_output_action: 0,
             card_retention: HashMap::new(),
+            saved_capture_paths: HashMap::new(),
             finalizing_cards: HashSet::new(),
             card_generation_fates: HashMap::new(),
             card_capture_ids: HashMap::new(),
@@ -1633,6 +1674,7 @@ impl App {
             pending_recent_captures_settings_save: None,
             pin_lock_escapes,
             pin_intents: HashMap::new(),
+            surface_waker: waker,
             input_wake_monitor,
             suppress_locked_restores: false,
             started: Instant::now(),
@@ -1686,6 +1728,7 @@ impl App {
             connection_test: None,
             visible_cards: BTreeSet::new(),
             scroll_hud: None,
+            scrolling_selection: None,
             scrolling_card: None,
             scrolling_target: None,
             scrolling_ready: None,
@@ -1728,6 +1771,8 @@ impl App {
     #[must_use]
     pub fn capture_settings(&self) -> scrozz_ui::settings::CaptureSettings {
         scrozz_ui::settings::CaptureSettings {
+            freeze_screen: crate::settings::freeze_screen(&self.config.after_capture)
+                .unwrap_or(false),
             window_shadow: crate::settings::window_shadow(&self.config.after_capture)
                 .unwrap_or(true),
         }
@@ -1788,13 +1833,19 @@ impl App {
 
     /// Persists capture fidelity preferences.
     pub fn edit_capture_settings(&mut self, settings: scrozz_ui::settings::CaptureSettings) {
-        if settings == self.capture_settings() {
-            return;
+        let current = self.capture_settings();
+        if settings.freeze_screen != current.freeze_screen {
+            self.store_setting_value(
+                crate::settings::FREEZE_SCREEN_KEY,
+                &settings.freeze_screen.to_string(),
+            );
         }
-        self.store_scene_value(
-            crate::settings::WINDOW_SHADOW_KEY,
-            &settings.window_shadow.to_string(),
-        );
+        if settings.window_shadow != current.window_shadow {
+            self.store_setting_value(
+                crate::settings::WINDOW_SHADOW_KEY,
+                &settings.window_shadow.to_string(),
+            );
+        }
     }
 
     /// Applies one Scenes request, persisting assignments and preset edits.
@@ -1803,7 +1854,7 @@ impl App {
 
         match event {
             ScenesEvent::SetDefault(choice) => {
-                self.store_scene_value(crate::settings::SCENES_DEFAULT_KEY, &choice.to_value());
+                self.store_setting_value(crate::settings::SCENES_DEFAULT_KEY, &choice.to_value());
             }
             ScenesEvent::SetAssignment(kind, assignment) => {
                 let Some((_, key)) = crate::settings::SCENE_CAPTURE_KEYS
@@ -1812,7 +1863,7 @@ impl App {
                 else {
                     return;
                 };
-                self.store_scene_value(key, &assignment.to_value());
+                self.store_setting_value(key, &assignment.to_value());
             }
             ScenesEvent::CreateFromCapture => {
                 if let Some(capture) = self.newest_screenshot_capture() {
@@ -1830,9 +1881,9 @@ impl App {
         }
     }
 
-    fn store_scene_value(&mut self, key: &str, value: &str) {
+    fn store_setting_value(&mut self, key: &str, value: &str) {
         let Some(store) = self.config.after_capture_store.clone() else {
-            self.note("Scenes were not changed because no config directory is available");
+            self.note("Settings were not changed because no config directory is available");
             return;
         };
         let key = key.to_owned();
@@ -1842,7 +1893,7 @@ impl App {
             Ok(())
         }) {
             Ok(updated) => self.config.after_capture = updated,
-            Err(error) => self.note(format!("Scenes were not saved: {error}")),
+            Err(error) => self.note(format!("Settings were not saved: {error}")),
         }
     }
 
@@ -1981,6 +2032,7 @@ impl App {
         self.drain_save_dialog();
         self.drain_pin_save_dialog();
         self.drain_connection_test();
+        self.drain_scrolling_selection();
         self.drain_cards(editors);
         // After the HUD's own events: an abort raised this frame must beat the
         // finished capture that was held back for exactly one pass.
@@ -2484,12 +2536,19 @@ impl App {
                     card.upload_unavailable_reason = self.cloud_settings.unavailable_reason.clone();
                     let summary = card.summary();
                     let card_id = card.id;
+                    let saved_path = card.written.first().map(PathBuf::from);
                     let capture_id = card.capture_id.clone();
                     if let Err(err) = self.surface.present(*card) {
                         self.pipeline.post(Job::Release(card_id));
                         self.note(format!("a restored card could not be shown: {err}"));
                     } else {
                         self.visible_cards.insert(card_id);
+                        if let Some(path) = saved_path {
+                            self.saved_capture_paths
+                                .entry(card_id)
+                                .or_default()
+                                .insert(None, path);
+                        }
                         self.card_retention.insert(card_id, (true, false));
                         if let Some(capture_id) = capture_id {
                             self.card_capture_ids.insert(card_id, capture_id);
@@ -2521,6 +2580,7 @@ impl App {
                 Outcome::Done {
                     card,
                     detail,
+                    saved_path,
                     version,
                     action,
                 } => {
@@ -2545,6 +2605,11 @@ impl App {
                         .is_some_and(|actions| actions.contains_key(&action));
                     if !outstanding {
                         continue;
+                    }
+                    if let Some(path) = &saved_path {
+                        // Save As can overwrite another revision's export even
+                        // when this completion itself has since become stale.
+                        self.invalidate_saved_capture_path(path);
                     }
                     // Round 5, Finding #2 / round 9, Finding #1: a Save
                     // dispatched against a live editor's revision can
@@ -2593,6 +2658,15 @@ impl App {
                     // log, retention, or trigger dismissal (round 13).
                     self.surface.set_status(card, Some(detail.clone()));
                     self.note(format!("{card} {detail}"));
+                    if let Some(path) = saved_path
+                        && self.visible_cards.contains(&card)
+                    {
+                        self.saved_capture_paths
+                            .entry(card)
+                            .or_default()
+                            .insert(version, path);
+                        self.refresh_saved_capture(card);
+                    }
                     if let Some(retention) = self.card_retention.get_mut(&card)
                         && detail.starts_with("saved")
                     {
@@ -2779,6 +2853,7 @@ impl App {
                     generation,
                     revision,
                 } => {
+                    self.refresh_saved_capture(card);
                     if let Some(pending) = self.pending_editor_closes.get_mut(&card)
                         && pending.generation == generation
                         && pending.revision == revision
@@ -3154,6 +3229,7 @@ impl App {
                         self.register_output_action(id, action, OutputActionKind::CardOutput, true);
                     }
                 }
+                CardEvent::Reveal(card) => self.reveal_saved_capture(card),
                 CardEvent::Save {
                     card,
                     choose_destination,
@@ -3172,14 +3248,10 @@ impl App {
                         continue;
                     }
                     if !choose_destination
-                        && self
-                            .card_retention
-                            .get(&card)
-                            .is_some_and(|(_, exported)| *exported)
+                        && self.saved_capture_path(card).is_some()
                         && editors.for_card(card).is_none()
                     {
-                        self.dismiss_recent_capture(card, "used its existing export");
-                        self.note(format!("{card} was already saved to Export Location"));
+                        self.reveal_saved_capture(card);
                         continue;
                     }
                     if choose_destination {
@@ -3191,7 +3263,7 @@ impl App {
                                 card,
                                 action,
                                 OutputActionKind::CardOutput,
-                                true,
+                                false,
                             );
                         }
                     }
@@ -3431,12 +3503,25 @@ impl App {
         }
         for action in scrolling {
             match action {
-                ScrollHudAction::Start(axis) if self.scrolling_card.is_none() => {
-                    self.start_scrolling_capture(axis);
+                ScrollHudAction::SetControl(control) if self.scrolling_card.is_none() => {
+                    if let Some(mut state) = self.scroll_hud.clone() {
+                        state.control = control;
+                        state.automatic = control == ScrollControl::Automatic;
+                        state.status = ScrollHudStatus::Configuring;
+                        self.set_scroll_hud(state);
+                    }
                 }
-                ScrollHudAction::Start(_) => {
+                ScrollHudAction::Start if self.scrolling_card.is_none() => {
+                    self.start_scrolling_capture();
+                }
+                ScrollHudAction::SetControl(_) | ScrollHudAction::Start => {
                     self.note("a scrolling capture is already running");
                 }
+                ScrollHudAction::Cancel if self.scrolling_card.is_none() => {
+                    self.finish_scrolling_hud();
+                    self.note("cancelled scrolling capture before it started");
+                }
+                ScrollHudAction::Cancel => self.abort_scrolling_capture(),
                 ScrollHudAction::Keep if self.scrolling_card.is_some() => {
                     self.keep_scrolling_capture();
                 }
@@ -3836,6 +3921,78 @@ impl App {
         }
     }
 
+    fn saved_capture_path(&self, card: CardId) -> Option<&PathBuf> {
+        let version = self.pipeline.captures().get(card).and_then(|bytes| {
+            bytes
+                .generation()
+                .map(|generation| (generation, bytes.revision()))
+        });
+        self.saved_capture_paths.get(&card)?.get(&version)
+    }
+
+    fn invalidate_saved_capture_path(&mut self, path: &Path) {
+        let mut changed = Vec::new();
+        for (card, exports) in &mut self.saved_capture_paths {
+            let before = exports.len();
+            exports.retain(|_, saved| saved != path);
+            if exports.len() != before {
+                changed.push(*card);
+            }
+        }
+        for card in changed {
+            let exported = self.saved_capture_path(card).is_some();
+            if let Some(retention) = self.card_retention.get_mut(&card) {
+                // History identity is rechecked by the existing release path.
+                // Without it, keep the card rather than trusting the lost file.
+                *retention = (
+                    exported || self.card_capture_ids.contains_key(&card),
+                    exported,
+                );
+            }
+            self.refresh_saved_capture(card);
+        }
+    }
+
+    fn refresh_saved_capture(&mut self, card: CardId) {
+        let saved = self.saved_capture_path(card).is_some();
+        self.surface.set_saved(card, saved);
+    }
+
+    fn reveal_saved_capture(&mut self, card: CardId) {
+        let Some(path) = self.saved_capture_path(card).cloned() else {
+            self.surface.set_saved(card, false);
+            self.surface
+                .set_status(card, Some("Save this screenshot first".to_owned()));
+            self.note(format!("{card} has no saved file for its current revision"));
+            return;
+        };
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            result => {
+                let reason = result.map_or_else(|error| error.to_string(), |_| "not a file".into());
+                self.invalidate_saved_capture_path(&path);
+                self.surface
+                    .set_status(card, Some("Saved file unavailable. Save again.".to_owned()));
+                self.note(format!(
+                    "{card} could not reveal {}: {reason}",
+                    path.display()
+                ));
+                return;
+            }
+        }
+        match (self.file_launcher)(FileLaunchAction::Reveal, &path) {
+            Ok(()) => self.note(format!("{card} revealed {}", path.display())),
+            Err(error) => {
+                self.surface
+                    .set_status(card, Some(format!("Could not show saved file: {error}")));
+                self.note(format!(
+                    "{card} could not reveal {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     fn complete_upload(&mut self, card: CardId, close_after: bool) {
         if close_after {
             self.dismiss_recent_capture(card, "completed its upload");
@@ -4151,7 +4308,7 @@ impl App {
         // above must see on a second Save As attempt while this one is
         // still open.
         let action = self.allocate_output_action();
-        self.register_output_action(card, action, OutputActionKind::CardOutput, true);
+        self.register_output_action(card, action, OutputActionKind::CardOutput, false);
         self.pending_save_dialog = Some(PendingSaveDialog {
             card,
             generation,
@@ -4290,6 +4447,7 @@ impl App {
         self.visible_cards.remove(&card);
         self.drag_keep_after_accept.remove(&card);
         self.card_retention.remove(&card);
+        self.saved_capture_paths.remove(&card);
         // Round 10, Finding #1: this card's generation history can never be
         // consulted again once it is gone -- no overlay card remains for a
         // completion racing an already-retired generation to update, and no
@@ -4704,6 +4862,7 @@ impl App {
         card.upload_unavailable_reason = self.cloud_settings.unavailable_reason.clone();
         let history_changed = card.capture_id.is_some();
         let card_id = card.id;
+        let saved_path = card.written.first().map(PathBuf::from);
         let capture_id = card.capture_id.clone();
         let retained_elsewhere = ready.retained_elsewhere;
         let exported = ready.exported;
@@ -4742,6 +4901,12 @@ impl App {
                 ));
             } else {
                 self.visible_cards.insert(card_id);
+                if let Some(path) = saved_path {
+                    self.saved_capture_paths
+                        .entry(card_id)
+                        .or_default()
+                        .insert(None, path);
+                }
                 self.card_retention
                     .insert(card_id, (retained_elsewhere, exported));
                 if let Some(capture_id) = capture_id {
@@ -4814,10 +4979,17 @@ impl App {
             || self.deferred_save.contains(&card);
         if owned {
             if self.visible_cards.contains(&card) {
+                if let Some(path) = written.first() {
+                    self.saved_capture_paths
+                        .entry(card)
+                        .or_default()
+                        .insert(None, PathBuf::from(path));
+                }
                 self.card_retention
                     .insert(card, (retained_elsewhere, exported));
                 self.surface
                     .finalize_capture(card, capture_id.clone(), written.first().cloned());
+                self.refresh_saved_capture(card);
             }
             if let Some(capture_id) = capture_id.clone() {
                 self.card_capture_ids.insert(card, capture_id);
@@ -4831,9 +5003,8 @@ impl App {
         }
 
         if self.deferred_save.remove(&card) {
-            if exported {
-                self.dismiss_recent_capture(card, "used its completed automatic export");
-                self.note(format!("{card} was already saved to Export Location"));
+            if self.saved_capture_path(card).is_some() {
+                self.refresh_saved_capture(card);
             } else {
                 let action = self.allocate_output_action();
                 if self.post_card_output(
@@ -4841,7 +5012,7 @@ impl App {
                     CardOutput::Save(None, action),
                     EditorSnapshots::EMPTY,
                 ) {
-                    self.register_output_action(card, action, OutputActionKind::CardOutput, true);
+                    self.register_output_action(card, action, OutputActionKind::CardOutput, false);
                 }
             }
         }
@@ -4859,6 +5030,10 @@ impl App {
     }
 
     fn begin_scrolling_capture(&mut self, origin: CaptureOrigin) {
+        if self.scrolling_selection.is_some() {
+            self.note("finish drawing the scrolling area or press Escape to cancel");
+            return;
+        }
         if self.scrolling_card.is_some() {
             if self.scrolling_keep_pending {
                 self.abort_scrolling_capture();
@@ -4879,21 +5054,109 @@ impl App {
             return;
         }
 
-        let target = match (self.scrolling_target_resolver)() {
+        if crate::commands::is_wayland() {
+            let placeholder = scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(0.0, 0.0),
+                scrozz_core::LogicalSize::new(1.0, 1.0),
+            );
+            match (self.scrolling_target_resolver)(placeholder, None) {
+                Ok(target) => {
+                    self.scrolling_target = Some(target);
+                    self.set_scroll_hud(ScrollHudState::configuring());
+                    self.note("choose Manual, press Start capture, then select a window");
+                }
+                Err(error) => {
+                    self.note(format!(
+                        "could not prepare Wayland scrolling capture: {error}"
+                    ));
+                }
+            }
+            return;
+        }
+
+        self.selector
+            .prime_cursor(scrozz_shell::OverlayCursor::Crosshair);
+        let selector = Arc::clone(&self.selector);
+        let waker = self.surface_waker.clone();
+        let (send, result) = channel();
+        let spawn = std::thread::Builder::new()
+            .name("scrozz-scrolling-area-selector".to_owned())
+            .spawn(move || {
+                let options = SelectionOptions {
+                    hud: false,
+                    confirm_region: true,
+                    scrolling_setup: true,
+                    freeze: false,
+                    magnifier: false,
+                    ..SelectionOptions::for_mode(SelectionMode::Region)
+                };
+                let selected = selector.select_for_capture(&options, CursorMode::Hidden, false);
+                selector.capture_finished();
+                publish_scrolling_selection(send, waker, selected);
+            });
+        if let Err(error) = spawn {
+            self.selector.cancel_cursor_prime();
+            self.note(format!("could not start scrolling area selection: {error}"));
+            return;
+        }
+        self.scrolling_selection = Some(result);
+        self.note("draw the part of the window that should become the long capture");
+    }
+
+    fn drain_scrolling_selection(&mut self) {
+        let Some(selection) = self.scrolling_selection.as_ref() else {
+            return;
+        };
+        let result = match selection.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.scrolling_selection = None;
+                self.note("the scrolling area selector stopped without a result");
+                return;
+            }
+        };
+        self.scrolling_selection = None;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_cancellation() => {
+                self.note("cancelled scrolling area selection");
+                return;
+            }
+            Err(error) => {
+                self.note(format!("could not select a scrolling area: {error}"));
+                return;
+            }
+        };
+        let Some(region) = outcome.rect else {
+            self.note("the scrolling selector returned no area");
+            return;
+        };
+        let scrolling = outcome.scrolling.unwrap_or(scrozz_core::ScrollSelection {
+            control: ScrollControl::Manual,
+        });
+        let target = match (self.scrolling_target_resolver)(region, outcome.display.clone()) {
             Ok(target) => target,
             Err(error) => {
-                self.note(format!("could not select a scrolling target: {error}"));
+                self.note(format!("could not use that scrolling area: {error}"));
                 return;
             }
         };
         self.scrolling_target = Some(target);
-        self.set_scroll_hud(ScrollHudState::choosing(ScrollAxis::Vertical));
-        self.note("choose whether the scrolling capture should grow vertically or horizontally");
+        self.start_scrolling_capture_with(scrolling.control);
     }
 
-    fn start_scrolling_capture(&mut self, axis: ScrollAxis) {
-        let Some(selected) = self.scrolling_target.take() else {
-            self.note("the snapshotted scrolling target is no longer available");
+    fn start_scrolling_capture(&mut self) {
+        let Some(state) = self.scroll_hud.clone() else {
+            self.note("scrolling capture setup is no longer available");
+            return;
+        };
+        self.start_scrolling_capture_with(state.control);
+    }
+
+    fn start_scrolling_capture_with(&mut self, control: ScrollControl) {
+        let Some(selected) = self.scrolling_target.clone() else {
+            self.note("the selected scrolling area is no longer available");
             self.finish_scrolling_hud();
             return;
         };
@@ -4903,10 +5166,8 @@ impl App {
             self.finish_scrolling_hud();
             return;
         }
-        // Re-resolved on purpose: the axis picker gave the user time to focus
-        // something else, and capturing the window they were looking at when
-        // the HUD opened would be a different capture than the one they asked
-        // for.
+        // Re-resolved on purpose: setup gave the user time to move the target,
+        // and capture must follow the exact selected window and relative region.
         let target = match (self.scrolling_target_refresher)(selected) {
             Ok(target) => target,
             Err(error) => {
@@ -4921,13 +5182,19 @@ impl App {
         self.play_shutter_sound();
         let card = self.pipeline.allocate();
         self.scrolling_card = Some(card);
-        let needs_passthrough = target.requires_overlay_passthrough();
-        self.set_scroll_hud(ScrollHudState::prepared(axis, needs_passthrough));
+        let needs_passthrough =
+            control == ScrollControl::Automatic && target.requires_overlay_passthrough();
+        let mut hud = ScrollHudState::prepared(control);
+        if let Some((selection, work_area, scale)) = target.overlay_surface() {
+            hud = hud.with_surface(selection, work_area, scale);
+        }
+        self.set_scroll_hud(hud);
         self.surface.request_scroll_passthrough(needs_passthrough);
         self.scrolling_start_pending = Some(PendingScrollingStart {
-            axis,
+            control,
             card,
             target: Box::new(target),
+            policy: self.config.after_capture.clone(),
             needs_passthrough,
             passthrough_requested_at: Instant::now(),
         });
@@ -4951,12 +5218,19 @@ impl App {
             .scrolling_start_pending
             .take()
             .expect("checked pending scrolling start");
-        if !self
-            .pipeline
-            .post_scrolling(pending.axis, pending.card, pending.target)
-        {
-            self.note("the capture worker has gone");
-            self.finish_scrolling_hud();
+        if let Err(error) = self.pipeline.post_scrolling(
+            pending.control,
+            pending.card,
+            Box::new((*pending.target).clone()),
+            pending.policy,
+        ) {
+            self.scrolling_card = None;
+            self.surface.request_scroll_passthrough(false);
+            if let Some(mut state) = self.scroll_hud.clone() {
+                state.status = ScrollHudStatus::Failed(format!("Could not start: {error}"));
+                self.set_scroll_hud(state);
+            }
+            self.note(format!("scrolling capture could not start: {error}"));
         }
     }
 
@@ -5009,6 +5283,7 @@ impl App {
 
     fn finish_scrolling_hud(&mut self) {
         self.hide_scrolling_hud();
+        self.scrolling_selection = None;
         self.scrolling_target = None;
         self.scrolling_abort_pending = None;
         self.scrolling_start_pending = None;
@@ -5022,10 +5297,37 @@ impl App {
         }
         if error.is_cancellation() {
             self.note(format!("{card} discarded"));
+            self.finish_scrolling_hud();
         } else {
             self.note(format!("{card} scrolling capture failed: {error}"));
+            self.surface.request_scroll_passthrough(false);
+            self.scrolling_abort_pending = None;
+            self.scrolling_start_pending = None;
+            self.scrolling_keep_pending = false;
+            self.scrolling_card = None;
+            if let Some(mut state) = self.scroll_hud.clone() {
+                state.status = ScrollHudStatus::Failed(match error {
+                    CliError::Core(CoreError::PermissionDenied { capability, .. })
+                        if capability.contains("Accessibility") =>
+                    {
+                        "Allow Accessibility access, then Start again.".to_owned()
+                    }
+                    CliError::Core(CoreError::Unsupported { .. })
+                        if state.control == ScrollControl::Automatic =>
+                    {
+                        "Automatic is unavailable. Choose Manual and try again.".to_owned()
+                    }
+                    _ if state.control == ScrollControl::Automatic => {
+                        "No movement detected. Choose Manual and try again.".to_owned()
+                    }
+                    _ => "No stitch formed. Scroll slower or select a smaller area.".to_owned(),
+                });
+                state.automatic = false;
+                self.set_scroll_hud(state);
+            } else {
+                self.finish_scrolling_hud();
+            }
         }
-        self.finish_scrolling_hud();
         true
     }
 
@@ -5058,7 +5360,11 @@ impl App {
             }
             Progress::WaitingForManualScroll => {
                 state.status = ScrollHudStatus::WaitingForManualScroll;
-                state.automatic = false;
+                state.automatic = state.control == ScrollControl::Automatic;
+            }
+            Progress::DirectionDetected { direction } => {
+                state = state.with_direction(*direction);
+                state.status = ScrollHudStatus::Capturing;
             }
             Progress::Advanced {
                 frame,
@@ -5141,6 +5447,7 @@ impl App {
             pending.kind,
             pending.origin,
             card,
+            self.capture_settings().freeze_screen,
             self.config.after_capture.clone(),
         ) {
             self.note(format!("{card} could not start: {error}"));
@@ -6117,6 +6424,15 @@ impl App {
             self.pipeline.post(Job::Release(card));
         }
         self.opening_cards.remove(&card);
+        let version = self.pipeline.captures().get(card).and_then(|bytes| {
+            bytes
+                .generation()
+                .map(|generation| (generation, bytes.revision()))
+        });
+        if let Some(exports) = self.saved_capture_paths.get_mut(&card) {
+            exports.retain(|saved_version, _| *saved_version == version);
+        }
+        self.refresh_saved_capture(card);
         self.surface.set_editing(card, false);
     }
 
@@ -6150,6 +6466,7 @@ impl App {
             data: Box::new(data),
         };
         if self.pipeline.post(job) {
+            self.surface.set_saved(card, false);
             // Any retention recorded before now describes the pre-edit
             // content, not the revision just filed above: trusting it would
             // let a later overflow or auto-close treat this card as already
@@ -6789,7 +7106,7 @@ impl App {
         // and a quit that left it held would leave a transparent window over
         // the desktop for as long as the process took to die.
         if self.scrolling_card.is_some() || self.scrolling_start_pending.is_some() {
-            self.pipeline.cancel_scrolling(CancelAction::Keep);
+            self.pipeline.cancel_scrolling(CancelAction::Abort);
         }
         self.finish_scrolling_hud();
         if let Err(error) = self.save_recording_settings_panel() {
@@ -8501,7 +8818,8 @@ mod tests {
     use crate::gui::selection::UnsupportedSelector;
     use scrozz_core::{
         Capture, CaptureTarget, ColorSpace, Display, DisplayId, Frame, LogicalPoint, LogicalRect,
-        LogicalSize, PhysicalSize, PixelFormat, Provenance, ScaleFactor, WindowId,
+        LogicalSize, PhysicalSize, PixelFormat, Provenance, RegionSelector, ScaleFactor,
+        SelectionSource, WindowId,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9100,15 +9418,19 @@ mod tests {
         assert!(!app.deferred_save.contains(&card));
         assert!(!app.card_has_outstanding_card_level_output(card));
         assert!(
-            app.editor_only_cards.contains(&card),
-            "automatic export may hide the card but must preserve its opening editor source"
+            app.opening_cards.contains(&card),
+            "automatic export must preserve the opening editor source"
         );
         assert!(
-            surface
+            !surface
                 .trace()
                 .contains(&crate::gui::card::SurfaceCall::Dismiss(card)),
-            "the explicit Save intent should consume the completed automatic export"
+            "the saved card stays available to reveal its file"
         );
+        assert!(surface.trace().contains(&SurfaceCall::SetSaved {
+            id: card,
+            saved: true
+        }));
     }
 
     #[test]
@@ -9218,7 +9540,22 @@ mod tests {
     fn save_to_export_location_reuses_an_after_capture_export() {
         let (mut app, surface) = app();
         let card = CardId(43);
+        let path = temp_export_path("reveal-automatic");
+        std::fs::write(&path, b"saved screenshot").expect("saved file");
+        app.saved_capture_paths
+            .entry(card)
+            .or_default()
+            .insert(None, path.clone());
         app.card_retention.insert(card, (true, true));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let launched = Arc::clone(&observed);
+        app.file_launcher = Arc::new(move |action, path| {
+            launched
+                .lock()
+                .expect("launches")
+                .push((action, path.to_path_buf()));
+            Ok(())
+        });
         surface.inject(CardEvent::Save {
             card,
             choose_destination: false,
@@ -9226,12 +9563,169 @@ mod tests {
 
         app.tick();
 
-        assert!(surface.trace().contains(&SurfaceCall::Dismiss(card)));
-        assert!(
-            app.notes()
-                .iter()
-                .any(|note| note.contains("already saved to Export Location"))
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
+        assert_eq!(
+            *observed.lock().expect("launches"),
+            vec![(FileLaunchAction::Reveal, path.clone())]
         );
+        std::fs::remove_file(path).expect("remove export");
+    }
+
+    #[test]
+    fn successful_manual_save_exposes_the_exact_file_without_retiring_the_card() {
+        let (mut app, surface) = app();
+        let card = CardId(431);
+        let editor = redacted_editor();
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("source");
+        app.visible_cards.insert(card);
+        let path = temp_export_path("folder with spaces");
+        let action = app.allocate_output_action();
+        app.register_output_action(card, action, OutputActionKind::CardOutput, false);
+        assert!(app.pipeline.post(Job::SaveTo {
+            card,
+            path: path.clone(),
+            action
+        }));
+        assert!(
+            app.saved_capture_path(card).is_none(),
+            "queued is not saved"
+        );
+        drain_until(&mut app, |app| app.saved_capture_path(card).is_some());
+        assert_eq!(app.saved_capture_path(card), Some(&path));
+        assert!(path.is_file());
+        assert!(surface.trace().contains(&SurfaceCall::SetSaved {
+            id: card,
+            saved: true
+        }));
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
+        app.dismiss_recent_capture(card, "test cleanup");
+        assert!(!app.saved_capture_paths.contains_key(&card));
+        std::fs::remove_file(path).expect("remove export");
+    }
+
+    #[test]
+    fn saved_file_action_matches_the_exact_committed_editor_revision() {
+        let (mut app, surface) = app();
+        let card = CardId(432);
+        let editor = redacted_editor();
+        app.pipeline
+            .captures()
+            .store_test_capture(card, editor.document().source())
+            .expect("source");
+        app.visible_cards.insert(card);
+        let original = PathBuf::from("/tmp/original.png");
+        let edited = PathBuf::from("/tmp/edited.png");
+        app.saved_capture_paths
+            .entry(card)
+            .or_default()
+            .insert(None, original.clone());
+        let action = app.allocate_output_action();
+        app.register_output_action(card, action, OutputActionKind::EditorOutput, false);
+        app.pipeline.inject_outcome_for_test(Outcome::Done {
+            card,
+            detail: "saved edited screenshot".into(),
+            saved_path: Some(edited.clone()),
+            version: Some((9, 1)),
+            action,
+        });
+        app.drain_pipeline();
+        assert_eq!(
+            app.saved_capture_path(card),
+            Some(&original),
+            "an uncommitted export must not replace the card's file"
+        );
+        app.commit_card_output(
+            card,
+            9,
+            RevisionedFrame::from_document(editor.document(), 1).expect("render"),
+            editor.document().data(),
+        );
+        drain_until(&mut app, |app| {
+            app.saved_capture_path(card) == Some(&edited)
+        });
+        assert!(surface.trace().contains(&SurfaceCall::SetSaved {
+            id: card,
+            saved: true
+        }));
+        app.commit_card_output(
+            card,
+            9,
+            RevisionedFrame::from_document(editor.document(), 2).expect("render"),
+            editor.document().data(),
+        );
+        drain_until(&mut app, |app| {
+            app.pipeline
+                .captures()
+                .get(card)
+                .is_some_and(|bytes| bytes.revision() == 2)
+        });
+        assert!(
+            app.saved_capture_path(card).is_none(),
+            "later edits need a new save"
+        );
+    }
+
+    #[test]
+    fn missing_saved_file_returns_to_save_without_launching_a_browser() {
+        let (mut app, surface) = app();
+        let card = CardId(433);
+        app.saved_capture_paths
+            .entry(card)
+            .or_default()
+            .insert(None, temp_export_path("missing"));
+        app.card_retention.insert(card, (true, true));
+        app.file_launcher = Arc::new(|_, _| panic!("must not reveal a missing file"));
+        surface.inject(CardEvent::Reveal(card));
+        app.drain_cards(EditorSnapshots::EMPTY);
+        assert!(app.saved_capture_path(card).is_none());
+        assert!(surface.trace().contains(&SurfaceCall::SetSaved {
+            id: card,
+            saved: false
+        }));
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
+        assert_eq!(app.card_retention.get(&card), Some(&(false, false)));
+        app.handle_auto_close(
+            card,
+            RecentCapturesAutoCloseAction::Hide,
+            EditorSnapshots::EMPTY,
+        );
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(card)));
+    }
+
+    #[test]
+    fn overwriting_another_cards_export_revokes_its_durability() {
+        let (mut app, surface) = app();
+        let first = CardId(434);
+        let second = CardId(435);
+        let path = PathBuf::from("/tmp/shared-destination.png");
+        app.visible_cards.extend([first, second]);
+        app.saved_capture_paths
+            .entry(first)
+            .or_default()
+            .insert(None, path.clone());
+        app.card_retention.insert(first, (true, true));
+        let action = app.allocate_output_action();
+        app.register_output_action(second, action, OutputActionKind::CardOutput, false);
+        app.pipeline.inject_outcome_for_test(Outcome::Done {
+            card: second,
+            detail: "saved screenshot".into(),
+            saved_path: Some(path.clone()),
+            version: None,
+            action,
+        });
+        app.drain_pipeline();
+        assert!(app.saved_capture_path(first).is_none());
+        assert_eq!(app.saved_capture_path(second), Some(&path));
+        assert_eq!(app.card_retention.get(&first), Some(&(false, false)));
+        app.handle_auto_close(
+            first,
+            RecentCapturesAutoCloseAction::Hide,
+            EditorSnapshots::EMPTY,
+        );
+        assert!(!surface.trace().contains(&SurfaceCall::Dismiss(first)));
     }
 
     #[test]
@@ -10271,6 +10765,7 @@ mod tests {
         app.pipeline.inject_outcome_for_test(Outcome::Done {
             card,
             detail: "saved to disk".to_owned(),
+            saved_path: Some(PathBuf::from("/tmp/saved.png")),
             version: Some((1, 1)),
             action: save_action,
         });
@@ -10656,6 +11151,7 @@ mod tests {
         app.pipeline.inject_outcome_for_test(Outcome::Done {
             card,
             detail: "saved to Export Location".to_owned(),
+            saved_path: Some(PathBuf::from("/tmp/saved.png")),
             // Stale: answers for the exact generation Cancel just discarded.
             version: Some((generation, 1)),
             action,
@@ -10722,6 +11218,7 @@ mod tests {
         app.pipeline.inject_outcome_for_test(Outcome::Done {
             card,
             detail: "saved to Export Location".to_owned(),
+            saved_path: Some(PathBuf::from("/tmp/saved.png")),
             version: Some((generation, 1)),
             action,
         });
@@ -10764,6 +11261,7 @@ mod tests {
         app.pipeline.inject_outcome_for_test(Outcome::Done {
             card,
             detail: "saved to Export Location".to_owned(),
+            saved_path: Some(PathBuf::from("/tmp/saved.png")),
             version: Some((generation, 1)),
             action,
         });
@@ -10893,6 +11391,7 @@ mod tests {
         app.pipeline.inject_outcome_for_test(Outcome::Done {
             card,
             detail: "copied to the clipboard".to_owned(),
+            saved_path: None,
             // Stale: answers for the exact generation Cancel just discarded.
             version: Some((generation, 1)),
             action,
@@ -10969,6 +11468,7 @@ mod tests {
         app.pipeline.inject_outcome_for_test(Outcome::Done {
             card,
             detail: "saved to Export Location".to_owned(),
+            saved_path: Some(PathBuf::from("/tmp/saved.png")),
             // Stale: answers for revision 1, superseded by the commit above.
             version: Some((generation, 1)),
             action,
@@ -11040,6 +11540,7 @@ mod tests {
         app.pipeline.inject_outcome_for_test(Outcome::Done {
             card,
             detail: "copied to the clipboard".to_owned(),
+            saved_path: None,
             version: Some((generation, 1)),
             action: editor_action,
         });
@@ -11061,6 +11562,7 @@ mod tests {
         app.pipeline.inject_outcome_for_test(Outcome::Done {
             card,
             detail: "saved to Export Location".to_owned(),
+            saved_path: Some(PathBuf::from("/tmp/saved.png")),
             version: None,
             action: card_level_action,
         });
@@ -12274,6 +12776,43 @@ mod tests {
                 .any(|note| note.contains("were not saved")),
             "{:?}",
             app.notes()
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn screenshot_freeze_setting_persists_and_updates_the_live_capture_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "scrozz-app-screenshot-freeze-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = AfterCaptureStore::new(root.join("settings.json"));
+        let surface = Recording::new();
+        let mut config = Config::sealed();
+        config.after_capture = AfterCaptureSettings::fresh();
+        config.after_capture_store = Some(store.clone());
+        let mut app = App::new(
+            config,
+            Box::new(surface),
+            Arc::new(UnsupportedSelector::headless()),
+            false,
+        )
+        .unwrap();
+
+        app.edit_capture_settings(scrozz_ui::settings::CaptureSettings {
+            freeze_screen: true,
+            window_shadow: true,
+        });
+
+        assert!(app.capture_settings().freeze_screen);
+        assert_eq!(
+            store
+                .load(InstallProfile::Fresh)
+                .unwrap()
+                .value(crate::settings::FREEZE_SCREEN_KEY),
+            Some("true")
         );
         drop(app);
         let _ = std::fs::remove_dir_all(root);
@@ -13725,44 +14264,99 @@ mod tests {
         assert!(!app.take_settings_request());
     }
 
+    struct FixtureScrollingSelector;
+
+    impl RegionSelector for FixtureScrollingSelector {
+        fn name(&self) -> &'static str {
+            "fixture-scrolling-selector"
+        }
+
+        fn capabilities(&self) -> SelectionCapabilities {
+            SelectionCapabilities::CLIENT_OVERLAY
+        }
+
+        fn select(&self, _options: &SelectionOptions) -> scrozz_core::Result<SelectionOutcome> {
+            Ok(SelectionOutcome::region(
+                LogicalRect::new(
+                    LogicalPoint::new(100.0, 100.0),
+                    LogicalSize::new(800.0, 500.0),
+                ),
+                Some(DisplayId("fixture-display".to_owned())),
+                ScaleFactor::IDENTITY,
+                SelectionSource::Scripted,
+            )
+            .with_scrolling(ScrollControl::Manual))
+        }
+    }
+
+    impl CaptureSelector for FixtureScrollingSelector {}
+
     fn scrolling_app() -> (App, Recording) {
         let surface = Recording::new();
         let handle = surface.handle();
         let app = App::new_with_scrolling_target_resolver(
             Config::sealed(),
             Box::new(surface),
-            Arc::new(UnsupportedSelector::headless()),
+            Arc::new(FixtureScrollingSelector),
             false,
-            Box::new(|| Ok(fixture_scrolling_target())),
+            Box::new(|_, _| Ok(fixture_scrolling_target())),
         )
         .expect("a sealed app must start");
         (app, handle)
     }
 
+    fn finish_scrolling_area_selection(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.scrolling_selection.is_some() {
+            app.drain_scrolling_selection();
+            assert!(Instant::now() < deadline, "scrolling selection timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
-    fn scrolling_capture_opens_an_axis_picker_before_anything_is_posted() {
+    fn scrolling_selection_result_wakes_the_reactive_host_after_publication() {
+        let (send, receive) = channel();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, Ordering::AcqRel);
+        });
+
+        publish_scrolling_selection(send, Some(waker), Err(CoreError::Cancelled));
+
+        assert!(receive.recv().unwrap().is_err());
+        assert_eq!(wakes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn scrolling_selector_commits_area_and_controls_before_pipeline_start() {
         let (mut app, surface) = scrolling_app();
 
         assert_eq!(
             app.perform(Action::Capture(CaptureKind::Scrolling)),
             Tick::Continue
         );
+        finish_scrolling_area_selection(&mut app);
 
-        let hud = surface.scrolling_hud().expect("axis picker");
-        assert_eq!(hud.status, ScrollHudStatus::ChoosingAxis);
+        let hud = surface.scrolling_hud().expect("scrolling progress");
+        assert_eq!(hud.status, ScrollHudStatus::Prepared);
+        assert_eq!(hud.control, ScrollControl::Manual);
         assert!(
-            app.scrolling_card.is_none(),
-            "no card may be allocated until an axis is chosen"
+            app.scrolling_card.is_some() && app.scrolling_start_pending.is_some(),
+            "the selector's Start capture decision must carry directly into admission"
         );
     }
 
     #[test]
-    fn a_second_scrolling_invocation_cancels_an_unstarted_picker() {
+    fn cancel_closes_an_unstarted_scrolling_setup() {
         let (mut app, surface) = scrolling_app();
-        app.perform(Action::Capture(CaptureKind::Scrolling));
+        app.scrolling_target = Some(fixture_scrolling_target());
+        app.set_scroll_hud(ScrollHudState::configuring());
         assert!(surface.scrolling_hud().is_some());
 
-        app.perform(Action::Capture(CaptureKind::Scrolling));
+        surface.inject_scroll_action(ScrollHudAction::Cancel);
+        app.drain_cards(EditorSnapshots::EMPTY);
         assert!(surface.scrolling_hud().is_none());
         assert!(!surface.scroll_passthrough_requested());
     }
@@ -13771,9 +14365,13 @@ mod tests {
     fn automatic_scrolling_waits_only_where_overlay_passthrough_is_required() {
         let (mut app, surface) = scrolling_app();
         surface.set_scroll_passthrough_ready(false);
-        app.perform(Action::Capture(CaptureKind::Scrolling));
+        app.scrolling_target = Some(fixture_scrolling_target());
+        let mut state = ScrollHudState::configuring();
+        state.control = ScrollControl::Automatic;
+        state.automatic = true;
+        app.set_scroll_hud(state);
 
-        app.start_scrolling_capture(ScrollAxis::Vertical);
+        app.start_scrolling_capture();
         if cfg!(target_os = "macos") {
             assert!(
                 !surface.scroll_passthrough_requested(),
@@ -13805,7 +14403,7 @@ mod tests {
         let (mut app, surface) = scrolling_app();
         let card = CardId(17);
         app.scrolling_card = Some(card);
-        app.set_scroll_hud(ScrollHudState::prepared(ScrollAxis::Vertical, true));
+        app.set_scroll_hud(ScrollHudState::prepared(ScrollControl::Automatic));
         app.surface.request_scroll_passthrough(true);
 
         app.update_scroll_hud(
@@ -13825,17 +14423,40 @@ mod tests {
     }
 
     #[test]
+    fn first_viewport_movement_updates_the_hud_without_a_direction_picker() {
+        let (mut app, surface) = scrolling_app();
+        let card = CardId(170);
+        app.scrolling_card = Some(card);
+        app.set_scroll_hud(ScrollHudState::prepared(ScrollControl::Automatic));
+
+        app.update_scroll_hud(
+            card,
+            &Progress::DirectionDetected {
+                direction: scrozz_core::ScrollDirection::Left,
+            },
+        );
+
+        let state = surface.scrolling_hud().expect("scrolling HUD");
+        assert_eq!(state.direction, Some(scrozz_core::ScrollDirection::Left));
+        assert_eq!(state.status, ScrollHudStatus::Capturing);
+        assert!(state.automatic);
+    }
+
+    #[test]
     fn cancelled_and_failed_scrolling_sessions_release_every_ui_owner() {
-        for error in [
-            CliError::Core(CoreError::Cancelled),
-            CliError::Core(CoreError::Platform("scroll driver failed".to_owned())),
+        for (error, keeps_setup) in [
+            (CliError::Core(CoreError::Cancelled), false),
+            (
+                CliError::Core(CoreError::Platform("scroll driver failed".to_owned())),
+                true,
+            ),
         ] {
             let (mut app, surface) = scrolling_app();
             let card = CardId(18);
             app.scrolling_card = Some(card);
             app.scrolling_abort_pending = Some(card);
             app.scrolling_keep_pending = true;
-            app.set_scroll_hud(ScrollHudState::prepared(ScrollAxis::Vertical, true));
+            app.set_scroll_hud(ScrollHudState::prepared(ScrollControl::Automatic));
             app.surface.request_scroll_passthrough(true);
 
             assert!(app.finish_failed_scrolling_capture(card, &error));
@@ -13843,7 +14464,13 @@ mod tests {
             assert!(app.scrolling_card.is_none());
             assert!(app.scrolling_abort_pending.is_none());
             assert!(!app.scrolling_keep_pending);
-            assert!(surface.scrolling_hud().is_none());
+            assert_eq!(surface.scrolling_hud().is_some(), keeps_setup);
+            if keeps_setup {
+                assert!(matches!(
+                    surface.scrolling_hud().map(|state| state.status),
+                    Some(ScrollHudStatus::Failed(_))
+                ));
+            }
             assert!(!surface.scroll_passthrough_requested());
         }
     }
@@ -13853,7 +14480,7 @@ mod tests {
         let (mut app, surface) = scrolling_app();
         let card = CardId(19);
         app.scrolling_card = Some(card);
-        app.set_scroll_hud(ScrollHudState::prepared(ScrollAxis::Vertical, false));
+        app.set_scroll_hud(ScrollHudState::prepared(ScrollControl::Manual));
         assert!(app.pipeline.seal_scrolling_output_for_test());
 
         app.abort_scrolling_capture();
@@ -13870,8 +14497,12 @@ mod tests {
     #[test]
     fn shutting_down_never_leaves_the_overlay_click_through() {
         let (mut app, surface) = scrolling_app();
-        app.perform(Action::Capture(CaptureKind::Scrolling));
-        app.start_scrolling_capture(ScrollAxis::Vertical);
+        app.scrolling_target = Some(fixture_scrolling_target());
+        let mut state = ScrollHudState::configuring();
+        state.control = ScrollControl::Automatic;
+        state.automatic = true;
+        app.set_scroll_hud(state);
+        app.start_scrolling_capture();
         assert_eq!(
             surface.scroll_passthrough_requested(),
             !cfg!(target_os = "macos")
@@ -14490,6 +15121,10 @@ mod tests {
     #[test]
     fn documented_startup_capture_value_means_fullscreen() {
         assert_eq!(Config::capture_on_start("1"), Some(CaptureKind::Fullscreen));
+        assert_eq!(
+            Config::capture_on_start("scrolling"),
+            Some(CaptureKind::Scrolling)
+        );
     }
 
     #[test]

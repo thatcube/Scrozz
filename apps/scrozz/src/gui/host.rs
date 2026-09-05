@@ -1676,6 +1676,26 @@ impl Driver {
     }
 
     fn desired_card_target(&self) -> CardSurfaceTarget {
+        if let Some(surface) = self.handle.scroll_hud_surface() {
+            return scrolling_surface_target(surface);
+        }
+        if self.handle.scroll_hud_visible() {
+            if !self.handle.has_global_pointer_observation() {
+                let work_area = self.base_geometry.work_area;
+                return CardSurfaceTarget {
+                    geometry: RecentCapturesOverlayGeometry::with_content_viewport(
+                        work_area,
+                        egui::Rect::from_min_size(work_area.min, egui::vec2(1.0, 1.0)),
+                    ),
+                    scale: self.display_scale,
+                };
+            }
+            return CardSurfaceTarget {
+                geometry: self.base_geometry,
+                scale: self.display_scale,
+            };
+        }
+
         let stable_column = self.handle.has_global_pointer_observation();
         let occupied_slots = (!stable_column).then(|| {
             self.app
@@ -2181,6 +2201,17 @@ const CARD_READY_OBSERVATIONS: u8 = 2;
 struct CardSurfaceTarget {
     geometry: RecentCapturesOverlayGeometry,
     scale: Option<ScaleFactor>,
+}
+
+fn scrolling_surface_target(surface: scrozz_ui::ScrollHudSurface) -> CardSurfaceTarget {
+    let area = surface.work_area;
+    CardSurfaceTarget {
+        geometry: RecentCapturesOverlayGeometry::new(egui::Rect::from_min_size(
+            egui::pos2(area.origin.x as f32, area.origin.y as f32),
+            egui::vec2(area.size.width as f32, area.size.height as f32),
+        )),
+        scale: Some(surface.scale),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3530,6 +3561,21 @@ mod tests {
             geometry: card_surface_geometry(base),
             scale: Some(ScaleFactor::new(scale)),
         }
+    }
+
+    #[test]
+    fn scrolling_surface_target_keeps_the_selected_displays_global_origin() {
+        let target = scrolling_surface_target(scrozz_ui::ScrollHudSurface {
+            work_area: LogicalRect::new(
+                LogicalPoint::new(-1_920.0, 24.0),
+                LogicalSize::new(1_920.0, 1_056.0),
+            ),
+            scale: ScaleFactor::new(2.0),
+        });
+
+        assert_eq!(target.geometry.position(), egui::pos2(-1_920.0, 24.0));
+        assert_eq!(target.geometry.size(), egui::vec2(1_920.0, 1_056.0));
+        assert_eq!(target.scale, Some(ScaleFactor::new(2.0)));
     }
 
     fn exact_measurement(target: CardSurfaceTarget) -> ViewportMeasurement {

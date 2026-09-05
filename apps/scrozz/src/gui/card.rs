@@ -436,6 +436,8 @@ pub enum CardEvent {
         /// Whether the platform-native destination chooser should open.
         choose_destination: bool,
     },
+    /// Reveal the file saved for the card's current screenshot revision.
+    Reveal(CardId),
     /// Upload it to configured private storage and copy the link.
     Upload(CardId),
     /// A card's configured elapsed cleanup interval expired.
@@ -491,6 +493,7 @@ impl CardEvent {
     pub const fn card(&self) -> Option<CardId> {
         match self {
             Self::Copy(id)
+            | Self::Reveal(id)
             | Self::Upload(id)
             | Self::AutoClose(id, _)
             | Self::Dismiss(id)
@@ -584,6 +587,9 @@ pub trait CardSurface {
 
     /// Shows or clears action status on a card.
     fn set_status(&mut self, _id: CardId, _status: Option<String>) {}
+
+    /// Updates whether the current screenshot revision has a saved file.
+    fn set_saved(&mut self, _id: CardId, _saved: bool) {}
 
     /// Applies durability metadata that became available after card readiness.
     fn finalize_capture(
@@ -773,6 +779,13 @@ pub enum SurfaceCall {
         /// The status text now shown, or `None` if it was cleared.
         status: Option<String>,
     },
+    /// The current screenshot revision gained or lost its saved-file action.
+    SetSaved {
+        /// Which card.
+        id: CardId,
+        /// Whether its current revision has a saved file.
+        saved: bool,
+    },
 }
 
 impl Default for Recording {
@@ -945,6 +958,10 @@ impl CardSurface for Recording {
 
     fn set_status(&mut self, id: CardId, status: Option<String>) {
         self.record(SurfaceCall::SetStatus { id, status });
+    }
+
+    fn set_saved(&mut self, id: CardId, saved: bool) {
+        self.record(SurfaceCall::SetSaved { id, saved });
     }
 
     fn poll_drag_starts(&mut self) -> Vec<CardEvent> {

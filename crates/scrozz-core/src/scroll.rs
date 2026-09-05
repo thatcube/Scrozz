@@ -41,6 +41,57 @@ pub enum ScrollAxis {
     Horizontal,
 }
 
+/// The direction a viewport moves through document content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ScrollDirection {
+    /// Earlier rows enter from the top.
+    Up,
+    /// Later rows enter from the bottom.
+    #[default]
+    Down,
+    /// Earlier columns enter from the left.
+    Left,
+    /// Later columns enter from the right.
+    Right,
+}
+
+impl ScrollDirection {
+    /// Axis this direction travels along.
+    #[must_use]
+    pub const fn axis(self) -> ScrollAxis {
+        match self {
+            Self::Up | Self::Down => ScrollAxis::Vertical,
+            Self::Left | Self::Right => ScrollAxis::Horizontal,
+        }
+    }
+
+    /// Whether chronological frames need reversing before append-only stitching.
+    #[must_use]
+    pub const fn is_reverse(self) -> bool {
+        matches!(self, Self::Up | Self::Left)
+    }
+
+    /// Applies this direction to a positive movement magnitude.
+    #[must_use]
+    pub fn amount(self, magnitude: f64) -> f64 {
+        if self.is_reverse() {
+            -magnitude.abs()
+        } else {
+            magnitude.abs()
+        }
+    }
+}
+
+/// Who moves the selected content during a scrolling capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ScrollControl {
+    /// The user scrolls while Scrozz follows the selected area.
+    #[default]
+    Manual,
+    /// Scrozz posts conservative wheel input into the selected window.
+    Automatic,
+}
+
 /// How, or whether, this platform can move a foreign window's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScrollSynthesis {
@@ -157,6 +208,18 @@ impl ScrollGesture {
         }
     }
 
+    /// An upward scroll of `amount` logical points at `at`.
+    #[must_use]
+    pub const fn up(at: LogicalPoint, amount: f64) -> Self {
+        Self {
+            axis: ScrollAxis::Vertical,
+            at,
+            display: None,
+            window: None,
+            amount: -amount,
+        }
+    }
+
     /// A rightward scroll of `amount` logical points at `at`.
     #[must_use]
     pub const fn right(at: LogicalPoint, amount: f64) -> Self {
@@ -167,6 +230,32 @@ impl ScrollGesture {
             window: None,
             amount,
         }
+    }
+
+    /// A leftward scroll of `amount` logical points at `at`.
+    #[must_use]
+    pub const fn left(at: LogicalPoint, amount: f64) -> Self {
+        Self {
+            axis: ScrollAxis::Horizontal,
+            at,
+            display: None,
+            window: None,
+            amount: -amount,
+        }
+    }
+
+    /// Direction represented by this gesture, or `None` for a no-op.
+    #[must_use]
+    pub fn direction(&self) -> Option<ScrollDirection> {
+        if self.is_noop() {
+            return None;
+        }
+        Some(match (self.axis, self.amount.is_sign_negative()) {
+            (ScrollAxis::Vertical, true) => ScrollDirection::Up,
+            (ScrollAxis::Vertical, false) => ScrollDirection::Down,
+            (ScrollAxis::Horizontal, true) => ScrollDirection::Left,
+            (ScrollAxis::Horizontal, false) => ScrollDirection::Right,
+        })
     }
 
     /// Binds this gesture to the display selected for capture.
@@ -329,5 +418,26 @@ mod tests {
         assert!(ScrollGesture::down(at, 0.0).is_noop());
         assert!(ScrollGesture::down(at, f64::NAN).is_noop());
         assert!(!ScrollGesture::down(at, -40.0).is_noop());
+    }
+
+    #[test]
+    fn gesture_signs_map_to_all_four_directions() {
+        let at = LogicalPoint::new(0.0, 0.0);
+        assert_eq!(
+            ScrollGesture::up(at, 40.0).direction(),
+            Some(ScrollDirection::Up)
+        );
+        assert_eq!(
+            ScrollGesture::down(at, 40.0).direction(),
+            Some(ScrollDirection::Down)
+        );
+        assert_eq!(
+            ScrollGesture::left(at, 40.0).direction(),
+            Some(ScrollDirection::Left)
+        );
+        assert_eq!(
+            ScrollGesture::right(at, 40.0).direction(),
+            Some(ScrollDirection::Right)
+        );
     }
 }

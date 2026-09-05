@@ -223,7 +223,7 @@ The post-capture floating thumbnail. Small surface, enormous share of daily-use 
 | ID | Feature | Tier | Notes |
 |---|---|---|---|
 | QA-01 | Post-capture floating overlay | T0 | **Implemented:** dedicated Recent Captures Overlay Settings category, immediate runtime updates, and persisted platform-adaptive controls |
-| QA-02 | Copy / save / annotate from overlay | T0 | **Implemented:** Copy and Save close only after successful output; Save supports Export Location or a native destination chooser |
+| QA-02 | Copy / save / annotate from overlay | T0 | **Implemented:** Copy closes after successful output; Save keeps the card and becomes a folder action for its exact saved revision. Folder reveals the saved file; Option/Alt-click opens Save As. Save supports Export Location or a native destination chooser |
 | QA-03 | **Drag & drop to any app** | **T0** | **Implemented:** accepted external drops may close the card; cancel, rejection, and failure restore it. Option/Alt keeps it for one accepted drop |
 | QA-04 | Display file information | T2 | |
 | QA-05 | Restore recently closed overlay | T2 | |

@@ -11,6 +11,7 @@ use crate::scroll_units;
 const CAPABILITY: &str = "Accessibility control for scrolling other applications";
 const REMEDY: &str =
     "System Settings → Privacy & Security → Accessibility: switch Scrozz on, then retry";
+const LINE_TICKS_PER_STEP: i32 = 3;
 
 /// Scroll synthesis through `CGEventPost`.
 #[derive(Debug, Default)]
@@ -110,12 +111,13 @@ impl CgEventScrollDriver {
     }
 
     fn post(pid: libc::pid_t, gesture: &ScrollGesture) -> Result<()> {
-        let (wheel1, wheel2) = scroll_units::macos_deltas(gesture.axis, gesture.amount);
+        let (wheel1, wheel2) =
+            scroll_units::macos_line_deltas(gesture.axis, gesture.amount, LINE_TICKS_PER_STEP);
         let event =
-            CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Pixel, 2, wheel1, wheel2, 0)
+            CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Line, 2, wheel1, wheel2, 0)
                 .ok_or_else(|| {
-                    Error::Platform("CGEventCreateScrollWheelEvent2 returned null".into())
-                })?;
+                Error::Platform("CGEventCreateScrollWheelEvent2 returned null".into())
+            })?;
 
         CGEvent::set_location(Some(&event), CGPoint::new(gesture.at.x, gesture.at.y));
         CGEvent::post_to_pid(pid, Some(&event));
@@ -131,11 +133,12 @@ impl ScrollDriver for CgEventScrollDriver {
     fn expected_physical_delta(
         &self,
         gesture: &ScrollGesture,
-        frame_scale: ScaleFactor,
+        _frame_scale: ScaleFactor,
     ) -> Option<u32> {
-        let physical = gesture.amount * frame_scale.get();
-        (physical.is_finite() && physical > 0.0)
-            .then(|| physical.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+        let _ = gesture;
+        // Applications choose their own line height and acceleration. A guessed
+        // pixel prior can bias alignment away from the seam actually produced.
+        None
     }
 
     fn prepare(&mut self) -> Result<()> {
@@ -159,17 +162,6 @@ impl ScrollDriver for CgEventScrollDriver {
         Self::ensure_trusted()?;
         let pid = Self::ensure_selected_window_owns_point(gesture)?;
         Self::post(pid, gesture)?;
-        let current_pid = Self::ensure_selected_window_owns_point(gesture)?;
-        if current_pid != pid {
-            return Err(Error::TargetGone(format!(
-                "window {} changed owning process while scrolling",
-                gesture
-                    .window
-                    .as_ref()
-                    .expect("ownership was checked above")
-                    .0
-            )));
-        }
         Ok(())
     }
 
@@ -192,14 +184,14 @@ mod tests {
     use super::CgEventScrollDriver;
 
     #[test]
-    fn pixel_scrolls_expose_a_physical_alignment_prior() {
+    fn line_scrolls_do_not_invent_a_physical_alignment_prior() {
         let driver = CgEventScrollDriver::new();
         assert_eq!(
             driver.expected_physical_delta(
                 &ScrollGesture::down(LogicalPoint::new(10.0, 20.0), 120.0),
                 ScaleFactor::new(1.5),
             ),
-            Some(180)
+            None
         );
     }
 

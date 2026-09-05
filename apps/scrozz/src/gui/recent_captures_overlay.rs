@@ -54,6 +54,7 @@ pub struct RecentCapturesOverlayCards {
     reverse: HashMap<CardId, u64>,
     /// Durability that completed before the overlay acknowledged its push.
     pending_finalization: HashMap<CardId, (Option<CaptureId>, Option<String>)>,
+    pending_saved: HashMap<CardId, bool>,
     /// Durable pin identity to the card that created it.
     pinned: HashMap<String, CardId>,
     /// Translated events beyond the one this poll returned.
@@ -80,6 +81,7 @@ impl RecentCapturesOverlayCards {
             mapped: HashMap::new(),
             reverse: HashMap::new(),
             pending_finalization: HashMap::new(),
+            pending_saved: HashMap::new(),
             pinned: HashMap::new(),
             queued: VecDeque::new(),
             scroll_actions: VecDeque::new(),
@@ -101,6 +103,7 @@ impl RecentCapturesOverlayCards {
 
     fn forget(&mut self, ours: CardId) {
         self.pending_finalization.remove(&ours);
+        self.pending_saved.remove(&ours);
         if let Some(theirs) = self.reverse.remove(&ours) {
             self.mapped.remove(&theirs);
         }
@@ -134,6 +137,15 @@ impl CardSurface for RecentCapturesOverlayCards {
         if let Some(theirs) = self.reverse.get(&id).copied() {
             self.handle
                 .set_status(scrozz_ui::stack::CardId(theirs), status);
+        }
+    }
+
+    fn set_saved(&mut self, id: CardId, saved: bool) {
+        if let Some(theirs) = self.reverse.get(&id).copied() {
+            self.handle
+                .set_saved(scrozz_ui::stack::CardId(theirs), saved);
+        } else if self.pending.contains(&id) {
+            self.pending_saved.insert(id, saved);
         }
     }
 
@@ -369,6 +381,9 @@ impl RecentCapturesOverlayCards {
                         if let Some((capture, written)) = self.pending_finalization.remove(&ours) {
                             self.finalize_capture(ours, capture, written);
                         }
+                        if let Some(saved) = self.pending_saved.remove(&ours) {
+                            self.set_saved(ours, saved);
+                        }
                     } else {
                         tracing::warn!(
                             overlay_card = id.0,
@@ -390,6 +405,11 @@ impl RecentCapturesOverlayCards {
                 RecentCapturesOverlayEvent::CopyRequested { id } => {
                     if let Some(ours) = self.mapped.get(&id.0).copied() {
                         out.push(CardEvent::Copy(ours));
+                    }
+                }
+                RecentCapturesOverlayEvent::RevealRequested { id } => {
+                    if let Some(ours) = self.mapped.get(&id.0).copied() {
+                        out.push(CardEvent::Reveal(ours));
                     }
                 }
                 RecentCapturesOverlayEvent::SaveRequested {
@@ -535,6 +555,7 @@ fn request_for_card(card: &Card) -> CaptureRequest {
         card.upload_unavailable_reason.clone(),
     );
     request.source_px = card.source_px();
+    request.saved = !card.written.is_empty();
     if let Some(capture) = &card.capture_id {
         request = request.with_pin_id(capture.0.clone());
     }
@@ -602,6 +623,26 @@ mod tests {
         let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
         surface.present(card(1)).expect("push never refuses");
         assert_eq!(surface.len(), 1);
+    }
+
+    #[test]
+    fn saved_state_survives_push_ack_and_reveal_routes_to_the_same_card() {
+        let mut capture = card(7);
+        assert!(!request_for_card(&capture).saved);
+        capture.written.push("/tmp/screenshot.png".into());
+        assert!(request_for_card(&capture).saved);
+        let mut surface = RecentCapturesOverlayCards::new(RecentCapturesOverlayHandle::new());
+        surface.present(capture).expect("push");
+        surface.set_saved(CardId(7), true);
+        assert_eq!(surface.pending_saved.get(&CardId(7)), Some(&true));
+        surface
+            .handle
+            .report(RecentCapturesOverlayEvent::Pushed { id: UiCardId(19) });
+        surface
+            .handle
+            .report(RecentCapturesOverlayEvent::RevealRequested { id: UiCardId(19) });
+        assert_eq!(surface.poll(), Some(CardEvent::Reveal(CardId(7))));
+        assert!(surface.pending_saved.is_empty());
     }
 
     #[test]

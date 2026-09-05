@@ -156,7 +156,7 @@ stop_macos_app() {
     sleep 0.1
   done
 
-  echo "build: the existing Scrozz process did not stop; the new app was installed but not opened" >&2
+  echo "build: the existing Scrozz process did not stop; its installed bundle was left untouched" >&2
   return 1
 }
 
@@ -181,12 +181,14 @@ cmd_build() {
     return
   fi
 
+  stop_macos_app || return
   tools/make-app-bundle.sh "$MACOS_APP" || return
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$MACOS_APP" || return
   if [[ "${SCROZZ_BUILD_NO_LAUNCH:-0}" == "1" ]]; then
     echo "==> installed $MACOS_APP (relaunch suppressed)"
     return
   fi
-  stop_macos_app || return
   launch_macos_app
 }
 

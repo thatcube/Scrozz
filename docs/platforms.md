@@ -175,11 +175,13 @@ Shift constrains creation or movement to one axis while held, and Option/Alt
 grows from center. All-in-One exposes the available modes in the same HUD rather
 than opening a second picker.
 
-Freeze is off by default. When enabled it applies to region and single-display
-choices, where the pre-overlay
-display frame can be returned exactly (and cropped for a region). Window mode
-stays live so the backend can preserve the window's native isolation, shape and
-shadow; all-display mode stays live so the backend owns mixed-scale composition.
+**Settings → Screenshots → Freeze screen when taking a screenshot** is off by
+default. When enabled it applies to region and single-display choices, where the
+pre-overlay display frame can be returned exactly (and cropped for a region).
+Window mode stays live so the backend can preserve the window's native
+isolation, shape and shadow; all-display mode stays live so the backend owns
+mixed-scale composition. An explicit CLI `--freeze` or `--freeze=false`
+overrides the saved preference for that capture.
 Frozen frames and thumbnails are presentation data only: they are never inserted
 into the window target list and cannot become a desktop-sized capture candidate.
 The long-running root window is constructed hidden and parked off-screen because
@@ -336,12 +338,26 @@ down in reverse order when dropped. Every `capture_frame` returns the newest
 complete observation that is newer than the previously delivered one, so a frame
 buffered while the page was still settling is accepted rather than flushed.
 
+The app does not guess a scrolling window. The user first draws the exact area
+inside one visible application window, then chooses **Manual** or **Automatic**
+and presses **Start capture**. The first coherent viewport displacement selects
+up, down, left, or right from the captured pixels—there is no axis or direction
+picker to get wrong. Manual mode follows that route while the user scrolls and
+ends only when **Finish** is pressed. Automatic mode waits for that first user
+scroll, then continues in the same direction with bounded native wheel steps and
+stops at repeated end-of-content frames. Reverse routes are normalized before
+append-only stitching and flipped back for a naturally ordered final image. A
+failed automatic attempt keeps setup visible so the same area can be retried
+manually.
+
 Input delivery is per-platform and never global:
 
-* **macOS** synthesizes target-bound wheel gestures. The selected window is
+* **macOS** synthesizes small, line-based target-bound wheel gestures. The selected window is
   resolved against CoreGraphics' documented front-to-back list before a gesture
   is posted, so a window that moved behind another after selection is an error
-  rather than a scroll delivered to whatever is now on top.
+  rather than a scroll delivered to whatever is now on top. One retained
+  ScreenCaptureKit filter/configuration supplies every frame, and its own
+  point-to-pixel scale is carried into frame metadata.
 * **Windows** does not use global `SendInput`: wheel input normally follows
   keyboard focus, which could scroll a terminal or another window after a focus
   change. Scrozz snapshots the selected `HWND` together with its process creation

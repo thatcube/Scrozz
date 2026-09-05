@@ -11,8 +11,8 @@ use scrozz_core::{
 
 use super::geom::{self, DisplayLayout};
 
-const HANDLE_RADIUS: f64 = 7.0;
-const EDGE_BAND: f64 = 8.0;
+const HANDLE_RADIUS: f64 = 10.0;
+const EDGE_BAND: f64 = 12.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisDirection {
@@ -777,6 +777,7 @@ impl SelectionState {
                 display: None,
                 scale: ScaleFactor::IDENTITY,
                 source: SelectionSource::ClientOverlay,
+                scrolling: None,
             }),
             SelectionMode::Window => self.commit_window().or_else(|| {
                 self.announcement = Some(SelectionAnnouncement(
@@ -819,6 +820,14 @@ impl SelectionState {
         }
         let rect = self.region?;
         handle_at_point(rect, point)
+    }
+
+    #[must_use]
+    pub fn is_creating_region(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Creating { .. } | Phase::PlacingExact { .. }
+        )
     }
 
     fn begin_region_gesture(&mut self, point: LogicalPoint, display: Option<&DisplayId>) {
@@ -919,6 +928,7 @@ impl SelectionState {
             display: Some(display.id.clone()),
             scale: display.scale,
             source: SelectionSource::ClientOverlay,
+            scrolling: None,
         })
     }
 
@@ -932,6 +942,7 @@ impl SelectionState {
             display: Some(window.display.clone()),
             scale: display.scale,
             source: SelectionSource::ClientOverlay,
+            scrolling: None,
         })
     }
 

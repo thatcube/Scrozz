@@ -15,6 +15,14 @@ pub(crate) fn macos_deltas(axis: ScrollAxis, amount: f64) -> (i32, i32) {
     }
 }
 
+pub(crate) fn macos_line_deltas(axis: ScrollAxis, amount: f64, ticks_per_step: i32) -> (i32, i32) {
+    let delta = rounded_nonzero(amount).signum() * ticks_per_step.max(1);
+    match axis {
+        ScrollAxis::Vertical => (-delta, 0),
+        ScrollAxis::Horizontal => (0, -delta),
+    }
+}
+
 pub(crate) fn windows_delta(axis: ScrollAxis, amount: f64) -> i32 {
     let delta = rounded_nonzero(amount).signum() * POINTS_PER_NOTCH as i32;
     match axis {
@@ -101,6 +109,8 @@ mod tests {
     fn a_subpoint_nonzero_gesture_is_not_lost_to_integer_rounding() {
         assert_eq!(windows_delta(ScrollAxis::Vertical, 0.1), -120);
         assert_eq!(macos_deltas(ScrollAxis::Horizontal, -0.1), (0, 1));
+        assert_eq!(macos_line_deltas(ScrollAxis::Vertical, 800.0, 3), (-3, 0));
+        assert_eq!(macos_line_deltas(ScrollAxis::Horizontal, -800.0, 3), (0, 3));
     }
 
     #[test]

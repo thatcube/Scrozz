@@ -873,6 +873,26 @@ impl AfterCaptureStore {
         self.with_lock(|| self.load_unlocked(profile))
     }
 
+    /// Loads effective settings without creating or rewriting the document.
+    ///
+    /// Used by dry-run planning, where reading user intent is required but any
+    /// persistence side effect would violate the command contract.
+    pub fn load_read_only(&self, profile: InstallProfile) -> Result<AfterCaptureSettings> {
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(profile.defaults());
+            }
+            Err(error) => {
+                return Err(Error::Storage(format!(
+                    "could not read {}: {error}",
+                    self.path.display()
+                )));
+            }
+        };
+        AfterCaptureSettings::from_json(&text).map(|(settings, _, _)| settings)
+    }
+
     fn load_unlocked(&self, profile: InstallProfile) -> Result<AfterCaptureSettings> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,

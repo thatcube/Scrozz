@@ -63,10 +63,12 @@ use crate::icons::{Icon, IconStore};
 use crate::motion::{Motion, fade};
 use crate::paint::{self, Surface};
 use crate::pinned;
-use crate::scrolling::{ScrollHudAction, ScrollHudState, ScrollingHud};
+use crate::scrolling::{
+    ScrollHudAction, ScrollHudState, ScrollHudStatus, ScrollHudSurface, ScrollingHud,
+};
 pub use crate::stack::RecentCapturesPlacement;
 use crate::stack::{CaptureStack, CardFrame, CardId, CardMetrics, CardState, Intent, dock};
-use crate::theme::{Appearance, Radius, Text, Theme, corner};
+use crate::theme::{Appearance, Radius, Space, Text, Theme, corner};
 
 /// Default longest edge, in pixels, of a card thumbnail.
 ///
@@ -621,6 +623,8 @@ pub struct CaptureRequest {
     pub pin_id: Option<PinId>,
     /// File name shown in the caption.
     pub name: String,
+    /// Whether this screenshot revision already has a saved export.
+    pub saved: bool,
     /// Where the pixels came from. Decides the chrome (D9).
     pub provenance: Provenance,
     /// The capture's own pixel dimensions, shown in the caption.
@@ -646,6 +650,7 @@ impl CaptureRequest {
         Self {
             pin_id: None,
             name: name.into(),
+            saved: false,
             provenance,
             source_px,
             source_scale: 1.0,
@@ -684,6 +689,7 @@ impl CaptureRequest {
         Some(Self {
             pin_id: None,
             name: name.into(),
+            saved: false,
             provenance,
             source_px,
             source_scale: frame.scale.get(),
@@ -780,6 +786,11 @@ pub enum RecentCapturesOverlayEvent {
         id: CardId,
         /// Whether the native destination chooser should be used.
         choose_destination: bool,
+    },
+    /// Reveal this screenshot's existing saved file.
+    RevealRequested {
+        /// The card.
+        id: CardId,
     },
     /// Open this capture in the annotation editor.
     AnnotateRequested {
@@ -916,6 +927,10 @@ enum Command {
     SetStatus {
         id: CardId,
         status: Option<String>,
+    },
+    SetSaved {
+        id: CardId,
+        saved: bool,
     },
     FinalizeCapture {
         id: CardId,
@@ -1097,6 +1112,16 @@ impl RecentCapturesOverlayHandle {
             .is_ok_and(|slot| slot.is_some())
     }
 
+    /// Display geometry currently reserved for scrolling capture.
+    #[must_use]
+    pub fn scroll_hud_surface(&self) -> Option<ScrollHudSurface> {
+        self.shared
+            .scroll_hud
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().and_then(|state| state.surface))
+    }
+
     /// Keep the native overlay mouse-transparent while automatic scrolling is
     /// delivering globally addressed input.
     pub fn request_scroll_passthrough(&self, requested: bool) {
@@ -1135,6 +1160,11 @@ impl RecentCapturesOverlayHandle {
     /// Backfills durable identity and any automatic-export file name.
     pub fn finalize_capture(&self, id: CardId, pin_id: Option<PinId>, name: Option<String>) {
         self.command(Command::FinalizeCapture { id, pin_id, name });
+    }
+
+    /// Changes Save into Reveal only after the displayed revision reaches disk.
+    pub fn set_saved(&self, id: CardId, saved: bool) {
+        self.command(Command::SetSaved { id, saved });
     }
 
     /// Updates what Upload can do for one card.
@@ -1509,6 +1539,29 @@ const fn automatic_passthrough_without_pointer(empty: bool) -> bool {
     empty
 }
 
+const fn detach_scroll_controls(passthrough_requested: bool, global_pointer: bool) -> bool {
+    passthrough_requested || !global_pointer
+}
+
+fn detached_scroll_dismiss_action(
+    status: &ScrollHudStatus,
+    dismissed: bool,
+) -> Option<ScrollHudAction> {
+    if !dismissed || matches!(status, ScrollHudStatus::Finalizing) {
+        return None;
+    }
+    Some(
+        if matches!(
+            status,
+            ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_)
+        ) {
+            ScrollHudAction::Cancel
+        } else {
+            ScrollHudAction::Abort
+        },
+    )
+}
+
 #[cfg(not(target_os = "macos"))]
 const PASSTHROUGH_POINTER_POLL: Duration = Duration::from_millis(8);
 
@@ -1738,6 +1791,7 @@ pub fn downscale(image: &egui::ColorImage, max_edge: u32) -> Option<egui::ColorI
 
 struct Entry {
     name: String,
+    saved: bool,
     provenance: Provenance,
     source_px: (u32, u32),
     pin_id: Option<PinId>,
@@ -1765,6 +1819,7 @@ impl Entry {
         let mut content = CardContent::new(&self.name, self.source_px, self.provenance)
             .with_media(self.media.card_media());
         content.editing = self.editing;
+        content.saved = self.saved;
         content.accent = self.accent;
         content.upload_enabled = self.upload_available;
         content.upload_unavailable_reason = self.upload_unavailable_reason.as_deref();
@@ -2193,6 +2248,7 @@ impl RecentCapturesOverlayApp {
                 id,
                 Entry {
                     name: request.name,
+                    saved: request.saved,
                     provenance: request.provenance,
                     source_px: request.source_px,
                     pin_id: request.pin_id,
@@ -2227,6 +2283,11 @@ impl RecentCapturesOverlayApp {
                 Command::SetStatus { id, status } => {
                     if let Some(entry) = self.content.get_mut(&id) {
                         entry.status = status;
+                    }
+                }
+                Command::SetSaved { id, saved } => {
+                    if let Some(entry) = self.content.get_mut(&id) {
+                        entry.saved = saved;
                     }
                 }
                 Command::FinalizeCapture { id, pin_id, name } => {
@@ -2869,6 +2930,76 @@ impl RecentCapturesOverlayApp {
         self.apply_pin_menu_command(ctx, menu.pin, command);
     }
 
+    fn should_detach_scroll_controls(&self) -> bool {
+        let requested = self
+            .handle
+            .shared
+            .scroll_passthrough_requested
+            .load(Ordering::Acquire);
+        let global_pointer = self
+            .handle
+            .shared
+            .global_pointer_observation
+            .load(Ordering::Acquire);
+        detach_scroll_controls(requested, global_pointer)
+    }
+
+    fn draw_detached_scroll_hud(
+        &mut self,
+        ctx: &egui::Context,
+        state: &ScrollHudState,
+        root: Rect,
+    ) {
+        let controls = ScrollingHud::control_rect(root, state);
+        let size = ScrollingHud::detached_viewport_size(state, self.geometry.work_area.width());
+        let safe = self.geometry.work_area;
+        let mut position = if state.selection.is_some() {
+            self.geometry.position() + controls.min.to_vec2() - Vec2::new(Space::LG, Space::SM)
+        } else {
+            egui::pos2(
+                safe.center().x - size.x * 0.5,
+                safe.bottom() - size.y - Space::XL,
+            )
+        };
+        position.x = position
+            .x
+            .clamp(safe.left(), (safe.right() - size.x).max(safe.left()));
+        position.y = position
+            .y
+            .clamp(safe.top(), (safe.bottom() - size.y).max(safe.top()));
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Scrolling Capture Controls")
+            .with_app_id("com.scrozz.scrolling-controls")
+            .with_inner_size(size)
+            .with_position(position)
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_active(false)
+            .with_mouse_passthrough(false)
+            .with_close_button(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false)
+            .with_has_shadow(false);
+        let theme = self.theme;
+        let response =
+            ctx.show_viewport_immediate(scrolling_controls_viewport_id(), builder, |ui, _class| {
+                let mut response = ScrollingHud::draw_detached(ui, &theme, state, true);
+                let dismissed = ui.input(|input| {
+                    input.viewport().close_requested() || input.key_pressed(egui::Key::Escape)
+                });
+                response.action = response
+                    .action
+                    .or_else(|| detached_scroll_dismiss_action(&state.status, dismissed));
+                response
+            });
+        if let Some(action) = response.action {
+            self.emit(RecentCapturesOverlayEvent::Scrolling(action));
+        }
+    }
+
     fn apply_pin_menu_command(&mut self, ctx: &egui::Context, pin: PinId, command: PinMenuCommand) {
         match command {
             PinMenuCommand::Content(action) => {
@@ -2971,11 +3102,13 @@ impl RecentCapturesOverlayApp {
         // Automatic scrolling delivers globally addressed wheel input, which the
         // overlay would otherwise swallow. The request outranks the pointer
         // heuristic for as long as it is held.
-        let forced = self
+        let requested = self
             .handle
             .shared
             .scroll_passthrough_requested
             .load(Ordering::Acquire);
+        let forced =
+            requested || (self.handle.scroll_hud_visible() && self.should_detach_scroll_controls());
         let desired = if forced {
             true
         } else if self.dragging.is_some() || self.armed.is_some() {
@@ -3087,6 +3220,17 @@ impl RecentCapturesOverlayApp {
                         self.settings.save_behavior,
                         alt_held,
                     ),
+                }),
+                false,
+            ),
+            CardAction::Reveal => (
+                Some(if alt_held {
+                    RecentCapturesOverlayEvent::SaveRequested {
+                        id,
+                        choose_destination: true,
+                    }
+                } else {
+                    RecentCapturesOverlayEvent::RevealRequested { id }
                 }),
                 false,
             ),
@@ -3230,6 +3374,10 @@ fn pin_viewport_id(id: &PinId) -> egui::ViewportId {
 
 fn pin_menu_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("scrozz-pinned-capture-menu")
+}
+
+fn scrolling_controls_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("scrozz-scrolling-controls")
 }
 
 fn trusted_pin_menu_anchor(
@@ -3635,6 +3783,9 @@ impl eframe::App for RecentCapturesOverlayApp {
             .lock()
             .ok()
             .and_then(|state| state.clone());
+        let detached_scroll_controls = scroll_hud
+            .as_ref()
+            .is_some_and(|_| self.should_detach_scroll_controls());
         for f in &frames {
             let Some(entry) = self.content.get(&f.id) else {
                 continue;
@@ -3679,20 +3830,25 @@ impl eframe::App for RecentCapturesOverlayApp {
         // hit-tests after every card and dock element. A card arriving during a
         // long scroll must never cover Stop/Keep/Discard or steal that click.
         if let Some(state) = scroll_hud.as_ref() {
-            let response = ScrollingHud::draw(ui, &self.theme, state, true);
-            hits.push(response.rect);
-            if pointer.is_some_and(|pointer| response.rect.contains(pointer)) {
-                hovered = None;
-                action = None;
-                drag_start = None;
-                drag_to = None;
-                cancel_drag_for_hud =
-                    self.dragging.is_some() && ctx.input(|input| input.pointer.any_released());
-                drag_end = false;
-                dock_clicked = false;
-            }
-            if let Some(action) = response.action {
-                self.emit(RecentCapturesOverlayEvent::Scrolling(action));
+            if detached_scroll_controls {
+                ScrollingHud::draw_boundary(ui, state);
+                self.draw_detached_scroll_hud(&ctx, state, ui.max_rect());
+            } else {
+                let response = ScrollingHud::draw(ui, &self.theme, state, true);
+                hits.push(response.rect);
+                if pointer.is_some_and(|pointer| response.rect.contains(pointer)) {
+                    hovered = None;
+                    action = None;
+                    drag_start = None;
+                    drag_to = None;
+                    cancel_drag_for_hud =
+                        self.dragging.is_some() && ctx.input(|input| input.pointer.any_released());
+                    drag_end = false;
+                    dock_clicked = false;
+                }
+                if let Some(action) = response.action {
+                    self.emit(RecentCapturesOverlayEvent::Scrolling(action));
+                }
             }
         }
 
@@ -4102,6 +4258,7 @@ mod tests {
         let accent = card::glow::sample_accent(&image);
         let entry = Entry {
             name: "capture.png".to_owned(),
+            saved: true,
             provenance: Provenance::Display,
             source_px: (2, 2),
             pin_id: None,
@@ -4120,6 +4277,7 @@ mod tests {
 
         let content = entry.card_content();
         assert_eq!(content.accent, Some(accent));
+        assert_eq!(content.save_action(), CardAction::Reveal);
         assert!(content.editing);
         assert!(!content.pin_enabled);
         assert!(content.pin_unavailable_reason.is_some());
@@ -4557,6 +4715,29 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_controls_detach_before_the_root_becomes_click_through() {
+        assert!(detach_scroll_controls(true, true));
+        assert!(detach_scroll_controls(false, false));
+        assert!(!detach_scroll_controls(false, true));
+    }
+
+    #[test]
+    fn detached_controls_ignore_escape_once_output_is_finalizing() {
+        assert_eq!(
+            detached_scroll_dismiss_action(&ScrollHudStatus::Finalizing, true),
+            None
+        );
+        assert_eq!(
+            detached_scroll_dismiss_action(&ScrollHudStatus::Configuring, true),
+            Some(ScrollHudAction::Cancel)
+        );
+        assert_eq!(
+            detached_scroll_dismiss_action(&ScrollHudStatus::Capturing, true),
+            Some(ScrollHudAction::Abort)
+        );
+    }
+
+    #[test]
     fn native_passthrough_readback_controls_the_acknowledgement() {
         let mut refused: NativePassthrough = Box::new(|_| Ok(false));
         assert_eq!(
@@ -4632,8 +4813,26 @@ mod tests {
         assert!(!handle.scroll_hud_visible());
         assert!(!handle.needs_visible_surface());
 
-        handle.show_scroll_hud(ScrollHudState::choosing(scrozz_core::ScrollAxis::Vertical));
+        let work_area = scrozz_core::LogicalRect::new(
+            scrozz_core::LogicalPoint::new(-1_920.0, 24.0),
+            scrozz_core::LogicalSize::new(1_920.0, 1_056.0),
+        );
+        handle.show_scroll_hud(ScrollHudState::configuring().with_surface(
+            scrozz_core::LogicalRect::new(
+                scrozz_core::LogicalPoint::new(120.0, 80.0),
+                scrozz_core::LogicalSize::new(900.0, 640.0),
+            ),
+            work_area,
+            ScaleFactor::new(2.0),
+        ));
         assert!(handle.scroll_hud_visible());
+        assert_eq!(
+            handle.scroll_hud_surface(),
+            Some(ScrollHudSurface {
+                work_area,
+                scale: ScaleFactor::new(2.0),
+            })
+        );
         assert!(
             handle.needs_visible_surface(),
             "the HUD must reveal the native root even when there are no cards"

@@ -8,8 +8,8 @@
 # rather than to whatever launched it.
 #
 # How durable that grant is depends on how the bundle is signed. This script
-# uses an installed Apple Development identity when one is available, giving
-# changed local builds one stable identity. Machines without one fall back to
+# preserves an existing certificate identity for local updates. New installs
+# prefer Developer ID, then Apple Development. Machines without one fall back to
 # an ad-hoc signature, whose effective identity is the binary's changing cdhash
 # and therefore requires Screen Recording approval after changed builds. Public
 # releases still need Developer ID signing and notarisation — see release.yml.
@@ -234,6 +234,27 @@ if [[ "${SCROZZ_BUNDLE_VALIDATE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
+# Resolve before replacing the installed bundle. Never silently switch an
+# established certificate identity just because the keychain changed.
+if [[ -z "$SIGNING_MODE" && "${SCROZZ_SKIP_SIGN:-0}" != "1" && -z "$SIGN_IDENTITY" ]]; then
+  # shellcheck source=tools/macos-signing.sh
+  source "$SCRIPT_DIR/macos-signing.sh"
+  EXISTING_IDENTITY=""
+  if [[ -d "$APP" ]]; then
+    EXISTING_SIGNATURE="$(codesign -dv --verbose=4 "$APP" 2>&1)" || {
+      echo "make-app-bundle: cannot inspect the existing signature; leaving $APP unchanged." >&2
+      exit 1
+    }
+    EXISTING_IDENTITY="$(printf '%s\n' "$EXISTING_SIGNATURE" |
+      sed -n 's/^Authority=//p' | head -1)"
+  fi
+  AVAILABLE_IDENTITIES="$(security find-identity -v -p codesigning)" || {
+    echo "make-app-bundle: cannot read signing identities; leaving $APP unchanged." >&2
+    exit 1
+  }
+  SIGN_IDENTITY="$(scrozz_default_signing_identity "$EXISTING_IDENTITY" "$AVAILABLE_IDENTITIES")"
+fi
+
 # --- where the executable comes from ---------------------------------------
 #
 # By default this script builds one, which is what a developer wants. The
@@ -377,22 +398,18 @@ case "$SIGNING_MODE" in
     if [[ "${SCROZZ_SKIP_SIGN:-0}" == "1" ]]; then
       echo "==> signing skipped (SCROZZ_SKIP_SIGN=1); caller owns the signature"
     else
-      SIGN_IDENTITY="${SCROZZ_SIGN_IDENTITY:-}"
-      if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
-        SIGN_IDENTITY="$(
-          security find-identity -v -p codesigning 2>/dev/null |
-            awk '/"Apple Development:/ { print $2; exit }'
-        )"
-      fi
-
-      if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
-        echo "==> signing with a stable Apple Development identity"
+      if [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
+        echo "==> signing with stable identity '$SIGN_IDENTITY'"
+        codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+      elif [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
+        echo "==> signing with stable identity '$SIGN_IDENTITY'"
         codesign --force --sign "$SIGN_IDENTITY" --identifier com.thatcube.Scrozz \
           --timestamp=none "$APP"
       else
         echo "==> signing ad-hoc (Screen Recording approval will not survive changed builds)"
         codesign --force --sign - --identifier com.thatcube.Scrozz "$APP"
       fi
+      codesign --verify --strict "$APP"
     fi
     ;;
   *)

@@ -257,6 +257,8 @@ pub struct CardContent<'a> {
     /// the open editor still needs to be raised from, so the card stops
     /// offering them rather than offering them greyed out.
     pub editing: bool,
+    /// Whether the displayed screenshot revision has an external saved file.
+    pub saved: bool,
     /// The uploaded thumbnail, if it has been uploaded yet.
     pub texture: Option<egui::TextureId>,
     /// The colours the capture is made of, sampled when its thumbnail was
@@ -285,6 +287,7 @@ impl<'a> CardContent<'a> {
             provenance,
             media: CardMedia::Image,
             editing: false,
+            saved: false,
             texture: None,
             accent: None,
             upload_enabled: true,
@@ -316,6 +319,16 @@ impl<'a> CardContent<'a> {
         self
     }
 
+    /// Save an unsaved screenshot, or reveal its existing export.
+    #[must_use]
+    pub const fn save_action(&self) -> CardAction {
+        if self.saved {
+            CardAction::Reveal
+        } else {
+            CardAction::Save
+        }
+    }
+
     /// The right-hand caption detail, e.g. `2560 × 1440`.
     #[must_use]
     pub fn dimensions(&self) -> String {
@@ -337,6 +350,8 @@ pub enum CardAction {
     Copy,
     /// Save the capture to disk.
     Save,
+    /// Reveal the screenshot's saved file in the platform file browser.
+    Reveal,
     /// Open the annotation editor.
     Annotate,
     /// Open the video editor for a recording.
@@ -362,6 +377,7 @@ impl CardAction {
         match self {
             Self::Copy => "copy",
             Self::Save => "save",
+            Self::Reveal => "reveal",
             Self::Annotate => "annotate",
             Self::Edit => "edit",
             Self::Continue => "continue",
@@ -377,6 +393,7 @@ impl CardAction {
         match self {
             Self::Copy => "Copy",
             Self::Save => "Save",
+            Self::Reveal => "Folder",
             Self::Annotate => "Annotate",
             Self::Edit => "Edit",
             Self::Continue => "Continue",
@@ -392,6 +409,7 @@ impl CardAction {
         match self {
             Self::Copy => Icon::Copy,
             Self::Save => Icon::DeviceFloppy,
+            Self::Reveal => Icon::Folder,
             Self::Annotate | Self::Continue => Icon::Pencil,
             Self::Edit => Icon::Video,
             Self::Upload => Icon::CloudUpload,
@@ -705,6 +723,14 @@ fn draw_duration_chip(ui: &Ui, capture: Rect, duration: Duration, alpha: f32) {
     painter.galley(plate.min + padding, galley, Color32::WHITE);
 }
 
+fn reveal_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Show in Finder. Option-click to Save As."
+    } else {
+        "Show in folder. Alt-click to Save As."
+    }
+}
+
 /// The hover chrome: a scrim, two equal neutral pills, four matching corner buttons.
 ///
 /// Returns the action pressed this frame. The controls themselves are drawn by
@@ -760,7 +786,7 @@ fn draw_chrome(
         let actions = if media.is_video() {
             [CardAction::Edit, CardAction::Close]
         } else {
-            [CardAction::Copy, CardAction::Save]
+            [CardAction::Copy, content.save_action()]
         };
         for (rect, action) in rects.into_iter().zip(actions) {
             let response = paint::card_icon_button(
@@ -773,6 +799,11 @@ fn draw_chrome(
                 ControlState::new(),
                 lift,
             );
+            let response = if action == CardAction::Reveal {
+                response.on_hover_text(reveal_hint())
+            } else {
+                response
+            };
             if response.clicked() {
                 pressed = Some(action);
             }
@@ -784,7 +815,7 @@ fn draw_chrome(
         // Copy and Save share one equal-priority treatment for still images.
         for (r, action) in primary_pill_rects(inner)?
             .into_iter()
-            .zip([CardAction::Copy, CardAction::Save])
+            .zip([CardAction::Copy, content.save_action()])
         {
             let resp = paint::card_pill_button(
                 ui,
@@ -795,6 +826,11 @@ fn draw_chrome(
                 action.label(),
                 lift,
             );
+            let resp = if action == CardAction::Reveal {
+                resp.on_hover_text(reveal_hint())
+            } else {
+                resp
+            };
             if resp.clicked() {
                 pressed = Some(action);
             }

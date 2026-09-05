@@ -8,7 +8,9 @@ use egui::{CursorIcon, Key, PointerButton, TextureHandle, Ui};
 use scrozz_core::selection::{
     SelectionCapabilities, SelectionMode, SelectionOptions, SelectionOutcome,
 };
-use scrozz_core::{Display, DisplayId, LogicalPoint, LogicalRect, LogicalSize, Window};
+use scrozz_core::{
+    Display, DisplayId, LogicalPoint, LogicalRect, LogicalSize, ScrollControl, Window,
+};
 
 pub mod frozen;
 pub mod geom;
@@ -45,6 +47,7 @@ pub struct SelectionUi {
     textures: BTreeMap<String, TextureHandle>,
     immediate: Option<SelectionDecision>,
     rendered_highlight_revision: u64,
+    scroll_control: ScrollControl,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +88,7 @@ impl SelectionUi {
             textures: BTreeMap::new(),
             immediate,
             rendered_highlight_revision: 0,
+            scroll_control: ScrollControl::Manual,
         }
     }
 
@@ -176,9 +180,10 @@ impl SelectionUi {
         });
         self.state.set_drag_modifiers(drag_modifiers);
         let primary_modifier = ui.ctx().input(|input| input.modifiers.command);
+        let theme = theme_for(ui);
         let paint = paint::draw_overlay(
             ui,
-            &theme_for(ui),
+            &theme,
             &self.state,
             &self.hud,
             paint::OverlayView {
@@ -192,38 +197,85 @@ impl SelectionUi {
             },
         );
         self.rendered_highlight_revision = self.state.highlight_revision();
-        if self.state.mode() == SelectionMode::Region {
-            ui.ctx().set_cursor_icon(if paint.pointer_over_controls {
-                CursorIcon::PointingHand
-            } else {
-                CursorIcon::Crosshair
-            });
-        }
+        let scrolling_controls = if self.state.options_ref().scrolling_setup
+            && !self.state.is_interacting()
+            && surface_display.is_none_or(|display| self.state.focus_display() == Some(display))
+            && let Some(region) = self.state.region()
+        {
+            let selection = DisplayLayout::canvas_rect_in(surface, region)
+                .translate(paint.canvas.rect.min.to_vec2());
+            Some(crate::scrolling::draw_scrolling_selection_toolbar(
+                ui,
+                &theme,
+                selection,
+                self.scroll_control,
+                true,
+            ))
+        } else {
+            None
+        };
+        let pointer_over_scrolling_controls = scrolling_controls.as_ref().is_some_and(|response| {
+            ui.ctx()
+                .input(|input| input.pointer.latest_pos())
+                .is_some_and(|pointer| response.rect.contains(pointer))
+        });
+        let pointer_over_controls = paint.pointer_over_controls || pointer_over_scrolling_controls;
         match paint.action {
             paint::OverlayAction::None => {}
             paint::OverlayAction::Mode(mode) => {
                 let _ = self.set_mode(mode);
             }
             paint::OverlayAction::Confirm => {
-                if let Some(outcome) = self.state.commit() {
+                if let Some(outcome) = self.commit_selection() {
                     return SelectionDecision::Selected(outcome);
                 }
+            }
+            paint::OverlayAction::Cancel => {
+                let _ = self.state.cancel();
+                return SelectionDecision::Cancelled;
+            }
+        }
+        if let Some(action) = scrolling_controls
+            .as_ref()
+            .and_then(|response| response.action)
+        {
+            match action {
+                crate::scrolling::ScrollHudAction::SetControl(control) => {
+                    self.scroll_control = control;
+                    ui.ctx().request_repaint();
+                }
+                crate::scrolling::ScrollHudAction::Start => {
+                    if let Some(outcome) = self.commit_selection() {
+                        return SelectionDecision::Selected(outcome);
+                    }
+                }
+                crate::scrolling::ScrollHudAction::Cancel => {
+                    let _ = self.state.cancel();
+                    return SelectionDecision::Cancelled;
+                }
+                crate::scrolling::ScrollHudAction::Keep
+                | crate::scrolling::ScrollHudAction::Abort => {}
             }
         }
         let pointer = self.handle_pointer(
             ui,
             &paint.canvas,
-            paint.pointer_over_controls,
+            pointer_over_controls,
             surface,
             surface_display,
         );
+        if self.state.mode() == SelectionMode::Region {
+            ui.ctx()
+                .set_cursor_icon(region_cursor(&self.state, pointer_over_controls));
+        }
         if let Some(decision) = pointer.decision {
             return decision;
         }
         if !self.state.options_ref().commits_region_on_release()
+            && !self.state.options_ref().requires_region_confirmation()
             && paint.canvas.clicked()
             && !self.state.gesture_changed()
-            && let Some(outcome) = self.state.commit()
+            && let Some(outcome) = self.commit_selection()
         {
             self.immediate = Some(SelectionDecision::Selected(outcome));
         }
@@ -340,7 +392,7 @@ impl SelectionUi {
             }
             changed = true;
             if !self.state.mode().is_freehand()
-                && let Some(outcome) = self.state.commit()
+                && let Some(outcome) = self.commit_selection()
             {
                 self.immediate = Some(SelectionDecision::Selected(outcome));
             }
@@ -368,7 +420,7 @@ impl SelectionUi {
             changed = true;
             if self.state.options_ref().commits_region_on_release() {
                 decision = if self.state.gesture_changed() {
-                    self.state.commit().map(SelectionDecision::Selected)
+                    self.commit_selection().map(SelectionDecision::Selected)
                 } else {
                     let _ = self.state.cancel();
                     Some(SelectionDecision::Cancelled)
@@ -438,10 +490,23 @@ impl SelectionUi {
                 self.handle_arrow(AxisDirection::Down, alt, shift);
             }
         }
-        if enter && let Some(outcome) = self.state.commit() {
+        if enter
+            && !self.state.options_ref().scrolling_setup
+            && let Some(outcome) = self.commit_selection()
+        {
             self.immediate = Some(SelectionDecision::Selected(outcome));
         }
         false
+    }
+
+    fn commit_selection(&mut self) -> Option<SelectionOutcome> {
+        let scrolling = self.state.options_ref().scrolling_setup;
+        let outcome = self.state.commit()?;
+        Some(if scrolling {
+            outcome.with_scrolling(self.scroll_control)
+        } else {
+            outcome
+        })
     }
 
     fn handle_arrow(&mut self, direction: AxisDirection, resize: bool, fast: bool) {
@@ -450,6 +515,40 @@ impl SelectionUi {
         } else {
             self.state.keyboard_nudge(direction, fast);
         }
+    }
+}
+
+fn region_cursor(state: &SelectionState, pointer_over_controls: bool) -> CursorIcon {
+    if pointer_over_controls {
+        return CursorIcon::PointingHand;
+    }
+    if state.is_creating_region() {
+        return CursorIcon::Crosshair;
+    }
+    let Some(pointer) = state.pointer() else {
+        return CursorIcon::Crosshair;
+    };
+    if let Some(handle) = state.handle_at_point(pointer) {
+        return match handle {
+            ResizeHandle::NorthWest | ResizeHandle::SouthEast => CursorIcon::ResizeNwSe,
+            ResizeHandle::NorthEast | ResizeHandle::SouthWest => CursorIcon::ResizeNeSw,
+            ResizeHandle::North | ResizeHandle::South => CursorIcon::ResizeVertical,
+            ResizeHandle::East | ResizeHandle::West => CursorIcon::ResizeHorizontal,
+        };
+    }
+    if state
+        .region()
+        .is_some_and(|region| geom::contains_point(region, pointer))
+    {
+        if state.is_interacting() {
+            CursorIcon::Grabbing
+        } else {
+            CursorIcon::Grab
+        }
+    } else if state.region().is_some() {
+        CursorIcon::Default
+    } else {
+        CursorIcon::Crosshair
     }
 }
 

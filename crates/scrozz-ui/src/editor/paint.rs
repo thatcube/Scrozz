@@ -660,27 +660,7 @@ fn draw_crop_scrim(
         StrokeKind::Outside,
     );
     thirds(painter, keep);
-    for handle in Handle::ALL {
-        let source = state
-            .pending_crop()
-            .map(|crop| handle.position(&crop))
-            .unwrap_or_else(|| handle.position(&rect));
-        let at = super::to_screen(state.source_to_display(source), view.subject, view.content);
-        let radius = HANDLE_RADIUS as f32;
-        let handle_rect = Rect::from_center_size(at, vec2(radius * 2.0, radius * 2.0));
-        painter.rect_filled(
-            handle_rect.expand(1.5),
-            corner(2.0),
-            Color32::from_black_alpha(150),
-        );
-        painter.rect_filled(handle_rect, corner(1.5), Color32::WHITE);
-        painter.rect_stroke(
-            handle_rect,
-            corner(1.5),
-            Stroke::new(1.0, palette.accent),
-            StrokeKind::Inside,
-        );
-    }
+    crate::crop_chrome::draw_resize_guides(painter, keep);
     for segment in state.active_crop_snap_segments() {
         let (from, to) = match segment.axis {
             super::crop::BoundaryAxis::Horizontal => (

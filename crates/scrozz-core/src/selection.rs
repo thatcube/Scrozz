@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CaptureTarget, DisplayId, Error, LogicalPoint, LogicalRect, LogicalSize, Result, ScaleFactor,
+    ScrollControl,
 };
 
 /// The static minimum applied before display scale is known.
@@ -416,6 +417,12 @@ pub struct SelectionOptions {
     pub delay: Option<Duration>,
     /// Show the mode heads-up display.
     pub hud: bool,
+    /// Keep a freehand region adjustable until an explicit confirmation.
+    #[serde(default)]
+    pub confirm_region: bool,
+    /// Draw scrolling-specific setup beside the adjustable region.
+    #[serde(default)]
+    pub scrolling_setup: bool,
 }
 
 impl Default for SelectionOptions {
@@ -434,6 +441,8 @@ impl Default for SelectionOptions {
             dimension_label: DimensionLabelMode::Logical,
             delay: None,
             hud: true,
+            confirm_region: false,
+            scrolling_setup: false,
         }
     }
 }
@@ -488,7 +497,13 @@ impl SelectionOptions {
     /// All-in-One selection.
     #[must_use]
     pub fn commits_region_on_release(&self) -> bool {
-        self.mode == SelectionMode::Region && !self.hud
+        self.mode == SelectionMode::Region && !self.hud && !self.confirm_region
+    }
+
+    /// Whether a region can only finish through the explicit confirmation control.
+    #[must_use]
+    pub fn requires_region_confirmation(&self) -> bool {
+        self.mode == SelectionMode::Region && self.confirm_region
     }
 }
 
@@ -556,6 +571,15 @@ pub struct SelectionOutcome {
     pub scale: ScaleFactor,
     /// Which route produced this.
     pub source: SelectionSource,
+    /// Scrolling setup committed with this region, when requested.
+    pub scrolling: Option<ScrollSelection>,
+}
+
+/// Input choices committed alongside a scrolling region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollSelection {
+    /// Who moves the selected content.
+    pub control: ScrollControl,
 }
 
 impl SelectionOutcome {
@@ -574,7 +598,15 @@ impl SelectionOutcome {
             display,
             scale,
             source,
+            scrolling: None,
         }
+    }
+
+    /// Attaches the explicit scrolling choices made in the selector.
+    #[must_use]
+    pub const fn with_scrolling(mut self, control: ScrollControl) -> Self {
+        self.scrolling = Some(ScrollSelection { control });
+        self
     }
 
     /// The selection in physical pixels, rounded outward.
@@ -1007,6 +1039,16 @@ mod tests {
         assert!(!options.freeze);
         assert!(!options.hud);
         assert_eq!(options.dimension_label, DimensionLabelMode::Logical);
+    }
+
+    #[test]
+    fn explicit_region_confirmation_disables_one_gesture_commit() {
+        let options = SelectionOptions {
+            confirm_region: true,
+            ..SelectionOptions::region()
+        };
+        assert!(!options.commits_region_on_release());
+        assert!(options.requires_region_confirmation());
     }
 
     #[test]

@@ -26,11 +26,12 @@ use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU8, Ordering},
 };
+use std::time::Duration;
 
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, Display, Error as CoreError, Frame,
-    LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, ScrollAxis, ScrollGesture, Window,
-    WindowId,
+    LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, ScaleFactor, ScrollAxis, ScrollControl,
+    ScrollGesture, Window, WindowId,
 };
 use scrozz_stitch::{
     CancelAction, CancelSignal, FrameSource, Progress, ScrollSession, ScrollSessionConfig,
@@ -219,7 +220,10 @@ pub(crate) fn report_terminal_scroll_progress(progress: Progress) {
             eprintln!("scrozz: captured viewport {frame}");
         }
         Progress::WaitingForManualScroll => {
-            eprintln!("scrozz: waiting for the selected window to scroll");
+            eprintln!("scrozz: waiting for one scroll in any direction");
+        }
+        Progress::DirectionDetected { direction } => {
+            eprintln!("scrozz: following {direction:?} movement");
         }
         Progress::Advanced {
             frame,
@@ -269,6 +273,7 @@ pub(crate) enum ScrollingContext {
         viewport: LogicalRect,
         window: WindowId,
         crop: Option<FrameCrop>,
+        selection: Option<RelativeViewport>,
     },
     ManualPortal,
 }
@@ -287,6 +292,7 @@ impl ScrollingTarget {
                 viewport,
                 window,
                 crop: None,
+                selection: None,
             },
         }
     }
@@ -297,6 +303,17 @@ impl ScrollingTarget {
         } = &mut self.context
         {
             *target_crop = Some(crop);
+        }
+        self
+    }
+
+    fn with_selection(mut self, selection: RelativeViewport) -> Self {
+        if let ScrollingContext::Native {
+            selection: target_selection,
+            ..
+        } = &mut self.context
+        {
+            *target_selection = Some(selection);
         }
         self
     }
@@ -326,6 +343,25 @@ impl ScrollingTarget {
         self.may_synthesize_scroll() && !cfg!(target_os = "macos")
     }
 
+    pub(crate) fn overlay_surface(&self) -> Option<(LogicalRect, LogicalRect, ScaleFactor)> {
+        match &self.context {
+            ScrollingContext::Native {
+                display, viewport, ..
+            } => Some((
+                LogicalRect::new(
+                    LogicalPoint::new(
+                        viewport.origin.x - display.work_area.origin.x,
+                        viewport.origin.y - display.work_area.origin.y,
+                    ),
+                    viewport.size,
+                ),
+                display.work_area,
+                display.scale,
+            )),
+            ScrollingContext::ManualPortal => None,
+        }
+    }
+
     pub(crate) fn refresh(self, backend: &dyn CaptureBackend) -> CliResult<Self> {
         if matches!(&self.context, ScrollingContext::ManualPortal) {
             return Ok(self);
@@ -340,9 +376,19 @@ impl ScrollingTarget {
         windows: Vec<Window>,
         displays: Vec<Display>,
     ) -> CliResult<Self> {
-        let window_id = match &self.context {
+        let (window_id, selection, preferred_display, preferred_scale) = match &self.context {
             ScrollingContext::ManualPortal => return Ok(self),
-            ScrollingContext::Native { window, .. } => window.clone(),
+            ScrollingContext::Native {
+                display,
+                window,
+                selection,
+                ..
+            } => (
+                window.clone(),
+                *selection,
+                display.id.clone(),
+                display.scale,
+            ),
         };
         let window = windows
             .into_iter()
@@ -359,21 +405,56 @@ impl ScrollingTarget {
                 window_id.0
             ))));
         }
-        let display = displays
-            .into_iter()
-            .find(|display| display.id == window.display)
-            .ok_or_else(|| {
-                CliError::Core(CoreError::TargetGone(format!(
-                    "display {} containing window {} is no longer connected",
-                    window.display.0, window_id.0
-                )))
-            })?;
-
-        resolved_native_scrolling_target(self.request, display, window)
+        if cfg!(target_os = "windows")
+            && window.display != preferred_display
+            && displays
+                .iter()
+                .find(|display| display.id == window.display)
+                .is_some_and(|display| display.scale != preferred_scale)
+        {
+            return Err(CliError::Core(CoreError::TargetGone(format!(
+                "window {} moved to a display with a different scale; redraw the scrolling area",
+                window_id.0
+            ))));
+        }
+        match selection {
+            Some(selection) => {
+                let viewport = selection.resolve(window.bounds);
+                let display = display_for_refreshed_region(
+                    &displays,
+                    &window,
+                    viewport,
+                    &preferred_display,
+                )
+                .ok_or_else(|| {
+                    CliError::Core(CoreError::TargetGone(format!(
+                        "the selected area for window {} is no longer contained by a connected display",
+                        window_id.0
+                    )))
+                })?;
+                resolved_native_scrolling_region_target(self.request, display, window, viewport)
+            }
+            None => {
+                let display = displays
+                    .into_iter()
+                    .find(|display| display.id == window.display)
+                    .ok_or_else(|| {
+                        CliError::Core(CoreError::TargetGone(format!(
+                            "display {} containing window {} is no longer connected",
+                            window.display.0, window_id.0
+                        )))
+                    })?;
+                resolved_native_scrolling_target(self.request, display, window)
+            }
+        }
     }
 
-    fn session_config(&self, axis: ScrollAxis) -> CliResult<ScrollSessionConfig> {
-        match &self.context {
+    fn session_config(
+        &self,
+        axis: ScrollAxis,
+        control: Option<ScrollControl>,
+    ) -> CliResult<ScrollSessionConfig> {
+        let mut config = match &self.context {
             ScrollingContext::Native {
                 display,
                 viewport,
@@ -386,9 +467,38 @@ impl ScrollingTarget {
                     ScrollAxis::Vertical => ScrollGesture::down(at, 1.0),
                     ScrollAxis::Horizontal => ScrollGesture::right(at, 1.0),
                 };
-                Ok(ScrollSessionConfig::new(gesture))
+                let mut config = ScrollSessionConfig::new(gesture);
+                if cfg!(target_os = "macos") {
+                    config.settle_delay = Duration::from_millis(280);
+                    config.manual_poll_interval = Duration::from_millis(150);
+                }
+                Ok(config)
+            }
+        }?;
+        if let Some(control) = control {
+            config = config.with_control(control);
+            if control == ScrollControl::Manual {
+                config.max_frames = 400;
             }
         }
+        Ok(config)
+    }
+
+    fn direction_detecting_session_config(
+        &self,
+        control: ScrollControl,
+    ) -> CliResult<ScrollSessionConfig> {
+        let (vertical_amount, horizontal_amount) = match &self.context {
+            ScrollingContext::Native { viewport, .. } => {
+                (viewport.size.height * 0.65, viewport.size.width * 0.65)
+            }
+            ScrollingContext::ManualPortal => (1.0, 1.0),
+        };
+        let mut config = self
+            .session_config(ScrollAxis::Vertical, Some(control))?
+            .with_direction_detection(vertical_amount, horizontal_amount);
+        config.max_frames = 400;
+        Ok(config)
     }
 }
 
@@ -434,6 +544,71 @@ pub(crate) fn resolve_scrolling_target(
     resolved_native_scrolling_target(request, display, window)
 }
 
+pub(crate) fn resolve_scrolling_region_target(
+    backend: &dyn CaptureBackend,
+    region: LogicalRect,
+) -> CliResult<ScrollingTarget> {
+    resolve_scrolling_region_target_on_display(backend, region, None)
+}
+
+pub(crate) fn resolve_scrolling_region_target_on_display(
+    backend: &dyn CaptureBackend,
+    region: LogicalRect,
+    selected_display: Option<&scrozz_core::DisplayId>,
+) -> CliResult<ScrollingTarget> {
+    if region.is_empty() {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "draw a scrolling area with positive width and height".to_owned(),
+        )));
+    }
+    let displays = backend.displays()?;
+    let selected_display = selected_display
+        .map(|selected| {
+            displays
+                .iter()
+                .find(|display| display.id == *selected)
+                .cloned()
+                .ok_or_else(|| {
+                    CliError::Core(CoreError::TargetGone(format!(
+                        "display {} vanished before scrolling capture started",
+                        selected.0
+                    )))
+                })
+        })
+        .transpose()?;
+    let windows = backend.windows()?;
+    let window = select_scrolling_window_for_region_on_display(
+        windows,
+        &displays,
+        region,
+        selected_display.as_ref(),
+    )
+    .ok_or_else(|| {
+        CliError::Core(CoreError::InvalidRequest(
+            "draw the scrolling area entirely inside one visible application window".to_owned(),
+        ))
+    })?;
+    let display = selected_display
+        .or_else(|| {
+            displays
+                .iter()
+                .find(|display| display.id == window.display)
+                .cloned()
+        })
+        .ok_or_else(|| {
+            CliError::Core(CoreError::TargetGone(format!(
+                "display {} containing window {} is no longer connected",
+                window.display.0, window.id.0
+            )))
+        })?;
+    let request = CaptureRequest {
+        target: CaptureTarget::Display(display.id.clone()),
+        cursor: scrozz_core::CursorMode::Hidden,
+        include_window_shadow: false,
+    };
+    resolved_native_scrolling_region_target(request, display, window, region)
+}
+
 pub(crate) fn scrolling_capture_target_with<C, F>(
     target: ScrollingTarget,
     axis: ScrollAxis,
@@ -465,10 +640,78 @@ where
     C: CancelSignal,
     F: FnMut(Progress),
 {
+    scrolling_capture_target_with_control_and_cancellation(
+        target,
+        axis,
+        None,
+        cancel,
+        acquisition_cancellation,
+        progress,
+    )
+}
+
+pub(crate) fn scrolling_capture_target_with_control_and_cancellation<C, F>(
+    target: ScrollingTarget,
+    axis: ScrollAxis,
+    control: Option<ScrollControl>,
+    cancel: &mut C,
+    acquisition_cancellation: &scrozz_capture::CaptureCancellation,
+    progress: F,
+) -> CliResult<Capture>
+where
+    C: CancelSignal,
+    F: FnMut(Progress),
+{
+    scrolling_capture_target_with_optional_axis_and_cancellation(
+        target,
+        Some(axis),
+        control,
+        cancel,
+        acquisition_cancellation,
+        progress,
+    )
+}
+
+pub(crate) fn scrolling_capture_target_with_detected_direction_and_cancellation<C, F>(
+    target: ScrollingTarget,
+    control: ScrollControl,
+    cancel: &mut C,
+    acquisition_cancellation: &scrozz_capture::CaptureCancellation,
+    progress: F,
+) -> CliResult<Capture>
+where
+    C: CancelSignal,
+    F: FnMut(Progress),
+{
+    scrolling_capture_target_with_optional_axis_and_cancellation(
+        target,
+        None,
+        Some(control),
+        cancel,
+        acquisition_cancellation,
+        progress,
+    )
+}
+
+fn scrolling_capture_target_with_optional_axis_and_cancellation<C, F>(
+    target: ScrollingTarget,
+    axis: Option<ScrollAxis>,
+    control: Option<ScrollControl>,
+    cancel: &mut C,
+    acquisition_cancellation: &scrozz_capture::CaptureCancellation,
+    progress: F,
+) -> CliResult<Capture>
+where
+    C: CancelSignal,
+    F: FnMut(Progress),
+{
     if acquisition_cancellation.is_cancelled() {
         return Err(CliError::Core(CoreError::Cancelled));
     }
-    let config = target.session_config(axis)?;
+    let config = match axis {
+        Some(axis) => target.session_config(axis, control)?,
+        None => target.direction_detecting_session_config(control.unwrap_or_default())?,
+    };
     let crop = match &target.context {
         ScrollingContext::Native { crop, .. } => *crop,
         ScrollingContext::ManualPortal => None,
@@ -533,6 +776,61 @@ pub(crate) fn resolved_native_scrolling_target(
     // and frame pixels share one coordinate space.
     request.include_window_shadow = needs_outer_frame_capture(&window_id);
     Ok(ScrollingTarget::new(request, display, viewport, window_id).with_crop(crop))
+}
+
+fn resolved_native_scrolling_region_target(
+    mut request: CaptureRequest,
+    display: Display,
+    window: Window,
+    region: LogicalRect,
+) -> CliResult<ScrollingTarget> {
+    let visible_window = intersect_rect(window.bounds, display.work_area).ok_or_else(|| {
+        CliError::Core(CoreError::InvalidRequest(format!(
+            "window {} is outside display {}'s usable area",
+            window.id.0, display.id.0
+        )))
+    })?;
+    if !contains_rect(visible_window, region) {
+        return Err(CliError::Core(CoreError::InvalidRequest(
+            "draw the scrolling area entirely inside the visible window content".to_owned(),
+        )));
+    }
+    let crop = FrameCrop::new(window.bounds, region)?;
+    let selection = RelativeViewport::new(window.bounds, region);
+    let window_id = window.id;
+    request.target = CaptureTarget::Window(window_id.clone());
+    request.include_window_shadow = needs_outer_frame_capture(&window_id);
+    Ok(ScrollingTarget::new(request, display, region, window_id)
+        .with_crop(crop)
+        .with_selection(selection))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelativeViewport {
+    offset: LogicalPoint,
+    size: LogicalSize,
+}
+
+impl RelativeViewport {
+    fn new(window: LogicalRect, viewport: LogicalRect) -> Self {
+        Self {
+            offset: LogicalPoint::new(
+                viewport.origin.x - window.origin.x,
+                viewport.origin.y - window.origin.y,
+            ),
+            size: viewport.size,
+        }
+    }
+
+    fn resolve(self, window: LogicalRect) -> LogicalRect {
+        LogicalRect::new(
+            LogicalPoint::new(
+                window.origin.x + self.offset.x,
+                window.origin.y + self.offset.y,
+            ),
+            self.size,
+        )
+    }
 }
 
 pub(crate) fn needs_outer_frame_capture(window: &WindowId) -> bool {
@@ -638,6 +936,99 @@ pub(crate) fn select_scrolling_window(windows: Vec<Window>, display: &Display) -
             && !window.bounds.is_empty()
             && !is_capture_control_window(window)
     })
+}
+
+fn select_scrolling_window_for_region(windows: Vec<Window>, region: LogicalRect) -> Option<Window> {
+    select_scrolling_window_for_region_on_display(windows, &[], region, None)
+}
+
+fn select_scrolling_window_for_region_on_display(
+    windows: Vec<Window>,
+    displays: &[Display],
+    region: LogicalRect,
+    selected_display: Option<&Display>,
+) -> Option<Window> {
+    let center = LogicalPoint::new(
+        region.origin.x + region.size.width * 0.5,
+        region.origin.y + region.size.height * 0.5,
+    );
+    let mut candidates = windows.into_iter().filter(|window| {
+        window.is_visible && !window.bounds.is_empty() && !is_capture_control_window(window)
+    });
+    let Some(selected_display) = selected_display else {
+        return candidates.find(|window| {
+            contains_point(window.bounds, center) && contains_rect(window.bounds, region)
+        });
+    };
+    candidates.find(|window| {
+        let declared_display = displays.iter().find(|display| display.id == window.display);
+        let eligible_display = window.display == selected_display.id
+            || declared_display.is_some_and(|display| {
+                !contains_rect(display.bounds, window.bounds)
+                    && spanning_coordinate_spaces_compatible(display, selected_display)
+                    && intersect_rect(window.bounds, selected_display.bounds).is_some()
+            });
+        eligible_display
+            && contains_point(window.bounds, center)
+            && contains_rect(window.bounds, region)
+    })
+}
+
+fn contains_point(rect: LogicalRect, point: LogicalPoint) -> bool {
+    point.x >= rect.origin.x
+        && point.y >= rect.origin.y
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y <= rect.origin.y + rect.size.height
+}
+
+fn contains_rect(outer: LogicalRect, inner: LogicalRect) -> bool {
+    const TOLERANCE: f64 = 1.0;
+    inner.origin.x + TOLERANCE >= outer.origin.x
+        && inner.origin.y + TOLERANCE >= outer.origin.y
+        && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + TOLERANCE
+        && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + TOLERANCE
+}
+
+fn display_for_refreshed_region(
+    displays: &[Display],
+    window: &Window,
+    region: LogicalRect,
+    previous: &scrozz_core::DisplayId,
+) -> Option<Display> {
+    let current = displays.iter().find(|display| display.id == window.display);
+    let previous = displays.iter().find(|display| display.id == *previous);
+    let spans_beyond_current =
+        current.is_some_and(|display| !contains_rect(display.bounds, window.bounds));
+    if spans_beyond_current
+        && let Some(previous) = previous.filter(|previous| {
+            current.is_some_and(|current| spanning_coordinate_spaces_compatible(current, previous))
+                && contains_rect(previous.bounds, region)
+        })
+    {
+        return Some(previous.clone());
+    }
+    current
+        .filter(|display| contains_rect(display.bounds, region))
+        .or_else(|| {
+            displays.iter().find(|display| {
+                current
+                    .is_none_or(|current| spanning_coordinate_spaces_compatible(current, display))
+                    && contains_rect(display.bounds, region)
+            })
+        })
+        .cloned()
+}
+
+fn spanning_coordinate_spaces_compatible(declared: &Display, selected: &Display) -> bool {
+    coordinate_spaces_compatible(declared.scale, selected.scale, cfg!(target_os = "windows"))
+}
+
+const fn coordinate_spaces_compatible(
+    declared: ScaleFactor,
+    selected: ScaleFactor,
+    require_same_scale: bool,
+) -> bool {
+    !require_same_scale || declared.get() == selected.get()
 }
 
 fn is_capture_control_window(window: &Window) -> bool {
@@ -777,6 +1168,7 @@ mod tests {
             viewport,
             window,
             crop,
+            ..
         } = &refreshed.context
         else {
             panic!("native target became a portal target");
@@ -787,10 +1179,20 @@ mod tests {
         assert_eq!(crop.map(|crop| crop.source_bounds), Some(moved_bounds));
 
         let config = refreshed
-            .session_config(ScrollAxis::Horizontal)
+            .session_config(ScrollAxis::Horizontal, None)
             .expect("refreshed gesture");
         assert_eq!(config.gesture.display, Some(moved_display.id));
         assert_eq!(config.gesture.at, LogicalPoint::new(1_690.0, 350.0));
+
+        let detecting = refreshed
+            .direction_detecting_session_config(ScrollControl::Automatic)
+            .expect("direction-detecting gesture");
+        let amounts = detecting
+            .direction_detection
+            .expect("GUI scrolling learns its route");
+        assert_eq!(amounts.vertical, 325.0);
+        assert_eq!(amounts.horizontal, 455.0);
+        assert_eq!(detecting.max_frames, 400);
     }
 
     #[test]
@@ -851,6 +1253,365 @@ mod tests {
         )
         .expect("a window behind Scrozz's own chrome");
         assert_eq!(chosen.id, WindowId("browser".to_owned()));
+    }
+
+    #[test]
+    fn a_drawn_region_selects_the_frontmost_window_that_fully_contains_it() {
+        let region = LogicalRect::new(
+            LogicalPoint::new(240.0, 180.0),
+            LogicalSize::new(500.0, 320.0),
+        );
+        let chosen = select_scrolling_window_for_region(
+            vec![
+                fixture_window(
+                    "utility",
+                    "Notes",
+                    "display-2",
+                    LogicalRect::new(
+                        LogicalPoint::new(700.0, 600.0),
+                        LogicalSize::new(200.0, 120.0),
+                    ),
+                    true,
+                ),
+                fixture_window(
+                    "browser",
+                    "Browser",
+                    "display-2",
+                    LogicalRect::new(
+                        LogicalPoint::new(120.0, 80.0),
+                        LogicalSize::new(900.0, 700.0),
+                    ),
+                    true,
+                ),
+            ],
+            region,
+        )
+        .expect("window under the complete drawn region");
+        assert_eq!(chosen.id, WindowId("browser".to_owned()));
+    }
+
+    #[test]
+    fn selected_display_disambiguates_overlapping_logical_desktops() {
+        let left = Display {
+            id: DisplayId("left".to_owned()),
+            name: "Left".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_920.0, 1_080.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_920.0, 1_080.0),
+            ),
+            scale: ScaleFactor::IDENTITY,
+            is_primary: true,
+        };
+        let right = Display {
+            id: DisplayId("right".to_owned()),
+            name: "Right".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(960.0, 0.0),
+                LogicalSize::new(1_280.0, 720.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(960.0, 0.0),
+                LogicalSize::new(1_280.0, 720.0),
+            ),
+            scale: ScaleFactor::new(2.0),
+            is_primary: false,
+        };
+        let region = LogicalRect::new(
+            LogicalPoint::new(1_100.0, 120.0),
+            LogicalSize::new(300.0, 240.0),
+        );
+        let chosen = select_scrolling_window_for_region_on_display(
+            vec![
+                fixture_window(
+                    "wrong",
+                    "Wrong",
+                    "left",
+                    LogicalRect::new(
+                        LogicalPoint::new(1_000.0, 80.0),
+                        LogicalSize::new(700.0, 500.0),
+                    ),
+                    true,
+                ),
+                fixture_window(
+                    "right-window",
+                    "Browser",
+                    "right",
+                    LogicalRect::new(
+                        LogicalPoint::new(1_000.0, 80.0),
+                        LogicalSize::new(700.0, 500.0),
+                    ),
+                    true,
+                ),
+            ],
+            &[left, right.clone()],
+            region,
+            Some(&right),
+        )
+        .expect("window on the display that owned the selector");
+        assert_eq!(chosen.id, WindowId("right-window".to_owned()));
+        assert!(!coordinate_spaces_compatible(
+            ScaleFactor::IDENTITY,
+            ScaleFactor::new(2.0),
+            true,
+        ));
+        assert!(coordinate_spaces_compatible(
+            ScaleFactor::IDENTITY,
+            ScaleFactor::new(2.0),
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_spanning_window_can_be_selected_on_its_non_dominant_display() {
+        let left = Display {
+            id: DisplayId("left".to_owned()),
+            name: "Left".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_000.0, 800.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_000.0, 800.0),
+            ),
+            scale: ScaleFactor::IDENTITY,
+            is_primary: true,
+        };
+        let right = Display {
+            id: DisplayId("right".to_owned()),
+            name: "Right".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(1_000.0, 0.0),
+                LogicalSize::new(1_000.0, 800.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(1_000.0, 0.0),
+                LogicalSize::new(1_000.0, 800.0),
+            ),
+            scale: ScaleFactor::IDENTITY,
+            is_primary: false,
+        };
+        let chosen = select_scrolling_window_for_region_on_display(
+            vec![fixture_window(
+                "spanning",
+                "Browser",
+                "left",
+                LogicalRect::new(
+                    LogicalPoint::new(800.0, 80.0),
+                    LogicalSize::new(600.0, 600.0),
+                ),
+                true,
+            )],
+            &[left, right.clone()],
+            LogicalRect::new(
+                LogicalPoint::new(1_080.0, 120.0),
+                LogicalSize::new(240.0, 300.0),
+            ),
+            Some(&right),
+        )
+        .expect("spanning window on the selected display");
+        assert_eq!(chosen.id, WindowId("spanning".to_owned()));
+    }
+
+    #[test]
+    fn a_foreground_spanning_window_beats_a_background_exact_display_window() {
+        let left = Display {
+            id: DisplayId("left".to_owned()),
+            name: "Left".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_000.0, 800.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_000.0, 800.0),
+            ),
+            scale: ScaleFactor::IDENTITY,
+            is_primary: true,
+        };
+        let right = Display {
+            id: DisplayId("right".to_owned()),
+            name: "Right".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(1_000.0, 0.0),
+                LogicalSize::new(1_000.0, 800.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(1_000.0, 0.0),
+                LogicalSize::new(1_000.0, 800.0),
+            ),
+            scale: ScaleFactor::IDENTITY,
+            is_primary: false,
+        };
+        let region = LogicalRect::new(
+            LogicalPoint::new(1_080.0, 120.0),
+            LogicalSize::new(240.0, 300.0),
+        );
+        let chosen = select_scrolling_window_for_region_on_display(
+            vec![
+                fixture_window(
+                    "foreground-spanning",
+                    "Browser",
+                    "left",
+                    LogicalRect::new(
+                        LogicalPoint::new(800.0, 80.0),
+                        LogicalSize::new(600.0, 600.0),
+                    ),
+                    true,
+                ),
+                fixture_window(
+                    "background-right",
+                    "Notes",
+                    "right",
+                    LogicalRect::new(
+                        LogicalPoint::new(1_000.0, 80.0),
+                        LogicalSize::new(600.0, 600.0),
+                    ),
+                    true,
+                ),
+            ],
+            &[left, right.clone()],
+            region,
+            Some(&right),
+        )
+        .expect("frontmost eligible window");
+        assert_eq!(chosen.id, WindowId("foreground-spanning".to_owned()));
+    }
+
+    #[test]
+    fn refresh_prefers_the_windows_current_display_over_overlapping_old_bounds() {
+        let left = Display {
+            id: DisplayId("left".to_owned()),
+            name: "Left".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_920.0, 1_080.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(1_920.0, 1_080.0),
+            ),
+            scale: ScaleFactor::IDENTITY,
+            is_primary: true,
+        };
+        let right = Display {
+            id: DisplayId("right".to_owned()),
+            name: "Right".to_owned(),
+            bounds: LogicalRect::new(
+                LogicalPoint::new(960.0, 0.0),
+                LogicalSize::new(1_280.0, 720.0),
+            ),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(960.0, 0.0),
+                LogicalSize::new(1_280.0, 720.0),
+            ),
+            scale: ScaleFactor::new(2.0),
+            is_primary: false,
+        };
+        let initial_bounds = LogicalRect::new(
+            LogicalPoint::new(1_100.0, 80.0),
+            LogicalSize::new(600.0, 500.0),
+        );
+        let target = resolved_native_scrolling_region_target(
+            CaptureRequest {
+                target: CaptureTarget::Display(right.id.clone()),
+                cursor: scrozz_core::CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            right.clone(),
+            fixture_window("browser", "Browser", "right", initial_bounds, true),
+            LogicalRect::new(
+                LogicalPoint::new(1_200.0, 140.0),
+                LogicalSize::new(300.0, 240.0),
+            ),
+        )
+        .expect("initial right-display target");
+
+        let moved_bounds = LogicalRect::new(
+            LogicalPoint::new(1_000.0, 80.0),
+            LogicalSize::new(600.0, 500.0),
+        );
+        let refreshed = target
+            .refresh_from_snapshots(
+                vec![fixture_window(
+                    "browser",
+                    "Browser",
+                    "left",
+                    moved_bounds,
+                    true,
+                )],
+                vec![left.clone(), right],
+            )
+            .expect("window moved fully onto the left display");
+        let ScrollingContext::Native {
+            display, viewport, ..
+        } = refreshed.context
+        else {
+            panic!("native target became a portal target");
+        };
+        assert_eq!(display.id, left.id);
+        assert_eq!(display.scale, ScaleFactor::IDENTITY);
+        assert_eq!(viewport.origin, LogicalPoint::new(1_100.0, 140.0));
+    }
+
+    #[test]
+    fn a_drawn_region_is_preserved_relative_to_a_moved_window() {
+        let display = fixture_display();
+        let initial_bounds = LogicalRect::new(
+            LogicalPoint::new(120.0, 80.0),
+            LogicalSize::new(900.0, 700.0),
+        );
+        let region = LogicalRect::new(
+            LogicalPoint::new(220.0, 180.0),
+            LogicalSize::new(500.0, 320.0),
+        );
+        let target = resolved_native_scrolling_region_target(
+            CaptureRequest {
+                target: CaptureTarget::Display(display.id.clone()),
+                cursor: scrozz_core::CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            display.clone(),
+            fixture_window("browser", "Browser", "display-2", initial_bounds, true),
+            region,
+        )
+        .expect("selected region");
+
+        let moved_bounds = LogicalRect::new(LogicalPoint::new(180.0, 110.0), initial_bounds.size);
+        let refreshed = target
+            .refresh_from_snapshots(
+                vec![fixture_window(
+                    "browser",
+                    "Browser",
+                    "display-2",
+                    moved_bounds,
+                    true,
+                )],
+                vec![display],
+            )
+            .expect("same moved window");
+        let ScrollingContext::Native {
+            viewport,
+            crop,
+            selection,
+            ..
+        } = refreshed.context
+        else {
+            panic!("selected region became a portal target");
+        };
+        assert_eq!(
+            viewport,
+            LogicalRect::new(
+                LogicalPoint::new(280.0, 210.0),
+                LogicalSize::new(500.0, 320.0)
+            )
+        );
+        assert_eq!(crop.map(|crop| crop.viewport), Some(viewport));
+        assert!(selection.is_some());
     }
 
     #[test]

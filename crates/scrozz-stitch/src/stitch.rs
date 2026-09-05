@@ -2,6 +2,7 @@
 
 use scrozz_core::{
     ColorSpace, Error, Frame, PhysicalSize, PixelFormat, Result, ScaleFactor, ScrollAxis,
+    ScrollDirection,
 };
 
 use crate::{
@@ -153,6 +154,7 @@ struct RollingCanvas {
 /// A deterministic scrolling stitcher.
 pub struct ScrollStitcher {
     axis: ScrollAxis,
+    direction: ScrollDirection,
     config: StitchConfig,
     latest_frame: Option<Frame>,
     latest_luma: Option<LumaPlane>,
@@ -169,6 +171,7 @@ impl std::fmt::Debug for ScrollStitcher {
         formatter
             .debug_struct("ScrollStitcher")
             .field("axis", &self.axis)
+            .field("direction", &self.direction)
             .field("config", &self.config)
             .field("accepted_frames", &self.accepted_frames)
             .field(
@@ -194,14 +197,25 @@ impl ScrollStitcher {
     /// Creates an empty stitcher.
     #[must_use]
     pub fn new(config: StitchConfig) -> Self {
-        Self::for_axis(ScrollAxis::Vertical, config)
+        Self::for_direction(ScrollDirection::Down, config)
     }
 
     /// Creates an empty stitcher for `axis`.
     #[must_use]
     pub fn for_axis(axis: ScrollAxis, config: StitchConfig) -> Self {
+        let direction = match axis {
+            ScrollAxis::Vertical => ScrollDirection::Down,
+            ScrollAxis::Horizontal => ScrollDirection::Right,
+        };
+        Self::for_direction(direction, config)
+    }
+
+    /// Creates an empty stitcher that follows chronological frames in `direction`.
+    #[must_use]
+    pub fn for_direction(direction: ScrollDirection, config: StitchConfig) -> Self {
         Self {
-            axis,
+            axis: direction.axis(),
+            direction,
             config,
             latest_frame: None,
             latest_luma: None,
@@ -220,13 +234,22 @@ impl ScrollStitcher {
         self.axis
     }
 
+    /// Direction this stitcher follows through the document.
+    #[must_use]
+    pub const fn direction(&self) -> ScrollDirection {
+        self.direction
+    }
+
     /// Updates the displacement prior once the first frame reveals its scale.
     pub fn set_expected_delta(&mut self, expected_delta: Option<u32>) {
         self.config.expected_delta = expected_delta;
     }
 
     /// Adds a frame and reports whether the document advanced.
-    pub fn push_frame(&mut self, frame: Frame) -> Result<PushOutcome> {
+    pub fn push_frame(&mut self, mut frame: Frame) -> Result<PushOutcome> {
+        if self.direction.is_reverse() {
+            reverse_frame(&mut frame, self.axis)?;
+        }
         if let Some(previous) = self.latest_frame.as_ref() {
             validate_compatible(previous, &frame)?;
         } else {
@@ -427,11 +450,13 @@ impl ScrollStitcher {
 
     /// Produces the current image.
     pub fn finish_frame(mut self) -> Result<Frame> {
-        match self.accepted_frames {
-            0 => Err(Error::InvalidRequest(
-                "cannot finish a scrolling capture with no frames".to_owned(),
-            )),
-            1 => Ok(self.latest_frame.take().expect("one retained frame")),
+        let mut frame = match self.accepted_frames {
+            0 => {
+                return Err(Error::InvalidRequest(
+                    "cannot finish a scrolling capture with no frames".to_owned(),
+                ));
+            }
+            1 => self.latest_frame.take().expect("one retained frame"),
             _ => {
                 let canvas = self.canvas.take().ok_or_else(|| {
                     Error::Platform(
@@ -440,9 +465,13 @@ impl ScrollStitcher {
                 })?;
                 drop(self.latest_frame.take());
                 drop(self.latest_luma.take());
-                canvas.finish()
+                canvas.finish()?
             }
+        };
+        if self.direction.is_reverse() {
+            reverse_frame(&mut frame, self.axis)?;
         }
+        Ok(frame)
     }
 
     fn stationary(&mut self) -> PushOutcome {
@@ -466,7 +495,7 @@ impl ScrollStitcher {
         if self.axis != ScrollAxis::Horizontal {
             return SideChromeBands::default();
         }
-        let chrome = self.chrome();
+        let chrome = self.natural_chrome();
         SideChromeBands {
             left: chrome.leading,
             right: chrome.trailing,
@@ -477,7 +506,7 @@ impl ScrollStitcher {
         if self.axis != ScrollAxis::Vertical {
             return ChromeBands::default();
         }
-        let chrome = self.chrome();
+        let chrome = self.natural_chrome();
         ChromeBands {
             top: chrome.leading,
             bottom: chrome.trailing,
@@ -486,6 +515,18 @@ impl ScrollStitcher {
 
     fn chrome(&self) -> AxisChromeBands {
         self.frozen_chrome.unwrap_or_default()
+    }
+
+    fn natural_chrome(&self) -> AxisChromeBands {
+        let chrome = self.chrome();
+        if self.direction.is_reverse() {
+            AxisChromeBands {
+                leading: chrome.trailing,
+                trailing: chrome.leading,
+            }
+        } else {
+            chrome
+        }
     }
 }
 
@@ -949,6 +990,124 @@ fn insufficient_overlap(error: AlignError) -> PushOutcome {
     }
 }
 
+/// Detects the dominant cardinal direction between two chronological frames.
+///
+/// No wheel delta is trusted here. Real pixels must prove one axis and one sign;
+/// ambiguous animation is treated as no decision so the caller can observe
+/// another frame rather than lock onto a guess.
+pub fn detect_scroll_direction(
+    previous: &Frame,
+    current: &Frame,
+    config: &StitchConfig,
+) -> Result<Option<ScrollDirection>> {
+    validate_compatible(previous, current)?;
+    let previous_luma = LumaPlane::from_frame(previous)?;
+    let current_luma = LumaPlane::from_frame(current)?;
+    if previous_luma == current_luma {
+        return Ok(None);
+    }
+
+    let mut candidates = Vec::with_capacity(4);
+    for direction in [
+        ScrollDirection::Up,
+        ScrollDirection::Down,
+        ScrollDirection::Left,
+        ScrollDirection::Right,
+    ] {
+        let axis = direction.axis();
+        let (oriented_previous, oriented_current) = if direction.is_reverse() {
+            (&current_luma, &previous_luma)
+        } else {
+            (&previous_luma, &current_luma)
+        };
+        let initial = match provisional_alignment(
+            oriented_previous,
+            oriented_current,
+            axis,
+            None,
+            &config.alignment,
+            &config.chrome,
+        ) {
+            Ok(alignment) if alignment.delta > config.movement_epsilon => alignment,
+            _ => continue,
+        };
+        let Ok((alignment, _)) = establish_bootstrap_chrome(
+            oriented_previous,
+            oriented_current,
+            axis,
+            initial,
+            None,
+            &config.alignment,
+            &config.chrome,
+        ) else {
+            continue;
+        };
+        if alignment.delta > config.movement_epsilon {
+            candidates.push((direction, alignment));
+        }
+    }
+
+    candidates.sort_by_key(|(_, alignment)| {
+        (
+            alignment.score,
+            std::cmp::Reverse(alignment.confidence),
+            std::cmp::Reverse(alignment.delta),
+        )
+    });
+    let Some(&(direction, best)) = candidates.first() else {
+        return Ok(None);
+    };
+    if candidates.get(1).is_some_and(|(_, runner_up)| {
+        runner_up.score.saturating_sub(best.score) < config.alignment.min_confidence
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(direction))
+}
+
+fn reverse_frame(frame: &mut Frame, axis: ScrollAxis) -> Result<()> {
+    if !frame.is_well_formed() {
+        return Err(Error::InvalidRequest(
+            "cannot reverse a malformed scrolling frame".to_owned(),
+        ));
+    }
+    let height = frame.height() as usize;
+    let width = frame.width() as usize;
+    match axis {
+        ScrollAxis::Vertical => {
+            for row in 0..height / 2 {
+                let top = row.checked_mul(frame.stride).ok_or_else(|| {
+                    Error::InvalidRequest("scrolling frame row offset overflowed".to_owned())
+                })?;
+                let bottom = (height - 1 - row)
+                    .checked_mul(frame.stride)
+                    .ok_or_else(|| {
+                        Error::InvalidRequest("scrolling frame row offset overflowed".to_owned())
+                    })?;
+                let (before_bottom, from_bottom) = frame.data.split_at_mut(bottom);
+                before_bottom[top..top + frame.stride]
+                    .swap_with_slice(&mut from_bottom[..frame.stride]);
+            }
+        }
+        ScrollAxis::Horizontal => {
+            let bytes_per_pixel = frame.format.bytes_per_pixel();
+            for row in 0..height {
+                let row_start = row.checked_mul(frame.stride).ok_or_else(|| {
+                    Error::InvalidRequest("scrolling frame row offset overflowed".to_owned())
+                })?;
+                for column in 0..width / 2 {
+                    let left = row_start + column * bytes_per_pixel;
+                    let right = row_start + (width - 1 - column) * bytes_per_pixel;
+                    for component in 0..bytes_per_pixel {
+                        frame.data.swap(left + component, right + component);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_output_limit(bytes: u64, max_output_bytes: u64) -> Result<()> {
     if bytes > max_output_bytes {
         return Err(Error::InvalidRequest(format!(
@@ -1220,6 +1379,98 @@ mod tests {
             PushOutcome::Advanced { delta: 3, .. }
         ));
         assert_eq!(stitcher.canvas.as_ref().map(RollingCanvas::width), Some(11));
+    }
+
+    #[test]
+    fn frame_motion_detects_all_four_cardinal_directions() {
+        let document: Vec<u8> = (0..16).map(|value| value * 12).collect();
+        let cases = [
+            (
+                ScrollDirection::Down,
+                frame(&document[0..8], 6),
+                frame(&document[3..11], 6),
+            ),
+            (
+                ScrollDirection::Up,
+                frame(&document[3..11], 6),
+                frame(&document[0..8], 6),
+            ),
+            (
+                ScrollDirection::Right,
+                column_frame(&document[0..8], 6),
+                column_frame(&document[3..11], 6),
+            ),
+            (
+                ScrollDirection::Left,
+                column_frame(&document[3..11], 6),
+                column_frame(&document[0..8], 6),
+            ),
+        ];
+
+        for (expected, previous, current) in cases {
+            assert_eq!(
+                detect_scroll_direction(&previous, &current, &config()).unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_directions_still_finish_in_natural_document_order() {
+        let document: Vec<u8> = (0..20).map(|value| value * 11).collect();
+        let mut up = ScrollStitcher::for_direction(ScrollDirection::Up, config());
+        for start in [6, 3, 0] {
+            up.push_frame(frame(&document[start..start + 8], 6))
+                .unwrap();
+        }
+        let output = up.finish_frame().unwrap();
+        let rows: Vec<u8> = output
+            .data
+            .chunks_exact(output.stride)
+            .map(|row| row[0])
+            .collect();
+        assert_eq!(rows, document[0..14]);
+
+        let mut left = ScrollStitcher::for_direction(ScrollDirection::Left, config());
+        for start in [6, 3, 0] {
+            left.push_frame(column_frame(&document[start..start + 8], 6))
+                .unwrap();
+        }
+        let output = left.finish_frame().unwrap();
+        let first_row = &output.data[..output.stride];
+        let (pixels, remainder) = first_row.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let columns: Vec<u8> = pixels.iter().map(|pixel| pixel[0]).collect();
+        assert_eq!(columns, document[0..14]);
+    }
+
+    #[test]
+    fn upward_detection_and_stitching_survive_fixed_edge_chrome() {
+        let document: Vec<u8> = (0..20).map(|value| 40 + value * 8).collect();
+        let viewport = |start: usize| {
+            let mut rows = vec![3, 17];
+            rows.extend_from_slice(&document[start..start + 8]);
+            rows.extend_from_slice(&[229, 247]);
+            frame(&rows, 6)
+        };
+        let previous = viewport(3);
+        let current = viewport(0);
+
+        assert_eq!(
+            detect_scroll_direction(&previous, &current, &config()).unwrap(),
+            Some(ScrollDirection::Up)
+        );
+        let mut stitcher = ScrollStitcher::for_direction(ScrollDirection::Up, config());
+        stitcher.push_frame(previous).unwrap();
+        stitcher.push_frame(current).unwrap();
+        assert_eq!(stitcher.summary().chrome, ChromeBands { top: 2, bottom: 2 });
+        let output = stitcher.finish_frame().unwrap();
+        let rows: Vec<u8> = output
+            .data
+            .chunks_exact(output.stride)
+            .map(|row| row[0])
+            .collect();
+        assert_eq!(rows, document[0..11]);
     }
 
     #[test]

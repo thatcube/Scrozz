@@ -25,11 +25,12 @@ pub use chrome::{
 pub use luma::{ColumnProfile, LumaPlane, RowProfile};
 pub use session::{
     AtomicCancellation, BackendFrameSource, CancelAction, CancelSignal, CompletionReason,
-    FrameSource, NeverCancel, NoopPacer, Pacer, Progress, ScrollSession, ScrollSessionConfig,
-    SessionOutput, ThreadPacer,
+    FrameSource, NeverCancel, NoopPacer, Pacer, Progress, ScrollDirectionAmounts, ScrollSession,
+    ScrollSessionConfig, SessionOutput, ThreadPacer,
 };
 pub use stitch::{
     PushOutcome, ScrollStitcher, SeamQuality, StitchConfig, StitchSummary, StopReason,
+    detect_scroll_direction,
 };
 
 /// Assembles overlapping frames into one long image.

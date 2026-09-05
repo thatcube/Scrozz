@@ -84,7 +84,7 @@ Read this as a map of what is *proven*, not what is *planned*.
 | Command-line interface | ✅ | 🟡 | 🟡 | Every capture the app can take, headlessly ([D11](docs/decisions.md)) |
 | Annotation editor | 🟡 | 🟡 | 🟡 | Full editor UI, history, crop, zoom, Smart Frame, arrows, text, secure Redact and revision-safe copy/save/drag are implemented; final aggregate and platform validation remain |
 | Screen recording | 🟠 | 🟠 | 🟠 | Native recording engines and editor playback exist; macOS editor/export corrections and Windows/Linux runtime closure remain active |
-| Scrolling capture | 🟡 | 🟡 | 🟡 | Vertical and horizontal stitching, sticky-chrome removal, progress, cancellation and partial salvage are wired end to end. macOS synthesizes target-bound gestures; Windows and X11 have native drivers awaiting real-desktop smoke, while Wayland is deliberately manual |
+| Scrolling capture | 🟡 | 🟡 | 🟡 | Draw an exact area, choose Manual or Automatic, press Start, then scroll once in any direction. Scrozz detects up/down/left/right from the pixels; Automatic continues that route while Manual follows you until Finish. macOS retains one ScreenCaptureKit target and uses conservative target-bound wheel steps; Windows and X11 have native drivers awaiting real-desktop smoke, while Wayland is deliberately manual |
 | Beautification | 🟡 | 🟡 | 🟡 | Smart Frame, automatic backgrounds, exact output sizes, custom presets and revision-safe export are integrated; hands-on aggregate validation remains |
 | BYO sharing | 🟠 | 🟠 | 🟠 | S3-compatible upload core exists; provider settings, credential-vault integration, history metadata and release packaging are active work |
 
@@ -125,6 +125,13 @@ capture that needs it explains why before macOS asks; if direct access is not
 granted, supported Window and Screen captures can use Apple's limited content
 picker instead. The picker replaces Scrozz's custom selector and cannot provide
 custom Area, All Displays, unattended global capture, or system-audio recording.
+
+Local bundle updates retain the installed signing certificate and refuse to
+silently replace it with another identity or an ad-hoc signature. A first local
+install prefers Developer ID, then Apple Development; explicitly changing
+signing identities can still require fresh privacy approval. Keep the runnable
+copy at `/Applications/Scrozz.app`: branch names belong on enclosing preview
+folders or archives, not on multiple registered apps sharing Scrozz's bundle ID.
 
 Scrozz then lives in the menu bar. It is invisible at rest by design
 ([D27](docs/decisions.md)) — the captures appear, the app does not.

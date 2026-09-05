@@ -34,6 +34,7 @@ pub(crate) enum OverlayAction {
     None,
     Mode(SelectionMode),
     Confirm,
+    Cancel,
 }
 
 pub(crate) struct PaintResult {
@@ -91,7 +92,7 @@ pub(super) fn draw_overlay(
     } else {
         None
     };
-    if should_draw_scrim(state.options_ref().hud) {
+    if should_draw_scrim(state.options_ref().hud || state.options_ref().confirm_region) {
         draw_scrim(&painter, canvas_rect, focus, view.surface, theme);
     }
     let mut confirmation = HudPaintResult {
@@ -111,7 +112,9 @@ pub(super) fn draw_overlay(
                 canvas_rect,
                 view.surface,
                 region,
-                state.options_ref().hud && state.constraint().exact.is_none(),
+                (state.options_ref().hud || state.options_ref().confirm_region)
+                    && state.constraint().exact.is_none()
+                    && !state.is_creating_region(),
                 theme,
             );
             if view.display.is_none() || state.pointer_display() == view.display {
@@ -153,7 +156,7 @@ pub(super) fn draw_overlay(
     };
     PaintResult {
         canvas: response,
-        action: if confirmation.action == OverlayAction::Confirm {
+        action: if confirmation.action != OverlayAction::None {
             confirmation.action
         } else {
             hud.action
@@ -383,15 +386,7 @@ fn draw_selection(
         StrokeKind::Inside,
     );
     if resizable {
-        for handle in handles(rect) {
-            painter.rect_filled(handle, corner(Radius::CHIP), palette.on_accent);
-            painter.rect_stroke(
-                handle,
-                corner(Radius::CHIP),
-                Stroke::new(1.0, Color32::from_black_alpha(170)),
-                StrokeKind::Inside,
-            );
-        }
+        crate::crop_chrome::draw_resize_guides(painter, rect);
     }
 }
 
@@ -422,20 +417,150 @@ fn draw_size_readout(
             |pixels| format!("{logical} logical · {pixels}"),
         ),
     };
-    let confirms = state.options_ref().hud;
-    let label = if confirms {
-        format!("{dimensions} · Capture")
-    } else {
-        dimensions
-    };
+    let confirms = (state.options_ref().hud || state.options_ref().confirm_region)
+        && !state.options_ref().scrolling_setup;
     let region_rect = translate(
         DisplayLayout::canvas_rect_in(surface, region),
         canvas_rect.min,
     );
+    if state.options_ref().confirm_region
+        && !state.options_ref().hud
+        && !state.options_ref().scrolling_setup
+    {
+        return draw_region_confirmation_controls(ui, canvas_rect, region_rect, &dimensions, theme);
+    }
+    let label = if state.options_ref().hud {
+        format!("{dimensions} · Capture")
+    } else if state.options_ref().confirm_region {
+        format!("{dimensions} · Done")
+    } else {
+        dimensions
+    };
     let size = vec2((label.len() as f32 * 8.0 + 28.0).max(138.0), 32.0);
     let mut origin = pos2(region_rect.left(), region_rect.top() - size.y - 10.0);
     if origin.y < canvas_rect.top() + Space::SM {
         origin.y = region_rect.bottom() + 10.0;
+    }
+
+    fn draw_region_confirmation_controls(
+        ui: &mut Ui,
+        canvas_rect: Rect,
+        region_rect: Rect,
+        dimensions: &str,
+        theme: &Theme,
+    ) -> HudPaintResult {
+        let gap = Space::SM;
+        let height = 32.0;
+        let dimension_width = (dimensions.len() as f32 * 8.0 + 24.0).max(116.0);
+        let button_width = 92.0;
+        let width = dimension_width + button_width * 2.0 + gap * 2.0;
+        let mut origin = pos2(
+            region_rect.center().x - width * 0.5,
+            region_rect.top() - height - 10.0,
+        );
+        if origin.y < canvas_rect.top() + Space::SM {
+            origin.y = region_rect.bottom() + 10.0;
+        }
+        origin.x = origin.x.clamp(
+            canvas_rect.left() + Space::SM,
+            canvas_rect.right() - width - Space::SM,
+        );
+        let dimensions_rect = Rect::from_min_size(origin, vec2(dimension_width, height));
+        let cancel_rect = Rect::from_min_size(
+            pos2(dimensions_rect.right() + gap, origin.y),
+            vec2(button_width, height),
+        );
+        let done_rect = Rect::from_min_size(
+            pos2(cancel_rect.right() + gap, origin.y),
+            vec2(button_width, height),
+        );
+        let dimension = ui.interact(
+            dimensions_rect,
+            Id::new("selector-region-dimensions"),
+            Sense::hover(),
+        );
+        let cancel = ui.interact(
+            cancel_rect,
+            Id::new("selector-region-cancel"),
+            Sense::click(),
+        );
+        let done = ui.interact(done_rect, Id::new("selector-region-done"), Sense::click());
+        cancel.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Cancel selection"));
+        done.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Done selecting area"));
+
+        chrome::glass_panel(
+            ui.painter(),
+            dimensions_rect,
+            Radius::BUTTON,
+            &theme.palette,
+            true,
+        );
+        chrome::glass_panel(
+            ui.painter(),
+            cancel_rect,
+            Radius::BUTTON,
+            &theme.palette,
+            true,
+        );
+        ui.painter().rect_filled(
+            done_rect,
+            corner(Radius::BUTTON),
+            if done.hovered() {
+                theme.palette.accent_hi
+            } else {
+                theme.palette.accent
+            },
+        );
+        for (rect, hovered) in [
+            (dimensions_rect, false),
+            (cancel_rect, cancel.hovered()),
+            (done_rect, done.hovered()),
+        ] {
+            ui.painter().rect_stroke(
+                rect,
+                corner(Radius::BUTTON),
+                Stroke::new(
+                    1.0,
+                    if hovered {
+                        theme.palette.focus_ring
+                    } else {
+                        theme.palette.hairline
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+        }
+        ui.painter().text(
+            dimensions_rect.center(),
+            Align2::CENTER_CENTER,
+            dimensions,
+            theme.font(Text::Button),
+            theme.palette.text,
+        );
+        ui.painter().text(
+            cancel_rect.center(),
+            Align2::CENTER_CENTER,
+            "Cancel",
+            theme.font(Text::Button),
+            theme.palette.text,
+        );
+        ui.painter().text(
+            done_rect.center(),
+            Align2::CENTER_CENTER,
+            "Done",
+            theme.font(Text::Button),
+            theme.palette.on_accent,
+        );
+        HudPaintResult {
+            action: if done.clicked() {
+                OverlayAction::Confirm
+            } else if cancel.clicked() {
+                OverlayAction::Cancel
+            } else {
+                OverlayAction::None
+            },
+            pointer_over_hud: dimension.hovered() || done.hovered() || cancel.hovered(),
+        }
     }
     origin.x = origin.x.clamp(
         canvas_rect.left() + Space::SM,
@@ -456,7 +581,7 @@ fn draw_size_readout(
             WidgetType::Button,
             true,
             if confirms {
-                format!("Capture selected area, {label}")
+                format!("Confirm selected area, {label}")
             } else {
                 format!("Selected area, {label}")
             },

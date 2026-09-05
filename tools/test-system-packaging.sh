@@ -16,6 +16,30 @@ fail() {
   exit 1
 }
 
+# shellcheck source=tools/macos-signing.sh
+source tools/macos-signing.sh
+DEV_IDENTITY='Apple Development: Fixture Developer (DEVTEAM)'
+RELEASE_IDENTITY='Developer ID Application: Fixture Developer (TEAMID)'
+IDENTITIES="1) DEVHASH \"$DEV_IDENTITY\"
+2) RELEASEHASH \"$RELEASE_IDENTITY\"
+2 valid identities found"
+[[ "$(scrozz_default_signing_identity "$DEV_IDENTITY" "$IDENTITIES")" == "$DEV_IDENTITY" ]] ||
+  fail "an established development identity changed on update"
+[[ "$(scrozz_default_signing_identity "$RELEASE_IDENTITY" "$IDENTITIES")" == "$RELEASE_IDENTITY" ]] ||
+  fail "an established release identity changed on update"
+[[ "$(scrozz_default_signing_identity "" "$IDENTITIES")" == "$RELEASE_IDENTITY" ]] ||
+  fail "a new bundle did not prefer the distribution identity"
+if scrozz_default_signing_identity "$DEV_IDENTITY" "0 valid identities found" >/dev/null 2>&1; then
+  fail "an unavailable installed identity silently fell back to ad-hoc signing"
+fi
+[[ "$(scrozz_default_signing_identity "" "0 valid identities found")" == "-" ]] ||
+  fail "a new unsigned development bundle lost its explicit ad-hoc fallback"
+if scrozz_default_signing_identity "" \
+  "$IDENTITIES
+3) OTHERHASH \"Developer ID Application: Another Developer (OTHERTEAM)\"" >/dev/null 2>&1; then
+  fail "an ambiguous keychain silently picked a distribution identity"
+fi
+
 expect_rejected() {
   if SCROZZ_BUNDLE_VALIDATE_ONLY=1 SCROZZ_SIGNING_MODE=ad-hoc-dev \
     tools/make-app-bundle.sh "$1" >/dev/null 2>&1; then

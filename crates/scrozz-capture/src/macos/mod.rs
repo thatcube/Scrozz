@@ -37,7 +37,7 @@ use scrozz_core::{
     LogicalRect, Provenance, Result, ScaleFactor, TargetEnumerator, Window,
 };
 
-use crate::CaptureCancellation;
+use crate::{CaptureCancellation, FrameSession};
 
 /// ScreenCaptureKit-backed still capture.
 #[derive(Debug, Default)]
@@ -89,6 +89,63 @@ impl TargetEnumerator for ScreenCaptureKitBackend {
     }
 }
 
+struct WindowFrameSession {
+    filter: Retained<SCContentFilter>,
+    configuration: Retained<SCStreamConfiguration>,
+    scale: ScaleFactor,
+    cancellation: Option<CaptureCancellation>,
+}
+
+impl FrameSession for WindowFrameSession {
+    fn capture_frame(&mut self) -> Result<scrozz_core::Frame> {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
+        let image = sck::capture_image_with_cancellation(
+            &self.filter,
+            &self.configuration,
+            self.cancellation.as_ref(),
+        )?;
+        let frame = image::to_frame(&image, self.scale)?;
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
+        Ok(frame)
+    }
+
+    fn name(&self) -> &str {
+        "ScreenCaptureKit window session"
+    }
+}
+
+pub(crate) fn window_frame_session(
+    request: CaptureRequest,
+    cancellation: Option<&CaptureCancellation>,
+) -> Result<Box<dyn FrameSession>> {
+    let CaptureTarget::Window(id) = &request.target else {
+        return Err(Error::InvalidRequest(
+            "a reusable macOS window session requires one window target".to_owned(),
+        ));
+    };
+    let content = sck::shareable_content_with_cancellation(cancellation)?;
+    let target = window::find(&content, id).ok_or_else(|| {
+        Error::TargetGone(format!(
+            "window {} is no longer open for scrolling capture",
+            id.0
+        ))
+    })?;
+    let fallback_scale = window_scale(&target);
+    let filter =
+        unsafe { SCContentFilter::initWithDesktopIndependentWindow(sck::alloc_filter(), &target) };
+    let (configuration, scale) = configure(&filter, &request, fallback_scale, None)?;
+    Ok(Box::new(WindowFrameSession {
+        filter,
+        configuration,
+        scale,
+        cancellation: cancellation.cloned(),
+    }))
+}
+
 impl CaptureBackend for ScreenCaptureKitBackend {
     fn excludes_current_process(&self, target: &CaptureTarget) -> bool {
         matches!(target, CaptureTarget::Display(_))
@@ -137,7 +194,7 @@ fn capture_display(
 
     let filter = display_filter_excluding_current_process(&content, &target);
 
-    let config = configure(&filter, request, scale, None)?;
+    let (config, scale) = configure(&filter, request, scale, None)?;
     let image = sck::capture_image_with_cancellation(&filter, &config, cancellation)?;
     Ok((image::to_frame(&image, scale)?, Provenance::Display))
 }
@@ -189,7 +246,7 @@ fn capture_window(
     let filter =
         unsafe { SCContentFilter::initWithDesktopIndependentWindow(sck::alloc_filter(), &target) };
 
-    let config = configure(&filter, request, scale, None)?;
+    let (config, scale) = configure(&filter, request, scale, None)?;
     let image = sck::capture_image_with_cancellation(&filter, &config, cancellation)?;
     Ok((image::to_frame(&image, scale)?, Provenance::Window))
 }
@@ -242,9 +299,9 @@ fn capture_region(
         rect.size,
     );
 
-    let config = configure(&filter, request, home.scale, Some(local))?;
+    let (config, scale) = configure(&filter, request, home.scale, Some(local))?;
     let image = sck::capture_image_with_cancellation(&filter, &config, cancellation)?;
-    Ok((image::to_frame(&image, home.scale)?, Provenance::Region))
+    Ok((image::to_frame(&image, scale)?, Provenance::Region))
 }
 
 /// Captures every display as one image.
@@ -302,20 +359,20 @@ fn configure(
     request: &CaptureRequest,
     fallback_scale: ScaleFactor,
     source_rect: Option<LogicalRect>,
-) -> Result<Retained<SCStreamConfiguration>> {
+) -> Result<(Retained<SCStreamConfiguration>, ScaleFactor)> {
     let config = unsafe { SCStreamConfiguration::new() };
+    // SAFETY: immutable property read from the live filter.
+    let pixel_scale = f64::from(unsafe { filter.pointPixelScale() });
+    let scale = if pixel_scale.is_finite() && pixel_scale > 0.0 {
+        display::scale_from_ratio(pixel_scale)
+    } else {
+        fallback_scale
+    };
 
     // SAFETY: all plain property reads and writes on a fresh configuration.
     unsafe {
         // The filter knows its own pixel scale on macOS 14+; fall back to the
         // display's when it reports something implausible.
-        let pixel_scale = f64::from(filter.pointPixelScale());
-        let scale = if pixel_scale.is_finite() && pixel_scale > 0.0 {
-            display::scale_from_ratio(pixel_scale)
-        } else {
-            fallback_scale
-        };
-
         let content = filter.contentRect();
         let region = source_rect.unwrap_or_else(|| display::from_cg_rect(content));
         let pixels = region.to_physical(scale);
@@ -354,7 +411,7 @@ fn configure(
         // the frame then reports honestly.
     }
 
-    Ok(config)
+    Ok((config, scale))
 }
 
 /// Builds a display filter that leaves Scrozz visible to the user but absent

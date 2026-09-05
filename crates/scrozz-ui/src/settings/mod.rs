@@ -141,6 +141,8 @@ impl SettingsEdits {
 /// Capture fidelity preferences that belong to the shutter, not to the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureSettings {
+    /// Whether screenshot selectors hold the pre-overlay desktop still.
+    pub freeze_screen: bool,
     /// Whether a window capture includes the window's own drop shadow.
     pub window_shadow: bool,
 }
@@ -148,6 +150,7 @@ pub struct CaptureSettings {
 impl Default for CaptureSettings {
     fn default() -> Self {
         Self {
+            freeze_screen: false,
             window_shadow: true,
         }
     }
@@ -359,7 +362,7 @@ pub enum Pane {
 impl Pane {
     /// Every pane, in navigation order, with its label and icon.
     pub const ALL: [(Self, &'static str, Icon); 8] = [
-        (Self::Capture, "Capture", Icon::Viewfinder),
+        (Self::Capture, "Screenshots", Icon::Viewfinder),
         (Self::Scenes, "Scenes", Icon::Palette),
         (Self::AfterCapture, "After Capture", Icon::Copy),
         (Self::Recording, "Recording", Icon::Video),
@@ -1018,7 +1021,18 @@ fn draw_capture(
     current: CaptureSettings,
 ) -> Option<CaptureSettings> {
     let mut settings = current;
-    kit::page(ui, theme, "Capture", None, |ui| {
+    kit::page(ui, theme, "Screenshots", None, |ui| {
+        kit::section(ui, theme, Some("Selection"), |ui| {
+            kit::row_with_help(
+                ui,
+                theme,
+                "Freeze screen",
+                "Freeze screen when taking a screenshot while choosing an area or screen.",
+                |ui| {
+                    kit::switch(ui, theme, &mut settings.freeze_screen, true);
+                },
+            );
+        });
         kit::section(ui, theme, Some("Window"), |ui| {
             kit::row_with_help(
                 ui,

@@ -86,6 +86,7 @@
 pub mod camera_settings;
 pub mod card;
 pub mod cloud_settings;
+mod crop_chrome;
 pub mod editor;
 pub mod harness;
 pub mod history;
@@ -136,7 +137,8 @@ pub use recording_settings::{
     RecordingSettingsAction, RecordingSettingsPanel, RecordingSettingsResponse,
 };
 pub use scrolling::{
-    ScrollHudAction, ScrollHudResponse, ScrollHudState, ScrollHudStatus, ScrollingHud,
+    ScrollHudAction, ScrollHudResponse, ScrollHudState, ScrollHudStatus, ScrollHudSurface,
+    ScrollingHud,
 };
 
 pub use select::{

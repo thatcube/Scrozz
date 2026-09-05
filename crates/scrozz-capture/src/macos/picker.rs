@@ -577,7 +577,7 @@ fn prepare_capture(
         cursor: CursorMode::Hidden,
         include_window_shadow: shadow_for(provenance, include_window_shadow),
     };
-    let configuration = super::configure(filter, &request, scale, None)?;
+    let (configuration, scale) = super::configure(filter, &request, scale, None)?;
     Ok((configuration, scale, target, provenance))
 }
 

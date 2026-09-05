@@ -654,6 +654,10 @@ fn luminance_at(image: &Image, x: f32, y: f32) -> u32 {
 /// offers, and a control that is merely painted somewhere else on the card
 /// would still be reachable by keyboard and by assistive technology.
 fn control_labels(editing: bool) -> Vec<String> {
+    saved_control_labels(editing, false, false)
+}
+
+fn saved_control_labels(editing: bool, saved: bool, compact: bool) -> Vec<String> {
     let ctx = egui::Context::default();
     ctx.enable_accesskit();
     theme::install_fonts(&ctx);
@@ -679,7 +683,11 @@ fn control_labels(editing: bool) -> Vec<String> {
                 let frame = CardFrame {
                     id: CardId(1),
                     slot: 0,
-                    rect: card_rect(),
+                    rect: if compact {
+                        Rect::from_min_size(pos2(34.0, 34.0), vec2(100.0, 70.0))
+                    } else {
+                        card_rect()
+                    },
                     alpha: 1.0,
                     // Fully revealed: the hover chrome is showing, which is
                     // exactly the state this contract is about.
@@ -693,6 +701,7 @@ fn control_labels(editing: bool) -> Vec<String> {
                     CardContent::new("capture-01.png", (1600, 1000), Provenance::Display)
                         .with_media(CardMedia::Image);
                 content.editing = editing;
+                content.saved = saved;
                 card::draw_card(ui, &surface, &frame, &content);
             },
         );
@@ -709,6 +718,30 @@ fn control_labels(editing: bool) -> Vec<String> {
             .collect();
     }
     labels
+}
+
+#[test]
+fn saved_cards_replace_save_with_folder_in_both_layouts() {
+    assert_eq!(CardAction::Reveal.icon(), scrozz_ui::icons::Icon::Folder);
+    for compact in [false, true] {
+        let labels = saved_control_labels(false, true, compact);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == CardAction::Reveal.label()),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == CardAction::Save.label()),
+            "{labels:?}"
+        );
+        let editing = saved_control_labels(true, true, compact);
+        assert!(
+            !editing
+                .iter()
+                .any(|label| label == CardAction::Reveal.label())
+        );
+    }
 }
 
 #[test]

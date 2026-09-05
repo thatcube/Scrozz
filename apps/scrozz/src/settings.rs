@@ -57,6 +57,8 @@ pub const APPLY_SMART_FRAME_AFTER_CAPTURE_KEY: &str = "after-capture.apply-smart
 pub const SCENES_DEFAULT_KEY: &str = "scenes.default";
 /// Window drop shadow fidelity for window captures.
 pub const WINDOW_SHADOW_KEY: &str = "capture.window-shadow";
+/// Whether the desktop is frozen while choosing a screenshot target.
+pub const FREEZE_SCREEN_KEY: &str = "capture.freeze-screen";
 pub const RECENT_CAPTURES_OVERLAY_PLACEMENT_KEY: &str = "recent-captures-overlay.placement";
 pub const RECENT_CAPTURES_OVERLAY_FOLLOW_ACTIVE_DISPLAY_KEY: &str =
     "recent-captures-overlay.follow-active-display";
@@ -588,7 +590,7 @@ pub const SETTINGS: &[Setting] = &[
         description: "Show guides and a pixel loupe never, while holding the primary modifier, or always.",
     },
     Setting {
-        key: "capture.freeze-screen",
+        key: FREEZE_SCREEN_KEY,
         kind: Kind::Bool,
         default: "false",
         description: "Freeze screen contents while choosing a region or display.",
@@ -1241,6 +1243,15 @@ pub fn stored_settings() -> CliResult<(AfterCaptureSettings, AfterCaptureStore)>
     Ok((settings, store))
 }
 
+/// Resolves the saved screenshot-freeze preference without writing settings.
+pub fn freeze_screen_read_only() -> CliResult<bool> {
+    let store = AfterCaptureStore::default_location().map_err(CliError::Core)?;
+    let persisted = store
+        .load_read_only(store.inferred_profile())
+        .map_err(CliError::Core)?;
+    freeze_screen(&persisted)
+}
+
 /// The value in force for a setting, and whether the user chose it.
 ///
 /// Shortcuts resolve through their registration-aware store; every other key
@@ -1347,6 +1358,19 @@ pub fn window_shadow(persisted: &AfterCaptureSettings) -> CliResult<bool> {
     value
         .parse::<bool>()
         .map_err(|_| CliError::usage(format!("{WINDOW_SHADOW_KEY} must be `true` or `false`")))
+}
+
+/// Whether screenshot selectors hold pre-overlay desktop pixels still.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] if the stored value is not a boolean.
+pub fn freeze_screen(persisted: &AfterCaptureSettings) -> CliResult<bool> {
+    let shortcuts = Shortcuts::default();
+    let value = resolve(lookup(FREEZE_SCREEN_KEY)?, &shortcuts, persisted).0;
+    value
+        .parse::<bool>()
+        .map_err(|_| CliError::usage(format!("{FREEZE_SCREEN_KEY} must be `true` or `false`")))
 }
 
 /// Folds the retired `after-capture.apply-smart-frame` flag into `scenes.default`.
@@ -2126,6 +2150,10 @@ mod tests {
     #[test]
     fn frozen_selection_defaults_off() {
         assert_eq!(lookup("capture.freeze-screen").unwrap().default, "false");
+        let mut persisted = AfterCaptureSettings::fresh();
+        assert!(!freeze_screen(&persisted).unwrap());
+        persisted.set_value(FREEZE_SCREEN_KEY, "true");
+        assert!(freeze_screen(&persisted).unwrap());
     }
 
     #[test]

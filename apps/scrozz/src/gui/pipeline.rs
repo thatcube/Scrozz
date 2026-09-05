@@ -64,7 +64,7 @@ use scrozz_annotate::{
 };
 use scrozz_core::{
     Capture, CaptureRequest, CaptureTarget, ColorSpace, CursorMode, Error as CoreError,
-    LogicalPoint, LogicalRect, LogicalSize, PinState, Provenance, ScaleFactor, ScrollAxis,
+    LogicalPoint, LogicalRect, LogicalSize, PinState, Provenance, ScaleFactor, ScrollControl,
     SelectionMode, SelectionOptions,
 };
 use scrozz_export::{EncodeOptions, Encoder, FrameEncoder, ImageFormat, PngEffort, RgbaImage};
@@ -142,6 +142,14 @@ const READY_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// therefore resident memory — without limit, because the worker is slower than
 /// the socket. Two is one being processed plus one waiting.
 const MAX_QUEUED_CAPTURE_FRAMES: usize = 2;
+
+fn emit_outcome(outcomes: &Sender<Outcome>, waker: Option<&SurfaceWaker>, outcome: Outcome) {
+    if outcomes.send(outcome).is_ok()
+        && let Some(waker) = waker
+    {
+        waker();
+    }
+}
 
 #[derive(Clone)]
 struct CaptureBudget {
@@ -473,13 +481,14 @@ enum AcquisitionJob {
         kind: CaptureKind,
         origin: CaptureOrigin,
         card: CardId,
+        freeze_screen: bool,
         policy: AfterCaptureSettings,
         clipboard: Option<ClipboardTurn>,
         _permit: CapturePermit,
         _lease: AcquisitionLease,
     },
     Scrolling {
-        axis: ScrollAxis,
+        control: ScrollControl,
         card: CardId,
         origin: CaptureOrigin,
         policy: AfterCaptureSettings,
@@ -1062,6 +1071,8 @@ pub enum Outcome {
         card: CardId,
         /// What happened, e.g. "copied to the clipboard".
         detail: String,
+        /// Exact destination of a successful file export, never a log-derived path.
+        saved_path: Option<std::path::PathBuf>,
         /// The editor generation and document revision the completed output
         /// was rendered from, when a live editor produced it. `None` when
         /// the output was read from the card's own cache with no editor
@@ -1598,6 +1609,7 @@ impl Pipeline {
         kind: CaptureKind,
         origin: CaptureOrigin,
         card: CardId,
+        freeze_screen: bool,
         policy: AfterCaptureSettings,
     ) -> CliResult<()> {
         let lease = self.acquisition_gate.try_acquire().ok_or_else(|| {
@@ -1620,6 +1632,7 @@ impl Pipeline {
             kind,
             origin,
             card,
+            freeze_screen,
             policy,
             clipboard,
             _permit: permit,
@@ -1804,10 +1817,22 @@ impl Pipeline {
     /// job is queued or waiting in native frame acquisition.
     pub fn post_scrolling(
         &self,
-        axis: ScrollAxis,
+        control: ScrollControl,
         card: CardId,
         target: Box<ScrollingTarget>,
-    ) -> bool {
+        policy: AfterCaptureSettings,
+    ) -> CliResult<()> {
+        let lease = self.acquisition_gate.try_acquire().ok_or_else(|| {
+            CliError::Core(CoreError::InvalidRequest(
+                "another capture is still selecting or preparing its card".to_owned(),
+            ))
+        })?;
+        let permit = self.capture_budget.try_acquire().ok_or_else(|| {
+            CliError::Core(CoreError::Platform(format!(
+                "the capture pipeline already holds the maximum of \
+                 {MAX_QUEUED_CAPTURE_FRAMES} full-resolution captures"
+            )))
+        })?;
         self.scrolling_cancellation.reset();
         let acquisition_cancellation = scrozz_capture::CaptureCancellation::new();
         *self
@@ -1815,37 +1840,30 @@ impl Pipeline {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(acquisition_cancellation.clone());
-        let policy = crate::settings::stored_settings()
-            .map(|(persisted, _)| persisted)
-            .unwrap_or_default();
         let clipboard = capture_clipboard_turn(&policy);
-        let posted = self
-            .acquisition_gate
-            .try_acquire()
-            .zip(self.capture_budget.try_acquire())
-            .is_some_and(|(lease, permit)| {
-                self.acquisitions
-                    .send(AcquisitionJob::Scrolling {
-                        axis,
-                        card,
-                        origin: CaptureOrigin::Direct,
-                        policy,
-                        clipboard,
-                        target,
-                        acquisition_cancellation: acquisition_cancellation.clone(),
-                        _permit: permit,
-                        _lease: lease,
-                    })
-                    .is_ok()
-            });
-        if !posted {
+        let posted = self.acquisitions.send(AcquisitionJob::Scrolling {
+            control,
+            card,
+            origin: CaptureOrigin::Direct,
+            policy,
+            clipboard,
+            target,
+            acquisition_cancellation: acquisition_cancellation.clone(),
+            _permit: permit,
+            _lease: lease,
+        });
+        if posted.is_err() {
             acquisition_cancellation.cancel();
             self.active_scrolling_acquisition
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
         }
-        posted
+        posted.map_err(|_| {
+            CliError::Core(CoreError::Platform(
+                "the acquisition worker stopped before scrolling capture was admitted".to_owned(),
+            ))
+        })
     }
 
     /// Asks the active scrolling session to keep its partial image or abort it.
@@ -2329,7 +2347,7 @@ struct AnalysisCacheKey {
 
 /// Everything the worker needs to run one scrolling session.
 struct ScrollingJob {
-    axis: ScrollAxis,
+    control: ScrollControl,
     target: ScrollingTarget,
     acquisition_cancellation: scrozz_capture::CaptureCancellation,
 }
@@ -2396,42 +2414,55 @@ impl AcquisitionWorker {
     }
 
     fn capture(&self, job: AcquisitionJob) {
-        let (kind, card, origin, policy, clipboard, scrolling, permit, _lease) = match job {
-            AcquisitionJob::Capture {
-                kind,
-                origin,
-                card,
-                policy,
-                clipboard,
-                _permit,
-                _lease,
-            } => (kind, card, origin, policy, clipboard, None, _permit, _lease),
-            AcquisitionJob::Scrolling {
-                axis,
-                card,
-                origin,
-                policy,
-                clipboard,
-                target,
-                acquisition_cancellation,
-                _permit,
-                _lease,
-            } => (
-                CaptureKind::Scrolling,
-                card,
-                origin,
-                policy,
-                clipboard,
-                Some(ScrollingJob {
-                    axis,
-                    target: *target,
+        let (kind, card, origin, freeze_screen, policy, clipboard, scrolling, permit, _lease) =
+            match job {
+                AcquisitionJob::Capture {
+                    kind,
+                    origin,
+                    card,
+                    freeze_screen,
+                    policy,
+                    clipboard,
+                    _permit,
+                    _lease,
+                } => (
+                    kind,
+                    card,
+                    origin,
+                    freeze_screen,
+                    policy,
+                    clipboard,
+                    None,
+                    _permit,
+                    _lease,
+                ),
+                AcquisitionJob::Scrolling {
+                    control,
+                    card,
+                    origin,
+                    policy,
+                    clipboard,
+                    target,
                     acquisition_cancellation,
-                }),
-                _permit,
-                _lease,
-            ),
-            AcquisitionJob::Stop => return,
-        };
+                    _permit,
+                    _lease,
+                } => (
+                    CaptureKind::Scrolling,
+                    card,
+                    origin,
+                    false,
+                    policy,
+                    clipboard,
+                    Some(ScrollingJob {
+                        control,
+                        target: *target,
+                        acquisition_cancellation,
+                    }),
+                    _permit,
+                    _lease,
+                ),
+                AcquisitionJob::Stop => return,
+            };
         let started = Instant::now();
         tracing::debug!(
             %card,
@@ -2440,7 +2471,14 @@ impl AcquisitionWorker {
             "capture acquisition started"
         );
         let mut lifecycle = CaptureLifecycle::new(Arc::clone(&self.selector));
-        match self.take(kind, card, &policy, &mut lifecycle, scrolling) {
+        match self.take(
+            kind,
+            card,
+            freeze_screen,
+            &policy,
+            &mut lifecycle,
+            scrolling,
+        ) {
             Ok(capture) => {
                 tracing::debug!(
                     %card,
@@ -2511,6 +2549,7 @@ impl AcquisitionWorker {
         &self,
         kind: CaptureKind,
         card: CardId,
+        freeze_screen: bool,
         policy: &AfterCaptureSettings,
         lifecycle: &mut CaptureLifecycle,
         scrolling: Option<ScrollingJob>,
@@ -2521,17 +2560,23 @@ impl AcquisitionWorker {
         if kind == CaptureKind::Scrolling {
             let job = scrolling.ok_or_else(|| {
                 CliError::Core(CoreError::InvalidRequest(
-                    "a scrolling pipeline job must name its axis and target".to_owned(),
+                    "a scrolling pipeline job must name its target".to_owned(),
                 ))
             })?;
             let outcomes = self.outcomes.clone();
-            let capture = crate::scrolling::scrolling_capture_target_with_cancellation(
+            let waker = self.waker.clone();
+            let capture =
+                crate::scrolling::scrolling_capture_target_with_detected_direction_and_cancellation(
                 job.target,
-                job.axis,
+                job.control,
                 &mut self.scrolling_cancellation.clone(),
                 &job.acquisition_cancellation,
                 move |progress| {
-                    let _ = outcomes.send(Outcome::Progress { card, progress });
+                    emit_outcome(
+                        &outcomes,
+                        waker.as_ref(),
+                        Outcome::Progress { card, progress },
+                    );
                 },
             )?;
             if !self.scrolling_cancellation.seal_output() {
@@ -2557,7 +2602,7 @@ impl AcquisitionWorker {
             }
             CaptureKind::Scrolling => unreachable!("scrolling captures return earlier"),
             CaptureKind::AllInOne | CaptureKind::Region | CaptureKind::Window => {
-                let options = selection_options_for(kind);
+                let options = selection_options_for(kind, freeze_screen);
                 let capabilities = self.selector.capabilities();
                 if !capabilities.supports(options.mode) {
                     return Err(CliError::Core(CoreError::Unsupported {
@@ -2619,19 +2664,20 @@ impl AcquisitionWorker {
     }
 
     fn emit(&self, outcome: Outcome) {
-        if self.outcomes.send(outcome).is_ok()
-            && let Some(waker) = &self.waker
-        {
-            waker();
-        }
+        emit_outcome(&self.outcomes, self.waker.as_ref(), outcome);
     }
 }
 
-fn selection_options_for(kind: CaptureKind) -> SelectionOptions {
+fn selection_options_for(kind: CaptureKind, freeze_screen: bool) -> SelectionOptions {
     match kind {
-        CaptureKind::AllInOne => SelectionOptions::default(),
+        CaptureKind::AllInOne => SelectionOptions {
+            confirm_region: true,
+            freeze: freeze_screen,
+            ..SelectionOptions::default()
+        },
         CaptureKind::Region => SelectionOptions {
             hud: false,
+            freeze: freeze_screen,
             ..SelectionOptions::for_mode(SelectionMode::Region)
         },
         CaptureKind::Window => SelectionOptions {
@@ -3993,11 +4039,8 @@ impl Worker {
         let result = FrameEncoder::new()
             .encode(rendered.frame(), ImageFormat::Png)
             .map_err(CliError::from)
-            .and_then(|bytes| {
-                let path = crate::output::export_default(&bytes)?;
-                Ok(format!("saved the annotated image to {}", path.display()))
-            });
-        self.answer(
+            .and_then(|bytes| crate::output::export_default(&bytes));
+        self.answer_saved(
             card,
             Some((generation, rendered.revision())),
             action,
@@ -4022,11 +4065,8 @@ impl Worker {
         let result = FrameEncoder::new()
             .encode(rendered.frame(), ImageFormat::Png)
             .map_err(CliError::from)
-            .and_then(|bytes| {
-                let path = crate::output::export_to_path(&bytes, path)?;
-                Ok(format!("saved the annotated image to {}", path.display()))
-            });
-        self.answer(
+            .and_then(|bytes| crate::output::export_to_path(&bytes, path));
+        self.answer_saved(
             card,
             Some((generation, rendered.revision())),
             action,
@@ -4049,19 +4089,25 @@ impl Worker {
     }
 
     fn save(&mut self, card: CardId, action: u64) {
-        let result = self.cached(card, "save").and_then(|cached| {
-            let path = crate::output::export_default(&cached.full)?;
-            Ok(format!("saved to {}", path.display()))
+        let cached = self.cached(card, "save");
+        let version = cached.as_ref().ok().and_then(|bytes| {
+            bytes
+                .generation()
+                .map(|generation| (generation, bytes.revision()))
         });
-        self.answer(card, None, action, result);
+        let result = cached.and_then(|bytes| crate::output::export_default(&bytes.full));
+        self.answer_saved(card, version, action, result);
     }
 
     fn save_to(&mut self, card: CardId, path: &std::path::Path, action: u64) {
-        let result = self.cached(card, "save").and_then(|cached| {
-            let path = crate::output::export_to_path(&cached.full, path)?;
-            Ok(format!("saved to {}", path.display()))
+        let cached = self.cached(card, "save");
+        let version = cached.as_ref().ok().and_then(|bytes| {
+            bytes
+                .generation()
+                .map(|generation| (generation, bytes.revision()))
         });
-        self.answer(card, None, action, result);
+        let result = cached.and_then(|bytes| crate::output::export_to_path(&bytes.full, path));
+        self.answer_saved(card, version, action, result);
     }
 
     /// Hands the card's *current* bytes to the upload worker.
@@ -4859,6 +4905,7 @@ impl Worker {
             Ok(detail) => Outcome::Done {
                 card,
                 detail,
+                saved_path: None,
                 version,
                 action,
             },
@@ -4869,6 +4916,29 @@ impl Worker {
             },
         };
         self.emit(message);
+    }
+
+    fn answer_saved(
+        &self,
+        card: CardId,
+        version: Option<(u64, u64)>,
+        action: u64,
+        result: CliResult<std::path::PathBuf>,
+    ) {
+        match result {
+            Ok(path) => self.emit(Outcome::Done {
+                card,
+                detail: format!("saved to {}", path.display()),
+                saved_path: Some(path),
+                version,
+                action,
+            }),
+            Err(error) => self.emit(Outcome::OutputRefused {
+                card,
+                error,
+                action,
+            }),
+        }
     }
 
     #[cfg(test)]
@@ -6917,6 +6987,7 @@ mod tests {
                 CaptureKind::Region,
                 CaptureOrigin::GlobalHotkey,
                 CardId(1),
+                true,
                 AfterCaptureSettings::default(),
             )
             .expect("latency-critical admission");
@@ -6925,6 +6996,7 @@ mod tests {
                 CaptureKind::Region,
                 CaptureOrigin::GlobalHotkey,
                 CardId(2),
+                false,
                 AfterCaptureSettings::default(),
             )
             .expect_err("a second press must not queue another selector");
@@ -6939,6 +7011,7 @@ mod tests {
             AcquisitionJob::Capture {
                 kind: CaptureKind::Region,
                 card: CardId(1),
+                freeze_screen: true,
                 ..
             }
         ));
@@ -6946,6 +7019,111 @@ mod tests {
             job_rx.try_recv().is_err(),
             "an older output/history job must not sit ahead of selector acquisition"
         );
+    }
+
+    #[test]
+    fn screenshot_freeze_setting_reaches_region_and_all_in_one_selectors() {
+        assert!(selection_options_for(CaptureKind::Region, true).freeze);
+        assert!(selection_options_for(CaptureKind::AllInOne, true).freeze);
+        assert!(!selection_options_for(CaptureKind::Region, false).freeze);
+        assert!(
+            !selection_options_for(CaptureKind::Window, true).freeze,
+            "semantic window capture stays live because frozen display pixels cannot reconstruct it"
+        );
+    }
+
+    #[test]
+    fn scrolling_admission_preserves_live_policy_mode_and_reports_contention() {
+        let (acquisitions, acquisition_rx) = channel();
+        let (jobs, _job_rx) = channel();
+        let (history_queries, _history_rx) = channel();
+        let (uploads, _upload_rx) = channel();
+        let (outcome_tx, outcomes) = channel();
+        let pipeline = Pipeline {
+            acquisitions,
+            jobs,
+            capture_budget: CaptureBudget::new(),
+            acquisition_gate: AcquisitionGate::new(),
+            selector: Arc::new(RefusingSelector),
+            acquisition_done: channel().1,
+            worker_done: channel().1,
+            scrolling_cancellation: AtomicCancellation::default(),
+            active_scrolling_acquisition: Mutex::new(None),
+            pending_pin_updates: Arc::new(PendingPinUpdates::default()),
+            history_queries,
+            uploads,
+            outcomes,
+            #[cfg(test)]
+            test_outcomes: outcome_tx,
+            acquisition_worker: None,
+            worker: None,
+            history_worker: None,
+            upload_worker: None,
+            upload_cancellation: crate::cloud::ShareCancellation::default(),
+            next_card: 1,
+            vault: CaptureVault::new(),
+        };
+        let display = scrozz_core::Display {
+            id: scrozz_core::DisplayId("fixture-display".to_owned()),
+            name: "Fixture".to_owned(),
+            bounds: LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(900.0, 700.0)),
+            work_area: LogicalRect::new(
+                LogicalPoint::new(0.0, 0.0),
+                LogicalSize::new(900.0, 700.0),
+            ),
+            scale: ScaleFactor::IDENTITY,
+            is_primary: true,
+        };
+        let target = ScrollingTarget::new(
+            scrozz_core::CaptureRequest {
+                target: CaptureTarget::Window(scrozz_core::WindowId("fixture-window".to_owned())),
+                cursor: CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            display,
+            LogicalRect::new(
+                LogicalPoint::new(100.0, 100.0),
+                LogicalSize::new(600.0, 400.0),
+            ),
+            scrozz_core::WindowId("fixture-window".to_owned()),
+        );
+        let mut policy = no_after_capture_actions();
+        policy.set(MediaKind::Screenshot, AfterCaptureAction::OpenEditor, true);
+
+        pipeline
+            .post_scrolling(
+                ScrollControl::Manual,
+                CardId(71),
+                Box::new(target.clone()),
+                policy,
+            )
+            .expect("scrolling admission");
+        let contention = pipeline
+            .post_scrolling(
+                ScrollControl::Automatic,
+                CardId(72),
+                Box::new(target),
+                no_after_capture_actions(),
+            )
+            .expect_err("one active capture must refuse another scrolling session");
+        assert!(
+            contention
+                .to_string()
+                .contains("still selecting or preparing")
+        );
+
+        let AcquisitionJob::Scrolling {
+            control,
+            policy,
+            card,
+            ..
+        } = acquisition_rx.recv().expect("scrolling acquisition job")
+        else {
+            panic!("scrolling admission queued the wrong job");
+        };
+        assert_eq!(control, ScrollControl::Manual);
+        assert_eq!(card, CardId(71));
+        assert!(policy.is_enabled(MediaKind::Screenshot, AfterCaptureAction::OpenEditor));
     }
 
     #[test]
@@ -7170,6 +7348,34 @@ mod tests {
             action: 1,
         }));
         let _ = wait_for(&pipeline);
+        wait_for_wake(&wakes);
+    }
+
+    #[test]
+    fn scrolling_progress_wakes_the_reactive_window_event_loop() {
+        let (outcomes, received) = channel();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let waker: SurfaceWaker = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Release);
+        });
+
+        emit_outcome(
+            &outcomes,
+            Some(&waker),
+            Outcome::Progress {
+                card: CardId(73),
+                progress: Progress::WaitingForManualScroll,
+            },
+        );
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Outcome::Progress {
+                card: CardId(73),
+                ..
+            })
+        ));
         wait_for_wake(&wakes);
     }
 

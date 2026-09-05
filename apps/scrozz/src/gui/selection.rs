@@ -863,10 +863,16 @@ impl ClientOverlayController {
     ) {
         native.refresh();
         let pending_cursor = self.pending_selection_cursor();
-        self.pointer_wake
-            .store(pending_cursor.is_some(), Ordering::Release);
+        let was_pinned = self
+            .pointer_wake
+            .swap(pending_cursor.is_some(), Ordering::AcqRel);
         if let Some(cursor) = pending_cursor {
             native.set_cursor(cursor);
+            ctx.request_repaint();
+        } else if was_pinned {
+            // Release the native crosshair exactly once. From here egui owns
+            // crop-style resize, move, control, and ordinary arrow cursors.
+            native.set_cursor(OverlayCursor::Arrow);
             ctx.request_repaint();
         }
     }
@@ -949,6 +955,13 @@ impl ClientOverlayController {
             | ControllerPhase::WaitingForPreparation { cursor, .. }
             | ControllerPhase::PreparingWithCards { cursor, .. } => *cursor,
             ControllerPhase::ReadyToSelect { prepared, .. } => selection_cursor(&prepared.options),
+            ControllerPhase::Selecting { ui, .. }
+                if ui.state().options_ref().confirm_region
+                    && ui.state().region().is_some()
+                    && !ui.state().is_creating_region() =>
+            {
+                return None;
+            }
             ControllerPhase::Selecting { ui, .. } => selection_cursor(ui.state().options_ref()),
             _ => return None,
         };
@@ -1990,6 +2003,56 @@ mod tests {
                 .recorded_cursors()
                 .iter()
                 .all(|cursor| *cursor == OverlayCursor::Crosshair)
+        );
+    }
+
+    #[test]
+    fn adjustable_region_releases_the_native_crosshair_after_drawing() {
+        let (_selector, mut controller) = region_test_pair(Completion::RestoreCards);
+        let bounds = LogicalRect::new(LogicalPoint::new(0.0, 0.0), LogicalSize::new(320.0, 240.0));
+        let displays = test_target_snapshot(bounds).displays;
+        let options = SelectionOptions {
+            confirm_region: true,
+            scrolling_setup: true,
+            ..SelectionOptions::region()
+        };
+        let ui = SelectionUi::new(options, displays.clone(), Vec::new())
+            .with_capabilities(SelectionCapabilities::CLIENT_OVERLAY);
+        let (decision, _result) = channel();
+        controller.phase = ControllerPhase::Selecting {
+            id: 1,
+            ui: Box::new(ui),
+            viewports: selector_viewports_for(&displays, false).unwrap(),
+            decision,
+        };
+        let ctx = egui::Context::default();
+        let (native, _) = crate::gui::panel::BehaviorController::recording();
+
+        controller.refresh_pending_cursor(&ctx, &native);
+        assert!(controller.pointer_wake_flag().load(Ordering::Acquire));
+        assert_eq!(
+            native.recorded_cursors().last(),
+            Some(&OverlayCursor::Crosshair)
+        );
+
+        let ControllerPhase::Selecting { ui, .. } = &mut controller.phase else {
+            unreachable!()
+        };
+        ui.state_mut()
+            .pointer_pressed(LogicalPoint::new(20.0, 20.0));
+        ui.state_mut()
+            .pointer_moved(LogicalPoint::new(180.0, 140.0));
+        ui.state_mut()
+            .pointer_released(LogicalPoint::new(180.0, 140.0));
+        controller.refresh_pending_cursor(&ctx, &native);
+
+        assert!(
+            !controller.pointer_wake_flag().load(Ordering::Acquire),
+            "egui must own arrow, move, and crop resize cursors after the initial draw"
+        );
+        assert_eq!(
+            native.recorded_cursors().last(),
+            Some(&OverlayCursor::Arrow)
         );
     }
 

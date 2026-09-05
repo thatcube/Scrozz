@@ -10,10 +10,12 @@ use std::{
 
 use scrozz_core::{
     Capture, CaptureBackend, CaptureRequest, CaptureTarget, Error, Frame, Provenance, Result,
-    ScrollDriver, ScrollGesture, ScrollSynthesis,
+    ScrollControl, ScrollDirection, ScrollDriver, ScrollGesture, ScrollSynthesis,
 };
 
-use crate::{PushOutcome, ScrollStitcher, SeamQuality, StitchConfig, StopReason};
+use crate::{
+    PushOutcome, ScrollStitcher, SeamQuality, StitchConfig, StopReason, detect_scroll_direction,
+};
 
 /// Supplies successive viewport frames from one long-lived capture context.
 ///
@@ -175,6 +177,11 @@ pub enum Progress {
     },
     /// The manual flow is waiting for the user to move the target.
     WaitingForManualScroll,
+    /// Real frame movement established the axis and sign for this session.
+    DirectionDetected {
+        /// Direction subsequent manual or automatic movement follows.
+        direction: ScrollDirection,
+    },
     /// New document content was accepted.
     Advanced {
         /// One-based frame number.
@@ -280,6 +287,38 @@ pub struct ScrollSessionConfig {
     pub max_frames: usize,
     /// Stitching thresholds.
     pub stitch: StitchConfig,
+    /// Explicit GUI input choice. `None` preserves adaptive CLI behavior.
+    pub control: Option<ScrollControl>,
+    /// Per-axis automatic step sizes when the user's first movement chooses the
+    /// axis and sign.
+    pub direction_detection: Option<ScrollDirectionAmounts>,
+}
+
+/// Positive automatic step sizes used after real frame movement picks a route.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollDirectionAmounts {
+    /// Vertical step magnitude in logical points.
+    pub vertical: f64,
+    /// Horizontal step magnitude in logical points.
+    pub horizontal: f64,
+}
+
+impl ScrollDirectionAmounts {
+    /// Creates per-axis movement magnitudes.
+    #[must_use]
+    pub const fn new(vertical: f64, horizontal: f64) -> Self {
+        Self {
+            vertical,
+            horizontal,
+        }
+    }
+
+    fn for_direction(self, direction: ScrollDirection) -> f64 {
+        match direction {
+            ScrollDirection::Up | ScrollDirection::Down => self.vertical,
+            ScrollDirection::Left | ScrollDirection::Right => self.horizontal,
+        }
+    }
 }
 
 impl ScrollSessionConfig {
@@ -293,7 +332,30 @@ impl ScrollSessionConfig {
             manual_stall_limit: 20,
             max_frames: 100,
             stitch: StitchConfig::default(),
+            control: None,
+            direction_detection: None,
         }
+    }
+
+    /// Uses one explicit input mode instead of adaptive fallback.
+    #[must_use]
+    pub const fn with_control(mut self, control: ScrollControl) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    /// Lets the first coherent viewport movement choose up/down/left/right.
+    #[must_use]
+    pub const fn with_direction_detection(
+        mut self,
+        vertical_amount: f64,
+        horizontal_amount: f64,
+    ) -> Self {
+        self.direction_detection = Some(ScrollDirectionAmounts::new(
+            vertical_amount,
+            horizontal_amount,
+        ));
+        self
     }
 }
 
@@ -332,9 +394,20 @@ where
         C: CancelSignal,
         F: FnMut(Progress),
     {
-        if self.config.gesture.amount <= 0.0 || !self.config.gesture.amount.is_finite() {
+        if self.config.gesture.amount == 0.0 || !self.config.gesture.amount.is_finite() {
             return Err(Error::InvalidRequest(
-                "scrolling capture needs a finite, positive scroll amount".to_owned(),
+                "scrolling capture needs a finite, non-zero scroll amount".to_owned(),
+            ));
+        }
+        if self.config.direction_detection.is_some_and(|amounts| {
+            !amounts.vertical.is_finite()
+                || amounts.vertical <= 0.0
+                || !amounts.horizontal.is_finite()
+                || amounts.horizontal <= 0.0
+        }) {
+            return Err(Error::InvalidRequest(
+                "automatic direction detection needs finite, positive step sizes on both axes"
+                    .to_owned(),
             ));
         }
         if self.config.max_frames == 0 {
@@ -347,18 +420,31 @@ where
         // must not open a RemoteDesktop grant dialog it can never use.
         let first = self.source.capture_frame()?;
         let first_scale = first.scale;
-        let mut stitcher = ScrollStitcher::for_axis(self.config.gesture.axis, self.config.stitch);
-        stitcher.push_frame(first)?;
         let mut captured_frames = 1usize;
         let mut has_advanced = false;
         progress(Progress::FrameCaptured { frame: 1 });
-        if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
-            return finish_checked(stitcher, reason, captured_frames, cancel, &mut progress);
-        }
+        let _ = cancellation_reason(cancel, has_advanced)?;
 
+        if self.config.control == Some(ScrollControl::Manual) {
+            self.driver = Box::new(scrozz_core::ManualScrollDriver::new(
+                "manual mode was selected before capture",
+            ));
+        }
         let mut capabilities = self.driver.capabilities();
+        if self.config.control == Some(ScrollControl::Automatic) && !capabilities.is_automatic() {
+            let why = match &capabilities.synthesis {
+                ScrollSynthesis::Manual { why } => why.clone(),
+                ScrollSynthesis::Automatic => unreachable!(),
+            };
+            return Err(Error::Unsupported {
+                what: "automatic scrolling for this target".to_owned(),
+                why,
+            });
+        }
         if let Err(error) = self.driver.prepare() {
-            if is_recoverable_synthesis_error(&error) {
+            if self.config.control != Some(ScrollControl::Automatic)
+                && is_recoverable_synthesis_error(&error)
+            {
                 self.driver = Box::new(scrozz_core::ManualScrollDriver::new(error.to_string()));
                 capabilities = self.driver.capabilities();
                 self.driver.prepare()?;
@@ -375,6 +461,109 @@ where
             },
         });
 
+        let mut stitcher = if let Some(amounts) = self.config.direction_detection {
+            let mut probes = 0u32;
+            let baseline = first;
+            let mut recent = None;
+            loop {
+                let mut finish_after_probe =
+                    matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
+                if captured_frames >= self.config.max_frames {
+                    return Err(no_movement_error(
+                        "scrolling capture reached its frame limit without detecting movement",
+                    ));
+                }
+                if !finish_after_probe {
+                    progress(Progress::WaitingForManualScroll);
+                    self.pacer.wait(self.config.manual_poll_interval);
+                }
+                finish_after_probe |=
+                    matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
+                let frame = self.source.capture_frame()?;
+                captured_frames += 1;
+                progress(Progress::FrameCaptured {
+                    frame: captured_frames,
+                });
+                finish_after_probe |=
+                    matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
+
+                let detected_from_baseline =
+                    detect_scroll_direction(&baseline, &frame, &self.config.stitch)?;
+                let detected_from_recent = if detected_from_baseline.is_none() {
+                    recent
+                        .as_ref()
+                        .map(|anchor| detect_scroll_direction(anchor, &frame, &self.config.stitch))
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                };
+                let Some(direction) = detected_from_baseline.or(detected_from_recent) else {
+                    if finish_after_probe {
+                        return Err(no_movement_error(
+                            "cannot keep a scrolling capture before the viewport moves",
+                        ));
+                    }
+                    probes = probes.saturating_add(1);
+                    progress(Progress::Stalled { count: probes });
+                    recent = Some(frame);
+                    continue;
+                };
+                let anchor = if detected_from_baseline.is_some() {
+                    baseline
+                } else {
+                    recent.take().expect("a recent direction has an anchor")
+                };
+                self.config.gesture.axis = direction.axis();
+                self.config.gesture.amount = direction.amount(amounts.for_direction(direction));
+                let mut detected = ScrollStitcher::for_direction(direction, self.config.stitch);
+                let started = detected.push_frame(anchor)?;
+                if started != PushOutcome::Started {
+                    return Err(Error::Platform(
+                        "direction detector did not initialize its stitcher".to_owned(),
+                    ));
+                }
+                let outcome = detected.push_frame(frame)?;
+                let PushOutcome::Advanced {
+                    delta,
+                    seam,
+                    output_extent,
+                    output_height,
+                } = outcome
+                else {
+                    return Err(Error::Platform(format!(
+                        "detected {direction:?} movement could not initialize stitching: {outcome:?}"
+                    )));
+                };
+                has_advanced = true;
+                progress(Progress::DirectionDetected { direction });
+                progress(Progress::Advanced {
+                    frame: captured_frames,
+                    delta,
+                    seam,
+                    output_extent,
+                    output_height,
+                });
+                if finish_after_probe {
+                    return finish_checked(
+                        detected,
+                        CompletionReason::CancelledKeep,
+                        captured_frames,
+                        cancel,
+                        &mut progress,
+                    );
+                }
+                break detected;
+            }
+        } else {
+            let direction = self.config.gesture.direction().ok_or_else(|| {
+                Error::InvalidRequest("scrolling capture gesture cannot be a no-op".to_owned())
+            })?;
+            let mut fixed = ScrollStitcher::for_direction(direction, self.config.stitch);
+            fixed.push_frame(first)?;
+            fixed
+        };
+
         if self.config.stitch.expected_delta.is_none() {
             stitcher.set_expected_delta(
                 self.driver
@@ -383,9 +572,8 @@ where
         }
 
         loop {
-            if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
-                return finish_checked(stitcher, reason, captured_frames, cancel, &mut progress);
-            }
+            let mut finish_after_frame =
+                matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
             if captured_frames >= self.config.max_frames {
                 if !has_advanced {
                     return Err(no_movement_error(
@@ -394,77 +582,93 @@ where
                 }
                 return finish_checked(
                     stitcher,
-                    CompletionReason::FrameLimit,
+                    if finish_after_frame {
+                        CompletionReason::CancelledKeep
+                    } else {
+                        CompletionReason::FrameLimit
+                    },
                     captured_frames,
                     cancel,
                     &mut progress,
                 );
             }
 
-            if capabilities.is_automatic() {
-                if let Err(error) = self.driver.scroll(&self.config.gesture) {
-                    if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
-                        return finish_checked(
-                            stitcher,
-                            reason,
-                            captured_frames,
-                            cancel,
-                            &mut progress,
-                        );
-                    }
-                    if !is_recoverable_synthesis_error(&error) {
-                        if !has_advanced {
-                            return Err(error);
+            if !finish_after_frame {
+                if capabilities.is_automatic() {
+                    if let Err(error) = self.driver.scroll(&self.config.gesture) {
+                        if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
+                            return finish_checked(
+                                stitcher,
+                                reason,
+                                captured_frames,
+                                cancel,
+                                &mut progress,
+                            );
                         }
-                        progress(Progress::Interrupted {
-                            reason: error.to_string(),
-                        });
-                        return finish_checked(
-                            stitcher,
-                            CompletionReason::Interrupted,
-                            captured_frames,
-                            cancel,
-                            &mut progress,
-                        );
-                    }
-                    self.driver = Box::new(scrozz_core::ManualScrollDriver::new(error.to_string()));
-                    capabilities = self.driver.capabilities();
-                    if let Err(error) = self.driver.prepare() {
-                        if !has_advanced {
-                            return Err(error);
+                        if self.config.control == Some(ScrollControl::Automatic)
+                            || !is_recoverable_synthesis_error(&error)
+                        {
+                            if !has_advanced {
+                                return Err(error);
+                            }
+                            progress(Progress::Interrupted {
+                                reason: error.to_string(),
+                            });
+                            return finish_checked(
+                                stitcher,
+                                CompletionReason::Interrupted,
+                                captured_frames,
+                                cancel,
+                                &mut progress,
+                            );
                         }
-                        progress(Progress::Interrupted {
-                            reason: error.to_string(),
+                        self.driver =
+                            Box::new(scrozz_core::ManualScrollDriver::new(error.to_string()));
+                        capabilities = self.driver.capabilities();
+                        if let Err(error) = self.driver.prepare() {
+                            if !has_advanced {
+                                return Err(error);
+                            }
+                            progress(Progress::Interrupted {
+                                reason: error.to_string(),
+                            });
+                            return finish_checked(
+                                stitcher,
+                                CompletionReason::Interrupted,
+                                captured_frames,
+                                cancel,
+                                &mut progress,
+                            );
+                        }
+                        progress(Progress::Prepared {
+                            driver: self.driver.name().to_owned(),
+                            automatic: false,
+                            manual_reason: match &capabilities.synthesis {
+                                ScrollSynthesis::Manual { why } => Some(why.clone()),
+                                ScrollSynthesis::Automatic => None,
+                            },
                         });
-                        return finish_checked(
-                            stitcher,
-                            CompletionReason::Interrupted,
-                            captured_frames,
-                            cancel,
-                            &mut progress,
-                        );
+                        continue;
                     }
-                    progress(Progress::Prepared {
-                        driver: self.driver.name().to_owned(),
-                        automatic: false,
-                        manual_reason: match &capabilities.synthesis {
-                            ScrollSynthesis::Manual { why } => Some(why.clone()),
-                            ScrollSynthesis::Automatic => None,
-                        },
-                    });
-                    continue;
+                    self.pacer.wait(self.config.settle_delay);
+                } else {
+                    progress(Progress::WaitingForManualScroll);
+                    self.pacer.wait(self.config.manual_poll_interval);
                 }
-                self.pacer.wait(self.config.settle_delay);
-            } else {
-                progress(Progress::WaitingForManualScroll);
-                self.pacer.wait(self.config.manual_poll_interval);
             }
 
-            if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
-                return finish_checked(stitcher, reason, captured_frames, cancel, &mut progress);
-            }
+            finish_after_frame |= matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
             let frame = match self.source.capture_frame() {
                 Ok(frame) => frame,
+                Err(_error) if finish_after_frame && has_advanced => {
+                    return finish_checked(
+                        stitcher,
+                        CompletionReason::CancelledKeep,
+                        captured_frames,
+                        cancel,
+                        &mut progress,
+                    );
+                }
                 Err(error) if has_advanced => {
                     if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
                         return finish_checked(
@@ -492,11 +696,18 @@ where
             progress(Progress::FrameCaptured {
                 frame: captured_frames,
             });
-            if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
-                return finish_checked(stitcher, reason, captured_frames, cancel, &mut progress);
-            }
+            finish_after_frame |= matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
             let outcome = match stitcher.push_frame(frame) {
                 Ok(outcome) => outcome,
+                Err(_error) if finish_after_frame && has_advanced => {
+                    return finish_checked(
+                        stitcher,
+                        CompletionReason::CancelledKeep,
+                        captured_frames,
+                        cancel,
+                        &mut progress,
+                    );
+                }
                 Err(error) if has_advanced => {
                     if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
                         return finish_checked(
@@ -541,12 +752,52 @@ where
                         output_extent,
                         output_height,
                     });
+                    if finish_after_frame {
+                        return finish_checked(
+                            stitcher,
+                            CompletionReason::CancelledKeep,
+                            captured_frames,
+                            cancel,
+                            &mut progress,
+                        );
+                    }
                 }
                 PushOutcome::NoMovement { stalls } => {
                     progress(Progress::Stalled { count: stalls });
+                    if finish_after_frame {
+                        if !has_advanced {
+                            return Err(no_movement_error(
+                                "cannot keep a scrolling capture before the viewport moves",
+                            ));
+                        }
+                        return finish_checked(
+                            stitcher,
+                            CompletionReason::CancelledKeep,
+                            captured_frames,
+                            cancel,
+                            &mut progress,
+                        );
+                    }
                 }
                 PushOutcome::EndOfContent { stalls } => {
                     progress(Progress::Stalled { count: stalls });
+                    if finish_after_frame {
+                        if !has_advanced {
+                            return Err(no_movement_error(
+                                "cannot keep a scrolling capture before the viewport moves",
+                            ));
+                        }
+                        return finish_checked(
+                            stitcher,
+                            CompletionReason::CancelledKeep,
+                            captured_frames,
+                            cancel,
+                            &mut progress,
+                        );
+                    }
+                    if self.config.control == Some(ScrollControl::Manual) {
+                        continue;
+                    }
                     if !capabilities.is_automatic()
                         && (!has_advanced || stalls < self.config.manual_stall_limit.max(1))
                     {
@@ -569,7 +820,11 @@ where
                     if has_advanced {
                         return finish_checked(
                             stitcher,
-                            CompletionReason::OverlapLost,
+                            if finish_after_frame {
+                                CompletionReason::CancelledKeep
+                            } else {
+                                CompletionReason::OverlapLost
+                            },
                             captured_frames,
                             cancel,
                             &mut progress,
@@ -594,7 +849,7 @@ const fn is_recoverable_synthesis_error(error: &Error) -> bool {
 
 fn no_movement_error(message: &str) -> Error {
     Error::InvalidRequest(format!(
-        "{message}; move the target along the selected axis and try again"
+        "{message}; move the target once in any one direction and try again"
     ))
 }
 
@@ -602,13 +857,23 @@ fn cancellation_reason<C>(cancel: &mut C, has_advanced: bool) -> Result<Option<C
 where
     C: CancelSignal,
 {
-    match cancel.cancellation() {
-        Some(CancelAction::Abort) => Err(Error::Cancelled),
+    match poll_cancel_action(cancel)? {
         Some(CancelAction::Keep) if has_advanced => Ok(Some(CompletionReason::CancelledKeep)),
         Some(CancelAction::Keep) => Err(no_movement_error(
             "cannot keep a scrolling capture before the viewport moves",
         )),
         None => Ok(None),
+        Some(CancelAction::Abort) => unreachable!("abort is returned as an error"),
+    }
+}
+
+fn poll_cancel_action<C>(cancel: &mut C) -> Result<Option<CancelAction>>
+where
+    C: CancelSignal,
+{
+    match cancel.cancellation() {
+        Some(CancelAction::Abort) => Err(Error::Cancelled),
+        action => Ok(action),
     }
 }
 
@@ -646,10 +911,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
     use scrozz_core::{
         ColorSpace, LogicalPoint, ManualScrollDriver, PhysicalSize, PixelFormat, ScaleFactor,
-        ScrollAxis, ScrollCapabilities,
+        ScrollAxis, ScrollCapabilities, ScrollControl, ScrollDirection,
     };
 
     use super::*;
@@ -692,6 +958,32 @@ mod tests {
 
         fn name(&self) -> &str {
             "fixture-driver"
+        }
+    }
+
+    struct RecordingDriver {
+        gestures: Arc<Mutex<Vec<ScrollGesture>>>,
+    }
+
+    impl ScrollDriver for RecordingDriver {
+        fn capabilities(&self) -> ScrollCapabilities {
+            ScrollCapabilities::automatic(false)
+        }
+
+        fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn scroll(&mut self, gesture: &ScrollGesture) -> Result<()> {
+            self.gestures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(gesture.clone());
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "recording-driver"
         }
     }
 
@@ -843,6 +1135,142 @@ mod tests {
     }
 
     #[test]
+    fn automatic_mode_learns_upward_motion_before_driving_the_same_route() {
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        let first = frame(&document[6..14]);
+        let source = Frames {
+            frames: VecDeque::from([
+                first.clone(),
+                first,
+                frame(&document[3..11]),
+                frame(&document[0..8]),
+            ]),
+        };
+        let gestures = Arc::new(Mutex::new(Vec::new()));
+        let driver = RecordingDriver {
+            gestures: Arc::clone(&gestures),
+        };
+        let mut config = config(4)
+            .with_control(ScrollControl::Automatic)
+            .with_direction_detection(3.0, 3.0);
+        config.manual_poll_interval = Duration::ZERO;
+        let mut events = Vec::new();
+
+        let output = ScrollSession::new(source, Box::new(driver), NoopPacer, config)
+            .run(&mut NeverCancel, |event| events.push(event))
+            .expect("direction-detecting session");
+
+        assert_eq!(output.reason, CompletionReason::FrameLimit);
+        assert_eq!(output.frame.height(), 14);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Progress::DirectionDetected {
+                    direction: ScrollDirection::Up
+                }
+            )
+        }));
+        let gestures = gestures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(gestures.len(), 1);
+        assert_eq!(gestures[0].direction(), Some(ScrollDirection::Up));
+    }
+
+    #[test]
+    fn direction_learning_recovers_after_unalignable_pre_scroll_repaints() {
+        let document: Vec<u8> = (0..14).map(|value| value * 10).collect();
+        let source = Frames {
+            frames: VecDeque::from([
+                frame(&[0; 8]),
+                frame(&[255; 8]),
+                frame(&document[0..8]),
+                frame(&document[3..11]),
+            ]),
+        };
+        let config = config(4)
+            .with_control(ScrollControl::Manual)
+            .with_direction_detection(3.0, 3.0);
+        let mut events = Vec::new();
+
+        let output = ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config)
+            .run(&mut NeverCancel, |event| events.push(event))
+            .expect("direction detector should rebase before the real scroll");
+
+        assert_eq!(output.reason, CompletionReason::FrameLimit);
+        assert_eq!(output.frame.height(), 11);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Progress::DirectionDetected {
+                    direction: ScrollDirection::Down
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn direction_learning_keeps_the_pre_scroll_baseline_across_a_transient_frame() {
+        let document: Vec<u8> = (0..14).map(|value| value * 10).collect();
+        let after = frame(&document[3..11]);
+        let source = Frames {
+            frames: VecDeque::from([
+                frame(&document[0..8]),
+                frame(&[255; 8]),
+                after.clone(),
+                after,
+            ]),
+        };
+        let config = config(4)
+            .with_control(ScrollControl::Manual)
+            .with_direction_detection(3.0, 3.0);
+        let mut events = Vec::new();
+
+        let output = ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config)
+            .run(&mut NeverCancel, |event| events.push(event))
+            .expect("the original baseline should survive one transient frame");
+
+        assert_eq!(output.frame.height(), 11);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Progress::DirectionDetected {
+                    direction: ScrollDirection::Down
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn direction_learning_prefers_the_original_baseline_when_both_pairs_align() {
+        let document: Vec<u8> = (0..14).map(|value| value * 10).collect();
+        let final_frame = frame(&document[3..11]);
+        let source = Frames {
+            frames: VecDeque::from([
+                frame(&document[0..8]),
+                frame(&document[1..9]),
+                final_frame.clone(),
+                final_frame,
+            ]),
+        };
+        let config = config(4)
+            .with_control(ScrollControl::Manual)
+            .with_direction_detection(3.0, 3.0);
+
+        let output = ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config)
+            .run(&mut NeverCancel, |_| {})
+            .expect("the original viewport should remain in the stitched prefix");
+
+        let rows: Vec<u8> = output
+            .frame
+            .data
+            .chunks_exact(output.frame.stride)
+            .map(|row| row[0])
+            .collect();
+        assert_eq!(rows, document[0..11]);
+    }
+
+    #[test]
     fn keep_returns_a_partial_image_while_abort_discards_it() {
         let document: Vec<u8> = (0..18).map(|v| v * 10).collect();
         let make = || Frames {
@@ -925,6 +1353,81 @@ mod tests {
                 } if reason.contains("fixture input")
             )
         }));
+    }
+
+    #[test]
+    fn explicit_automatic_mode_reports_permission_failure_without_switching_modes() {
+        let source = Frames {
+            frames: VecDeque::from([frame(&[10, 20, 30, 40, 50, 60, 70, 80])]),
+        };
+        let config = config(2).with_control(ScrollControl::Automatic);
+        let error = ScrollSession::new(source, Box::new(PermissionDriver), NoopPacer, config)
+            .run(&mut NeverCancel, |_| {})
+            .expect_err("automatic mode must remain automatic");
+        assert!(matches!(error, Error::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn explicit_manual_mode_waits_for_finish_instead_of_auto_ending_when_idle() {
+        let document: Vec<u8> = (0..14).map(|value| value * 10).collect();
+        let moved = frame(&document[3..11]);
+        let source = Frames {
+            frames: VecDeque::from([frame(&document[0..8]), moved.clone(), moved.clone(), moved]),
+        };
+        let mut events = Vec::new();
+        let config = config(8).with_control(ScrollControl::Manual);
+        let output = ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config)
+            .run(
+                &mut CancelAfter {
+                    polls: 0,
+                    after: 6,
+                    action: CancelAction::Keep,
+                },
+                |event| events.push(event),
+            )
+            .expect("manual finish");
+        assert_eq!(output.reason, CompletionReason::CancelledKeep);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Progress::Prepared {
+                    automatic: false,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn finish_analyzes_the_frame_that_triggered_the_request() {
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        for (finish_at, expected_height) in [(2, 11), (3, 14)] {
+            let source = Frames {
+                frames: VecDeque::from([
+                    frame(&document[0..8]),
+                    frame(&document[3..11]),
+                    frame(&document[6..14]),
+                ]),
+            };
+            let cancellation = AtomicCancellation::default();
+            let request = cancellation.clone();
+            let mut signal = cancellation.clone();
+            let output = ScrollSession::new(
+                source,
+                Box::<Driver>::default(),
+                NoopPacer,
+                config(8).with_control(ScrollControl::Manual),
+            )
+            .run(&mut signal, |event| {
+                if matches!(event, Progress::FrameCaptured { frame } if frame == finish_at) {
+                    assert!(request.cancel(CancelAction::Keep));
+                }
+            })
+            .expect("Finish should retain the newest captured viewport");
+
+            assert_eq!(output.reason, CompletionReason::CancelledKeep);
+            assert_eq!(output.frame.height(), expected_height);
+        }
     }
 
     #[test]

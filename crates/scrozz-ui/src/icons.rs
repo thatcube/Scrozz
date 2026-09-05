@@ -108,6 +108,7 @@ icons! {
     Crop => "crop",
     DeviceDesktop => "device-desktop",
     DeviceFloppy => "device-floppy",
+    Folder => "folder",
     Droplet => "droplet",
     GridDots => "grid-dots",
     GripVertical => "grip-vertical",

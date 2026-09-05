@@ -1328,6 +1328,7 @@ impl CaptureArgs {
             magnifier,
             delay,
             hud: mode.shows_hud(),
+            confirm_region: mode.shows_hud(),
             ..defaults
         }))
     }

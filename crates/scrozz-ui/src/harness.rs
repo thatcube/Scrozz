@@ -818,9 +818,9 @@ mod instants {
 
     pub(super) const SCROLLING: &[KeyInstant] = &[
         KeyInstant {
-            name: "choose-axis",
+            name: "choose-control",
             at_ms: 0,
-            expectation: "the scrolling HUD offers a tall-page and wide-canvas axis choice",
+            expectation: "after area selection, the HUD requires only Manual or Automatic mode and Start capture; movement determines the route",
         },
         KeyInstant {
             name: "vertical-progress",
