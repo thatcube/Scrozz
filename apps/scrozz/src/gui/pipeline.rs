@@ -7405,6 +7405,7 @@ mod tests {
                 height: 1,
                 source_width: 1,
                 source_height: 1,
+                viewport: scrozz_stitch::PreviewViewport::full(1, 1),
                 rgba: vec![value, 0, 0, 255],
             })
         };

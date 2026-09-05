@@ -24,7 +24,7 @@ pub use chrome::{
     detect_sticky_chrome, detect_sticky_side_chrome,
 };
 pub use luma::{ColumnProfile, LumaPlane, RowProfile};
-pub use preview::ScrollPreview;
+pub use preview::{PreviewViewport, ScrollPreview};
 pub use session::{
     AtomicCancellation, BackendFrameSource, CancelAction, CancelSignal, CompletionReason,
     FrameSource, NeverCancel, NoopPacer, Pacer, Progress, ScrollDirectionAmounts, ScrollSession,

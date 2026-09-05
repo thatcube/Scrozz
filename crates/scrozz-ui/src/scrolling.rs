@@ -75,6 +75,26 @@ pub struct ScrollHudSurface {
     pub scale: ScaleFactor,
 }
 
+/// Source dimensions and the last matched viewport within a live preview.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollPreviewGeometry {
+    /// Full stitched dimensions, not the thumbnail's dimensions.
+    pub source_px: (u32, u32),
+    /// Last matched viewport in normalized image coordinates.
+    pub viewport: Rect,
+}
+
+impl ScrollPreviewGeometry {
+    /// The entire initial frame is the current viewport.
+    #[must_use]
+    pub fn full(source_px: (u32, u32)) -> Self {
+        Self {
+            source_px,
+            viewport: Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        }
+    }
+}
+
 impl ScrollHudState {
     /// Setup before the first viewport movement establishes a route.
     #[must_use]
@@ -179,7 +199,7 @@ impl ScrollingHud {
         theme: &Theme,
         state: &ScrollHudState,
         texture: egui::TextureId,
-        source_px: (u32, u32),
+        geometry: ScrollPreviewGeometry,
     ) {
         let full = ui.max_rect();
         let selection = state
@@ -189,7 +209,9 @@ impl ScrollingHud {
         // macOS scrolling captures an isolated SCWindow, not composited desktop
         // pixels. Other capture paths must leave the selected pixels uncovered.
         let allow_overlap = cfg!(target_os = "macos") && selection.is_some();
-        if let Some(image) = preview_rect(full, selection, controls, source_px, allow_overlap) {
+        if let Some(image) =
+            preview_rect(full, selection, controls, geometry.source_px, allow_overlap)
+        {
             paint::glass_panel(ui.painter(), image.expand(5.0), 10.0, &theme.palette, true);
             ui.painter().image(
                 texture,
@@ -197,6 +219,73 @@ impl ScrollingHud {
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
+            Self::draw_preview_viewport(
+                ui.painter(),
+                theme,
+                image,
+                geometry.viewport,
+                state.status == ScrollHudStatus::WaitingForOverlap,
+            );
+        }
+    }
+
+    fn preview_viewport_rect(image: Rect, viewport: Rect) -> Option<Rect> {
+        if !image.is_finite() || !viewport.is_finite() {
+            return None;
+        }
+        let viewport = viewport.intersect(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
+        if !viewport.is_finite() || !viewport.is_positive() {
+            return None;
+        }
+        Some(Rect::from_min_max(
+            image.min + viewport.min.to_vec2() * image.size(),
+            image.min + viewport.max.to_vec2() * image.size(),
+        ))
+    }
+
+    fn draw_preview_viewport(
+        painter: &egui::Painter,
+        theme: &Theme,
+        image: Rect,
+        viewport: Rect,
+        lost: bool,
+    ) {
+        let Some(rect) = Self::preview_viewport_rect(image, viewport) else {
+            return;
+        };
+        let painter = painter.with_clip_rect(image.intersect(painter.clip_rect()));
+        let color = if lost {
+            theme.palette.warning
+        } else {
+            theme.palette.accent
+        };
+        painter.rect_filled(
+            rect,
+            0.0,
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 16),
+        );
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(3.0, Color32::from_black_alpha(100)),
+            StrokeKind::Inside,
+        );
+        if lost {
+            paint::dashed_path(
+                &painter,
+                &[
+                    rect.left_top(),
+                    rect.right_top(),
+                    rect.right_bottom(),
+                    rect.left_bottom(),
+                    rect.left_top(),
+                ],
+                Stroke::new(1.5, color),
+                4.0,
+                3.0,
+            );
+        } else {
+            painter.rect_stroke(rect, 0.0, Stroke::new(1.5, color), StrokeKind::Inside);
         }
     }
 
@@ -416,8 +505,8 @@ impl Scene for ScrollingScene {
             return;
         }
 
-        let state = match ctx.millis() {
-            100..=299 => ScrollHudState {
+        let mut state = match ctx.millis() {
+            100..=299 | 500.. => ScrollHudState {
                 status: ScrollHudStatus::Capturing,
                 frame: 3,
                 delta: Some(612),
@@ -446,8 +535,11 @@ impl Scene for ScrollingScene {
                 surface: None,
             },
         };
+        if ctx.millis() >= 500 {
+            state.status = ScrollHudStatus::WaitingForOverlap;
+        }
         let _ = ScrollingHud::draw(ui, &theme, &state, false);
-        let vertical = ctx.millis() < 300;
+        let vertical = ctx.millis() < 300 || ctx.millis() >= 500;
         let size = if vertical { [128, 614] } else { [640, 50] };
         let mut image = egui::ColorImage::filled(size, Color32::from_rgb(247, 248, 250));
         for y in 6..size[1] - 6 {
@@ -468,7 +560,21 @@ impl Scene for ScrollingScene {
             data.insert_temp(Id::new("scrolling-preview-fixture"), texture.clone())
         });
         let source_px = if vertical { (520, 2_496) } else { (4_320, 340) };
-        ScrollingHud::draw_preview(ui, &theme, &state, texture.id(), source_px);
+        let viewport = if vertical {
+            Rect::from_min_max(pos2(0.0, 1.0 - 340.0 / 2_496.0), pos2(1.0, 1.0))
+        } else {
+            Rect::from_min_max(pos2(1.0 - 520.0 / 4_320.0, 0.0), pos2(1.0, 1.0))
+        };
+        ScrollingHud::draw_preview(
+            ui,
+            &theme,
+            &state,
+            texture.id(),
+            ScrollPreviewGeometry {
+                source_px,
+                viewport,
+            },
+        );
     }
 }
 
@@ -827,7 +933,10 @@ fn status_line(state: &ScrollHudState) -> &'static str {
     match &state.status {
         ScrollHudStatus::Configuring | ScrollHudStatus::Failed(_) => "",
         ScrollHudStatus::Starting => "Getting ready",
-        ScrollHudStatus::WaitingForOverlap => "Scroll back a little",
+        ScrollHudStatus::WaitingForOverlap if state.selection.is_some() => {
+            "Return to outlined area"
+        }
+        ScrollHudStatus::WaitingForOverlap => "Return to previous view",
         ScrollHudStatus::AwaitingFinish(_) => "Capture paused",
         ScrollHudStatus::Finalizing => "Finishing",
         _ if state.delta.is_some() && state.automatic => "Auto scrolling",
@@ -840,8 +949,11 @@ fn status_line(state: &ScrollHudState) -> &'static str {
 fn status_hint(state: &ScrollHudState) -> &str {
     match &state.status {
         ScrollHudStatus::Starting => "Preparing the first frame. Wait before scrolling.",
+        ScrollHudStatus::WaitingForOverlap if state.selection.is_some() => {
+            "The last matched view is outlined in amber in the preview. Scroll until that section matches your capture area. Capture resumes on a match; Finish keeps what was captured."
+        }
         ScrollHudStatus::WaitingForOverlap => {
-            "Scroll back slowly until capture reconnects, or Finish to keep what was captured."
+            "Return to the last captured view. Capture resumes when it matches; Finish keeps what was captured."
         }
         ScrollHudStatus::AwaitingFinish(reason) | ScrollHudStatus::Failed(reason) => reason,
         ScrollHudStatus::Finalizing => "Preparing your screenshot.",
@@ -982,6 +1094,33 @@ fn text_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_outline_tracks_image_coordinates_without_drifting_outside() {
+        let image = Rect::from_min_size(pos2(100.0, 40.0), vec2(120.0, 600.0));
+        let viewport = Rect::from_min_max(pos2(0.0, 0.75), pos2(1.0, 1.0));
+        let marker = ScrollingHud::preview_viewport_rect(image, viewport).expect("outline");
+        assert_eq!(
+            marker,
+            Rect::from_min_max(pos2(100.0, 490.0), pos2(220.0, 640.0))
+        );
+        let horizontal = Rect::from_min_max(pos2(0.75, 0.0), pos2(1.0, 1.0));
+        assert_eq!(
+            ScrollingHud::preview_viewport_rect(image, horizontal)
+                .unwrap()
+                .left(),
+            190.0
+        );
+        assert!(ScrollingHud::preview_viewport_rect(image, Rect::NOTHING).is_none());
+        let mut lost = ScrollHudState::prepared(ScrollControl::Manual);
+        lost.selection = Some(LogicalRect::new(
+            scrozz_core::LogicalPoint::new(0.0, 0.0),
+            scrozz_core::LogicalSize::new(10.0, 10.0),
+        ));
+        lost.status = ScrollHudStatus::WaitingForOverlap;
+        assert_eq!(status_line(&lost), "Return to outlined area");
+        assert!(!status_line(&lost).contains("back"));
+    }
 
     #[test]
     fn prepared_state_starts_without_inventing_a_route() {

@@ -369,7 +369,11 @@ proportionally to fit the available work area. It updates only for the baseline
 and newly accepted content, not idle probes. The engine samples directly from
 its canvas into a bounded 768-pixel thumbnail; the GUI keeps only the newest
 pending preview rather than queuing images. Reverse-direction previews stay in
-natural document order. Finish, Discard, and a new capture clear the preview.
+natural document order. A thin outline marks the last matched viewport within
+that image; it becomes a steady amber return target when alignment is lost,
+rather than claiming to track an unknown position. Matching that viewport again
+clears recovery and resumes Auto without appending duplicate pixels or requiring
+another forward scroll. Finish, Discard, and a new capture clear the preview.
 The preview avoids the selected region and controls; macOS's isolated-window
 capture can use a corner when a full-screen selection leaves no outside space.
 Unknown portal capture regions do not show a preview, avoiding recursive capture.

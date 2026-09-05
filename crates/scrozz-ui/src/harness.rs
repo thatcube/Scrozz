@@ -832,6 +832,11 @@ mod instants {
             at_ms: 360,
             expectation: "a wide stitched preview fits in available screen space without covering capture controls",
         },
+        KeyInstant {
+            name: "reconnect-target",
+            at_ms: 540,
+            expectation: "a steady amber outline marks the last matched viewport as the return target",
+        },
     ];
 }
 

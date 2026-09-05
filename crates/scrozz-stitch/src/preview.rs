@@ -5,6 +5,32 @@ use scrozz_core::{Error, Frame, PixelFormat, Result};
 /// Maximum edge of a live preview, independent of the full capture's size.
 pub const PREVIEW_MAX_EDGE: u32 = 768;
 
+/// Last matched viewport, measured in full stitched-image pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewViewport {
+    /// Left edge.
+    pub x: u32,
+    /// Top edge.
+    pub y: u32,
+    /// Width of captured content, excluding removed fixed chrome.
+    pub width: u32,
+    /// Height of captured content, excluding removed fixed chrome.
+    pub height: u32,
+}
+
+impl PreviewViewport {
+    /// The complete initial frame before any content is appended.
+    #[must_use]
+    pub const fn full(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+}
+
 /// A small, straight-alpha RGBA view of the currently accepted capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollPreview {
@@ -16,6 +42,8 @@ pub struct ScrollPreview {
     pub source_width: u32,
     /// Original height.
     pub source_height: u32,
+    /// The section matching the most recently accepted viewport.
+    pub viewport: PreviewViewport,
     /// Row-major straight-alpha RGBA pixels.
     pub rgba: Vec<u8>,
 }
@@ -78,6 +106,7 @@ pub(crate) fn sample_preview(
         height,
         source_width,
         source_height,
+        viewport: PreviewViewport::full(source_width, source_height),
         rgba,
     }
 }

@@ -293,8 +293,12 @@ impl CardSurface for RecentCapturesOverlayCards {
         self.handle.hide_scroll_hud();
     }
 
-    fn show_scroll_preview(&mut self, image: egui::ColorImage, source_px: (u32, u32)) {
-        self.handle.show_scroll_preview(image, source_px);
+    fn show_scroll_preview(
+        &mut self,
+        image: egui::ColorImage,
+        geometry: scrozz_ui::ScrollPreviewGeometry,
+    ) {
+        self.handle.show_scroll_preview(image, geometry);
     }
 
     fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction> {

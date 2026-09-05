@@ -211,6 +211,9 @@ pub enum Progress {
         /// Why this viewport could not safely extend the capture.
         reason: String,
     },
+    /// The current pixels match the retained viewport again, without appending
+    /// duplicate content or requiring the user to move past it.
+    OverlapRestored,
     /// Acquisition stopped, but an interactive capture still needs an explicit
     /// Finish or Discard before any output can be published.
     AwaitingFinish {
@@ -601,7 +604,7 @@ where
             );
         }
 
-        let mut waiting_for_movement = false;
+        let mut waiting_for_overlap = false;
         loop {
             let mut finish_after_frame =
                 matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
@@ -630,7 +633,7 @@ where
             }
 
             if !finish_after_frame {
-                if capabilities.is_automatic() && !waiting_for_movement {
+                if capabilities.is_automatic() && !waiting_for_overlap {
                     if let Err(error) = self.driver.scroll(&self.config.gesture) {
                         if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
                             return finish_checked(
@@ -767,6 +770,15 @@ where
                 }
                 Err(error) => return Err(error),
             };
+            if waiting_for_overlap
+                && matches!(
+                    outcome,
+                    PushOutcome::NoMovement { .. } | PushOutcome::EndOfContent { .. }
+                )
+            {
+                waiting_for_overlap = false;
+                progress(Progress::OverlapRestored);
+            }
             match outcome {
                 PushOutcome::Started => {
                     return Err(Error::Platform(
@@ -780,7 +792,7 @@ where
                     output_height,
                 } => {
                     has_advanced = true;
-                    waiting_for_movement = false;
+                    waiting_for_overlap = false;
                     stitcher.set_expected_delta(Some(delta));
                     progress(Progress::Advanced {
                         frame: captured_frames,
@@ -836,11 +848,6 @@ where
                         );
                     }
                     if self.config.control.is_some() {
-                        // A slow repaint is not a reason to stop driving Auto.
-                        // Its overlap-recovery pause is cleared only by Advanced.
-                        if self.config.control == Some(ScrollControl::Manual) {
-                            waiting_for_movement = true;
-                        }
                         continue;
                     }
                     if !capabilities.is_automatic()
@@ -863,7 +870,7 @@ where
                 }
                 PushOutcome::InsufficientOverlap { reason } => {
                     if self.config.control.is_some() && !finish_after_frame {
-                        waiting_for_movement = true;
+                        waiting_for_overlap = true;
                         progress(Progress::WaitingForOverlap { reason });
                         continue;
                     }
@@ -1621,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_does_not_resume_an_overlap_pause_just_because_frames_are_stationary() {
+    fn auto_resumes_when_the_last_captured_viewport_matches_again() {
         let document: Vec<u8> = (0..20).map(|value| value * 10).collect();
         let second = frame(&document[3..11]);
         let source = Frames {
@@ -1637,7 +1644,7 @@ mod tests {
             ]),
         };
         let gestures = Arc::new(Mutex::new(Vec::new()));
-        let (output, _) = finish_after_frame(
+        let (output, events) = finish_after_frame(
             ScrollSession::new(
                 source,
                 Box::new(RecordingDriver {
@@ -1650,8 +1657,93 @@ mod tests {
             ),
             8,
         );
-        assert_eq!(gestures.lock().unwrap().len(), 2);
+        assert_eq!(gestures.lock().unwrap().len(), 5);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Progress::OverlapRestored))
+                .count(),
+            1
+        );
         assert_eq!(output.frame.height(), 17);
+    }
+
+    #[test]
+    fn returning_to_the_anchor_clears_recovery_without_appending_new_pixels() {
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        let second = frame(&document[3..11]);
+        for control in [ScrollControl::Manual, ScrollControl::Automatic] {
+            let source = Frames {
+                frames: VecDeque::from([
+                    frame(&document[0..8]),
+                    second.clone(),
+                    frame(&[255; 8]),
+                    second.clone(),
+                    second.clone(),
+                ]),
+            };
+            let (output, events) = finish_after_frame(
+                ScrollSession::new(
+                    source,
+                    Box::<Driver>::default(),
+                    NoopPacer,
+                    config(8)
+                        .with_control(control)
+                        .with_direction_detection(3.0, 3.0),
+                ),
+                5,
+            );
+            let restored = events
+                .iter()
+                .position(|event| matches!(event, Progress::OverlapRestored))
+                .expect("matched anchor");
+            let lost = events
+                .iter()
+                .position(|event| matches!(event, Progress::WaitingForOverlap { .. }))
+                .unwrap();
+            assert!(restored > lost);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Progress::Advanced { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(output.seams, 1);
+            assert_eq!(output.frame.height(), 11);
+        }
+    }
+
+    #[test]
+    fn stationary_unrelated_pixels_do_not_restore_overlap() {
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        let source = Frames {
+            frames: VecDeque::from([
+                frame(&document[0..8]),
+                frame(&document[3..11]),
+                frame(&[255; 8]),
+                frame(&[255; 8]),
+                frame(&[255; 8]),
+            ]),
+        };
+        let (output, events) = finish_after_frame(
+            ScrollSession::new(
+                source,
+                Box::<Driver>::default(),
+                NoopPacer,
+                config(8)
+                    .with_control(ScrollControl::Automatic)
+                    .with_direction_detection(3.0, 3.0),
+            ),
+            5,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Progress::OverlapRestored))
+        );
+        assert_eq!(output.seams, 1);
+        assert_eq!(output.frame.height(), 11);
     }
 
     #[test]

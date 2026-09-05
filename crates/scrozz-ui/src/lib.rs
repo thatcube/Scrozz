@@ -138,7 +138,7 @@ pub use recording_settings::{
 };
 pub use scrolling::{
     ScrollHudAction, ScrollHudResponse, ScrollHudState, ScrollHudStatus, ScrollHudSurface,
-    ScrollingHud,
+    ScrollPreviewGeometry, ScrollingHud,
 };
 
 pub use select::{

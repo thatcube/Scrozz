@@ -486,11 +486,8 @@ impl ScrollStitcher {
                 ends.push(end);
             }
         }
-        Ok(crate::preview::sample_preview(
-            canvas.width,
-            canvas.height,
-            canvas.format,
-            |x, y| {
+        let mut preview =
+            crate::preview::sample_preview(canvas.width, canvas.height, canvas.format, |x, y| {
                 let x = if reverse && axis == ScrollAxis::Horizontal {
                     canvas.width - 1 - x
                 } else {
@@ -515,8 +512,38 @@ impl ScrollStitcher {
                     }
                 };
                 bytes.try_into().expect("accepted canvas pixel")
+            });
+        let viewport_extent = self
+            .frozen_chrome
+            .expect("a canvas has frozen chrome")
+            .content_span(axis_extent(
+                self.latest_frame.as_ref().expect("an accepted frame"),
+                axis,
+            ))
+            .len();
+        preview.viewport = match axis {
+            ScrollAxis::Vertical => crate::PreviewViewport {
+                x: 0,
+                y: if reverse {
+                    0
+                } else {
+                    canvas.height - viewport_extent
+                },
+                width: canvas.width,
+                height: viewport_extent,
             },
-        ))
+            ScrollAxis::Horizontal => crate::PreviewViewport {
+                x: if reverse {
+                    0
+                } else {
+                    canvas.width - viewport_extent
+                },
+                y: 0,
+                width: viewport_extent,
+                height: canvas.height,
+            },
+        };
+        Ok(preview)
     }
 
     /// Produces the current image.
@@ -1541,11 +1568,48 @@ mod tests {
             let preview = stitcher.preview().unwrap();
             let output = stitcher.finish_frame().unwrap();
             assert_eq!(preview.rgba, output.data, "{direction:?}");
+            let viewport = match direction {
+                ScrollDirection::Down => crate::PreviewViewport {
+                    x: 0,
+                    y: 6,
+                    width: 6,
+                    height: 8,
+                },
+                ScrollDirection::Up => crate::PreviewViewport {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 8,
+                },
+                ScrollDirection::Right => crate::PreviewViewport {
+                    x: 6,
+                    y: 0,
+                    width: 8,
+                    height: 6,
+                },
+                ScrollDirection::Left => crate::PreviewViewport {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 6,
+                },
+            };
+            assert_eq!(preview.viewport, viewport, "{direction:?}");
             assert_eq!(
                 (preview.source_width, preview.source_height),
                 (output.width(), output.height())
             );
         }
+    }
+
+    #[test]
+    fn initial_preview_marks_the_entire_viewport() {
+        let first = frame(&[10, 20, 30, 40, 50, 60, 70, 80], 6);
+        let preview = crate::ScrollPreview::from_frame(&first).unwrap();
+        assert_eq!(preview.viewport, crate::PreviewViewport::full(6, 8));
+        let mut stitcher = ScrollStitcher::for_direction(ScrollDirection::Up, config());
+        stitcher.push_frame(first).unwrap();
+        assert_eq!(stitcher.preview().unwrap().viewport, preview.viewport);
     }
 
     #[test]

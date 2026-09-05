@@ -240,6 +240,9 @@ pub(crate) fn report_terminal_scroll_progress(progress: Progress) {
         Progress::WaitingForOverlap { reason } => {
             eprintln!("scrozz: scroll back slowly to reconnect: {reason}");
         }
+        Progress::OverlapRestored => {
+            eprintln!("scrozz: matched the last captured viewport; capture resumed")
+        }
         Progress::AwaitingFinish { reason } => {
             eprintln!("scrozz: acquisition paused ({reason:?}); choose Finish or Discard");
         }

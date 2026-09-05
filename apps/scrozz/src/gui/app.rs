@@ -1405,6 +1405,9 @@ fn describe_scroll_progress(progress: &Progress) -> String {
         Progress::WaitingForOverlap { reason } => {
             format!("is waiting for overlapping content: {reason}")
         }
+        Progress::OverlapRestored => {
+            "matched the last captured viewport; capture resumed".to_owned()
+        }
         Progress::AwaitingFinish { reason } => {
             format!("paused ({reason:?}); waiting for Finish or Discard")
         }
@@ -2555,7 +2558,20 @@ impl App {
                                 [preview.width as usize, preview.height as usize],
                                 &preview.rgba,
                             ),
-                            (preview.source_width, preview.source_height),
+                            scrozz_ui::ScrollPreviewGeometry {
+                                source_px: (preview.source_width, preview.source_height),
+                                viewport: egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        preview.viewport.x as f32 / preview.source_width as f32,
+                                        preview.viewport.y as f32 / preview.source_height as f32,
+                                    ),
+                                    egui::vec2(
+                                        preview.viewport.width as f32 / preview.source_width as f32,
+                                        preview.viewport.height as f32
+                                            / preview.source_height as f32,
+                                    ),
+                                ),
+                            },
                         );
                     }
                 }
@@ -5416,6 +5432,16 @@ impl App {
                     return;
                 }
                 state.status = ScrollHudStatus::WaitingForOverlap;
+            }
+            Progress::OverlapRestored => {
+                if state.status != ScrollHudStatus::WaitingForOverlap {
+                    return;
+                }
+                state.status = if state.delta.is_some() {
+                    ScrollHudStatus::Capturing
+                } else {
+                    ScrollHudStatus::Prepared
+                };
             }
             Progress::AwaitingFinish { reason } => {
                 state.automatic = false;
@@ -14522,6 +14548,36 @@ mod tests {
     }
 
     #[test]
+    fn matching_the_previous_view_clears_recovery_without_new_content() {
+        for control in [ScrollControl::Manual, ScrollControl::Automatic] {
+            let (mut app, surface) = scrolling_app();
+            let card = CardId(174);
+            app.scrolling_card = Some(card);
+            let mut state = ScrollHudState::prepared(control);
+            state.delta = Some(40);
+            state.output_extent = 800;
+            app.set_scroll_hud(state);
+            app.update_scroll_hud(
+                card,
+                &Progress::WaitingForOverlap {
+                    reason: "jumped".into(),
+                },
+            );
+            app.update_scroll_hud(card, &Progress::Stalled { count: 2 });
+            assert_eq!(
+                surface.scrolling_hud().unwrap().status,
+                ScrollHudStatus::WaitingForOverlap
+            );
+            app.update_scroll_hud(card, &Progress::OverlapRestored);
+            let state = surface.scrolling_hud().unwrap();
+            assert_eq!(state.status, ScrollHudStatus::Capturing);
+            assert_eq!(state.output_extent, 800);
+            assert_eq!(state.automatic, control == ScrollControl::Automatic);
+            assert!(surface.presented().is_empty());
+        }
+    }
+
+    #[test]
     fn only_the_active_scrolling_session_can_replace_the_preview() {
         let (mut app, surface) = scrolling_app();
         let card = CardId(173);
@@ -14536,6 +14592,7 @@ mod tests {
                         height: 1,
                         source_width: 680,
                         source_height: 4_200,
+                        viewport: scrozz_stitch::PreviewViewport::full(680, 4_200),
                         rgba: vec![255; 4],
                     })))),
                 });

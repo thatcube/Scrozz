@@ -613,7 +613,12 @@ pub trait CardSurface {
     fn hide_scroll_hud(&mut self) {}
 
     /// Replaces the live stitched preview, without creating a saved capture.
-    fn show_scroll_preview(&mut self, _image: egui::ColorImage, _source_px: (u32, u32)) {}
+    fn show_scroll_preview(
+        &mut self,
+        _image: egui::ColorImage,
+        _geometry: scrozz_ui::ScrollPreviewGeometry,
+    ) {
+    }
 
     /// Takes one pending scrolling-HUD decision, if there is one.
     fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction> {
@@ -1036,8 +1041,14 @@ impl CardSurface for Recording {
             .expect("scroll HUD state is poisoned") = None;
     }
 
-    fn show_scroll_preview(&mut self, _image: egui::ColorImage, source_px: (u32, u32)) {
-        self.record(SurfaceCall::ScrollPreview { source_px });
+    fn show_scroll_preview(
+        &mut self,
+        _image: egui::ColorImage,
+        geometry: scrozz_ui::ScrollPreviewGeometry,
+    ) {
+        self.record(SurfaceCall::ScrollPreview {
+            source_px: geometry.source_px,
+        });
     }
 
     fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction> {
