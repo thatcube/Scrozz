@@ -114,6 +114,8 @@ pub fn horizontal_session_config(amount: f64, max_frames: usize) -> ScrollSessio
         at: LogicalPoint::new(50.0, 50.0),
         display: None,
         window: None,
+        owner_pid: None,
+        window_bounds: None,
         area: None,
         amount,
     });

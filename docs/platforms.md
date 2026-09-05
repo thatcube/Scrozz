@@ -358,6 +358,15 @@ append-only stitching and flipped back for a naturally ordered final image. A
 failed automatic attempt keeps setup visible so the same area can be retried
 manually.
 
+Fixed-header detection checks the stationary edge against the moving content,
+including solid headers taller than a scroll step. Interactive vertical captures
+keep the detected top header once, with stitched content underneath it. Fixed
+footers and horizontal fixed chrome retain their existing exclusion behavior.
+Downward captures can refine a header boundary as blank space scrolls away or
+the header collapses, without rewriting previously accepted content. The live
+preview and final output use the same header pixels and account for them in the
+capture size limit.
+
 Interactive alignment requires at least 33% of the analyzed viewport to
 overlap. This prevents a tiny repeated strip at a distant offset from competing
 with the real, substantially overlapping seam; genuinely repeated content still
@@ -396,6 +405,11 @@ Input delivery is guarded per platform:
   returning resumes it. The selected window must own that point in CoreGraphics'
   front-to-back list. Only Scrozz windows confirmed natively mouse-transparent
   are skipped; settings, editors, and other covering windows block delivery.
+  The selected process and window frame are retained from selection and checked
+  before input. Moving/resizing the target, replacing its process, or changing
+  its display invalidates the session rather than silently moving the capture
+  boundary. Frame acquisition rechecks that identity and geometry on both sides
+  of each snapshot.
   Steps use precise pixel deltas capped at 48 logical points (and at one fifth
   of the selected viewport) rather than coarse three-line jumps. The cursor is
   never moved and keyboard modifiers are not inherited. One retained

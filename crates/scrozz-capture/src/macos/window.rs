@@ -119,7 +119,7 @@ pub(crate) fn find(
 
 fn to_window(window: &SCWindow, displays: &[Display]) -> Window {
     // SAFETY: all plain property reads on a live `SCWindow`.
-    let (id, frame, title, application, is_visible) = unsafe {
+    let (id, frame, title, application, owner_pid, is_visible) = unsafe {
         (
             window.windowID(),
             window.frame(),
@@ -127,6 +127,9 @@ fn to_window(window: &SCWindow, displays: &[Display]) -> Window {
             window
                 .owningApplication()
                 .map(|app| app.applicationName().to_string()),
+            window
+                .owningApplication()
+                .and_then(|app| u32::try_from(app.processID()).ok()),
             window.isOnScreen(),
         )
     };
@@ -139,6 +142,7 @@ fn to_window(window: &SCWindow, displays: &[Display]) -> Window {
         // rather than a blank string a picker would render as a gap.
         title: title.filter(|title| !title.is_empty()),
         application: application.filter(|name| !name.is_empty()),
+        owner_pid,
         bounds,
         display: containing_display(bounds, displays),
         is_visible,
@@ -201,6 +205,7 @@ mod tests {
             id: WindowId(id.to_string()),
             title: Some(format!("window-{id}")),
             application: Some("Test".to_owned()),
+            owner_pid: None,
             bounds: window_at(100.0, 500.0),
             display: DisplayId("main".to_owned()),
             is_visible: true,

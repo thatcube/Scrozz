@@ -2092,6 +2092,7 @@ mod tests {
             id: scrozz_core::WindowId(id.to_owned()),
             title: Some(id.to_owned()),
             application: Some("Test".to_owned()),
+            owner_pid: None,
             bounds,
             display: DisplayId("main".to_owned()),
             is_visible: true,

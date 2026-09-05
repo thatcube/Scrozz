@@ -639,6 +639,7 @@ impl TargetEnumerator for X11Backend {
                     id: WindowId(format!("x11:{handle:08x}")),
                     title: self.window_title(handle),
                     application: self.window_application(handle),
+                    owner_pid: self.window_process_id(handle),
                     bounds: bounds.to_logical(self.scale.get()),
                     display,
                     is_visible: mapped,

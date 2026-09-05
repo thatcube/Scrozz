@@ -12,9 +12,9 @@ pub struct PreviewViewport {
     pub x: u32,
     /// Top edge.
     pub y: u32,
-    /// Width of captured content, excluding removed fixed chrome.
+    /// Width of moving content, excluding fixed chrome.
     pub width: u32,
-    /// Height of captured content, excluding removed fixed chrome.
+    /// Height of moving content, excluding fixed chrome.
     pub height: u32,
 }
 

@@ -507,6 +507,7 @@ pub fn to_window(record: &WindowRecord, monitors: &[MonitorRecord]) -> Window {
         )),
         title: record.title.clone(),
         application: record.application.clone(),
+        owner_pid: Some(record.process_id),
         bounds: logical_from_device(record.bounds, scale),
         display,
         is_visible: true,

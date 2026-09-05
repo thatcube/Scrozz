@@ -93,8 +93,8 @@ impl From<SideChromeBands> for AxisChromeBands {
 pub struct ChromeConfig {
     /// Same-coordinate mean error still considered a match.
     pub zero_match_max: u32,
-    /// Same-coordinate error required in moving content that does match when
-    /// shifted by the measured displacement.
+    /// Contrast required where the measured displacement crosses a fixed-band
+    /// boundary into moving content.
     pub shifted_mismatch_min: u32,
     /// Ignore thinner runs; one matching separator line is not chrome.
     pub min_band: u32,
@@ -283,11 +283,19 @@ fn detect_prefix(
                 axis,
                 perpendicular,
             ) <= config.zero_match_max
-                && shifted_axis_line_sad(previous, current, axis, position, delta, perpendicular)
-                    .is_some_and(|shifted| shifted >= config.shifted_mismatch_min)
         })
         .count() as u32;
     if length >= config.min_band
+        && boundary_proves_fixed_band(
+            previous,
+            current,
+            axis,
+            delta,
+            perpendicular,
+            length,
+            false,
+            config,
+        )
         && has_shifted_content_evidence(
             previous,
             current,
@@ -329,11 +337,19 @@ fn detect_suffix(
                 axis,
                 perpendicular,
             ) <= config.zero_match_max
-                && shifted_axis_line_sad(previous, current, axis, position, delta, perpendicular)
-                    .is_some_and(|shifted| shifted >= config.shifted_mismatch_min)
         })
         .count() as u32;
     if length >= config.min_band
+        && boundary_proves_fixed_band(
+            previous,
+            current,
+            axis,
+            delta,
+            perpendicular,
+            length,
+            true,
+            config,
+        )
         && has_shifted_content_evidence(
             previous,
             current,
@@ -353,38 +369,45 @@ fn detect_suffix(
     }
 }
 
-fn shifted_axis_line_sad(
+#[allow(clippy::too_many_arguments)]
+fn boundary_proves_fixed_band(
     previous: &LumaPlane,
     current: &LumaPlane,
     axis: ScrollAxis,
-    position: u32,
     delta: u32,
     perpendicular: AnalysisSpan,
-) -> Option<u32> {
+    length: u32,
+    trailing: bool,
+    config: &ChromeConfig,
+) -> bool {
     let extent = axis_extent(previous, axis);
-    if position.saturating_add(delta) < extent {
-        Some(rectangular_sad(
-            previous,
-            position + delta,
-            current,
-            position,
-            1,
-            axis,
-            perpendicular,
-        ))
-    } else if position >= delta {
-        Some(rectangular_sad(
-            previous,
-            position,
-            current,
-            position - delta,
-            1,
-            axis,
-            perpendicular,
-        ))
-    } else {
-        None
+    let samples = config.min_band.min(delta).min(length);
+    if samples == 0 {
+        return false;
     }
+    let start = if trailing {
+        extent - length
+    } else {
+        length - samples
+    };
+    // A solid toolbar matches itself away from its boundary. Require contrast
+    // against the moving content at that boundary, not inside every fixed row.
+    (start..start + samples).all(|position| {
+        let pair = if trailing {
+            position
+                .checked_sub(delta)
+                .map(|shifted| (position, shifted))
+        } else {
+            position
+                .checked_add(delta)
+                .filter(|shifted| *shifted < extent)
+                .map(|shifted| (shifted, position))
+        };
+        pair.is_some_and(|(prior, next)| {
+            rectangular_sad(previous, prior, current, next, 1, axis, perpendicular)
+                >= config.shifted_mismatch_min
+        })
+    })
 }
 
 fn has_shifted_content_evidence(
@@ -419,7 +442,7 @@ fn has_shifted_content_evidence(
             axis,
             perpendicular,
         );
-        if shifted <= config.zero_match_max && zero >= config.shifted_mismatch_min {
+        if shifted <= config.zero_match_max && zero > config.zero_match_max {
             run += 1;
             if run >= config.min_band {
                 return true;
@@ -534,6 +557,50 @@ mod tests {
         let second = plane(&[10, 10, 70, 90, 110, 130, 150, 170, 190, 210], 8);
         let chrome = detect_sticky_chrome(&first, &second, 2, &config());
         assert_eq!(chrome.top, 2);
+    }
+
+    #[test]
+    fn solid_fixed_bands_larger_than_the_scroll_step_are_detected() {
+        let first = plane(
+            &[
+                10, 10, 10, 10, 10, 10, 40, 60, 80, 100, 120, 140, 160, 180, 240, 240, 240, 240,
+            ],
+            8,
+        );
+        let second = plane(
+            &[
+                10, 10, 10, 10, 10, 10, 80, 100, 120, 140, 160, 180, 200, 220, 240, 240, 240, 240,
+            ],
+            8,
+        );
+        let settings = ChromeConfig {
+            max_height_percent: 60,
+            ..config()
+        };
+        assert_eq!(
+            detect_sticky_chrome(&first, &second, 2, &settings),
+            ChromeBands { top: 6, bottom: 4 }
+        );
+    }
+
+    #[test]
+    fn fixed_edges_are_detected_when_body_motion_is_low_contrast_but_distinct() {
+        let first = plane(
+            &[
+                10, 10, 10, 10, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 250, 250,
+            ],
+            8,
+        );
+        let second = plane(
+            &[
+                10, 10, 10, 10, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 250, 250,
+            ],
+            8,
+        );
+        assert_eq!(
+            detect_sticky_chrome(&first, &second, 2, &config()),
+            ChromeBands { top: 4, bottom: 2 }
+        );
     }
 
     #[test]

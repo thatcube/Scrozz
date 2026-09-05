@@ -95,6 +95,9 @@ pub struct StitchSummary {
 /// Tuning for one stitch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StitchConfig {
+    /// Keep a detected fixed top header once in vertical captures. Other fixed
+    /// edge chrome remains excluded from the stitched content.
+    pub preserve_fixed_header: bool,
     /// Alignment thresholds.
     pub alignment: AlignmentConfig,
     /// Sticky-chrome thresholds.
@@ -112,6 +115,7 @@ pub struct StitchConfig {
 impl Default for StitchConfig {
     fn default() -> Self {
         Self {
+            preserve_fixed_header: false,
             alignment: AlignmentConfig::default(),
             chrome: ChromeConfig::default(),
             stall_limit: 2,
@@ -163,6 +167,7 @@ pub struct ScrollStitcher {
     seams: Vec<CachedSeam>,
     accepted_frames: usize,
     canvas: Option<RollingCanvas>,
+    fixed_header: Option<Frame>,
     stalls: u32,
 }
 
@@ -224,6 +229,7 @@ impl ScrollStitcher {
             seams: Vec::new(),
             accepted_frames: 0,
             canvas: None,
+            fixed_header: None,
             stalls: 0,
         }
     }
@@ -281,43 +287,24 @@ impl ScrollStitcher {
 
         let expected_delta = self.config.expected_delta;
         let (alignment, chrome) = if let Some(chrome) = self.frozen_chrome {
-            let span = chrome.content_span(axis_extent(previous_frame, self.axis));
             let perpendicular = self
                 .frozen_perpendicular
                 .expect("a frozen canvas has a perpendicular viewport");
-            let alignment = match align_axis_in_perpendicular(
+            let (alignment, chrome) = match align_locked_viewport(
                 previous_luma,
                 &plane,
-                self.axis,
-                span,
+                self.direction,
+                chrome,
                 perpendicular,
-                expected_delta,
-                &self.config.alignment,
+                &self.config,
             ) {
-                Ok(alignment) => alignment,
-                Err(error) => return Ok(insufficient_overlap(error)),
+                Ok(result) => result,
+                Err(reason) => return Ok(PushOutcome::InsufficientOverlap { reason }),
             };
             if alignment.delta <= self.config.movement_epsilon {
                 return Ok(self.stationary());
             }
-
-            let proof = detect_sticky_axis_chrome_in(
-                previous_luma,
-                &plane,
-                self.axis,
-                alignment.delta,
-                perpendicular,
-                &self.config.chrome,
-            );
-            if !proves_chrome(chrome, proof) {
-                return Ok(PushOutcome::InsufficientOverlap {
-                    reason: format!(
-                        "new frame does not prove the locked sticky chrome: \
-                         required {}+{} pixels, observed {}+{}",
-                        chrome.leading, chrome.trailing, proof.leading, proof.trailing
-                    ),
-                });
-            }
+            let span = chrome.content_span(axis_extent(previous_frame, self.axis));
             let observed_perpendicular = stationary_perpendicular_span(
                 previous_luma,
                 &plane,
@@ -379,15 +366,47 @@ impl ScrollStitcher {
             .accepted_frames
             .checked_add(1)
             .ok_or_else(|| Error::InvalidRequest("too many scrolling frames".to_owned()))?;
+        let header_height =
+            if self.config.preserve_fixed_header && self.axis == ScrollAxis::Vertical {
+                if self.direction.is_reverse() {
+                    chrome.trailing
+                } else {
+                    chrome.leading
+                }
+            } else {
+                0
+            };
+        let new_header = if self.canvas.is_none() && header_height > 0 {
+            Some(copy_fixed_header(
+                previous_frame,
+                header_height,
+                perpendicular,
+                self.direction.is_reverse(),
+                self.config.max_output_bytes,
+            )?)
+        } else {
+            None
+        };
+        let header = self.fixed_header.as_ref().or(new_header.as_ref());
+        let header_bytes = header.map_or(0, |frame| frame.data.len() as u64);
+        let canvas_limit = self
+            .config
+            .max_output_bytes
+            .checked_sub(header_bytes)
+            .ok_or_else(|| {
+                Error::InvalidRequest("fixed header exceeds the capture size limit".into())
+            })?;
+        if self.axis == ScrollAxis::Vertical {
+            self.canvas
+                .as_ref()
+                .map_or(span.len(), RollingCanvas::height)
+                .checked_add(alignment.delta.min(span.len()))
+                .and_then(|height| height.checked_add(header.map_or(0, Frame::height)))
+                .ok_or_else(|| Error::InvalidRequest("scrolling capture is too tall".into()))?;
+        }
 
         if let Some(canvas) = self.canvas.as_mut() {
-            canvas.append(
-                &frame,
-                span,
-                perpendicular,
-                alignment.delta,
-                self.config.max_output_bytes,
-            )?;
+            canvas.append(&frame, span, perpendicular, alignment.delta, canvas_limit)?;
         } else {
             self.canvas = Some(RollingCanvas::from_first_pair(
                 previous_frame,
@@ -396,9 +415,9 @@ impl ScrollStitcher {
                 span,
                 perpendicular,
                 alignment.delta,
-                self.config.max_output_bytes,
+                canvas_limit,
             )?);
-            self.frozen_chrome = Some(chrome);
+            self.fixed_header = new_header;
             self.frozen_perpendicular = Some(perpendicular);
         }
 
@@ -408,20 +427,19 @@ impl ScrollStitcher {
         });
         self.latest_frame = Some(frame);
         self.latest_luma = Some(plane);
+        self.frozen_chrome = Some(chrome);
         self.accepted_frames = next_frame_count;
         self.stalls = 0;
 
+        let summary = self.summary();
         Ok(PushOutcome::Advanced {
             delta: alignment.delta,
             seam: SeamQuality {
                 mean_absolute_error: alignment.score,
                 confidence: alignment.confidence,
             },
-            output_extent: self
-                .canvas
-                .as_ref()
-                .map_or(0, |canvas| canvas.axis_extent(self.axis)),
-            output_height: self.canvas.as_ref().map_or(0, RollingCanvas::height),
+            output_extent: summary.output_extent,
+            output_height: summary.output_height,
         })
     }
 
@@ -433,7 +451,7 @@ impl ScrollStitcher {
             seams: self.seams.len(),
             output_height: self.canvas.as_ref().map_or_else(
                 || self.latest_frame.as_ref().map_or(0, Frame::height),
-                RollingCanvas::height,
+                |canvas| canvas.height() + self.fixed_header.as_ref().map_or(0, Frame::height),
             ),
             output_extent: self.canvas.as_ref().map_or_else(
                 || {
@@ -441,7 +459,10 @@ impl ScrollStitcher {
                         .as_ref()
                         .map_or(0, |frame| axis_extent(frame, self.axis))
                 },
-                |canvas| canvas.axis_extent(self.axis),
+                |canvas| {
+                    canvas.axis_extent(self.axis)
+                        + self.fixed_header.as_ref().map_or(0, Frame::height)
+                },
             ),
             chrome: self.vertical_chrome(),
             stalls: self.stalls,
@@ -486,8 +507,23 @@ impl ScrollStitcher {
                 ends.push(end);
             }
         }
+        let header_height = self.fixed_header.as_ref().map_or(0, Frame::height);
+        let total_height = canvas
+            .height
+            .checked_add(header_height)
+            .ok_or_else(|| Error::InvalidRequest("scrolling preview is too tall".into()))?;
         let mut preview =
-            crate::preview::sample_preview(canvas.width, canvas.height, canvas.format, |x, y| {
+            crate::preview::sample_preview(canvas.width, total_height, canvas.format, |x, y| {
+                if let Some(header) = &self.fixed_header
+                    && y < header_height
+                {
+                    let row = if reverse { header_height - 1 - y } else { y };
+                    let offset = row as usize * header.stride + x as usize * 4;
+                    return header.data[offset..offset + 4]
+                        .try_into()
+                        .expect("retained header pixel");
+                }
+                let y = y - header_height;
                 let x = if reverse && axis == ScrollAxis::Horizontal {
                     canvas.width - 1 - x
                 } else {
@@ -525,9 +561,9 @@ impl ScrollStitcher {
             ScrollAxis::Vertical => crate::PreviewViewport {
                 x: 0,
                 y: if reverse {
-                    0
+                    header_height
                 } else {
-                    canvas.height - viewport_extent
+                    total_height - viewport_extent
                 },
                 width: canvas.width,
                 height: viewport_extent,
@@ -566,6 +602,27 @@ impl ScrollStitcher {
                 canvas.finish()?
             }
         };
+        if let Some(mut header) = self.fixed_header.take() {
+            let height = frame
+                .height()
+                .checked_add(header.height())
+                .ok_or_else(|| Error::InvalidRequest("scrolling capture is too tall".into()))?;
+            checked_output_len(
+                frame.width(),
+                height,
+                frame.format.bytes_per_pixel(),
+                self.config.max_output_bytes,
+            )?;
+            if self.direction.is_reverse() {
+                try_reserve_exact(&mut frame.data, header.data.len())?;
+                frame.data.extend_from_slice(&header.data);
+            } else {
+                try_reserve_exact(&mut header.data, frame.data.len())?;
+                header.data.extend_from_slice(&frame.data);
+                frame.data = header.data;
+            }
+            frame.size.height = f64::from(height);
+        }
         if self.direction.is_reverse() {
             reverse_frame(&mut frame, self.axis)?;
         }
@@ -647,6 +704,92 @@ impl Stitcher for ScrollStitcher {
     fn finish(self: Box<Self>) -> Result<Frame> {
         self.finish_frame()
     }
+}
+
+fn align_locked_viewport(
+    previous: &LumaPlane,
+    current: &LumaPlane,
+    direction: ScrollDirection,
+    frozen: AxisChromeBands,
+    perpendicular: AnalysisSpan,
+    config: &StitchConfig,
+) -> std::result::Result<(Alignment, AxisChromeBands), String> {
+    let axis = direction.axis();
+    let extent = axis_extent_luma(previous, axis);
+    let may_refine_header = config.preserve_fixed_header && direction == ScrollDirection::Down;
+    let initial = align_axis_in_perpendicular(
+        previous,
+        current,
+        axis,
+        frozen.content_span(extent),
+        perpendicular,
+        config.expected_delta,
+        &config.alignment,
+    );
+    let (candidate, original_error) = match initial {
+        Ok(candidate) if candidate.delta <= config.movement_epsilon => {
+            return Ok((candidate, frozen));
+        }
+        Ok(candidate) => (candidate, None),
+        Err(error) if may_refine_header => (
+            provisional_alignment(
+                previous,
+                current,
+                axis,
+                config.expected_delta,
+                &config.alignment,
+                &config.chrome,
+            )
+            .map_err(|_| error.to_string())?,
+            Some(error.to_string()),
+        ),
+        Err(error) => return Err(error.to_string()),
+    };
+    let observed = detect_sticky_axis_chrome_in(
+        previous,
+        current,
+        axis,
+        candidate.delta,
+        perpendicular,
+        &config.chrome,
+    );
+    if original_error.is_none() && proves_chrome(frozen, observed) {
+        return Ok((candidate, frozen));
+    }
+    if !may_refine_header
+        || observed.trailing != frozen.trailing
+        || observed.leading == frozen.leading
+    {
+        return Err(original_error.unwrap_or_else(|| format!(
+            "new frame does not prove the locked sticky chrome: required {}+{} pixels, observed {}+{}",
+            frozen.leading, frozen.trailing, observed.leading, observed.trailing,
+        )));
+    }
+    // With the initial header retained, a downward capture already owns every
+    // initial row. Refining only its leading analysis boundary changes neither
+    // those pixels nor the bottom strip appended next.
+    let refined = align_axis_in_perpendicular(
+        previous,
+        current,
+        axis,
+        observed.content_span(extent),
+        perpendicular,
+        config.expected_delta,
+        &config.alignment,
+    )
+    .map_err(|error| error.to_string())?;
+    let confirmed = detect_sticky_axis_chrome_in(
+        previous,
+        current,
+        axis,
+        refined.delta,
+        perpendicular,
+        &config.chrome,
+    );
+    if !proves_chrome(observed, confirmed) {
+        return Err("fixed header changed without a consistent content match".into());
+    }
+    Ok((refined, observed))
 }
 
 fn provisional_alignment(
@@ -807,6 +950,47 @@ fn validate_compatible(first: &Frame, next: &Frame) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn copy_fixed_header(
+    frame: &Frame,
+    height: u32,
+    columns: AnalysisSpan,
+    reverse: bool,
+    max_output_bytes: u64,
+) -> Result<Frame> {
+    let bytes = checked_output_len(
+        columns.len(),
+        height,
+        frame.format.bytes_per_pixel(),
+        max_output_bytes,
+    )?;
+    let mut data = Vec::new();
+    try_reserve_exact(&mut data, bytes)?;
+    let start = if reverse {
+        frame
+            .height()
+            .checked_sub(height)
+            .ok_or_else(|| Error::InvalidRequest("fixed header is outside its viewport".into()))?
+    } else {
+        0
+    };
+    append_rectangle(
+        &mut data,
+        frame,
+        start,
+        height,
+        columns.start,
+        columns.len(),
+    )?;
+    Ok(Frame {
+        data,
+        size: PhysicalSize::new(f64::from(columns.len()), f64::from(height)),
+        stride: checked_row_bytes(columns.len(), frame.format.bytes_per_pixel())?,
+        format: frame.format,
+        color_space: frame.color_space,
+        scale: frame.scale,
+    })
 }
 
 impl RollingCanvas {
@@ -1600,6 +1784,158 @@ mod tests {
                 (output.width(), output.height())
             );
         }
+    }
+
+    #[test]
+    fn detected_fixed_header_is_kept_once_for_downward_and_upward_capture() {
+        let document: Vec<u8> = (0..24).map(|value| 30 + value * 7).collect();
+        let viewport = |offset| {
+            let mut rows = vec![10; 4];
+            rows.extend_from_slice(&document[offset..offset + 16]);
+            rows.extend_from_slice(&[250; 2]);
+            frame(&rows, 6)
+        };
+        for direction in [ScrollDirection::Down, ScrollDirection::Up] {
+            let mut settings = config();
+            settings.preserve_fixed_header = true;
+            settings.expected_delta = Some(2);
+            let mut stitcher = ScrollStitcher::for_direction(direction, settings);
+            for offset in if direction == ScrollDirection::Down {
+                [0, 2, 4]
+            } else {
+                [4, 2, 0]
+            } {
+                assert!(
+                    matches!(
+                        stitcher.push_frame(viewport(offset)).unwrap(),
+                        PushOutcome::Started | PushOutcome::Advanced { .. }
+                    ),
+                    "{direction:?}"
+                );
+            }
+            assert_eq!(stitcher.summary().chrome, ChromeBands { top: 4, bottom: 2 });
+            assert_eq!(stitcher.summary().output_height, 24);
+            let preview = stitcher.preview().unwrap();
+            assert_eq!(preview.source_height, 24);
+            assert_eq!(preview.viewport.height, 16);
+            assert_eq!(
+                preview.viewport.y,
+                if direction == ScrollDirection::Down {
+                    8
+                } else {
+                    4
+                }
+            );
+            let output = stitcher.finish_frame().unwrap();
+            let mut expected = vec![10; 4];
+            expected.extend_from_slice(&document[..20]);
+            assert_eq!(output.data, frame(&expected, 6).data, "{direction:?}");
+            assert_eq!(preview.rgba, output.data);
+        }
+    }
+
+    #[test]
+    fn retained_header_counts_toward_the_output_limit_without_corrupting_the_prefix() {
+        let document: Vec<u8> = (0..24).map(|value| 30 + value * 7).collect();
+        let viewport = |offset| {
+            let mut rows = vec![10; 4];
+            rows.extend_from_slice(&document[offset..offset + 16]);
+            rows.extend_from_slice(&[250; 2]);
+            frame(&rows, 6)
+        };
+        let mut settings = config();
+        settings.preserve_fixed_header = true;
+        settings.expected_delta = Some(2);
+        settings.max_output_bytes = 22 * 6 * 4;
+        let mut stitcher = ScrollStitcher::new(settings);
+        stitcher.push_frame(viewport(0)).unwrap();
+        stitcher.push_frame(viewport(2)).unwrap();
+        let prefix = stitcher.preview().unwrap();
+        assert!(stitcher.push_frame(viewport(4)).is_err());
+        assert_eq!(stitcher.preview().unwrap(), prefix);
+        assert_eq!(stitcher.finish_frame().unwrap().data, prefix.rgba);
+    }
+
+    #[test]
+    fn fixed_header_is_recognized_after_matching_blank_content_has_scrolled_away() {
+        let mut document = vec![10; 6];
+        document.extend((0..32).map(|value| 40 + value * 5));
+        let viewport = |offset| {
+            let mut rows = vec![10; 4];
+            rows.extend_from_slice(&document[offset..offset + 16]);
+            rows.extend_from_slice(&[250; 2]);
+            frame(&rows, 6)
+        };
+        let mut settings = config();
+        settings.preserve_fixed_header = true;
+        settings.expected_delta = Some(2);
+        let mut stitcher = ScrollStitcher::new(settings);
+        for offset in [0, 2, 4, 6, 8, 10] {
+            assert!(
+                matches!(
+                    stitcher.push_frame(viewport(offset)).unwrap(),
+                    PushOutcome::Started | PushOutcome::Advanced { .. }
+                ),
+                "offset {offset}"
+            );
+        }
+        assert_eq!(stitcher.summary().chrome.top, 4);
+        let mut expected = vec![10; 4];
+        expected.extend_from_slice(&document[..26]);
+        assert_eq!(
+            stitcher.finish_frame().unwrap().data,
+            frame(&expected, 6).data
+        );
+    }
+
+    #[test]
+    fn collapsing_a_retained_header_does_not_drop_or_repeat_content() {
+        let document: Vec<u8> = (0..30).map(|value| 30 + value * 5).collect();
+        let viewport = |offset, header_rows| {
+            let mut rows = vec![10; header_rows];
+            rows.extend_from_slice(&document[offset..offset + 20 - header_rows]);
+            rows.extend_from_slice(&[250; 2]);
+            frame(&rows, 6)
+        };
+        let mut settings = config();
+        settings.preserve_fixed_header = true;
+        settings.expected_delta = Some(2);
+        let mut stitcher = ScrollStitcher::new(settings);
+        stitcher.push_frame(viewport(0, 4)).unwrap();
+        stitcher.push_frame(viewport(2, 4)).unwrap();
+        assert!(matches!(
+            stitcher.push_frame(viewport(4, 0)).unwrap(),
+            PushOutcome::Advanced { .. }
+        ));
+        let preview = stitcher.preview().unwrap();
+        let mut expected = vec![10; 4];
+        expected.extend_from_slice(&document[..24]);
+        assert_eq!(preview.rgba, frame(&expected, 6).data);
+        assert_eq!(stitcher.finish_frame().unwrap().data, preview.rgba);
+    }
+
+    #[test]
+    fn changing_a_footer_still_refuses_to_rewrite_an_accepted_capture() {
+        let document: Vec<u8> = (0..30).map(|value| 30 + value * 5).collect();
+        let viewport = |offset, footer_rows| {
+            let mut rows = vec![10; 4];
+            rows.extend_from_slice(&document[offset..offset + 18 - footer_rows]);
+            rows.extend(std::iter::repeat_n(250, footer_rows));
+            frame(&rows, 6)
+        };
+        let mut settings = config();
+        settings.preserve_fixed_header = true;
+        settings.expected_delta = Some(2);
+        let mut stitcher = ScrollStitcher::new(settings);
+        stitcher.push_frame(viewport(0, 2)).unwrap();
+        stitcher.push_frame(viewport(2, 2)).unwrap();
+        let accepted = stitcher.preview().unwrap();
+        assert!(matches!(
+            stitcher.push_frame(viewport(4, 4)).unwrap(),
+            PushOutcome::InsufficientOverlap { .. }
+        ));
+        assert_eq!(stitcher.preview().unwrap(), accepted);
+        assert_eq!(stitcher.finish_frame().unwrap().data, accepted.rgba);
     }
 
     #[test]

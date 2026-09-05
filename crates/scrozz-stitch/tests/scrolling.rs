@@ -6,16 +6,57 @@ use std::collections::VecDeque;
 
 use scrozz_core::{ManualScrollDriver, Provenance, ScaleFactor, ScrollAxis};
 use scrozz_stitch::{
-    AlignError, AlignmentConfig, CancelAction, CancelSignal, ChromeBands, ChromeConfig,
-    CompletionReason, LumaPlane, NeverCancel, NoopPacer, PushOutcome, ScrollSession,
-    ScrollStitcher, SideChromeBands, align_horizontal, align_vertical, detect_sticky_chrome,
-    detect_sticky_side_chrome,
+    AlignError, AlignmentConfig, AtomicCancellation, CancelAction, CancelSignal, ChromeBands,
+    ChromeConfig, CompletionReason, LumaPlane, NeverCancel, NoopPacer, Progress, PushOutcome,
+    ScrollSession, ScrollStitcher, SideChromeBands, align_horizontal, align_vertical,
+    detect_sticky_chrome, detect_sticky_side_chrome,
 };
 
 use common::{
     FixtureDriver, FixtureSource, compact_stitch, gray_column_frame, gray_frame,
     horizontal_session_config, horizontal_viewport, session_config, viewport,
 };
+
+#[test]
+fn interactive_header_capture_keeps_one_header_and_still_requires_finish() {
+    let document: Vec<u8> = (0..30).map(|value| 30 + value * 5).collect();
+    let source = FixtureSource {
+        frames: VecDeque::from([
+            viewport(&document, 0, 16, &[10; 4], &[250; 2], 12, 2.0),
+            viewport(&document, 2, 16, &[10; 4], &[250; 2], 12, 2.0),
+            viewport(&document, 4, 16, &[10; 4], &[250; 2], 12, 2.0),
+        ]),
+    };
+    let mut config = session_config(2.0, 8)
+        .with_control(scrozz_core::ScrollControl::Manual)
+        .with_direction_detection(2.0, 2.0);
+    config.stitch.preserve_fixed_header = true;
+    config.stitch.alignment.min_overlap_percent = 33;
+    config.preview = true;
+    let signal = AtomicCancellation::default();
+    let mut cancel = signal.clone();
+    let mut last_preview = None;
+    let output = ScrollSession::new(
+        source,
+        Box::new(ManualScrollDriver::new("fixture")),
+        NoopPacer,
+        config,
+    )
+    .run(&mut cancel, |event| {
+        if matches!(event, Progress::FrameCaptured { frame: 3 }) {
+            signal.cancel(CancelAction::Keep);
+        }
+        if let Progress::Preview(preview) = event {
+            last_preview = Some(preview);
+        }
+    })
+    .expect("explicit Finish");
+    let mut expected = vec![10; 4];
+    expected.extend_from_slice(&document[..20]);
+    assert_eq!(output.reason, CompletionReason::CancelledKeep);
+    assert_eq!(output.frame.data, gray_frame(&expected, 12, 2.0).data);
+    assert_eq!(last_preview.unwrap().rgba, output.frame.data);
+}
 
 fn textured_plane(
     width: u32,

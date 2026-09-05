@@ -29,9 +29,9 @@ use std::sync::{
 use std::time::Duration;
 
 use scrozz_core::{
-    Capture, CaptureBackend, CaptureRequest, CaptureTarget, Display, Error as CoreError, Frame,
-    LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, ScaleFactor, ScrollAxis, ScrollControl,
-    ScrollGesture, Window, WindowId,
+    Capture, CaptureBackend, CaptureRequest, CaptureTarget, Display, DisplayId, Error as CoreError,
+    Frame, LogicalPoint, LogicalRect, LogicalSize, PhysicalSize, ScaleFactor, ScrollAxis,
+    ScrollControl, ScrollGesture, Window, WindowId,
 };
 use scrozz_stitch::{
     CancelAction, CancelSignal, FrameSource, Progress, ScrollSession, ScrollSessionConfig,
@@ -288,10 +288,18 @@ pub(crate) enum ScrollingContext {
         display: Box<Display>,
         viewport: LogicalRect,
         window: WindowId,
+        identity: Box<ScrollingWindowIdentity>,
         crop: Option<FrameCrop>,
         selection: Option<RelativeViewport>,
     },
     ManualPortal,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScrollingWindowIdentity {
+    application: Option<String>,
+    owner_pid: Option<u32>,
+    source_display: DisplayId,
 }
 
 impl ScrollingTarget {
@@ -301,12 +309,18 @@ impl ScrollingTarget {
         viewport: LogicalRect,
         window: WindowId,
     ) -> Self {
+        let source_display = display.id.clone();
         Self {
             request,
             context: ScrollingContext::Native {
                 display: Box::new(display),
                 viewport,
                 window,
+                identity: Box::new(ScrollingWindowIdentity {
+                    application: None,
+                    owner_pid: None,
+                    source_display,
+                }),
                 crop: None,
                 selection: None,
             },
@@ -319,6 +333,27 @@ impl ScrollingTarget {
         } = &mut self.context
         {
             *target_crop = Some(crop);
+        }
+        self
+    }
+
+    fn with_application(mut self, application: Option<String>) -> Self {
+        if let ScrollingContext::Native { identity, .. } = &mut self.context {
+            identity.application = application;
+        }
+        self
+    }
+
+    fn with_owner_pid(mut self, owner_pid: Option<u32>) -> Self {
+        if let ScrollingContext::Native { identity, .. } = &mut self.context {
+            identity.owner_pid = owner_pid;
+        }
+        self
+    }
+
+    fn with_source_display(mut self, source_display: DisplayId) -> Self {
+        if let ScrollingContext::Native { identity, .. } = &mut self.context {
+            identity.source_display = source_display;
         }
         self
     }
@@ -392,20 +427,24 @@ impl ScrollingTarget {
         windows: Vec<Window>,
         displays: Vec<Display>,
     ) -> CliResult<Self> {
-        let (window_id, selection, preferred_display, preferred_scale) = match &self.context {
-            ScrollingContext::ManualPortal => return Ok(self),
-            ScrollingContext::Native {
-                display,
-                window,
-                selection,
-                ..
-            } => (
-                window.clone(),
-                *selection,
-                display.id.clone(),
-                display.scale,
-            ),
-        };
+        let (window_id, application, owner_pid, selection, preferred_display, preferred_scale) =
+            match &self.context {
+                ScrollingContext::ManualPortal => return Ok(self),
+                ScrollingContext::Native {
+                    display,
+                    window,
+                    identity,
+                    selection,
+                    ..
+                } => (
+                    window.clone(),
+                    identity.application.clone(),
+                    identity.owner_pid,
+                    *selection,
+                    display.id.clone(),
+                    display.scale,
+                ),
+            };
         let window = windows
             .into_iter()
             .find(|window| window.id == window_id)
@@ -415,6 +454,21 @@ impl ScrollingTarget {
                     window_id.0
                 )))
             })?;
+        if let Some(owner_pid) = owner_pid {
+            if window.owner_pid != Some(owner_pid) {
+                return Err(CliError::Core(CoreError::TargetGone(format!(
+                    "window {} now belongs to a different process",
+                    window_id.0
+                ))));
+            }
+        } else if let Some(application) = application
+            && window.application.as_deref() != Some(application.as_str())
+        {
+            return Err(CliError::Core(CoreError::TargetGone(format!(
+                "window {} now belongs to a different application",
+                window_id.0
+            ))));
+        }
         if !window.is_visible || window.bounds.is_empty() {
             return Err(CliError::Core(CoreError::TargetGone(format!(
                 "window {} is no longer visible for scrolling capture",
@@ -486,6 +540,10 @@ impl ScrollingTarget {
                 Ok(ScrollSessionConfig::new(gesture))
             }
         }?;
+        if let ScrollingContext::Native { identity, crop, .. } = &self.context {
+            config.gesture.owner_pid = identity.owner_pid;
+            config.gesture.window_bounds = crop.map(|crop| crop.source_bounds);
+        }
         if cfg!(target_os = "macos") {
             config.settle_delay = Duration::from_millis(280);
             config.manual_poll_interval = Duration::from_millis(150);
@@ -515,6 +573,7 @@ impl ScrollingTarget {
         config.max_frames = 400;
         config.preview = self.overlay_surface().is_some();
         config.stitch.alignment.min_overlap_percent = 33;
+        config.stitch.preserve_fixed_header = true;
         Ok(config)
     }
 }
@@ -733,6 +792,16 @@ where
         ScrollingContext::Native { crop, .. } => *crop,
         ScrollingContext::ManualPortal => None,
     };
+    let guard = if cfg!(target_os = "macos")
+        && matches!(&target.context, ScrollingContext::Native { .. })
+    {
+        Some(CaptureFrameGuard {
+            target: target.clone(),
+            backend: platform::capture_backend()?,
+        })
+    } else {
+        None
+    };
     let request = target.request;
     let source = CaptureFrameSource {
         session: scrozz_capture::frame_session_with_cancellation(
@@ -741,6 +810,7 @@ where
         )
         .map_err(CliError::Core)?,
         crop,
+        guard,
         acquisition_cancellation: acquisition_cancellation.clone(),
     };
     let driver = platform::scroll_driver()?;
@@ -751,6 +821,7 @@ where
 pub(crate) struct CaptureFrameSource {
     session: Box<dyn scrozz_capture::FrameSession>,
     crop: Option<FrameCrop>,
+    guard: Option<CaptureFrameGuard>,
     acquisition_cancellation: scrozz_capture::CaptureCancellation,
 }
 
@@ -759,9 +830,15 @@ impl FrameSource for CaptureFrameSource {
         if self.acquisition_cancellation.is_cancelled() {
             return Err(CoreError::Cancelled);
         }
+        if let Some(guard) = &self.guard {
+            guard.validate()?;
+        }
         let frame = self.session.capture_frame()?;
         if self.acquisition_cancellation.is_cancelled() {
             return Err(CoreError::Cancelled);
+        }
+        if let Some(guard) = &self.guard {
+            guard.validate()?;
         }
         match self.crop {
             Some(crop) => crop.apply(frame),
@@ -771,6 +848,85 @@ impl FrameSource for CaptureFrameSource {
 
     fn name(&self) -> &str {
         self.session.name()
+    }
+}
+
+struct CaptureFrameGuard {
+    target: ScrollingTarget,
+    backend: Box<dyn CaptureBackend>,
+}
+
+impl CaptureFrameGuard {
+    fn validate(&self) -> scrozz_core::Result<()> {
+        let refreshed = self
+            .target
+            .clone()
+            .refresh(self.backend.as_ref())
+            .map_err(|error| match error {
+                CliError::Core(error) => error,
+                other => CoreError::Platform(format!(
+                    "could not revalidate the scrolling frame source: {other}"
+                )),
+            })?;
+        let expected = FrameSourceGeometry::from_target(&self.target);
+        let actual = FrameSourceGeometry::from_target(&refreshed);
+        if actual != expected {
+            let window = match self.target.capture_target() {
+                CaptureTarget::Window(window) => window.0,
+                _ => "selected".to_owned(),
+            };
+            return Err(CoreError::TargetGone(format!(
+                "window {window} changed position, size, visible viewport, or display scale during \
+                 scrolling capture; redraw the scrolling area"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FrameSourceGeometry {
+    source_size: LogicalSize,
+    viewport_offset: LogicalPoint,
+    viewport_size: LogicalSize,
+    viewport_origin: LogicalPoint,
+    scale: ScaleFactor,
+    source_display: DisplayId,
+}
+
+impl FrameSourceGeometry {
+    fn from_target(target: &ScrollingTarget) -> Option<Self> {
+        let ScrollingContext::Native {
+            display,
+            viewport,
+            identity,
+            crop,
+            ..
+        } = &target.context
+        else {
+            return None;
+        };
+        let (source_size, viewport_offset, viewport_size) = crop.map_or(
+            (viewport.size, LogicalPoint::new(0.0, 0.0), viewport.size),
+            |crop| {
+                (
+                    crop.source_bounds.size,
+                    LogicalPoint::new(
+                        crop.viewport.origin.x - crop.source_bounds.origin.x,
+                        crop.viewport.origin.y - crop.source_bounds.origin.y,
+                    ),
+                    crop.viewport.size,
+                )
+            },
+        );
+        Some(Self {
+            source_size,
+            viewport_offset,
+            viewport_size,
+            viewport_origin: viewport.origin,
+            scale: display.scale,
+            source_display: identity.source_display.clone(),
+        })
     }
 }
 
@@ -787,12 +943,19 @@ pub(crate) fn resolved_native_scrolling_target(
     })?;
     let crop = FrameCrop::new(window.bounds, viewport)?;
     let window_id = window.id;
+    let application = window.application;
+    let owner_pid = window.owner_pid;
+    let source_display = window.display;
     request.target = CaptureTarget::Window(window_id.clone());
     // X11 enumeration reports the outer frame while a shadowless capture reads
     // only the client drawable. Capture the frame window so work-area clipping
     // and frame pixels share one coordinate space.
     request.include_window_shadow = needs_outer_frame_capture(&window_id);
-    Ok(ScrollingTarget::new(request, display, viewport, window_id).with_crop(crop))
+    Ok(ScrollingTarget::new(request, display, viewport, window_id)
+        .with_application(application)
+        .with_owner_pid(owner_pid)
+        .with_source_display(source_display)
+        .with_crop(crop))
 }
 
 fn resolved_native_scrolling_region_target(
@@ -815,9 +978,15 @@ fn resolved_native_scrolling_region_target(
     let crop = FrameCrop::new(window.bounds, region)?;
     let selection = RelativeViewport::new(window.bounds, region);
     let window_id = window.id;
+    let application = window.application;
+    let owner_pid = window.owner_pid;
+    let source_display = window.display;
     request.target = CaptureTarget::Window(window_id.clone());
     request.include_window_shadow = needs_outer_frame_capture(&window_id);
     Ok(ScrollingTarget::new(request, display, region, window_id)
+        .with_application(application)
+        .with_owner_pid(owner_pid)
+        .with_source_display(source_display)
         .with_crop(crop)
         .with_selection(selection))
 }
@@ -1129,6 +1298,7 @@ mod tests {
             id: WindowId(id.to_owned()),
             title: Some(format!("{application} window")),
             application: Some(application.to_owned()),
+            owner_pid: None,
             bounds,
             display: DisplayId(display.to_owned()),
             is_visible,
@@ -1213,6 +1383,7 @@ mod tests {
         assert_eq!(detecting.max_frames, 400);
         assert!(detecting.preview);
         assert_eq!(detecting.stitch.alignment.min_overlap_percent, 33);
+        assert!(detecting.stitch.preserve_fixed_header);
     }
 
     #[cfg(target_os = "macos")]
@@ -1295,6 +1466,70 @@ mod tests {
             )
             .expect_err("a different window must never be substituted");
         assert!(matches!(error, CliError::Core(CoreError::TargetGone(_))));
+    }
+
+    #[test]
+    fn a_recycled_window_id_cannot_switch_owning_applications() {
+        let display = fixture_display();
+        let bounds = LogicalRect::new(
+            LogicalPoint::new(120.0, 80.0),
+            LogicalSize::new(900.0, 700.0),
+        );
+        let target = resolved_native_scrolling_target(
+            CaptureRequest {
+                target: CaptureTarget::Display(display.id.clone()),
+                cursor: scrozz_core::CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            display.clone(),
+            fixture_window("recycled", "Browser", "display-2", bounds, true),
+        )
+        .expect("initial target");
+
+        let error = target
+            .refresh_from_snapshots(
+                vec![fixture_window(
+                    "recycled",
+                    "Notes",
+                    "display-2",
+                    bounds,
+                    true,
+                )],
+                vec![display],
+            )
+            .expect_err("the same numeric id from another app must fail closed");
+        assert!(matches!(error, CliError::Core(CoreError::TargetGone(_))));
+    }
+
+    #[test]
+    fn selected_process_identity_is_carried_into_the_first_scroll_and_refresh() {
+        let display = fixture_display();
+        let bounds = LogicalRect::new(
+            LogicalPoint::new(120.0, 80.0),
+            LogicalSize::new(900.0, 700.0),
+        );
+        let mut selected = fixture_window("recycled", "Browser", "display-2", bounds, true);
+        selected.owner_pid = Some(100);
+        let target = resolved_native_scrolling_target(
+            CaptureRequest {
+                target: CaptureTarget::Window(selected.id.clone()),
+                cursor: scrozz_core::CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            display.clone(),
+            selected.clone(),
+        )
+        .unwrap();
+        let config = target
+            .direction_detecting_session_config(ScrollControl::Automatic)
+            .unwrap();
+        assert_eq!(config.gesture.owner_pid, Some(100));
+        assert_eq!(config.gesture.window_bounds, Some(bounds));
+        selected.owner_pid = Some(101);
+        assert!(matches!(
+            target.refresh_from_snapshots(vec![selected], vec![display]),
+            Err(CliError::Core(CoreError::TargetGone(_)))
+        ));
     }
 
     #[test]
@@ -1595,6 +1830,7 @@ mod tests {
             LogicalPoint::new(1_000.0, 80.0),
             LogicalSize::new(600.0, 500.0),
         );
+        let initial_geometry = FrameSourceGeometry::from_target(&target);
         let refreshed = target
             .refresh_from_snapshots(
                 vec![fixture_window(
@@ -1607,6 +1843,11 @@ mod tests {
                 vec![left.clone(), right],
             )
             .expect("window moved fully onto the left display");
+        assert_ne!(
+            initial_geometry,
+            FrameSourceGeometry::from_target(&refreshed),
+            "a reusable ScreenCaptureKit session cannot follow a display transition"
+        );
         let ScrollingContext::Native {
             display, viewport, ..
         } = refreshed.context
@@ -1643,6 +1884,7 @@ mod tests {
 
         let moved_bounds = LogicalRect::new(LogicalPoint::new(180.0, 110.0), initial_bounds.size);
         let refreshed = target
+            .clone()
             .refresh_from_snapshots(
                 vec![fixture_window(
                     "browser",
@@ -1659,19 +1901,68 @@ mod tests {
             crop,
             selection,
             ..
-        } = refreshed.context
+        } = &refreshed.context
         else {
             panic!("selected region became a portal target");
         };
         assert_eq!(
-            viewport,
+            *viewport,
             LogicalRect::new(
                 LogicalPoint::new(280.0, 210.0),
                 LogicalSize::new(500.0, 320.0)
             )
         );
-        assert_eq!(crop.map(|crop| crop.viewport), Some(viewport));
+        assert_eq!(crop.map(|crop| crop.viewport), Some(*viewport));
         assert!(selection.is_some());
+        assert_ne!(
+            FrameSourceGeometry::from_target(&target),
+            FrameSourceGeometry::from_target(&refreshed),
+            "the drawn capture area and pointer bounds must not silently follow window translation"
+        );
+    }
+
+    #[test]
+    fn a_resize_invalidates_the_reusable_window_frame_session() {
+        let display = fixture_display();
+        let initial_bounds = LogicalRect::new(
+            LogicalPoint::new(120.0, 80.0),
+            LogicalSize::new(900.0, 700.0),
+        );
+        let region = LogicalRect::new(
+            LogicalPoint::new(220.0, 180.0),
+            LogicalSize::new(500.0, 320.0),
+        );
+        let target = resolved_native_scrolling_region_target(
+            CaptureRequest {
+                target: CaptureTarget::Display(display.id.clone()),
+                cursor: scrozz_core::CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            display.clone(),
+            fixture_window("browser", "Browser", "display-2", initial_bounds, true),
+            region,
+        )
+        .expect("selected region");
+
+        let resized = target
+            .clone()
+            .refresh_from_snapshots(
+                vec![fixture_window(
+                    "browser",
+                    "Browser",
+                    "display-2",
+                    LogicalRect::new(initial_bounds.origin, LogicalSize::new(1_000.0, 760.0)),
+                    true,
+                )],
+                vec![display],
+            )
+            .expect("the selected region still fits after resize");
+
+        assert_ne!(
+            FrameSourceGeometry::from_target(&target),
+            FrameSourceGeometry::from_target(&resized),
+            "a fixed ScreenCaptureKit configuration cannot safely outlive a resize"
+        );
     }
 
     #[test]

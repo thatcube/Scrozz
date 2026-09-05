@@ -46,6 +46,7 @@ fn window(
         id: WindowId(id.to_owned()),
         title: title.map(str::to_owned),
         application: application.map(str::to_owned),
+        owner_pid: None,
         bounds,
         display: DisplayId(display.to_owned()),
         is_visible,

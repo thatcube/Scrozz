@@ -186,6 +186,10 @@ pub struct ScrollGesture {
     /// Carrying its stable id lets the driver reject recycled handles and prove
     /// the target at [`Self::at`] still belongs to the selected window.
     pub window: Option<WindowId>,
+    /// Process identity captured when the window was selected, if available.
+    pub owner_pid: Option<u32>,
+    /// Native window frame captured at session start, for pre-input geometry checks.
+    pub window_bounds: Option<LogicalRect>,
     /// Selected capture area. Pointer-bound drivers must not inject outside it.
     pub area: Option<LogicalRect>,
     /// How far to scroll, in logical points.
@@ -206,6 +210,8 @@ impl ScrollGesture {
             at,
             display: None,
             window: None,
+            owner_pid: None,
+            window_bounds: None,
             area: None,
             amount,
         }
@@ -219,6 +225,8 @@ impl ScrollGesture {
             at,
             display: None,
             window: None,
+            owner_pid: None,
+            window_bounds: None,
             area: None,
             amount: -amount,
         }
@@ -232,6 +240,8 @@ impl ScrollGesture {
             at,
             display: None,
             window: None,
+            owner_pid: None,
+            window_bounds: None,
             area: None,
             amount,
         }
@@ -245,6 +255,8 @@ impl ScrollGesture {
             at,
             display: None,
             window: None,
+            owner_pid: None,
+            window_bounds: None,
             area: None,
             amount: -amount,
         }

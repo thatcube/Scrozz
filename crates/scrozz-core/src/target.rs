@@ -45,6 +45,8 @@ pub struct Window {
     pub title: Option<String>,
     /// Owning application's display name.
     pub application: Option<String>,
+    /// Native owning process, when the window server exposes it.
+    pub owner_pid: Option<u32>,
     /// Frame in the global logical desktop.
     pub bounds: LogicalRect,
     /// The display this window is predominantly on.
