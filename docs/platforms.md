@@ -342,10 +342,14 @@ The app does not guess a scrolling window. The user first draws the exact area
 inside one visible application window, then chooses **Manual** or **Automatic**
 and presses **Start capture**. The first coherent viewport displacement selects
 up, down, left, or right from the captured pixels—there is no axis or direction
-picker to get wrong. Manual mode follows that route while the user scrolls and
-ends only when **Finish** is pressed. Automatic mode waits for that first user
-scroll, then continues in the same direction with bounded native wheel steps and
-stops at repeated end-of-content frames. Reverse routes are normalized before
+picker to get wrong. Manual mode follows that route while the user scrolls.
+Automatic mode waits for that first user scroll, then continues in the same
+direction with bounded native wheel steps. Both modes save only after **Finish**
+and remain discardable until then. Stationary frames do not consume the capture
+budget; Automatic pauses its wheel input until movement resumes. Lost overlap
+waits for the user to scroll back and reconnect, without saving a partial image.
+Capture limits or later acquisition failures hold the valid pixels in memory
+and keep **Finish** and **Discard** available. Reverse routes are normalized before
 append-only stitching and flipped back for a naturally ordered final image. A
 failed automatic attempt keeps setup visible so the same area can be retried
 manually.

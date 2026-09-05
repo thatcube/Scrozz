@@ -31,6 +31,10 @@ pub enum ScrollHudStatus {
     WaitingForManualScroll,
     /// The viewport has not moved for this many probes.
     Stalled(u32),
+    /// The last accepted viewport is intact; scrolling back can reconnect it.
+    WaitingForOverlap,
+    /// Pixels are retained in memory until the user chooses Finish or Discard.
+    AwaitingFinish(String),
     /// Stitching is complete and the final image is being encoded and persisted.
     Finalizing,
     /// Capture did not start or advance; configuration remains available.
@@ -933,11 +937,16 @@ fn status_line(state: &ScrollHudState) -> String {
         ),
         ScrollHudStatus::Stalled(_) if state.delta.is_some() => "No new movement.".to_owned(),
         ScrollHudStatus::Stalled(_) => "Scroll once or discard.".to_owned(),
+        ScrollHudStatus::WaitingForOverlap => "Scroll back slowly to reconnect.".to_owned(),
+        ScrollHudStatus::AwaitingFinish(_) => "Paused. Finish or discard.".to_owned(),
         ScrollHudStatus::Finalizing => "Finalizing the stitched image…".to_owned(),
     }
 }
 
 fn detail_line(state: &ScrollHudState) -> String {
+    if let ScrollHudStatus::AwaitingFinish(reason) = &state.status {
+        return reason.clone();
+    }
     let route = match state.direction {
         Some(direction) => direction_label(direction),
         None => "Detecting direction",

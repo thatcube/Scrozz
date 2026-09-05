@@ -236,6 +236,12 @@ pub(crate) fn report_terminal_scroll_progress(progress: Progress) {
         Progress::Stalled { count } => {
             eprintln!("scrozz: no movement detected (probe {count})");
         }
+        Progress::WaitingForOverlap { reason } => {
+            eprintln!("scrozz: scroll back slowly to reconnect: {reason}");
+        }
+        Progress::AwaitingFinish { reason } => {
+            eprintln!("scrozz: acquisition paused ({reason:?}); choose Finish or Discard");
+        }
         Progress::Interrupted { reason } => {
             eprintln!("scrozz: keeping the valid stitched prefix after: {reason}");
         }

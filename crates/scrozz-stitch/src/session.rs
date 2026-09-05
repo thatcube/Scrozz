@@ -200,8 +200,19 @@ pub enum Progress {
         /// Consecutive stationary observations.
         count: u32,
     },
-    /// A later frame could not be captured or assembled; the valid prefix will
-    /// be returned instead of discarded.
+    /// Keep the accepted canvas while the user reconnects the viewport.
+    WaitingForOverlap {
+        /// Why this viewport could not safely extend the capture.
+        reason: String,
+    },
+    /// Acquisition stopped, but an interactive capture still needs an explicit
+    /// Finish or Discard before any output can be published.
+    AwaitingFinish {
+        /// Why acquisition cannot continue.
+        reason: CompletionReason,
+    },
+    /// A later frame could not be captured or assembled; the valid prefix is
+    /// retained. Interactive sessions still require Finish before returning it.
     Interrupted {
         /// Diagnostic from the terminal failure.
         reason: String,
@@ -283,7 +294,8 @@ pub struct ScrollSessionConfig {
     pub manual_poll_interval: Duration,
     /// Stationary manual polls required after movement to declare completion.
     pub manual_stall_limit: u32,
-    /// Hard cap preventing an unbounded capture.
+    /// Hard cap preventing an unbounded capture. Interactive sessions count
+    /// accepted viewports, not idle probes, and wait for Finish at this limit.
     pub max_frames: usize,
     /// Stitching thresholds.
     pub stitch: StitchConfig,
@@ -388,7 +400,8 @@ where
         }
     }
 
-    /// Runs until end-of-content, cancellation, overlap failure or the frame cap.
+    /// Interactive sessions return pixels only after Finish; adaptive CLI
+    /// sessions may also finish at end-of-content or a safety boundary.
     pub fn run<C, F>(mut self, cancel: &mut C, mut progress: F) -> Result<SessionOutput>
     where
         C: CancelSignal,
@@ -468,7 +481,7 @@ where
             loop {
                 let mut finish_after_probe =
                     matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
-                if captured_frames >= self.config.max_frames {
+                if self.config.control.is_none() && captured_frames >= self.config.max_frames {
                     return Err(no_movement_error(
                         "scrolling capture reached its frame limit without detecting movement",
                     ));
@@ -480,7 +493,7 @@ where
                 finish_after_probe |=
                     matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
                 let frame = self.source.capture_frame()?;
-                captured_frames += 1;
+                captured_frames = captured_frames.saturating_add(1);
                 progress(Progress::FrameCaptured {
                     frame: captured_frames,
                 });
@@ -571,16 +584,22 @@ where
             );
         }
 
+        let mut waiting_for_movement = false;
         loop {
             let mut finish_after_frame =
                 matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep));
-            if captured_frames >= self.config.max_frames {
+            let budget_frames = if self.config.control.is_some() {
+                stitcher.summary().frames
+            } else {
+                captured_frames
+            };
+            if budget_frames >= self.config.max_frames {
                 if !has_advanced {
                     return Err(no_movement_error(
                         "scrolling capture reached its frame limit without detecting movement",
                     ));
                 }
-                return finish_checked(
+                return self.complete_session(
                     stitcher,
                     if finish_after_frame {
                         CompletionReason::CancelledKeep
@@ -594,7 +613,7 @@ where
             }
 
             if !finish_after_frame {
-                if capabilities.is_automatic() {
+                if capabilities.is_automatic() && !waiting_for_movement {
                     if let Err(error) = self.driver.scroll(&self.config.gesture) {
                         if let Some(reason) = cancellation_reason(cancel, has_advanced)? {
                             return finish_checked(
@@ -614,7 +633,7 @@ where
                             progress(Progress::Interrupted {
                                 reason: error.to_string(),
                             });
-                            return finish_checked(
+                            return self.complete_session(
                                 stitcher,
                                 CompletionReason::Interrupted,
                                 captured_frames,
@@ -632,7 +651,7 @@ where
                             progress(Progress::Interrupted {
                                 reason: error.to_string(),
                             });
-                            return finish_checked(
+                            return self.complete_session(
                                 stitcher,
                                 CompletionReason::Interrupted,
                                 captured_frames,
@@ -682,7 +701,7 @@ where
                     progress(Progress::Interrupted {
                         reason: error.to_string(),
                     });
-                    return finish_checked(
+                    return self.complete_session(
                         stitcher,
                         CompletionReason::Interrupted,
                         captured_frames,
@@ -692,7 +711,7 @@ where
                 }
                 Err(error) => return Err(error),
             };
-            captured_frames += 1;
+            captured_frames = captured_frames.saturating_add(1);
             progress(Progress::FrameCaptured {
                 frame: captured_frames,
             });
@@ -721,7 +740,7 @@ where
                     progress(Progress::Interrupted {
                         reason: error.to_string(),
                     });
-                    return finish_checked(
+                    return self.complete_session(
                         stitcher,
                         CompletionReason::Interrupted,
                         captured_frames,
@@ -744,6 +763,7 @@ where
                     output_height,
                 } => {
                     has_advanced = true;
+                    waiting_for_movement = false;
                     stitcher.set_expected_delta(Some(delta));
                     progress(Progress::Advanced {
                         frame: captured_frames,
@@ -795,7 +815,8 @@ where
                             &mut progress,
                         );
                     }
-                    if self.config.control == Some(ScrollControl::Manual) {
+                    if self.config.control.is_some() {
+                        waiting_for_movement = true;
                         continue;
                     }
                     if !capabilities.is_automatic()
@@ -808,7 +829,7 @@ where
                             "scrolling capture ended before the viewport moved",
                         ));
                     }
-                    return finish_checked(
+                    return self.complete_session(
                         stitcher,
                         CompletionReason::EndOfContent,
                         captured_frames,
@@ -817,8 +838,13 @@ where
                     );
                 }
                 PushOutcome::InsufficientOverlap { reason } => {
+                    if self.config.control.is_some() && !finish_after_frame {
+                        waiting_for_movement = true;
+                        progress(Progress::WaitingForOverlap { reason });
+                        continue;
+                    }
                     if has_advanced {
-                        return finish_checked(
+                        return self.complete_session(
                             stitcher,
                             if finish_after_frame {
                                 CompletionReason::CancelledKeep
@@ -837,6 +863,31 @@ where
                 }
             }
         }
+    }
+
+    fn complete_session<C, F>(
+        &mut self,
+        stitcher: ScrollStitcher,
+        mut reason: CompletionReason,
+        captured_frames: usize,
+        cancel: &mut C,
+        progress: &mut F,
+    ) -> Result<SessionOutput>
+    where
+        C: CancelSignal,
+        F: FnMut(Progress),
+    {
+        if self.config.control.is_some() && reason != CompletionReason::CancelledKeep {
+            progress(Progress::AwaitingFinish { reason });
+            loop {
+                if matches!(poll_cancel_action(cancel)?, Some(CancelAction::Keep)) {
+                    reason = CompletionReason::CancelledKeep;
+                    break;
+                }
+                self.pacer.wait(self.config.manual_poll_interval);
+            }
+        }
+        finish_checked(stitcher, reason, captured_frames, cancel, progress)
     }
 }
 
@@ -1106,6 +1157,29 @@ mod tests {
         config
     }
 
+    fn finish_after_frame(
+        session: ScrollSession<Frames, NoopPacer>,
+        finish_at: usize,
+    ) -> (SessionOutput, Vec<Progress>) {
+        let request = AtomicCancellation::default();
+        let mut signal = request.clone();
+        let mut events = Vec::new();
+        let output = session
+            .run(&mut signal, |event| {
+                assert!(
+                    !matches!(event, Progress::AwaitingFinish { .. }),
+                    "paused too early: {event:?}"
+                );
+                if matches!(event, Progress::FrameCaptured { frame } if frame == finish_at) {
+                    request.cancel(CancelAction::Keep);
+                }
+                events.push(event);
+            })
+            .expect("explicit Finish");
+        assert_eq!(output.reason, CompletionReason::CancelledKeep);
+        (output, events)
+    }
+
     #[test]
     fn a_session_reports_progress_and_stops_at_end_of_content() {
         let document: Vec<u8> = (0..18).map(|v| v * 10).collect();
@@ -1154,13 +1228,10 @@ mod tests {
             .with_control(ScrollControl::Automatic)
             .with_direction_detection(3.0, 3.0);
         config.manual_poll_interval = Duration::ZERO;
-        let mut events = Vec::new();
-
-        let output = ScrollSession::new(source, Box::new(driver), NoopPacer, config)
-            .run(&mut NeverCancel, |event| events.push(event))
-            .expect("direction-detecting session");
-
-        assert_eq!(output.reason, CompletionReason::FrameLimit);
+        let (output, events) = finish_after_frame(
+            ScrollSession::new(source, Box::new(driver), NoopPacer, config),
+            4,
+        );
         assert_eq!(output.frame.height(), 14);
         assert!(events.iter().any(|event| {
             matches!(
@@ -1191,13 +1262,10 @@ mod tests {
         let config = config(4)
             .with_control(ScrollControl::Manual)
             .with_direction_detection(3.0, 3.0);
-        let mut events = Vec::new();
-
-        let output = ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config)
-            .run(&mut NeverCancel, |event| events.push(event))
-            .expect("direction detector should rebase before the real scroll");
-
-        assert_eq!(output.reason, CompletionReason::FrameLimit);
+        let (output, events) = finish_after_frame(
+            ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config),
+            4,
+        );
         assert_eq!(output.frame.height(), 11);
         assert!(events.iter().any(|event| {
             matches!(
@@ -1224,11 +1292,10 @@ mod tests {
         let config = config(4)
             .with_control(ScrollControl::Manual)
             .with_direction_detection(3.0, 3.0);
-        let mut events = Vec::new();
-
-        let output = ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config)
-            .run(&mut NeverCancel, |event| events.push(event))
-            .expect("the original baseline should survive one transient frame");
+        let (output, events) = finish_after_frame(
+            ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config),
+            4,
+        );
 
         assert_eq!(output.frame.height(), 11);
         assert!(events.iter().any(|event| {
@@ -1257,9 +1324,10 @@ mod tests {
             .with_control(ScrollControl::Manual)
             .with_direction_detection(3.0, 3.0);
 
-        let output = ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config)
-            .run(&mut NeverCancel, |_| {})
-            .expect("the original viewport should remain in the stitched prefix");
+        let (output, _) = finish_after_frame(
+            ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config),
+            4,
+        );
 
         let rows: Vec<u8> = output
             .frame
@@ -1427,6 +1495,158 @@ mod tests {
 
             assert_eq!(output.reason, CompletionReason::CancelledKeep);
             assert_eq!(output.frame.height(), expected_height);
+        }
+    }
+
+    #[test]
+    fn interactive_idle_probes_do_not_spend_the_frame_budget_or_finish_capture() {
+        let document: Vec<u8> = (0..20).map(|value| value * 10).collect();
+        for control in [ScrollControl::Manual, ScrollControl::Automatic] {
+            let moved = frame(&document[3..11]);
+            let mut frames = VecDeque::from([frame(&document[0..8]), moved.clone()]);
+            frames.extend(std::iter::repeat_n(moved, 8));
+            frames.extend([frame(&document[6..14]), frame(&document[9..17])]);
+            let finish_at = frames.len();
+            let gestures = Arc::new(Mutex::new(Vec::new()));
+            let driver = RecordingDriver {
+                gestures: Arc::clone(&gestures),
+            };
+            let (output, events) = finish_after_frame(
+                ScrollSession::new(
+                    Frames { frames },
+                    Box::new(driver),
+                    NoopPacer,
+                    config(4)
+                        .with_control(control)
+                        .with_direction_detection(3.0, 3.0),
+                ),
+                finish_at,
+            );
+            assert_eq!(output.frame.height(), 17);
+            assert_eq!(output.captured_frames, finish_at);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Progress::Stalled { count } if *count > 4))
+            );
+            let scrolls = gestures.lock().expect("gestures").len();
+            assert_eq!(
+                scrolls,
+                if control == ScrollControl::Automatic {
+                    3
+                } else {
+                    0
+                },
+                "automatic input pauses when stationary and resumes after real movement"
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_direction_detection_waits_beyond_the_old_probe_limit() {
+        let document: Vec<u8> = (0..14).map(|value| value * 10).collect();
+        for control in [ScrollControl::Manual, ScrollControl::Automatic] {
+            let mut frames: VecDeque<_> = std::iter::repeat_n(frame(&document[0..8]), 10).collect();
+            frames.push_back(frame(&document[3..11]));
+            let (output, _) = finish_after_frame(
+                ScrollSession::new(
+                    Frames { frames },
+                    Box::<Driver>::default(),
+                    NoopPacer,
+                    config(2)
+                        .with_control(control)
+                        .with_direction_detection(3.0, 3.0),
+                ),
+                11,
+            );
+            assert_eq!(output.frame.height(), 11);
+        }
+    }
+
+    #[test]
+    fn interactive_overlap_loss_waits_for_reconnection_without_saving() {
+        let document: Vec<u8> = (0..20).map(|value| value * 10).collect();
+        for control in [ScrollControl::Manual, ScrollControl::Automatic] {
+            let source = Frames {
+                frames: VecDeque::from([
+                    frame(&document[0..8]),
+                    frame(&document[3..11]),
+                    frame(&[255; 8]),
+                    frame(&document[6..14]),
+                    frame(&document[9..17]),
+                ]),
+            };
+            let (output, events) = finish_after_frame(
+                ScrollSession::new(
+                    source,
+                    Box::<Driver>::default(),
+                    NoopPacer,
+                    config(8)
+                        .with_control(control)
+                        .with_direction_detection(3.0, 3.0),
+                ),
+                5,
+            );
+            assert_eq!(output.frame.height(), 17);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Progress::WaitingForOverlap { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_limits_and_interruptions_wait_for_finish_or_discard() {
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        for action in [CancelAction::Keep, CancelAction::Abort] {
+            for failure in ["frame-limit", "capture-error", "byte-limit", "driver-error"] {
+                let mut config = config(if failure == "frame-limit" { 2 } else { 8 })
+                    .with_control(ScrollControl::Automatic);
+                let mut frames = VecDeque::from([frame(&document[0..8]), frame(&document[3..11])]);
+                if failure == "byte-limit" {
+                    config.stitch.max_output_bytes = 6 * 11 * 4;
+                    frames.push_back(frame(&document[6..14]));
+                }
+                let driver: Box<dyn ScrollDriver> = if failure == "driver-error" {
+                    Box::<TargetGoneAfterOneScroll>::default()
+                } else {
+                    Box::<Driver>::default()
+                };
+                let request = AtomicCancellation::default();
+                let mut signal = request.clone();
+                let mut paused = false;
+                let result = ScrollSession::new(Frames { frames }, driver, NoopPacer, config).run(
+                    &mut signal,
+                    |event| {
+                        if let Progress::AwaitingFinish { reason } = event {
+                            assert_eq!(
+                                reason,
+                                if failure == "frame-limit" {
+                                    CompletionReason::FrameLimit
+                                } else {
+                                    CompletionReason::Interrupted
+                                }
+                            );
+                            paused = true;
+                            request.cancel(action);
+                        }
+                        if matches!(event, Progress::Finished { .. }) {
+                            assert!(paused, "no unsolicited output for {failure}");
+                            assert_eq!(action, CancelAction::Keep);
+                        }
+                    },
+                );
+                assert!(paused, "{failure} must preserve the pending choice");
+                match action {
+                    CancelAction::Keep => {
+                        let output = result.expect("explicit Finish keeps the valid prefix");
+                        assert_eq!(output.reason, CompletionReason::CancelledKeep);
+                        assert_eq!(output.frame.height(), 11);
+                    }
+                    CancelAction::Abort => assert!(result.expect_err("Discard").is_cancellation()),
+                }
+            }
         }
     }
 

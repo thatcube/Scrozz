@@ -889,7 +889,7 @@ fn draw_chrome(
     pressed
 }
 
-/// The always-visible morphing pill shown in place of the edit corner while
+/// The always-visible morphing pill centered on the thumbnail while
 /// a card's editor is open.
 ///
 /// Unlike every other control here, this one does not fade with hover:
@@ -913,15 +913,7 @@ fn draw_editing_pill(
     if alpha <= 0.004 {
         return None;
     }
-    let inner = container.shrink(CHROME_INSET);
-    let width = 116.0_f32.min(inner.width());
-    if width <= 0.0 || inner.height() < PILL_H {
-        return None;
-    }
-    let rect = Rect::from_min_size(
-        pos2(inner.left(), inner.bottom() - PILL_H),
-        vec2(width, PILL_H),
-    );
+    let rect = editing_pill_rect(container)?;
     let response = paint::editing_pill(
         ui,
         surface,
@@ -930,6 +922,13 @@ fn draw_editing_pill(
         alpha,
     );
     response.clicked().then_some(CardAction::Continue)
+}
+
+fn editing_pill_rect(container: Rect) -> Option<Rect> {
+    let inner = container.shrink(CHROME_INSET);
+    let width = 116.0_f32.min(inner.width());
+    (width > 0.0 && inner.height() >= PILL_H)
+        .then(|| Rect::from_center_size(container.center(), vec2(width, PILL_H)))
 }
 
 /// The four corner slots, in origin order: top-left, top-right, bottom-left,
@@ -1183,6 +1182,16 @@ mod tests {
             assert!(inner.contains_rect(controls[1]), "{source:?}");
             assert_eq!(controls[0].center().x, controls[1].center().x);
             assert!(controls[0].bottom() < controls[1].top());
+        }
+    }
+
+    #[test]
+    fn editing_and_continue_share_the_thumbnail_center_at_every_card_size() {
+        for size in [vec2(100.0, 70.0), vec2(210.0, 150.0), vec2(320.0, 200.0)] {
+            let thumbnail = Rect::from_min_size(pos2(34.0, 78.0), size);
+            let pill = editing_pill_rect(thumbnail).expect("editing pill fits");
+            assert_eq!(pill.center(), thumbnail.center());
+            assert!(thumbnail.shrink(CHROME_INSET).contains_rect(pill));
         }
     }
 

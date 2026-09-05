@@ -1401,8 +1401,14 @@ fn describe_scroll_progress(progress: &Progress) -> String {
             "stitched frame {frame} ({delta} px advanced, {output_extent} px along the capture axis)"
         ),
         Progress::Stalled { count } => format!("saw no movement ({count})"),
+        Progress::WaitingForOverlap { reason } => {
+            format!("is waiting for overlapping content: {reason}")
+        }
+        Progress::AwaitingFinish { reason } => {
+            format!("paused ({reason:?}); waiting for Finish or Discard")
+        }
         Progress::Interrupted { reason } => {
-            format!("kept the valid stitched prefix after {reason}")
+            format!("stopped acquiring scrolling frames after {reason}")
         }
         Progress::Finished {
             reason,
@@ -5381,6 +5387,20 @@ impl App {
                 state.status = ScrollHudStatus::Stalled(*count);
             }
             Progress::Interrupted { .. } => {}
+            Progress::WaitingForOverlap { .. } => {
+                state.status = ScrollHudStatus::WaitingForOverlap;
+            }
+            Progress::AwaitingFinish { reason } => {
+                state.automatic = false;
+                state.status = ScrollHudStatus::AwaitingFinish(
+                    if *reason == scrozz_stitch::CompletionReason::FrameLimit {
+                        "Capture limit reached"
+                    } else {
+                        "Capture interrupted"
+                    }
+                    .to_owned(),
+                );
+            }
             Progress::Finished { .. } => {
                 state.status = ScrollHudStatus::Finalizing;
             }
@@ -14440,6 +14460,37 @@ mod tests {
         assert_eq!(state.direction, Some(scrozz_core::ScrollDirection::Left));
         assert_eq!(state.status, ScrollHudStatus::Capturing);
         assert!(state.automatic);
+    }
+
+    #[test]
+    fn scrolling_pauses_keep_the_hud_open_without_finalizing_or_saving() {
+        let (mut app, surface) = scrolling_app();
+        let card = CardId(171);
+        app.scrolling_card = Some(card);
+        let mut state = ScrollHudState::prepared(ScrollControl::Automatic);
+        state.delta = Some(40);
+        app.set_scroll_hud(state);
+        for progress in [
+            Progress::Stalled { count: 999 },
+            Progress::WaitingForOverlap {
+                reason: "viewport jumped".into(),
+            },
+            Progress::AwaitingFinish {
+                reason: scrozz_stitch::CompletionReason::FrameLimit,
+            },
+        ] {
+            app.update_scroll_hud(card, &progress);
+            let state = surface.scrolling_hud().expect("pending Finish or Discard");
+            assert_ne!(state.status, ScrollHudStatus::Finalizing);
+            assert_eq!(state.delta, Some(40), "Finish remains available");
+            assert_eq!(app.scrolling_card, Some(card));
+            assert!(!app.scrolling_keep_pending);
+            assert!(surface.presented().is_empty());
+        }
+        assert!(matches!(
+            surface.scrolling_hud().expect("HUD").status,
+            ScrollHudStatus::AwaitingFinish(_)
+        ));
     }
 
     #[test]
