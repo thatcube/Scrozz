@@ -161,6 +161,8 @@ impl CancelSignal for AtomicCancellation {
 /// A meaningful update suitable for a HUD, CLI log or test recorder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
+    /// Bounded live pixels from the last accepted canvas, never a new output.
+    Preview(Arc<crate::ScrollPreview>),
     /// The baseline viewport is captured and the platform input path is ready.
     ///
     /// Interactive callers must not invite the user to scroll before this
@@ -290,6 +292,8 @@ impl SessionOutput {
 /// Timing and safety limits for an orchestrated capture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScrollSessionConfig {
+    /// Emit bounded live previews for interactive surfaces.
+    pub preview: bool,
     /// Scroll delivered after each accepted frame.
     pub gesture: ScrollGesture,
     /// Time given to smooth scrolling and repaint before capture.
@@ -342,6 +346,7 @@ impl ScrollSessionConfig {
     #[must_use]
     pub fn new(gesture: ScrollGesture) -> Self {
         Self {
+            preview: false,
             gesture,
             settle_delay: Duration::from_millis(180),
             manual_poll_interval: Duration::from_millis(250),
@@ -477,6 +482,11 @@ where
                 ScrollSynthesis::Manual { why } => Some(why.clone()),
             },
         });
+        if self.config.preview {
+            progress(Progress::Preview(Arc::new(
+                crate::ScrollPreview::from_frame(&first)?,
+            )));
+        }
 
         let mut stitcher = if let Some(amounts) = self.config.direction_detection {
             let mut probes = 0u32;
@@ -561,6 +571,9 @@ where
                     output_extent,
                     output_height,
                 });
+                if self.config.preview {
+                    progress(Progress::Preview(Arc::new(detected.preview()?)));
+                }
                 if finish_after_probe {
                     return finish_checked(
                         detected,
@@ -776,6 +789,9 @@ where
                         output_extent,
                         output_height,
                     });
+                    if self.config.preview {
+                        progress(Progress::Preview(Arc::new(stitcher.preview()?)));
+                    }
                     if finish_after_frame {
                         return finish_checked(
                             stitcher,
@@ -820,7 +836,11 @@ where
                         );
                     }
                     if self.config.control.is_some() {
-                        waiting_for_movement = true;
+                        // A slow repaint is not a reason to stop driving Auto.
+                        // Its overlap-recovery pause is cleared only by Advanced.
+                        if self.config.control == Some(ScrollControl::Manual) {
+                            waiting_for_movement = true;
+                        }
                         continue;
                     }
                     if !capabilities.is_automatic()
@@ -1537,11 +1557,11 @@ mod tests {
             assert_eq!(
                 scrolls,
                 if control == ScrollControl::Automatic {
-                    3
+                    finish_at - 2
                 } else {
                     0
                 },
-                "automatic input pauses when stationary and resumes after real movement"
+                "automatic input must keep probing through delayed or stationary frames"
             );
         }
     }
@@ -1598,6 +1618,40 @@ mod tests {
                     .any(|event| matches!(event, Progress::WaitingForOverlap { .. }))
             );
         }
+    }
+
+    #[test]
+    fn auto_does_not_resume_an_overlap_pause_just_because_frames_are_stationary() {
+        let document: Vec<u8> = (0..20).map(|value| value * 10).collect();
+        let second = frame(&document[3..11]);
+        let source = Frames {
+            frames: VecDeque::from([
+                frame(&document[0..8]),
+                second.clone(),
+                frame(&[255; 8]),
+                second.clone(),
+                second.clone(),
+                second,
+                frame(&document[6..14]),
+                frame(&document[9..17]),
+            ]),
+        };
+        let gestures = Arc::new(Mutex::new(Vec::new()));
+        let (output, _) = finish_after_frame(
+            ScrollSession::new(
+                source,
+                Box::new(RecordingDriver {
+                    gestures: Arc::clone(&gestures),
+                }),
+                NoopPacer,
+                config(8)
+                    .with_control(ScrollControl::Automatic)
+                    .with_direction_detection(3.0, 3.0),
+            ),
+            8,
+        );
+        assert_eq!(gestures.lock().unwrap().len(), 2);
+        assert_eq!(output.frame.height(), 17);
     }
 
     #[test]
@@ -1693,6 +1747,47 @@ mod tests {
                 ..
             ]
         ));
+    }
+
+    #[test]
+    fn live_preview_updates_only_for_the_baseline_and_accepted_content() {
+        let document: Vec<u8> = (0..18).map(|value| value * 10).collect();
+        let first = frame(&document[0..8]);
+        let second = frame(&document[3..11]);
+        let source = Frames {
+            frames: VecDeque::from([
+                first.clone(),
+                first,
+                second.clone(),
+                second,
+                frame(&document[6..14]),
+            ]),
+        };
+        let mut config = config(8)
+            .with_control(ScrollControl::Manual)
+            .with_direction_detection(3.0, 3.0);
+        config.preview = true;
+        let (output, events) = finish_after_frame(
+            ScrollSession::new(source, Box::<Driver>::default(), NoopPacer, config),
+            5,
+        );
+        let previews: Vec<_> = events
+            .iter()
+            .filter_map(|event| {
+                if let Progress::Preview(image) = event {
+                    Some(image)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(previews.len(), 3);
+        assert_eq!(
+            previews.iter().map(|p| p.source_height).collect::<Vec<_>>(),
+            vec![8, 11, 14]
+        );
+        assert_eq!(previews.last().unwrap().rgba, output.frame.data);
+        assert_eq!(output.reason, CompletionReason::CancelledKeep);
     }
 
     #[test]

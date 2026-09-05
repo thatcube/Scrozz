@@ -448,6 +448,77 @@ impl ScrollStitcher {
         }
     }
 
+    /// Samples the accepted canvas without allocating another full-size image.
+    pub fn preview(&self) -> Result<crate::ScrollPreview> {
+        let reverse = self.direction.is_reverse();
+        let axis = self.axis;
+        let Some(canvas) = &self.canvas else {
+            let frame = self.latest_frame.as_ref().ok_or_else(|| {
+                Error::InvalidRequest("cannot preview a scrolling capture without frames".into())
+            })?;
+            return Ok(crate::preview::sample_preview(
+                frame.width(),
+                frame.height(),
+                frame.format,
+                |x, y| {
+                    let x = if reverse && axis == ScrollAxis::Horizontal {
+                        frame.width() - 1 - x
+                    } else {
+                        x
+                    };
+                    let y = if reverse && axis == ScrollAxis::Vertical {
+                        frame.height() - 1 - y
+                    } else {
+                        y
+                    };
+                    let offset = y as usize * frame.stride + x as usize * 4;
+                    frame.data[offset..offset + 4]
+                        .try_into()
+                        .expect("accepted frame pixel")
+                },
+            ));
+        };
+        let mut ends = Vec::new();
+        if let CanvasPixels::Horizontal(strips) = &canvas.pixels {
+            let mut end = 0;
+            for strip in strips {
+                end += strip.width;
+                ends.push(end);
+            }
+        }
+        Ok(crate::preview::sample_preview(
+            canvas.width,
+            canvas.height,
+            canvas.format,
+            |x, y| {
+                let x = if reverse && axis == ScrollAxis::Horizontal {
+                    canvas.width - 1 - x
+                } else {
+                    x
+                };
+                let y = if reverse && axis == ScrollAxis::Vertical {
+                    canvas.height - 1 - y
+                } else {
+                    y
+                };
+                let bytes = match &canvas.pixels {
+                    CanvasPixels::Vertical(data) => {
+                        let offset = (y as usize * canvas.width as usize + x as usize) * 4;
+                        &data[offset..offset + 4]
+                    }
+                    CanvasPixels::Horizontal(strips) => {
+                        let index = ends.partition_point(|end| *end <= x);
+                        let start = if index == 0 { 0 } else { ends[index - 1] };
+                        let strip = &strips[index];
+                        let offset = y as usize * strip.row_bytes + (x - start) as usize * 4;
+                        &strip.data[offset..offset + 4]
+                    }
+                };
+                bytes.try_into().expect("accepted canvas pixel")
+            },
+        ))
+    }
+
     /// Produces the current image.
     pub fn finish_frame(mut self) -> Result<Frame> {
         let mut frame = match self.accepted_frames {
@@ -1442,6 +1513,39 @@ mod tests {
         assert!(remainder.is_empty());
         let columns: Vec<u8> = pixels.iter().map(|pixel| pixel[0]).collect();
         assert_eq!(columns, document[0..14]);
+    }
+
+    #[test]
+    fn live_previews_match_the_finished_pixels_for_all_four_directions() {
+        let document: Vec<u8> = (0..20).map(|value| value * 11).collect();
+        for direction in [
+            ScrollDirection::Down,
+            ScrollDirection::Up,
+            ScrollDirection::Right,
+            ScrollDirection::Left,
+        ] {
+            let mut stitcher = ScrollStitcher::for_direction(direction, config());
+            let starts = if direction.is_reverse() {
+                [6, 3, 0]
+            } else {
+                [0, 3, 6]
+            };
+            for start in starts {
+                let viewport = if direction.axis() == ScrollAxis::Vertical {
+                    frame(&document[start..start + 8], 6)
+                } else {
+                    column_frame(&document[start..start + 8], 6)
+                };
+                stitcher.push_frame(viewport).unwrap();
+            }
+            let preview = stitcher.preview().unwrap();
+            let output = stitcher.finish_frame().unwrap();
+            assert_eq!(preview.rgba, output.data, "{direction:?}");
+            assert_eq!(
+                (preview.source_width, preview.source_height),
+                (output.width(), output.height())
+            );
+        }
     }
 
     #[test]

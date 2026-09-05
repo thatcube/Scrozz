@@ -1371,6 +1371,7 @@ fn publish_scrolling_selection(
 
 fn describe_scroll_progress(progress: &Progress) -> String {
     match progress {
+        Progress::Preview(_) => "updated the scrolling preview".to_owned(),
         Progress::Prepared {
             driver,
             automatic,
@@ -2536,6 +2537,27 @@ impl App {
                 Outcome::Progress { card, progress } => {
                     self.update_scroll_hud(card, &progress);
                     self.note(format!("{card} {}", describe_scroll_progress(&progress)));
+                }
+                Outcome::ScrollPreview { card, latest } => {
+                    let preview = match latest.lock() {
+                        Ok(mut latest) => latest.take(),
+                        Err(error) => {
+                            self.note(format!("{card} scrolling preview unavailable: {error}"));
+                            None
+                        }
+                    };
+                    if self.scrolling_card == Some(card)
+                        && self.scroll_hud.is_some()
+                        && let Some(preview) = preview
+                    {
+                        self.surface.show_scroll_preview(
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [preview.width as usize, preview.height as usize],
+                                &preview.rgba,
+                            ),
+                            (preview.source_width, preview.source_height),
+                        );
+                    }
                 }
                 Outcome::Restored(mut card) => {
                     card.upload_available = self.cloud_settings.upload_enabled;
@@ -5351,6 +5373,7 @@ impl App {
             return;
         };
         match progress {
+            Progress::Preview(_) => return,
             Progress::Prepared { automatic, .. } => {
                 state.status = ScrollHudStatus::Prepared;
                 state.automatic = *automatic;
@@ -14496,6 +14519,40 @@ mod tests {
             surface.scrolling_hud().expect("HUD").status,
             ScrollHudStatus::AwaitingFinish(_)
         ));
+    }
+
+    #[test]
+    fn only_the_active_scrolling_session_can_replace_the_preview() {
+        let (mut app, surface) = scrolling_app();
+        let card = CardId(173);
+        app.scrolling_card = Some(card);
+        app.set_scroll_hud(ScrollHudState::prepared(ScrollControl::Manual));
+        for id in [CardId(172), card] {
+            app.pipeline
+                .inject_outcome_for_test(Outcome::ScrollPreview {
+                    card: id,
+                    latest: Arc::new(Mutex::new(Some(Arc::new(scrozz_stitch::ScrollPreview {
+                        width: 1,
+                        height: 1,
+                        source_width: 680,
+                        source_height: 4_200,
+                        rgba: vec![255; 4],
+                    })))),
+                });
+        }
+        app.drain_pipeline();
+        assert_eq!(
+            surface
+                .trace()
+                .iter()
+                .filter(|event| matches!(event, SurfaceCall::ScrollPreview { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            surface.presented().is_empty(),
+            "previews are not saved capture cards"
+        );
     }
 
     #[test]

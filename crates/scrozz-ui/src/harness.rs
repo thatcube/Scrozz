@@ -825,12 +825,12 @@ mod instants {
         KeyInstant {
             name: "vertical-progress",
             at_ms: 180,
-            expectation: "one steady capture status and Finish/Discard controls without polling diagnostics",
+            expectation: "a tall live stitched preview fits beside the selected region; capture controls stay steady",
         },
         KeyInstant {
             name: "horizontal-progress",
             at_ms: 360,
-            expectation: "horizontal and vertical routes share the same minimal, stable capture controls",
+            expectation: "a wide stitched preview fits in available screen space without covering capture controls",
         },
     ];
 }
@@ -1351,7 +1351,7 @@ impl Fixture {
             };
         let size_pt = match scenario {
             Scenario::SensitiveReview => (1080.0, 680.0),
-            Scenario::ScrollingCapture => (640.0, 260.0),
+            Scenario::ScrollingCapture => (960.0, 640.0),
             // Every editor scenario is rendered at a width the editor window
             // can actually be: `MIN_WINDOW_SIZE` is the floor under a real
             // one, and a golden narrower than that asserts a layout the user

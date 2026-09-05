@@ -11,6 +11,7 @@ use scrozz_core::{Frame, Result};
 pub mod align;
 pub mod chrome;
 pub mod luma;
+pub mod preview;
 pub mod session;
 pub mod stitch;
 
@@ -23,6 +24,7 @@ pub use chrome::{
     detect_sticky_chrome, detect_sticky_side_chrome,
 };
 pub use luma::{ColumnProfile, LumaPlane, RowProfile};
+pub use preview::ScrollPreview;
 pub use session::{
     AtomicCancellation, BackendFrameSource, CancelAction, CancelSignal, CompletionReason,
     FrameSource, NeverCancel, NoopPacer, Pacer, Progress, ScrollDirectionAmounts, ScrollSession,

@@ -346,7 +346,8 @@ picker to get wrong. Manual mode follows that route while the user scrolls.
 Automatic mode waits for that first user scroll, then continues in the same
 direction with bounded native wheel steps. Both modes save only after **Finish**
 and remain discardable until then. Stationary frames do not consume the capture
-budget; Automatic pauses its wheel input until movement resumes. Lost overlap
+budget; Automatic keeps sending paced wheel steps through stationary frames
+rather than going permanently idle after a delayed repaint. Lost overlap
 waits for the user to scroll back and reconnect, without saving a partial image.
 Capture limits or later acquisition failures hold the valid pixels in memory
 and keep **Finish** and **Discard** available. Reverse routes are normalized before
@@ -362,6 +363,16 @@ The status changes only when the user needs to do something
 different: prepare, begin scrolling, reconnect, or finish. Frame counts, seam
 measurements, direction prompts, and idle probes stay out of the visible UI.
 Routine polling never replaces the status or repeatedly redraws the control bar.
+
+A live preview shows the accepted stitched pixels beside the capture and scales
+proportionally to fit the available work area. It updates only for the baseline
+and newly accepted content, not idle probes. The engine samples directly from
+its canvas into a bounded 768-pixel thumbnail; the GUI keeps only the newest
+pending preview rather than queuing images. Reverse-direction previews stay in
+natural document order. Finish, Discard, and a new capture clear the preview.
+The preview avoids the selected region and controls; macOS's isolated-window
+capture can use a corner when a full-screen selection leaves no outside space.
+Unknown portal capture regions do not show a preview, avoiding recursive capture.
 
 Input delivery is per-platform and never global:
 

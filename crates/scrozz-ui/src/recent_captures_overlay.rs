@@ -1034,6 +1034,7 @@ struct Shared {
     outbox: Mutex<Vec<RecentCapturesOverlayEvent>>,
     commands: Mutex<Vec<Command>>,
     scroll_hud: Mutex<Option<ScrollHudState>>,
+    scroll_preview: Mutex<Option<(egui::ColorImage, (u32, u32))>>,
     ctx: Mutex<Option<egui::Context>>,
     report: Mutex<Option<PanelReport>>,
     native_pins: Mutex<Vec<NativePinRequest>>,
@@ -1099,6 +1100,17 @@ impl RecentCapturesOverlayHandle {
     pub fn hide_scroll_hud(&self) {
         if let Ok(mut slot) = self.shared.scroll_hud.lock() {
             *slot = None;
+        }
+        if let Ok(mut preview) = self.shared.scroll_preview.lock() {
+            *preview = None;
+        }
+        self.wake();
+    }
+
+    /// Replaces the pending preview instead of queuing old stitched images.
+    pub fn show_scroll_preview(&self, image: egui::ColorImage, source_px: (u32, u32)) {
+        if let Ok(mut preview) = self.shared.scroll_preview.lock() {
+            *preview = Some((image, source_px));
         }
         self.wake();
     }
@@ -1864,6 +1876,7 @@ impl PinnedEntry {
 
 /// The `eframe` application that hosts the capture stack.
 pub struct RecentCapturesOverlayApp {
+    scroll_preview: Option<(egui::TextureHandle, (u32, u32))>,
     stack: CaptureStack,
     content: HashMap<CardId, Entry>,
     pins: HashMap<PinId, PinnedEntry>,
@@ -1969,6 +1982,7 @@ impl RecentCapturesOverlayApp {
             .store(1, Ordering::Release);
 
         Self {
+            scroll_preview: None,
             stack: CaptureStack::configured(
                 options.geometry.local(),
                 options.settings.placement,
@@ -2944,6 +2958,39 @@ impl RecentCapturesOverlayApp {
         detach_scroll_controls(requested, global_pointer)
     }
 
+    fn refresh_scroll_preview(&mut self, ctx: &egui::Context, state: Option<&ScrollHudState>) {
+        let pending = self
+            .handle
+            .shared
+            .scroll_preview
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take());
+        if state.is_none_or(|state| {
+            matches!(
+                state.status,
+                ScrollHudStatus::Starting
+                    | ScrollHudStatus::Configuring
+                    | ScrollHudStatus::Failed(_)
+                    | ScrollHudStatus::Finalizing
+            )
+        }) {
+            self.scroll_preview = None;
+            return;
+        }
+        if let Some((image, source_px)) = pending {
+            if let Some((texture, size)) = &mut self.scroll_preview {
+                texture.set(image, egui::TextureOptions::LINEAR);
+                *size = source_px;
+            } else {
+                self.scroll_preview = Some((
+                    ctx.load_texture("scrozz.scroll.preview", image, egui::TextureOptions::LINEAR),
+                    source_px,
+                ));
+            }
+        }
+    }
+
     fn draw_detached_scroll_hud(
         &mut self,
         ctx: &egui::Context,
@@ -3756,7 +3803,6 @@ impl eframe::App for RecentCapturesOverlayApp {
         let was_empty = self.stack.is_empty();
         let dock_was = self.stack.dock().is_collapsed();
 
-        let surface = Surface::new(&self.theme, &self.icons, m);
         let mut frames = self.stack.frame(&m);
         sort_card_frames_for_painting(&mut frames);
 
@@ -3786,6 +3832,8 @@ impl eframe::App for RecentCapturesOverlayApp {
         let detached_scroll_controls = scroll_hud
             .as_ref()
             .is_some_and(|_| self.should_detach_scroll_controls());
+        self.refresh_scroll_preview(&ctx, scroll_hud.as_ref());
+        let surface = Surface::new(&self.theme, &self.icons, m);
         for f in &frames {
             let Some(entry) = self.content.get(&f.id) else {
                 continue;
@@ -3849,6 +3897,9 @@ impl eframe::App for RecentCapturesOverlayApp {
                 if let Some(action) = response.action {
                     self.emit(RecentCapturesOverlayEvent::Scrolling(action));
                 }
+            }
+            if let Some((texture, source_px)) = &self.scroll_preview {
+                ScrollingHud::draw_preview(ui, &self.theme, state, texture.id(), *source_px);
             }
         }
 
@@ -4805,6 +4856,33 @@ mod tests {
                 acknowledged: false
             }
         );
+    }
+
+    #[test]
+    fn hiding_the_scroll_hud_releases_its_pending_preview() {
+        let handle = RecentCapturesOverlayHandle::new();
+        handle.show_scroll_hud(ScrollHudState::prepared(scrozz_core::ScrollControl::Manual));
+        handle.show_scroll_preview(
+            egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+            (400, 800),
+        );
+        handle.show_scroll_preview(
+            egui::ColorImage::filled([1, 2], egui::Color32::BLACK),
+            (400, 8_000),
+        );
+        assert_eq!(
+            handle
+                .shared
+                .scroll_preview
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .1,
+            (400, 8_000)
+        );
+        handle.hide_scroll_hud();
+        assert!(handle.shared.scroll_preview.lock().unwrap().is_none());
     }
 
     #[test]

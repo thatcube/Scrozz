@@ -151,6 +151,38 @@ fn emit_outcome(outcomes: &Sender<Outcome>, waker: Option<&SurfaceWaker>, outcom
     }
 }
 
+type ScrollPreviewSlot = Arc<Mutex<Option<Arc<scrozz_stitch::ScrollPreview>>>>;
+
+fn publish_scroll_preview(
+    outcomes: &Sender<Outcome>,
+    waker: Option<&SurfaceWaker>,
+    card: CardId,
+    latest: &ScrollPreviewSlot,
+    image: Arc<scrozz_stitch::ScrollPreview>,
+) {
+    let notify = match latest.lock() {
+        Ok(mut pending) => {
+            let notify = pending.is_none();
+            *pending = Some(image);
+            notify
+        }
+        Err(error) => {
+            tracing::error!(%card, %error, "scrolling preview mailbox is unavailable");
+            return;
+        }
+    };
+    if notify {
+        emit_outcome(
+            outcomes,
+            waker,
+            Outcome::ScrollPreview {
+                card,
+                latest: Arc::clone(latest),
+            },
+        );
+    }
+}
+
 #[derive(Clone)]
 struct CaptureBudget {
     in_flight: Arc<AtomicUsize>,
@@ -976,6 +1008,13 @@ impl RememberedShare {
 /// What the capture thread produced.
 #[derive(Debug)]
 pub enum Outcome {
+    /// Wake for the newest live preview. Replaced frames are never queued.
+    ScrollPreview {
+        /// Owning scrolling session.
+        card: CardId,
+        /// At most one bounded image awaiting the main thread.
+        latest: ScrollPreviewSlot,
+    },
     /// The user committed a shutter action; acquisition and processing follow.
     Shutter {
         /// In-flight card correlated with the later ready/failure outcome.
@@ -2565,6 +2604,7 @@ impl AcquisitionWorker {
             })?;
             let outcomes = self.outcomes.clone();
             let waker = self.waker.clone();
+            let preview = Arc::new(Mutex::new(None));
             let capture =
                 crate::scrolling::scrolling_capture_target_with_detected_direction_and_cancellation(
                 job.target,
@@ -2572,6 +2612,10 @@ impl AcquisitionWorker {
                 &mut self.scrolling_cancellation.clone(),
                 &job.acquisition_cancellation,
                 move |progress| {
+                    if let Progress::Preview(image) = progress {
+                        publish_scroll_preview(&outcomes, waker.as_ref(), card, &preview, image);
+                        return;
+                    }
                     emit_outcome(
                         &outcomes,
                         waker.as_ref(),
@@ -7349,6 +7393,46 @@ mod tests {
         }));
         let _ = wait_for(&pipeline);
         wait_for_wake(&wakes);
+    }
+
+    #[test]
+    fn scrolling_previews_coalesce_without_queuing_old_pixel_buffers() {
+        let (outcomes, received) = channel();
+        let latest = Arc::new(Mutex::new(None));
+        let image = |value| {
+            Arc::new(scrozz_stitch::ScrollPreview {
+                width: 1,
+                height: 1,
+                source_width: 1,
+                source_height: 1,
+                rgba: vec![value, 0, 0, 255],
+            })
+        };
+        let old = image(10);
+        let released = Arc::downgrade(&old);
+        publish_scroll_preview(&outcomes, None, CardId(73), &latest, old);
+        for value in 11..=99 {
+            publish_scroll_preview(&outcomes, None, CardId(73), &latest, image(value));
+        }
+        assert!(
+            released.upgrade().is_none(),
+            "superseded pixels must be released"
+        );
+        let Outcome::ScrollPreview {
+            card,
+            latest: pending,
+        } = received.try_recv().unwrap()
+        else {
+            panic!("preview notification");
+        };
+        assert_eq!(card, CardId(73));
+        assert!(received.try_recv().is_err(), "only one pending wake");
+        assert_eq!(pending.lock().unwrap().take().unwrap().rgba[0], 99);
+        publish_scroll_preview(&outcomes, None, CardId(73), &latest, image(100));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(Outcome::ScrollPreview { .. })
+        ));
     }
 
     #[test]

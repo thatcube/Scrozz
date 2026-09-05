@@ -173,6 +173,33 @@ pub struct ScrollHudResponse {
 pub struct ScrollingHud;
 
 impl ScrollingHud {
+    /// A noninteractive, aspect-fitted view of the accepted stitched pixels.
+    pub(crate) fn draw_preview(
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &ScrollHudState,
+        texture: egui::TextureId,
+        source_px: (u32, u32),
+    ) {
+        let full = ui.max_rect();
+        let selection = state
+            .selection
+            .and_then(|selection| local_selection_rect(full, selection));
+        let controls = Self::control_rect(full, state);
+        // macOS scrolling captures an isolated SCWindow, not composited desktop
+        // pixels. Other capture paths must leave the selected pixels uncovered.
+        let allow_overlap = cfg!(target_os = "macos") && selection.is_some();
+        if let Some(image) = preview_rect(full, selection, controls, source_px, allow_overlap) {
+            paint::glass_panel(ui.painter(), image.expand(5.0), 10.0, &theme.palette, true);
+            ui.painter().image(
+                texture,
+                image,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+    }
+
     /// Bounds of the interactive controls in the root overlay's coordinates.
     #[must_use]
     pub(crate) fn control_rect(full: Rect, state: &ScrollHudState) -> Rect {
@@ -283,6 +310,74 @@ impl ScrollingHud {
     }
 }
 
+fn preview_rect(
+    full: Rect,
+    selection: Option<Rect>,
+    controls: Rect,
+    source_px: (u32, u32),
+    allow_overlap: bool,
+) -> Option<Rect> {
+    if source_px.0 == 0 || source_px.1 == 0 {
+        return None;
+    }
+    // A portal can capture an unknown source. Never place a preview over it.
+    let selection = selection?;
+    let safe = full.shrink(Space::LG);
+    let source = vec2(source_px.0 as f32, source_px.1 as f32);
+    let fit = |area: Rect| {
+        if area.width() < 20.0 || area.height() < 20.0 {
+            return None;
+        }
+        let scale = (area.width().min(240.0) / source.x)
+            .min(area.height().min(620.0) / source.y)
+            .min(1.0);
+        let size = source * scale;
+        Some(Rect::from_center_size(area.center(), size))
+    };
+    let outside = |obstacle: Rect, area: Rect| {
+        [
+            Rect::from_min_max(pos2(obstacle.right(), area.top()), area.max),
+            Rect::from_min_max(area.min, pos2(obstacle.left(), area.bottom())),
+            Rect::from_min_max(area.min, pos2(area.right(), obstacle.top())),
+            Rect::from_min_max(pos2(area.left(), obstacle.bottom()), area.max),
+        ]
+        .map(|rect| rect.intersect(area))
+    };
+    let regions = outside(selection.expand(Space::LG), safe);
+    let mut best: Option<(f32, Rect)> = None;
+    for (index, region) in regions.into_iter().enumerate() {
+        for area in outside(controls.expand(Space::LG), region) {
+            if let Some(rect) = fit(area) {
+                let score = rect.area()
+                    * match index {
+                        0 => 1.12,
+                        1 => 1.1,
+                        _ => 1.0,
+                    };
+                if best.is_none_or(|(previous, _)| score > previous) {
+                    best = Some((score, rect));
+                }
+            }
+        }
+    }
+    if best.is_none() && allow_overlap {
+        for area in outside(controls.expand(Space::LG), safe) {
+            // Only the isolated-window path may use an on-screen corner when
+            // a full-screen selection leaves no external strip.
+            let corner = Rect::from_min_max(
+                pos2((area.right() - 200.0).max(area.left()), area.top()),
+                area.max,
+            );
+            if let Some(rect) = fit(corner)
+                && best.is_none_or(|(previous, _)| rect.area() > previous)
+            {
+                best = Some((rect.area(), rect));
+            }
+        }
+    }
+    best.map(|(_, rect)| rect)
+}
+
 /// Deterministic setup and progress states for the visual harness.
 pub struct ScrollingScene;
 
@@ -304,8 +399,8 @@ impl Scene for ScrollingScene {
 
         if ctx.millis() <= 99 {
             let selection = LogicalRect::new(
-                scrozz_core::LogicalPoint::new(80.0, 8.0),
-                scrozz_core::LogicalSize::new(480.0, 60.0),
+                scrozz_core::LogicalPoint::new(160.0, 80.0),
+                scrozz_core::LogicalSize::new(520.0, 340.0),
             );
             draw_selection_mask(ui.painter(), ui.max_rect(), Some(selection));
             if let Some(rect) = local_selection_rect(ui.max_rect(), selection) {
@@ -331,8 +426,8 @@ impl Scene for ScrollingScene {
                 control: ScrollControl::Automatic,
                 direction: Some(ScrollDirection::Down),
                 selection: Some(LogicalRect::new(
-                    scrozz_core::LogicalPoint::new(80.0, 8.0),
-                    scrozz_core::LogicalSize::new(480.0, 75.0),
+                    scrozz_core::LogicalPoint::new(160.0, 80.0),
+                    scrozz_core::LogicalSize::new(520.0, 340.0),
                 )),
                 surface: None,
             },
@@ -345,13 +440,35 @@ impl Scene for ScrollingScene {
                 control: ScrollControl::Manual,
                 direction: Some(ScrollDirection::Right),
                 selection: Some(LogicalRect::new(
-                    scrozz_core::LogicalPoint::new(80.0, 8.0),
-                    scrozz_core::LogicalSize::new(480.0, 75.0),
+                    scrozz_core::LogicalPoint::new(160.0, 80.0),
+                    scrozz_core::LogicalSize::new(520.0, 340.0),
                 )),
                 surface: None,
             },
         };
         let _ = ScrollingHud::draw(ui, &theme, &state, false);
+        let vertical = ctx.millis() < 300;
+        let size = if vertical { [128, 614] } else { [640, 50] };
+        let mut image = egui::ColorImage::filled(size, Color32::from_rgb(247, 248, 250));
+        for y in 6..size[1] - 6 {
+            for x in 6..size[0] - 6 {
+                if y % 48 < 10 {
+                    image.pixels[y * size[0] + x] = Color32::from_rgb(45, 64, 86);
+                } else if y % 8 < 3 && x % 120 < 104 {
+                    image.pixels[y * size[0] + x] = Color32::from_rgb(180, 186, 194);
+                }
+            }
+        }
+        let texture = ui.ctx().load_texture(
+            "scrolling-preview-fixture",
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(Id::new("scrolling-preview-fixture"), texture.clone())
+        });
+        let source_px = if vertical { (520, 2_496) } else { (4_320, 340) };
+        ScrollingHud::draw_preview(ui, &theme, &state, texture.id(), source_px);
     }
 }
 
@@ -713,7 +830,9 @@ fn status_line(state: &ScrollHudState) -> &'static str {
         ScrollHudStatus::WaitingForOverlap => "Scroll back a little",
         ScrollHudStatus::AwaitingFinish(_) => "Capture paused",
         ScrollHudStatus::Finalizing => "Finishing",
+        _ if state.delta.is_some() && state.automatic => "Auto scrolling",
         _ if state.delta.is_some() => "Capturing",
+        _ if state.automatic => "Scroll to start Auto",
         _ => "Scroll to begin",
     }
 }
@@ -873,15 +992,44 @@ mod tests {
     }
 
     #[test]
+    fn live_preview_fits_the_screen_without_covering_capture_or_controls() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1_280.0, 800.0));
+        let selection = Rect::from_min_size(pos2(240.0, 120.0), vec2(680.0, 420.0));
+        let controls = anchored_panel_rect(screen, selection, 420.0, 48.0);
+        for size in [(680, 420), (680, 4_200), (680, 90_000), (20_000, 420)] {
+            let preview =
+                preview_rect(screen, Some(selection), controls, size, false).expect("preview");
+            assert!(screen.contains_rect(preview.expand(5.0)));
+            assert!(!preview.expand(5.0).intersects(selection));
+            assert!(!preview.expand(5.0).intersects(controls));
+            let aspect = size.0 as f32 / size.1 as f32;
+            assert!((preview.aspect_ratio() - aspect).abs() < 0.001, "{size:?}");
+        }
+    }
+
+    #[test]
+    fn full_screen_preview_fallback_requires_isolated_capture() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1_280.0, 800.0));
+        let controls = Rect::from_min_size(pos2(420.0, 720.0), vec2(420.0, 48.0));
+        assert!(preview_rect(screen, Some(screen), controls, (1_280, 5_000), false).is_none());
+        let preview = preview_rect(screen, Some(screen), controls, (1_280, 5_000), true)
+            .expect("isolated preview");
+        assert!(screen.contains_rect(preview.expand(5.0)));
+        assert!(!preview.expand(5.0).intersects(controls));
+        assert!(preview_rect(screen, None, controls, (1_280, 5_000), true).is_none());
+    }
+
+    #[test]
     fn polling_and_direction_changes_do_not_change_normal_status_text() {
         for control in [ScrollControl::Manual, ScrollControl::Automatic] {
             let mut state = ScrollHudState::prepared(control);
             for delta in [None, Some(612)] {
                 state.delta = delta;
-                let expected = if delta.is_some() {
-                    "Capturing"
-                } else {
-                    "Scroll to begin"
+                let expected = match (control, delta.is_some()) {
+                    (ScrollControl::Automatic, true) => "Auto scrolling",
+                    (ScrollControl::Automatic, false) => "Scroll to start Auto",
+                    (ScrollControl::Manual, true) => "Capturing",
+                    (ScrollControl::Manual, false) => "Scroll to begin",
                 };
                 for status in [
                     ScrollHudStatus::Prepared,

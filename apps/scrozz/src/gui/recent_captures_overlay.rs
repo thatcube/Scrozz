@@ -293,6 +293,10 @@ impl CardSurface for RecentCapturesOverlayCards {
         self.handle.hide_scroll_hud();
     }
 
+    fn show_scroll_preview(&mut self, image: egui::ColorImage, source_px: (u32, u32)) {
+        self.handle.show_scroll_preview(image, source_px);
+    }
+
     fn poll_scroll_hud(&mut self) -> Option<ScrollHudAction> {
         if self.scroll_actions.is_empty() {
             self.translate_batch();

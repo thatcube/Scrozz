@@ -204,6 +204,7 @@ pub(crate) fn advance_terminal_cancellation(state: &AtomicU8) -> Option<u8> {
 
 pub(crate) fn report_terminal_scroll_progress(progress: Progress) {
     match progress {
+        Progress::Preview(_) => {}
         Progress::Prepared {
             driver,
             automatic: true,
@@ -473,14 +474,13 @@ impl ScrollingTarget {
                     ScrollAxis::Vertical => ScrollGesture::down(at, 1.0),
                     ScrollAxis::Horizontal => ScrollGesture::right(at, 1.0),
                 };
-                let mut config = ScrollSessionConfig::new(gesture);
-                if cfg!(target_os = "macos") {
-                    config.settle_delay = Duration::from_millis(280);
-                    config.manual_poll_interval = Duration::from_millis(150);
-                }
-                Ok(config)
+                Ok(ScrollSessionConfig::new(gesture))
             }
         }?;
+        if cfg!(target_os = "macos") {
+            config.settle_delay = Duration::from_millis(280);
+            config.manual_poll_interval = Duration::from_millis(150);
+        }
         if let Some(control) = control {
             config = config.with_control(control);
             if control == ScrollControl::Manual {
@@ -504,6 +504,7 @@ impl ScrollingTarget {
             .session_config(ScrollAxis::Vertical, Some(control))?
             .with_direction_detection(vertical_amount, horizontal_amount);
         config.max_frames = 400;
+        config.preview = self.overlay_surface().is_some();
         Ok(config)
     }
 }
@@ -1199,6 +1200,46 @@ mod tests {
         assert_eq!(amounts.vertical, 325.0);
         assert_eq!(amounts.horizontal, 455.0);
         assert_eq!(detecting.max_frames, 400);
+        assert!(detecting.preview);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_macos_sessions_use_the_repaint_safe_timing() {
+        let display = fixture_display();
+        let viewport = display.work_area;
+        let target = ScrollingTarget::new(
+            CaptureRequest {
+                target: CaptureTarget::Window(WindowId("browser-window".to_owned())),
+                cursor: scrozz_core::CursorMode::Hidden,
+                include_window_shadow: false,
+            },
+            display,
+            viewport,
+            WindowId("browser-window".to_owned()),
+        );
+
+        let config = target
+            .direction_detecting_session_config(ScrollControl::Automatic)
+            .expect("native automatic session");
+
+        assert_eq!(config.settle_delay, Duration::from_millis(280));
+        assert_eq!(config.manual_poll_interval, Duration::from_millis(150));
+    }
+
+    #[test]
+    fn portal_sessions_omit_preview_without_known_overlay_geometry() {
+        let target = ScrollingTarget::manual_portal(CaptureRequest {
+            target: wayland_portal_picker_target(),
+            cursor: scrozz_core::CursorMode::Hidden,
+            include_window_shadow: false,
+        });
+
+        let config = target
+            .direction_detecting_session_config(ScrollControl::Manual)
+            .expect("portal session");
+
+        assert!(!config.preview);
     }
 
     #[test]
